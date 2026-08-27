@@ -1,0 +1,44 @@
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+
+pub val IO_COMPLETE: u8 = 1;
+pub val IO_PENDING: u8 = 2;
+pub val IO_END: u8 = 3;
+pub val IO_ERROR: u8 = 4;
+pub val IO_CANCELLED: u8 = 5;
+
+pub rec Io {
+    status: u8;
+    count: usize;
+    error: str;
+}
+
+# tokens are unique among live operations on one transport
+pub def ReadFun: fun(ptr, *u8, usize, u64) Io;
+pub def WriteFun: fun(ptr, *u8, usize, u64) Io;
+pub def CompleteFun: fun(ptr, u64) Io;
+pub def CancelFun: fun(ptr, u64) bool;
+pub def CloseFun: fun(ptr) bool;
+
+pub rec Transport {
+    ctx: ptr;
+    f_read: ReadFun;
+    f_write: WriteFun;
+    f_complete: CompleteFun;
+    f_cancel: CancelFun;
+    f_close: CloseFun;
+}
+
+pub fun is_terminal(io: Io) bool {
+    ret io.status == IO_END || io.status == IO_ERROR || io.status == IO_CANCELLED;
+}
+
+test "http.core.transport: terminal states are explicit" {
+    var io: Io;
+    io.status = IO_PENDING;
+    if (is_terminal(io)) { ret 1; }
+    io.status = IO_END;
+    if (!is_terminal(io)) { ret 1; }
+    ret 0;
+}

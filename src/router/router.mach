@@ -1,0 +1,43 @@
+use R: std.types.result;
+use std.types.view;
+
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+
+use http.core.message;
+
+pub val HANDLER_RESPOND: u8 = 1;
+pub val HANDLER_NEXT: u8 = 2;
+
+pub def Handler: fun(ptr, *message.Request, *message.Response) R.Result[u8, str];
+
+pub rec Route {
+    method: view.View;
+    pattern: view.View;
+    handler_ctx: ptr;
+    handler: Handler;
+}
+
+pub rec Router {
+    routes: *Route;
+    len: usize;
+    cap: usize;
+}
+
+pub fun init(routes: *Route, cap: usize) Router {
+    ret Router{routes: routes, len: 0, cap: cap};
+}
+
+pub fun is_full(r: *Router) bool {
+    ret r.len == r.cap;
+}
+
+test "http.router.router: caller controls route capacity" {
+    var slots: [2]Route;
+    var r: Router = init(?slots[0], 2);
+    if (is_full(?r)) { ret 1; }
+    r.len = 2;
+    if (!is_full(?r)) { ret 1; }
+    ret 0;
+}

@@ -1,0 +1,24 @@
+use std.types.size.usize;
+
+pub val CLIENT_IDLE: u8 = 1;
+pub val CLIENT_ACTIVE: u8 = 2;
+pub val CLIENT_CLOSING: u8 = 3;
+pub val CLIENT_CLOSED: u8 = 4;
+
+pub rec Config {
+    max_connections: usize;
+    connect_timeout_ns: u64;
+    request_timeout_ns: u64;
+    idle_timeout_ns: u64;
+}
+
+pub rec Client {
+    state: u8;
+    active_connections: usize;
+}
+
+pub fun init() Client {
+    var c: Client;
+    c.state = CLIENT_IDLE;
+    ret c;
+}

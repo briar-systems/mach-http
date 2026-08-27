@@ -1,0 +1,16 @@
+# http/3 connection state contracts
+
+use std.types.size.usize;
+
+pub val STATE_OPEN:     u8 = 1;
+pub val STATE_DRAINING: u8 = 2;
+pub val STATE_CLOSED:   u8 = 3;
+
+pub rec Connection {
+    state:               u8;
+    local_control_open:  u8;
+    remote_control_open: u8;
+    active_requests:     usize;
+    next_push_id:        u64;
+    last_goaway_id:      u64;
+}

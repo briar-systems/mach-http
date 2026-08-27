@@ -1,0 +1,66 @@
+use std.types.view;
+
+use std.types.size.usize;
+
+use http.core.body;
+
+pub val WIRE_H1: u8 = 1;
+pub val WIRE_H2: u8 = 2;
+pub val WIRE_H3: u8 = 3;
+
+pub rec Version {
+    wire: u8;
+    major: u8;
+    minor: u8;
+}
+
+pub rec Header {
+    name: view.View;
+    value: view.View;
+}
+
+pub rec Headers {
+    items: *Header;
+    len: usize;
+}
+
+# all views are borrowed from request-owned storage
+pub rec Request {
+    method: view.View;
+    scheme: view.View;
+    authority: view.View;
+    target: view.View;
+    version: Version;
+    headers: Headers;
+    body: body.Body;
+}
+
+# response storage remains owned by the handler or server arena
+pub rec Response {
+    status: u16;
+    headers: Headers;
+    body: body.Body;
+}
+
+pub fun version_h1(major: u8, minor: u8) Version {
+    ret Version{wire: WIRE_H1, major: major, minor: minor};
+}
+
+pub fun version_h2() Version {
+    ret Version{wire: WIRE_H2, major: 2, minor: 0};
+}
+
+pub fun version_h3() Version {
+    ret Version{wire: WIRE_H3, major: 3, minor: 0};
+}
+
+pub fun headers(items: *Header, len: usize) Headers {
+    ret Headers{items: items, len: len};
+}
+
+test "http.core.message: protocol versions retain wire identity" {
+    if (version_h1(1, 1).wire != WIRE_H1) { ret 1; }
+    if (version_h2().wire != WIRE_H2) { ret 1; }
+    if (version_h3().wire != WIRE_H3) { ret 1; }
+    ret 0;
+}

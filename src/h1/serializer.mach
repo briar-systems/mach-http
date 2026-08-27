@@ -1,0 +1,23 @@
+use std.types.size.usize;
+
+pub val SERIALIZE_HEAD: u8 = 1;
+pub val SERIALIZE_BODY: u8 = 2;
+pub val SERIALIZE_DONE: u8 = 3;
+
+pub rec Serializer {
+    phase: u8;
+    header_index: usize;
+    field_offset: usize;
+    body_written: u64;
+}
+
+pub fun init() Serializer {
+    var s: Serializer;
+    s.phase = SERIALIZE_HEAD;
+    ret s;
+}
+
+test "http.h1.serializer: starts at the message head" {
+    if (init().phase != SERIALIZE_HEAD) { ret 1; }
+    ret 0;
+}

@@ -1,0 +1,24 @@
+# websocket framing and upgrade contracts
+
+use std.types.bool.bool;
+use std.types.size.usize;
+
+pub val OPCODE_CONTINUATION: u8 = 0x0;
+pub val OPCODE_TEXT:         u8 = 0x1;
+pub val OPCODE_BINARY:       u8 = 0x2;
+pub val OPCODE_CLOSE:        u8 = 0x8;
+pub val OPCODE_PING:         u8 = 0x9;
+pub val OPCODE_PONG:         u8 = 0xA;
+
+pub rec Limits {
+    max_frame_bytes:   u64;
+    max_message_bytes: u64;
+    max_fragments:     usize;
+}
+
+pub rec Frame {
+    fin:        bool;
+    opcode:     u8;
+    masked:     bool;
+    payload_len: u64;
+}

@@ -1,0 +1,17 @@
+# bounded hpack state contracts
+
+use std.types.size.usize;
+
+pub rec Limits {
+    max_dynamic_table_bytes: usize;
+    max_header_list_bytes:   usize;
+    max_header_count:        usize;
+    max_string_bytes:        usize;
+}
+
+pub rec DynamicTable {
+    bytes:      usize;
+    entries:    usize;
+    max_bytes:  usize;
+    generation: u64;
+}

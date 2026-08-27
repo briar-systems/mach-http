@@ -1,0 +1,26 @@
+# http/2 connection state contracts
+
+use std.types.size.usize;
+
+pub val STATE_PREFACE:  u8 = 1;
+pub val STATE_OPEN:     u8 = 2;
+pub val STATE_DRAINING: u8 = 3;
+pub val STATE_CLOSED:   u8 = 4;
+
+pub rec Settings {
+    header_table_size:      u32;
+    enable_push:            u32;
+    max_concurrent_streams: u32;
+    initial_window_size:    u32;
+    max_frame_size:         u32;
+    max_header_list_size:   u32;
+}
+
+pub rec Connection {
+    state:              u8;
+    next_local_stream:  u32;
+    last_remote_stream: u32;
+    send_window:        i64;
+    recv_window:        i64;
+    active_streams:     usize;
+}

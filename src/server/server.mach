@@ -1,0 +1,28 @@
+use limits: http.h1.parser;
+
+use std.types.size.usize;
+
+pub val SERVER_NEW: u8 = 1;
+pub val SERVER_RUNNING: u8 = 2;
+pub val SERVER_DRAINING: u8 = 3;
+pub val SERVER_STOPPED: u8 = 4;
+
+pub rec Config {
+    request_limits: limits.Limits;
+    max_connections: usize;
+    max_pipeline: usize;
+    request_timeout_ns: u64;
+    idle_timeout_ns: u64;
+    drain_timeout_ns: u64;
+}
+
+pub rec Server {
+    state: u8;
+    active_connections: usize;
+}
+
+pub fun init() Server {
+    var s: Server;
+    s.state = SERVER_NEW;
+    ret s;
+}

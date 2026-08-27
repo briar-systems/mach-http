@@ -1,0 +1,27 @@
+# http/2 frame contracts
+
+pub val FRAME_DATA:          u8 = 0;
+pub val FRAME_HEADERS:       u8 = 1;
+pub val FRAME_PRIORITY:      u8 = 2;
+pub val FRAME_RESET_STREAM:  u8 = 3;
+pub val FRAME_SETTINGS:      u8 = 4;
+pub val FRAME_PUSH_PROMISE:  u8 = 5;
+pub val FRAME_PING:          u8 = 6;
+pub val FRAME_GOAWAY:        u8 = 7;
+pub val FRAME_WINDOW_UPDATE: u8 = 8;
+pub val FRAME_CONTINUATION:  u8 = 9;
+
+pub val DEFAULT_MAX_FRAME_SIZE: u32 = 16384;
+pub val MAX_FRAME_SIZE:         u32 = 16777215;
+
+pub rec Header {
+    length:    u32;
+    typ:       u8;
+    flags:     u8;
+    stream_id: u32;
+}
+
+test "http.h2.frame: frame size bounds are ordered" {
+    if (DEFAULT_MAX_FRAME_SIZE > MAX_FRAME_SIZE) { ret 1; }
+    ret 0;
+}

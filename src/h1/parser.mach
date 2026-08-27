@@ -1,0 +1,54 @@
+use std.types.size.usize;
+use std.types.string.str;
+
+pub val PARSE_NEED_INPUT: u8 = 1;
+pub val PARSE_HEADERS: u8 = 2;
+pub val PARSE_BODY: u8 = 3;
+pub val PARSE_MESSAGE: u8 = 4;
+pub val PARSE_ERROR: u8 = 5;
+
+pub rec Limits {
+    max_start_line: usize;
+    max_header_line: usize;
+    max_header_bytes: usize;
+    max_headers: usize;
+    max_body_bytes: u64;
+}
+
+pub rec Parser {
+    phase: u8;
+    consumed: usize;
+    header_bytes: usize;
+    header_count: usize;
+    body_remaining: u64;
+}
+
+pub rec Feed {
+    status: u8;
+    consumed: usize;
+    error_offset: usize;
+    error: str;
+}
+
+pub fun limits_default() Limits {
+    ret Limits{
+        max_start_line: 8192,
+        max_header_line: 8192,
+        max_header_bytes: 32768,
+        max_headers: 100,
+        max_body_bytes: 16777216,
+    };
+}
+
+pub fun init() Parser {
+    var p: Parser;
+    p.phase = PARSE_NEED_INPUT;
+    ret p;
+}
+
+test "http.h1.parser: defaults are bounded" {
+    val l: Limits = limits_default();
+    if (l.max_start_line == 0 || l.max_header_bytes == 0 || l.max_headers == 0) { ret 1; }
+    if (l.max_body_bytes == 0) { ret 1; }
+    ret 0;
+}

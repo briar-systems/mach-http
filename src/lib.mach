@@ -1,0 +1,26 @@
+use std.runtime;
+use std.types.string.str;
+
+pub val VERSION: str = "0.1.0";
+
+fwd http.core.body;
+fwd http.core.message;
+fwd http.core.transport;
+fwd http.h1.framing;
+fwd http.h1.parser;
+fwd http.h1.serializer;
+fwd h2_frame: http.h2.frame;
+fwd http.h2.hpack;
+fwd h2_connection: http.h2.connection;
+fwd h3_frame: http.h3.frame;
+fwd http.h3.qpack;
+fwd h3_connection: http.h3.connection;
+fwd http.websocket;
+fwd http.server.server;
+fwd http.client.client;
+fwd http.router.router;
+
+test "http: version is present" {
+    if (VERSION[0] == 0) { ret 1; }
+    ret 0;
+}

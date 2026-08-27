@@ -1,0 +1,17 @@
+# bounded qpack state contracts
+
+use std.types.size.usize;
+
+pub rec Limits {
+    max_table_capacity:  usize;
+    max_blocked_streams: usize;
+    max_field_bytes:     usize;
+    max_field_count:     usize;
+}
+
+pub rec State {
+    inserted:        u64;
+    acknowledged:    u64;
+    blocked_streams: usize;
+    table_bytes:     usize;
+}

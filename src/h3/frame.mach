@@ -1,0 +1,15 @@
+# http/3 frame contracts
+
+pub val FRAME_DATA:          u64 = 0x0;
+pub val FRAME_HEADERS:       u64 = 0x1;
+pub val FRAME_CANCEL_PUSH:   u64 = 0x3;
+pub val FRAME_SETTINGS:      u64 = 0x4;
+pub val FRAME_PUSH_PROMISE:  u64 = 0x5;
+pub val FRAME_GOAWAY:        u64 = 0x7;
+pub val FRAME_MAX_PUSH_ID:   u64 = 0xD;
+
+pub rec Header {
+    typ:    u64;
+    length: u64;
+}
+

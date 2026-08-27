@@ -1,0 +1,42 @@
+use R: std.types.result;
+
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+
+pub val READ_DATA: u8 = 1;
+pub val READ_END: u8 = 2;
+pub val READ_PENDING: u8 = 3;
+
+pub val LENGTH_UNKNOWN: u8 = 0;
+pub val LENGTH_KNOWN: u8 = 1;
+
+pub rec Read {
+    status: u8;
+    count: usize;
+}
+
+pub def ReadFun: fun(ptr, *u8, usize) R.Result[Read, str];
+pub def CloseFun: fun(ptr) R.Result[bool, str];
+
+# body bytes are borrowed for each read and never accumulated by this contract
+pub rec Body {
+    ctx: ptr;
+    f_read: ReadFun;
+    f_close: CloseFun;
+    length_kind: u8;
+    length: u64;
+}
+
+pub fun known_length(b: *Body) bool {
+    ret b.length_kind == LENGTH_KNOWN;
+}
+
+test "http.core.body: known length is explicit" {
+    var b: Body;
+    b.length_kind = LENGTH_UNKNOWN;
+    if (known_length(?b)) { ret 1; }
+    b.length_kind = LENGTH_KNOWN;
+    if (!known_length(?b)) { ret 1; }
+    ret 0;
+}

@@ -1,0 +1,23 @@
+use std.types.bool.bool;
+use std.types.bool.true;
+
+pub val FRAME_NONE: u8 = 0;
+pub val FRAME_LENGTH: u8 = 1;
+pub val FRAME_CHUNKED: u8 = 2;
+pub val FRAME_CLOSE: u8 = 3;
+
+pub rec Plan {
+    mode: u8;
+    length: u64;
+    keep_alive: bool;
+}
+
+pub fun none() Plan {
+    ret Plan{mode: FRAME_NONE, length: 0, keep_alive: true};
+}
+
+test "http.h1.framing: bodyless plan can keep a connection alive" {
+    val p: Plan = none();
+    if (p.mode != FRAME_NONE || !p.keep_alive) { ret 1; }
+    ret 0;
+}
