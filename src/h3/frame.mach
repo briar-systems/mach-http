@@ -220,6 +220,7 @@ fun fail(parser: *Parser, consumed: usize, error: Error) Event {
 }
 
 fun frame_allowed(kind: StreamKind, typ: u64) bool {
+    if (typ == 0x2 || typ == 0x6 || typ == 0x8 || typ == 0x9) { ret false; }
     if (typ == FRAME_DATA || typ == FRAME_HEADERS) {
         ret kind == KIND_REQUEST || kind == KIND_PUSH;
     }

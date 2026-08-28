@@ -1,17 +1,1850 @@
-# bounded qpack state contracts
+# bounded qpack codec with exact table and blocked-section ownership
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view;
+use std.memory;
+use http.core.field;
+use http.h2.hpack;
+
+pub val MAX_INTEGER: u64 = 0x3fffffffffffffff;
+
+pub def Error: u8;
+pub val ERROR_NONE: Error = 0;
+pub val ERROR_STATE: Error = 1;
+pub val ERROR_INPUT: Error = 2;
+pub val ERROR_INTEGER: Error = 3;
+pub val ERROR_INDEX: Error = 4;
+pub val ERROR_HUFFMAN: Error = 5;
+pub val ERROR_STRING_LIMIT: Error = 6;
+pub val ERROR_FIELD_LIMIT: Error = 7;
+pub val ERROR_TABLE_CAPACITY: Error = 8;
+pub val ERROR_TABLE_BLOCKED: Error = 9;
+pub val ERROR_BLOCKED_STREAMS: Error = 10;
+pub val ERROR_ENCODER_STREAM: Error = 11;
+pub val ERROR_DECODER_STREAM: Error = 12;
+pub val ERROR_DECOMPRESSION: Error = 13;
+pub val ERROR_OUTPUT: Error = 14;
+pub val ERROR_TRUNCATED: Error = 15;
 
 pub rec Limits {
-    max_table_capacity:  usize;
+    max_table_capacity: usize;
     max_blocked_streams: usize;
-    max_field_bytes:     usize;
-    max_field_count:     usize;
+    max_field_bytes: usize;
+    max_field_count: usize;
+    max_field_section_bytes: usize;
+    max_encoded_section_bytes: usize;
+    max_instruction_bytes: usize;
+    max_outstanding_sections: usize;
+    max_references: usize;
 }
 
 pub rec State {
-    inserted:        u64;
-    acknowledged:    u64;
+    inserted: u64;
+    acknowledged: u64;
     blocked_streams: usize;
-    table_bytes:     usize;
+    table_bytes: usize;
+}
+
+pub rec Entry {
+    name: view.View;
+    value: view.View;
+    size: usize;
+    absolute: u64;
+    references: usize;
+}
+
+pub rec DynamicTable {
+    items: *Entry;
+    entry_capacity: usize;
+    count: usize;
+    storage: *u8;
+    storage_capacity: usize;
+    storage_length: usize;
+    scratch: *u8;
+    scratch_capacity: usize;
+    bytes: usize;
+    capacity: usize;
+    max_capacity: usize;
+    insert_count: u64;
+    dropped_count: u64;
+    generation: u64;
+    valid: bool;
+}
+
+pub rec Reference {
+    section: usize;
+    absolute: u64;
+    active: bool;
+}
+
+pub rec Section {
+    stream_id: u64;
+    required_insert_count: u64;
+    base: u64;
+    sequence: u64;
+    blocked: bool;
+    active: bool;
+}
+
+pub rec Sections {
+    items: *Section;
+    capacity: usize;
+    references: *Reference;
+    reference_capacity: usize;
+    table: *DynamicTable;
+    count: usize;
+    blocked_count: usize;
+    known_received: u64;
+    next_sequence: u64;
+    max_blocked_streams: usize;
+    valid: bool;
+}
+
+pub def DecodeStatus: u8;
+pub val DECODE_NEED_INPUT: DecodeStatus = 1;
+pub val DECODE_BLOCKED: DecodeStatus = 2;
+pub val DECODE_COMPLETE: DecodeStatus = 3;
+pub val DECODE_ERROR: DecodeStatus = 4;
+
+pub rec Decode {
+    status: DecodeStatus;
+    consumed: usize;
+    count: usize;
+    bytes: usize;
+    required_insert_count: u64;
+    error: Error;
+}
+
+pub rec FieldDecoder {
+    limits: Limits;
+    table: *DynamicTable;
+    sections: *Sections;
+    stream_id: u64;
+    encoded: *u8;
+    encoded_capacity: usize;
+    encoded_length: usize;
+    fields: *field.Field;
+    field_capacity: usize;
+    field_count: usize;
+    storage: *u8;
+    storage_capacity: usize;
+    storage_length: usize;
+    scratch: *u8;
+    scratch_capacity: usize;
+    field_bytes: usize;
+    required_insert_count: u64;
+    base: u64;
+    section_slot: usize;
+    blocked: bool;
+    finished: bool;
+    error: Error;
+    initialized: bool;
+}
+
+pub rec Encode {
+    ok: bool;
+    written: usize;
+    required_insert_count: u64;
+    error: Error;
+}
+
+pub rec FieldEncoder {
+    limits: Limits;
+    table: *DynamicTable;
+    sections: *Sections;
+    stream_id: u64;
+    output: *u8;
+    output_capacity: usize;
+    output_length: usize;
+    fields: usize;
+    field_bytes: usize;
+    base: u64;
+    max_reference: u64;
+    references: *u64;
+    reference_capacity: usize;
+    reference_count: usize;
+    finished: bool;
+    error: Error;
+    initialized: bool;
+}
+
+pub def InstructionKind: u8;
+pub val INSTRUCTION_SET_CAPACITY: InstructionKind = 1;
+pub val INSTRUCTION_INSERT_NAME_REFERENCE: InstructionKind = 2;
+pub val INSTRUCTION_INSERT_LITERAL_NAME: InstructionKind = 3;
+pub val INSTRUCTION_DUPLICATE: InstructionKind = 4;
+pub val INSTRUCTION_SECTION_ACK: InstructionKind = 5;
+pub val INSTRUCTION_STREAM_CANCEL: InstructionKind = 6;
+pub val INSTRUCTION_INSERT_COUNT_INCREMENT: InstructionKind = 7;
+
+pub def InstructionStatus: u8;
+pub val INSTRUCTION_NEED_INPUT: InstructionStatus = 1;
+pub val INSTRUCTION_COMPLETE: InstructionStatus = 2;
+pub val INSTRUCTION_ERROR: InstructionStatus = 3;
+
+pub rec Instruction {
+    status: InstructionStatus;
+    consumed: usize;
+    kind: InstructionKind;
+    value: u64;
+    absolute: u64;
+    error: Error;
+}
+
+pub rec EncoderStreamDecoder {
+    limits: Limits;
+    table: *DynamicTable;
+    input: *u8;
+    input_capacity: usize;
+    input_length: usize;
+    scratch: *u8;
+    scratch_capacity: usize;
+    error: Error;
+    initialized: bool;
+}
+
+pub rec DecoderStreamDecoder {
+    limits: Limits;
+    table: *DynamicTable;
+    sections: *Sections;
+    input: *u8;
+    input_capacity: usize;
+    input_length: usize;
+    error: Error;
+    initialized: bool;
+}
+
+pub fun limits_default() Limits {
+    ret Limits{
+        max_table_capacity: 4096,
+        max_blocked_streams: 16,
+        max_field_bytes: 16384,
+        max_field_count: 100,
+        max_field_section_bytes: 65536,
+        max_encoded_section_bytes: 65536,
+        max_instruction_bytes: 32768,
+        max_outstanding_sections: 128,
+        max_references: 1024,
+    };
+}
+
+fun limits_valid(limits: Limits) bool {
+    ret limits.max_field_bytes != 0 && limits.max_field_count != 0
+        && limits.max_field_section_bytes != 0
+        && limits.max_encoded_section_bytes != 0
+        && limits.max_instruction_bytes != 0
+        && limits.max_outstanding_sections != 0 && limits.max_references != 0;
+}
+
+fun text(value: str) view.View { ret view.view(value, str_len(value)); }
+
+fun same(a: view.View, b: view.View) bool {
+    ret a.len == b.len && (a.len == 0 || (a.data != nil && b.data != nil
+        && memory.raw_equal(a.data, b.data, a.len)));
+}
+
+fun entry_size(name: view.View, value: view.View) usize {
+    if (name.len > (-1)::usize - value.len
+     || name.len + value.len > (-1)::usize - 32) { ret (-1)::usize; }
+    ret name.len + value.len + 32;
+}
+
+fun make_entry(name: str, value: str) Entry {
+    val name_view: view.View = text(name);
+    val value_view: view.View = text(value);
+    ret Entry{name: name_view, value: value_view,
+        size: entry_size(name_view, value_view), absolute: 0, references: 0};
+}
+
+pub fun static_entry(index: usize) Entry {
+    if (index == 0) { ret make_entry(":authority", ""); }
+    if (index == 1) { ret make_entry(":path", "/"); }
+    if (index == 2) { ret make_entry("age", "0"); }
+    if (index == 3) { ret make_entry("content-disposition", ""); }
+    if (index == 4) { ret make_entry("content-length", "0"); }
+    if (index == 5) { ret make_entry("cookie", ""); }
+    if (index == 6) { ret make_entry("date", ""); }
+    if (index == 7) { ret make_entry("etag", ""); }
+    if (index == 8) { ret make_entry("if-modified-since", ""); }
+    if (index == 9) { ret make_entry("if-none-match", ""); }
+    if (index == 10) { ret make_entry("last-modified", ""); }
+    if (index == 11) { ret make_entry("link", ""); }
+    if (index == 12) { ret make_entry("location", ""); }
+    if (index == 13) { ret make_entry("referer", ""); }
+    if (index == 14) { ret make_entry("set-cookie", ""); }
+    if (index == 15) { ret make_entry(":method", "CONNECT"); }
+    if (index == 16) { ret make_entry(":method", "DELETE"); }
+    if (index == 17) { ret make_entry(":method", "GET"); }
+    if (index == 18) { ret make_entry(":method", "HEAD"); }
+    if (index == 19) { ret make_entry(":method", "OPTIONS"); }
+    if (index == 20) { ret make_entry(":method", "POST"); }
+    if (index == 21) { ret make_entry(":method", "PUT"); }
+    if (index == 22) { ret make_entry(":scheme", "http"); }
+    if (index == 23) { ret make_entry(":scheme", "https"); }
+    if (index == 24) { ret make_entry(":status", "103"); }
+    if (index == 25) { ret make_entry(":status", "200"); }
+    if (index == 26) { ret make_entry(":status", "304"); }
+    if (index == 27) { ret make_entry(":status", "404"); }
+    if (index == 28) { ret make_entry(":status", "503"); }
+    if (index == 29) { ret make_entry("accept", "*/*"); }
+    if (index == 30) { ret make_entry("accept", "application/dns-message"); }
+    if (index == 31) { ret make_entry("accept-encoding", "gzip, deflate, br"); }
+    if (index == 32) { ret make_entry("accept-ranges", "bytes"); }
+    if (index == 33) { ret make_entry("access-control-allow-headers", "cache-control"); }
+    if (index == 34) { ret make_entry("access-control-allow-headers", "content-type"); }
+    if (index == 35) { ret make_entry("access-control-allow-origin", "*"); }
+    if (index == 36) { ret make_entry("cache-control", "max-age=0"); }
+    if (index == 37) { ret make_entry("cache-control", "max-age=2592000"); }
+    if (index == 38) { ret make_entry("cache-control", "max-age=604800"); }
+    if (index == 39) { ret make_entry("cache-control", "no-cache"); }
+    if (index == 40) { ret make_entry("cache-control", "no-store"); }
+    if (index == 41) { ret make_entry("cache-control", "public, max-age=31536000"); }
+    if (index == 42) { ret make_entry("content-encoding", "br"); }
+    if (index == 43) { ret make_entry("content-encoding", "gzip"); }
+    if (index == 44) { ret make_entry("content-type", "application/dns-message"); }
+    if (index == 45) { ret make_entry("content-type", "application/javascript"); }
+    if (index == 46) { ret make_entry("content-type", "application/json"); }
+    if (index == 47) { ret make_entry("content-type", "application/x-www-form-urlencoded"); }
+    if (index == 48) { ret make_entry("content-type", "image/gif"); }
+    if (index == 49) { ret make_entry("content-type", "image/jpeg"); }
+    if (index == 50) { ret make_entry("content-type", "image/png"); }
+    if (index == 51) { ret make_entry("content-type", "text/css"); }
+    if (index == 52) { ret make_entry("content-type", "text/html; charset=utf-8"); }
+    if (index == 53) { ret make_entry("content-type", "text/plain"); }
+    if (index == 54) { ret make_entry("content-type", "text/plain;charset=utf-8"); }
+    if (index == 55) { ret make_entry("range", "bytes=0-"); }
+    if (index == 56) { ret make_entry("strict-transport-security", "max-age=31536000"); }
+    if (index == 57) { ret make_entry("strict-transport-security", "max-age=31536000; includesubdomains"); }
+    if (index == 58) { ret make_entry("strict-transport-security", "max-age=31536000; includesubdomains; preload"); }
+    if (index == 59) { ret make_entry("vary", "accept-encoding"); }
+    if (index == 60) { ret make_entry("vary", "origin"); }
+    if (index == 61) { ret make_entry("x-content-type-options", "nosniff"); }
+    if (index == 62) { ret make_entry("x-xss-protection", "1; mode=block"); }
+    if (index == 63) { ret make_entry(":status", "100"); }
+    if (index == 64) { ret make_entry(":status", "204"); }
+    if (index == 65) { ret make_entry(":status", "206"); }
+    if (index == 66) { ret make_entry(":status", "302"); }
+    if (index == 67) { ret make_entry(":status", "400"); }
+    if (index == 68) { ret make_entry(":status", "403"); }
+    if (index == 69) { ret make_entry(":status", "421"); }
+    if (index == 70) { ret make_entry(":status", "425"); }
+    if (index == 71) { ret make_entry(":status", "500"); }
+    if (index == 72) { ret make_entry("accept-language", ""); }
+    if (index == 73) { ret make_entry("access-control-allow-credentials", "FALSE"); }
+    if (index == 74) { ret make_entry("access-control-allow-credentials", "TRUE"); }
+    if (index == 75) { ret make_entry("access-control-allow-headers", "*"); }
+    if (index == 76) { ret make_entry("access-control-allow-methods", "get"); }
+    if (index == 77) { ret make_entry("access-control-allow-methods", "get, post, options"); }
+    if (index == 78) { ret make_entry("access-control-allow-methods", "options"); }
+    if (index == 79) { ret make_entry("access-control-expose-headers", "content-length"); }
+    if (index == 80) { ret make_entry("access-control-request-headers", "content-type"); }
+    if (index == 81) { ret make_entry("access-control-request-method", "get"); }
+    if (index == 82) { ret make_entry("access-control-request-method", "post"); }
+    if (index == 83) { ret make_entry("alt-svc", "clear"); }
+    if (index == 84) { ret make_entry("authorization", ""); }
+    if (index == 85) { ret make_entry("content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"); }
+    if (index == 86) { ret make_entry("early-data", "1"); }
+    if (index == 87) { ret make_entry("expect-ct", ""); }
+    if (index == 88) { ret make_entry("forwarded", ""); }
+    if (index == 89) { ret make_entry("if-range", ""); }
+    if (index == 90) { ret make_entry("origin", ""); }
+    if (index == 91) { ret make_entry("purpose", "prefetch"); }
+    if (index == 92) { ret make_entry("server", ""); }
+    if (index == 93) { ret make_entry("timing-allow-origin", "*"); }
+    if (index == 94) { ret make_entry("upgrade-insecure-requests", "1"); }
+    if (index == 95) { ret make_entry("user-agent", ""); }
+    if (index == 96) { ret make_entry("x-forwarded-for", ""); }
+    if (index == 97) { ret make_entry("x-frame-options", "deny"); }
+    if (index == 98) { ret make_entry("x-frame-options", "sameorigin"); }
+    ret make_entry("", "");
+}
+
+pub fun table_init(table: *DynamicTable, entries: *Entry, entry_capacity: usize,
+    storage: *u8, storage_capacity: usize, scratch: *u8,
+    scratch_capacity: usize, max_capacity: usize) bool {
+    if (table == nil || table.valid || max_capacity > storage_capacity
+     || max_capacity > scratch_capacity
+     || (max_capacity != 0 && (entries == nil || entry_capacity == 0
+        || storage == nil || scratch == nil))) {
+        ret false;
+    }
+    table.items = entries; table.entry_capacity = entry_capacity; table.count = 0;
+    table.storage = storage; table.storage_capacity = storage_capacity;
+    table.storage_length = 0; table.scratch = scratch;
+    table.scratch_capacity = scratch_capacity; table.bytes = 0; table.capacity = 0;
+    table.max_capacity = max_capacity; table.insert_count = 0; table.dropped_count = 0;
+    table.generation = 1; table.valid = true;
+    ret true;
+}
+
+fun table_evict_one(table: *DynamicTable) bool {
+    if (table.count == 0) { ret true; }
+    val oldest: *Entry = ?table.items[table.count - 1];
+    if (oldest.references != 0) { ret false; }
+    table.bytes = table.bytes - oldest.size;
+    table.storage_length = table.storage_length - oldest.name.len - oldest.value.len;
+    table.count = table.count - 1;
+    table.dropped_count = table.dropped_count + 1;
+    table.generation = table.generation + 1;
+    ret true;
+}
+
+pub fun table_set_capacity(table: *DynamicTable, capacity: usize) Error {
+    if (table == nil || !table.valid) { ret ERROR_STATE; }
+    if (capacity > table.max_capacity) { ret ERROR_TABLE_CAPACITY; }
+    var remaining: usize = table.bytes; var evictions: usize = 0;
+    for (remaining > capacity) {
+        val entry: *Entry = ?table.items[table.count - evictions - 1];
+        if (entry.references != 0) { ret ERROR_TABLE_BLOCKED; }
+        remaining = remaining - entry.size; evictions = evictions + 1;
+    }
+    for (evictions != 0) {
+        table_evict_one(table); evictions = evictions - 1;
+    }
+    table.capacity = capacity; table.generation = table.generation + 1;
+    ret ERROR_NONE;
+}
+
+pub fun table_find_absolute(table: *DynamicTable, absolute: u64) *Entry {
+    if (table == nil || !table.valid || absolute < table.dropped_count
+     || absolute >= table.insert_count) { ret nil; }
+    val relative: u64 = table.insert_count - absolute - 1;
+    if (relative >= table.count::u64) { ret nil; }
+    ret ?table.items[relative::usize];
+}
+
+pub fun table_find_relative(table: *DynamicTable, relative: u64) *Entry {
+    if (table == nil || !table.valid || relative >= table.count::u64) { ret nil; }
+    ret ?table.items[relative::usize];
+}
+
+pub fun table_insert(table: *DynamicTable, name: view.View, value: view.View) Error {
+    if (table == nil || !table.valid || (name.data == nil && name.len != 0)
+     || (value.data == nil && value.len != 0) || table.insert_count >= MAX_INTEGER) {
+        ret ERROR_STATE;
+    }
+    val size: usize = entry_size(name, value);
+    if (size == (-1)::usize || size > table.capacity || table.entry_capacity == 0) {
+        ret ERROR_TABLE_CAPACITY;
+    }
+    val physical: usize = name.len + value.len;
+    val storage_start: usize = table.storage::usize;
+    val storage_end: usize = storage_start + table.storage_length;
+    var name_inside: bool = false; var value_inside: bool = false;
+    if (name.len != 0 && name.data::usize >= storage_start
+     && name.data::usize + name.len <= storage_end) {
+        name_inside = true;
+    }
+    if (value.len != 0 && value.data::usize >= storage_start
+     && value.data::usize + value.len <= storage_end) {
+        value_inside = true;
+    }
+    var safe_name: view.View = name; var safe_value: view.View = value;
+    if (name_inside || value_inside) {
+        if (physical > table.scratch_capacity) { ret ERROR_TABLE_CAPACITY; }
+        memory.raw_copy(table.scratch, name.data, name.len);
+        memory.raw_copy(?table.scratch[name.len], value.data, value.len);
+        safe_name = view.view(table.scratch, name.len);
+        safe_value = view.view(?table.scratch[name.len], value.len);
+    }
+    var remaining_count: usize = table.count; var remaining_bytes: usize = table.bytes;
+    var remaining_storage: usize = table.storage_length; var evictions: usize = 0;
+    for (remaining_count == table.entry_capacity
+        || remaining_bytes > table.capacity - size) {
+        val entry: *Entry = ?table.items[remaining_count - 1];
+        if (entry.references != 0) { ret ERROR_TABLE_BLOCKED; }
+        remaining_count = remaining_count - 1;
+        remaining_bytes = remaining_bytes - entry.size;
+        remaining_storage = remaining_storage - entry.name.len - entry.value.len;
+        evictions = evictions + 1;
+    }
+    if (physical > table.storage_capacity - remaining_storage) {
+        ret ERROR_TABLE_CAPACITY;
+    }
+    for (evictions != 0) {
+        table_evict_one(table); evictions = evictions - 1;
+    }
+    memory.raw_move(?table.storage[physical], table.storage, table.storage_length);
+    var i: usize = table.count;
+    for (i > 0) {
+        val prior: Entry = table.items[i - 1];
+        table.items[i] = Entry{
+            name: view.view(?prior.name.data[physical], prior.name.len),
+            value: view.view(?prior.value.data[physical], prior.value.len),
+            size: prior.size, absolute: prior.absolute, references: prior.references,
+        };
+        i = i - 1;
+    }
+    var name_source: *u8 = safe_name.data; var value_source: *u8 = safe_value.data;
+    memory.raw_copy(table.storage, name_source, name.len);
+    memory.raw_copy(?table.storage[name.len], value_source, value.len);
+    table.items[0] = Entry{name: view.view(table.storage, name.len),
+        value: view.view(?table.storage[name.len], value.len), size: size,
+        absolute: table.insert_count, references: 0};
+    table.count = table.count + 1; table.storage_length = table.storage_length + physical;
+    table.bytes = table.bytes + size; table.insert_count = table.insert_count + 1;
+    table.generation = table.generation + 1;
+    ret ERROR_NONE;
+}
+
+pub fun state(table: *DynamicTable, sections: *Sections) State {
+    var blocked: usize = 0; var acknowledged: u64 = 0;
+    if (sections != nil && sections.valid) {
+        blocked = sections.blocked_count; acknowledged = sections.known_received;
+    }
+    if (table == nil || !table.valid) {
+        ret State{inserted: 0, acknowledged: acknowledged,
+            blocked_streams: blocked, table_bytes: 0};
+    }
+    ret State{inserted: table.insert_count, acknowledged: acknowledged,
+        blocked_streams: blocked, table_bytes: table.bytes};
+}
+
+pub fun sections_init(sections: *Sections, items: *Section, capacity: usize,
+    references: *Reference, reference_capacity: usize, table: *DynamicTable,
+    limits: Limits) bool {
+    if (sections == nil || sections.valid || !limits_valid(limits)
+     || items == nil || capacity < limits.max_outstanding_sections
+     || references == nil || reference_capacity < limits.max_references
+     || table == nil || !table.valid) { ret false; }
+    sections.items = items; sections.capacity = capacity;
+    sections.references = references; sections.reference_capacity = reference_capacity;
+    sections.table = table; sections.count = 0; sections.blocked_count = 0;
+    sections.known_received = 0; sections.next_sequence = 1;
+    sections.max_blocked_streams = limits.max_blocked_streams; sections.valid = true;
+    var i: usize = 0;
+    for (i < capacity) { sections.items[i].active = false; i = i + 1; }
+    for (i < reference_capacity) {
+        sections.references[i].active = false; i = i + 1;
+    }
+    ret true;
+}
+
+fun stream_blocked(sections: *Sections, stream_id: u64, except: usize) bool {
+    var i: usize = 0;
+    for (i < sections.capacity) {
+        if (i != except && sections.items[i].active && sections.items[i].blocked
+         && sections.items[i].stream_id == stream_id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun allocate_section(sections: *Sections, stream_id: u64,
+    required: u64, base: u64, blocked: bool) usize {
+    if (sections == nil || !sections.valid || sections.count >= sections.capacity
+     || sections.next_sequence == MAX_INTEGER) {
+        ret (-1)::usize;
+    }
+    if (blocked && !stream_blocked(sections, stream_id, (-1)::usize)
+     && sections.blocked_count >= sections.max_blocked_streams) { ret (-1)::usize; }
+    var slot: usize = 0;
+    for (slot < sections.capacity && sections.items[slot].active) { slot = slot + 1; }
+    if (slot == sections.capacity) { ret (-1)::usize; }
+    sections.items[slot] = Section{stream_id: stream_id,
+        required_insert_count: required, base: base,
+        sequence: sections.next_sequence, blocked: blocked, active: true};
+    sections.next_sequence = sections.next_sequence + 1; sections.count = sections.count + 1;
+    if (blocked && !stream_blocked(sections, stream_id, slot)) {
+        sections.blocked_count = sections.blocked_count + 1;
+    }
+    ret slot;
+}
+
+fun release_section(sections: *Sections, slot: usize) bool {
+    if (sections == nil || !sections.valid || slot >= sections.capacity
+     || !sections.items[slot].active) { ret false; }
+    val stream_id: u64 = sections.items[slot].stream_id;
+    val was_blocked: bool = sections.items[slot].blocked;
+    var i: usize = 0;
+    for (i < sections.reference_capacity) {
+        if (sections.references[i].active && sections.references[i].section == slot) {
+            val entry: *Entry = table_find_absolute(sections.table,
+                sections.references[i].absolute);
+            if (entry != nil && entry.references != 0) {
+                entry.references = entry.references - 1;
+            }
+            sections.references[i].active = false;
+        }
+        i = i + 1;
+    }
+    sections.items[slot].active = false; sections.count = sections.count - 1;
+    if (was_blocked && !stream_blocked(sections, stream_id, (-1)::usize)) {
+        sections.blocked_count = sections.blocked_count - 1;
+    }
+    ret true;
+}
+
+fun add_reference(sections: *Sections, slot: usize, absolute: u64) bool {
+    val entry: *Entry = table_find_absolute(sections.table, absolute);
+    if (entry == nil) { ret false; }
+    var i: usize = 0;
+    for (i < sections.reference_capacity) {
+        if (sections.references[i].active && sections.references[i].section == slot
+         && sections.references[i].absolute == absolute) { ret true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < sections.reference_capacity && sections.references[i].active) {
+        i = i + 1;
+    }
+    if (i == sections.reference_capacity) { ret false; }
+    sections.references[i] = Reference{section: slot, absolute: absolute, active: true};
+    entry.references = entry.references + 1;
+    ret true;
+}
+
+pub fun sections_unblock(sections: *Sections) usize {
+    if (sections == nil || !sections.valid) { ret 0; }
+    var changed: usize = 0; var i: usize = 0;
+    for (i < sections.capacity) {
+        if (sections.items[i].active && sections.items[i].blocked
+         && sections.items[i].required_insert_count <= sections.table.insert_count) {
+            val stream_id: u64 = sections.items[i].stream_id;
+            sections.items[i].blocked = false; changed = changed + 1;
+            if (!stream_blocked(sections, stream_id, (-1)::usize)) {
+                sections.blocked_count = sections.blocked_count - 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret changed;
+}
+
+pub fun sections_acknowledge(sections: *Sections, stream_id: u64) Error {
+    if (sections == nil || !sections.valid) { ret ERROR_STATE; }
+    var slot: usize = (-1)::usize; var sequence: u64 = (-1)::u64;
+    var i: usize = 0;
+    for (i < sections.capacity) {
+        if (sections.items[i].active && sections.items[i].stream_id == stream_id
+         && sections.items[i].required_insert_count != 0
+         && sections.items[i].sequence < sequence) {
+            slot = i; sequence = sections.items[i].sequence;
+        }
+        i = i + 1;
+    }
+    if (slot == (-1)::usize) { ret ERROR_DECODER_STREAM; }
+    if (sections.items[slot].required_insert_count > sections.known_received) {
+        sections.known_received = sections.items[slot].required_insert_count;
+    }
+    release_section(sections, slot);
+    ret ERROR_NONE;
+}
+
+pub fun sections_cancel(sections: *Sections, stream_id: u64) Error {
+    if (sections == nil || !sections.valid) { ret ERROR_STATE; }
+    var i: usize = 0;
+    for (i < sections.capacity) {
+        if (sections.items[i].active && sections.items[i].stream_id == stream_id) {
+            release_section(sections, i);
+        }
+        i = i + 1;
+    }
+    ret ERROR_NONE;
+}
+
+pub fun sections_increment(sections: *Sections, increment: u64) Error {
+    if (sections == nil || !sections.valid || increment == 0
+     || sections.known_received > sections.table.insert_count
+     || increment > sections.table.insert_count - sections.known_received) {
+        ret ERROR_DECODER_STREAM;
+    }
+    sections.known_received = sections.known_received + increment;
+    ret ERROR_NONE;
+}
+
+pub fun encode_required_insert_count(required: u64, max_capacity: usize) u64 {
+    if (required == 0) { ret 0; }
+    val max_entries: u64 = (max_capacity / 32)::u64;
+    if (max_entries == 0 || max_entries > MAX_INTEGER / 2) { ret (-1)::u64; }
+    ret (required % (2 * max_entries)) + 1;
+}
+
+pub fun decode_required_insert_count(encoded: u64, total_inserts: u64,
+    max_capacity: usize) u64 {
+    if (encoded == 0) { ret 0; }
+    val max_entries: u64 = (max_capacity / 32)::u64;
+    if (max_entries == 0 || max_entries > MAX_INTEGER / 2) { ret (-1)::u64; }
+    val full_range: u64 = 2 * max_entries;
+    if (encoded > full_range || total_inserts > (-1)::u64 - max_entries) {
+        ret (-1)::u64;
+    }
+    val max_value: u64 = total_inserts + max_entries;
+    val max_wrapped: u64 = (max_value / full_range) * full_range;
+    var required: u64 = max_wrapped + encoded - 1;
+    if (required > max_value) {
+        if (required <= full_range) { ret (-1)::u64; }
+        required = required - full_range;
+    }
+    if (required == 0) { ret (-1)::u64; }
+    ret required;
+}
+
+rec StringValue { value: view.View; next: usize; error: Error; }
+
+fun decode_integer(input: *u8, length: usize, offset: usize,
+    prefix: u8) hpack.Integer {
+    var result: hpack.Integer = hpack.decode_integer(input, length, offset, prefix);
+    if (result.error == hpack.ERROR_NONE && result.value > MAX_INTEGER) {
+        result.error = hpack.ERROR_INTEGER;
+    }
+    ret result;
+}
+
+fun decode_string(input: *u8, length: usize, offset: usize, prefix: u8,
+    huffman_bit: u8, output: *u8, output_capacity: usize,
+    maximum: usize) StringValue {
+    val encoded_length: hpack.Integer = decode_integer(input, length, offset, prefix);
+    if (encoded_length.error != hpack.ERROR_NONE) {
+        ret StringValue{value: view.view(nil, 0), next: offset, error: ERROR_INPUT};
+    }
+    if (encoded_length.value > ((-1)::usize)::u64) {
+        ret StringValue{value: view.view(nil, 0), next: offset, error: ERROR_INTEGER};
+    }
+    val bytes: usize = encoded_length.value::usize;
+    if (bytes > length - encoded_length.next) {
+        ret StringValue{value: view.view(nil, 0), next: offset, error: ERROR_INPUT};
+    }
+    var written: usize = bytes;
+    if ((input[offset] & huffman_bit) != 0) {
+        written = hpack.huffman_decode(?input[encoded_length.next], bytes,
+            output, output_capacity, maximum);
+        if (written == (-1)::usize) {
+            ret StringValue{value: view.view(nil, 0), next: offset, error: ERROR_HUFFMAN};
+        }
+    } or {
+        if (bytes > maximum || output == nil || output_capacity < bytes) {
+            ret StringValue{value: view.view(nil, 0), next: offset,
+                error: ERROR_STRING_LIMIT};
+        }
+        memory.raw_copy(output, ?input[encoded_length.next], bytes);
+    }
+    ret StringValue{value: view.view(output, written),
+        next: encoded_length.next + bytes, error: ERROR_NONE};
+}
+
+fun encode_string(value: view.View, prefix: u8, pattern: u8, huffman_bit: u8,
+    huffman_enabled: bool, output: *u8, capacity: usize) usize {
+    var encoded_length: usize = value.len;
+    if (huffman_enabled) {
+        encoded_length = hpack.huffman_encoded_size(value.data, value.len);
+        if (encoded_length == (-1)::usize) { ret 0; }
+    }
+    var first_pattern: u8 = pattern;
+    if (huffman_enabled) { first_pattern = first_pattern | huffman_bit; }
+    val first: usize = hpack.encode_integer(encoded_length::u64, prefix,
+        first_pattern, output, capacity);
+    if (first == 0 || encoded_length > capacity - first) { ret 0; }
+    if (huffman_enabled) {
+        if (hpack.huffman_encode(value.data, value.len, ?output[first],
+            capacity - first) != encoded_length) { ret 0; }
+    } or { memory.raw_copy(?output[first], value.data, value.len); }
+    ret first + encoded_length;
+}
+
+fun instruction_result(status: InstructionStatus, kind: InstructionKind,
+    consumed: usize, value: u64, absolute: u64, error: Error) Instruction {
+    ret Instruction{status: status, consumed: consumed, kind: kind,
+        value: value, absolute: absolute, error: error};
+}
+
+fun integer_error(value: hpack.Integer) Error {
+    if (value.error == hpack.ERROR_INTEGER) { ret ERROR_INTEGER; }
+    ret ERROR_INPUT;
+}
+
+pub fun encoder_stream_decoder_init(decoder: *EncoderStreamDecoder,
+    table: *DynamicTable, input: *u8, input_capacity: usize,
+    scratch: *u8, scratch_capacity: usize, limits: Limits) bool {
+    if (decoder == nil || decoder.initialized || !limits_valid(limits)
+     || table == nil || !table.valid || input == nil
+     || input_capacity < limits.max_instruction_bytes || scratch == nil
+     || scratch_capacity < limits.max_field_bytes * 2) { ret false; }
+    decoder.limits = limits; decoder.table = table; decoder.input = input;
+    decoder.input_capacity = input_capacity; decoder.input_length = 0;
+    decoder.scratch = scratch; decoder.scratch_capacity = scratch_capacity;
+    decoder.error = ERROR_NONE; decoder.initialized = true;
+    ret true;
+}
+
+fun parse_encoder_instruction(decoder: *EncoderStreamDecoder) Instruction {
+    val input: *u8 = decoder.input; val length: usize = decoder.input_length;
+    if (length == 0) {
+        ret instruction_result(INSTRUCTION_NEED_INPUT, 0, 0, 0, 0, ERROR_NONE);
+    }
+    val first: u8 = input[0];
+    if ((first & 0x80) != 0) {
+        val index: hpack.Integer = decode_integer(input, length, 0, 6);
+        if (index.error != hpack.ERROR_NONE) {
+            val error: Error = integer_error(index);
+            if (error == ERROR_INPUT) {
+                ret instruction_result(INSTRUCTION_NEED_INPUT, 0, 0, 0, 0, ERROR_NONE);
+            }
+            ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, error);
+        }
+        val value: StringValue = decode_string(input, length, index.next, 7, 0x80,
+            decoder.scratch, decoder.scratch_capacity, decoder.limits.max_field_bytes);
+        if (value.error == ERROR_INPUT) {
+            ret instruction_result(INSTRUCTION_NEED_INPUT, 0, 0, 0, 0, ERROR_NONE);
+        }
+        if (value.error != ERROR_NONE) {
+            ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, value.error);
+        }
+        var source: *Entry = nil;
+        if ((first & 0x40) != 0) {
+            if (index.value > 98) {
+                ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, ERROR_INDEX);
+            }
+            var fixed: Entry = static_entry(index.value::usize); source = ?fixed;
+            val error: Error = table_insert(decoder.table, source.name, value.value);
+            if (error != ERROR_NONE) {
+                ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, error);
+            }
+        } or {
+            source = table_find_relative(decoder.table, index.value);
+            if (source == nil) {
+                ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, ERROR_INDEX);
+            }
+            val error: Error = table_insert(decoder.table, source.name, value.value);
+            if (error != ERROR_NONE) {
+                ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, error);
+            }
+        }
+        ret instruction_result(INSTRUCTION_COMPLETE,
+            INSTRUCTION_INSERT_NAME_REFERENCE, value.next, index.value,
+            decoder.table.insert_count - 1, ERROR_NONE);
+    }
+    if ((first & 0xc0) == 0x40) {
+        val name: StringValue = decode_string(input, length, 0, 5, 0x20,
+            decoder.scratch, decoder.scratch_capacity, decoder.limits.max_field_bytes);
+        if (name.error == ERROR_INPUT) {
+            ret instruction_result(INSTRUCTION_NEED_INPUT, 0, 0, 0, 0, ERROR_NONE);
+        }
+        if (name.error != ERROR_NONE) {
+            ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, name.error);
+        }
+        val value: StringValue = decode_string(input, length, name.next, 7, 0x80,
+            ?decoder.scratch[name.value.len], decoder.scratch_capacity - name.value.len,
+            decoder.limits.max_field_bytes);
+        if (value.error == ERROR_INPUT) {
+            ret instruction_result(INSTRUCTION_NEED_INPUT, 0, 0, 0, 0, ERROR_NONE);
+        }
+        if (value.error != ERROR_NONE) {
+            ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, value.error);
+        }
+        val error: Error = table_insert(decoder.table, name.value, value.value);
+        if (error != ERROR_NONE) {
+            ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, error);
+        }
+        ret instruction_result(INSTRUCTION_COMPLETE,
+            INSTRUCTION_INSERT_LITERAL_NAME, value.next, 0,
+            decoder.table.insert_count - 1, ERROR_NONE);
+    }
+    val integer: hpack.Integer = decode_integer(input, length, 0, 5);
+    if (integer.error != hpack.ERROR_NONE) {
+        val error: Error = integer_error(integer);
+        if (error == ERROR_INPUT) {
+            ret instruction_result(INSTRUCTION_NEED_INPUT, 0, 0, 0, 0, ERROR_NONE);
+        }
+        ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, error);
+    }
+    if ((first & 0xe0) == 0x20) {
+        if (integer.value > ((-1)::usize)::u64) {
+            ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0,
+                ERROR_TABLE_CAPACITY);
+        }
+        val error: Error = table_set_capacity(decoder.table, integer.value::usize);
+        if (error != ERROR_NONE) {
+            ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, error);
+        }
+        ret instruction_result(INSTRUCTION_COMPLETE, INSTRUCTION_SET_CAPACITY,
+            integer.next, integer.value, 0, ERROR_NONE);
+    }
+    val source: *Entry = table_find_relative(decoder.table, integer.value);
+    if (source == nil) {
+        ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, ERROR_INDEX);
+    }
+    val error: Error = table_insert(decoder.table, source.name, source.value);
+    if (error != ERROR_NONE) {
+        ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, error);
+    }
+    ret instruction_result(INSTRUCTION_COMPLETE, INSTRUCTION_DUPLICATE,
+        integer.next, integer.value, decoder.table.insert_count - 1, ERROR_NONE);
+}
+
+pub fun encoder_stream_feed(decoder: *EncoderStreamDecoder, input: *u8,
+    length: usize, eof: bool) Instruction {
+    if (decoder == nil || !decoder.initialized || decoder.error != ERROR_NONE
+     || (input == nil && length != 0)) {
+        ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, ERROR_STATE);
+    }
+    var consumed: usize = 0;
+    for (consumed < length) {
+        if (decoder.input_length >= decoder.input_capacity
+         || decoder.input_length >= decoder.limits.max_instruction_bytes) {
+            decoder.error = ERROR_STRING_LIMIT;
+            ret instruction_result(INSTRUCTION_ERROR, 0, consumed, 0, 0,
+                decoder.error);
+        }
+        decoder.input[decoder.input_length] = input[consumed];
+        decoder.input_length = decoder.input_length + 1; consumed = consumed + 1;
+        var result: Instruction = parse_encoder_instruction(decoder);
+        if (result.status == INSTRUCTION_ERROR) {
+            decoder.error = ERROR_ENCODER_STREAM; result.error = ERROR_ENCODER_STREAM;
+            result.consumed = consumed; ret result;
+        }
+        if (result.status == INSTRUCTION_COMPLETE) {
+            decoder.input_length = 0; result.consumed = consumed; ret result;
+        }
+    }
+    if (eof && decoder.input_length != 0) {
+        decoder.error = ERROR_ENCODER_STREAM;
+        ret instruction_result(INSTRUCTION_ERROR, 0, consumed, 0, 0,
+            ERROR_ENCODER_STREAM);
+    }
+    ret instruction_result(INSTRUCTION_NEED_INPUT, 0, consumed, 0, 0, ERROR_NONE);
+}
+
+pub fun encode_set_capacity(table: *DynamicTable, capacity: usize,
+    output: *u8, output_capacity: usize) Encode {
+    if (table == nil || !table.valid || capacity > table.max_capacity) {
+        ret Encode{ok: false, written: 0, required_insert_count: 0,
+            error: ERROR_TABLE_CAPACITY};
+    }
+    val written: usize = hpack.encode_integer(capacity::u64, 5, 0x20,
+        output, output_capacity);
+    if (written == 0) {
+        ret Encode{ok: false, written: 0, required_insert_count: 0,
+            error: ERROR_OUTPUT};
+    }
+    val error: Error = table_set_capacity(table, capacity);
+    ret Encode{ok: error == ERROR_NONE, written: written,
+        required_insert_count: 0, error: error};
+}
+
+pub fun encode_insert_name_reference(table: *DynamicTable, static_name: bool,
+    index: u64, value: view.View, huffman_enabled: bool,
+    output: *u8, output_capacity: usize) Encode {
+    var source: *Entry = nil; var fixed: Entry;
+    if (static_name) {
+        if (index > 98) {
+            ret Encode{ok: false, written: 0, required_insert_count: 0,
+                error: ERROR_INDEX};
+        }
+        fixed = static_entry(index::usize); source = ?fixed;
+    } or {
+        source = table_find_relative(table, index);
+        if (source == nil) {
+            ret Encode{ok: false, written: 0, required_insert_count: 0,
+                error: ERROR_INDEX};
+        }
+    }
+    var pattern: u8 = 0x80;
+    if (static_name) { pattern = 0xc0; }
+    val first: usize = hpack.encode_integer(index, 6,
+        pattern, output, output_capacity);
+    if (first == 0) {
+        ret Encode{ok: false, written: 0, required_insert_count: 0, error: ERROR_OUTPUT};
+    }
+    val second: usize = encode_string(value, 7, 0, 0x80, huffman_enabled,
+        ?output[first], output_capacity - first);
+    if (second == 0) {
+        ret Encode{ok: false, written: 0, required_insert_count: 0, error: ERROR_OUTPUT};
+    }
+    val error: Error = table_insert(table, source.name, value);
+    ret Encode{ok: error == ERROR_NONE, written: first + second,
+        required_insert_count: 0, error: error};
+}
+
+pub fun encode_insert_literal_name(table: *DynamicTable, name: view.View,
+    value: view.View, huffman_enabled: bool, output: *u8,
+    output_capacity: usize) Encode {
+    val first: usize = encode_string(name, 5, 0x40, 0x20, huffman_enabled,
+        output, output_capacity);
+    if (first == 0) {
+        ret Encode{ok: false, written: 0, required_insert_count: 0, error: ERROR_OUTPUT};
+    }
+    val second: usize = encode_string(value, 7, 0, 0x80, huffman_enabled,
+        ?output[first], output_capacity - first);
+    if (second == 0) {
+        ret Encode{ok: false, written: 0, required_insert_count: 0, error: ERROR_OUTPUT};
+    }
+    val error: Error = table_insert(table, name, value);
+    ret Encode{ok: error == ERROR_NONE, written: first + second,
+        required_insert_count: 0, error: error};
+}
+
+pub fun encode_duplicate(table: *DynamicTable, relative: u64,
+    output: *u8, output_capacity: usize) Encode {
+    val source: *Entry = table_find_relative(table, relative);
+    if (source == nil) {
+        ret Encode{ok: false, written: 0, required_insert_count: 0, error: ERROR_INDEX};
+    }
+    val written: usize = hpack.encode_integer(relative, 5, 0,
+        output, output_capacity);
+    if (written == 0) {
+        ret Encode{ok: false, written: 0, required_insert_count: 0, error: ERROR_OUTPUT};
+    }
+    val error: Error = table_insert(table, source.name, source.value);
+    ret Encode{ok: error == ERROR_NONE, written: written,
+        required_insert_count: 0, error: error};
+}
+
+pub fun decoder_stream_decoder_init(decoder: *DecoderStreamDecoder,
+    table: *DynamicTable, sections: *Sections, input: *u8,
+    input_capacity: usize, limits: Limits) bool {
+    if (decoder == nil || decoder.initialized || !limits_valid(limits)
+     || table == nil || !table.valid || sections == nil || !sections.valid
+     || input == nil || input_capacity < limits.max_instruction_bytes) { ret false; }
+    decoder.limits = limits; decoder.table = table; decoder.sections = sections;
+    decoder.input = input; decoder.input_capacity = input_capacity;
+    decoder.input_length = 0; decoder.error = ERROR_NONE; decoder.initialized = true;
+    ret true;
+}
+
+fun parse_decoder_instruction(decoder: *DecoderStreamDecoder) Instruction {
+    if (decoder.input_length == 0) {
+        ret instruction_result(INSTRUCTION_NEED_INPUT, 0, 0, 0, 0, ERROR_NONE);
+    }
+    val first: u8 = decoder.input[0]; var prefix: u8 = 6;
+    var kind: InstructionKind = INSTRUCTION_INSERT_COUNT_INCREMENT;
+    if ((first & 0x80) != 0) { prefix = 7; kind = INSTRUCTION_SECTION_ACK; }
+    or (first & 0xc0 == 0x40) { prefix = 6; kind = INSTRUCTION_STREAM_CANCEL; }
+    val integer: hpack.Integer = decode_integer(decoder.input,
+        decoder.input_length, 0, prefix);
+    if (integer.error != hpack.ERROR_NONE) {
+        val error: Error = integer_error(integer);
+        if (error == ERROR_INPUT) {
+            ret instruction_result(INSTRUCTION_NEED_INPUT, 0, 0, 0, 0, ERROR_NONE);
+        }
+        ret instruction_result(INSTRUCTION_ERROR, kind, 0, 0, 0, error);
+    }
+    var error: Error = ERROR_NONE;
+    if (kind == INSTRUCTION_SECTION_ACK) {
+        error = sections_acknowledge(decoder.sections, integer.value);
+    } or (kind == INSTRUCTION_STREAM_CANCEL) {
+        error = sections_cancel(decoder.sections, integer.value);
+    } or { error = sections_increment(decoder.sections, integer.value); }
+    if (error != ERROR_NONE) {
+        ret instruction_result(INSTRUCTION_ERROR, kind, 0, integer.value, 0, error);
+    }
+    ret instruction_result(INSTRUCTION_COMPLETE, kind, integer.next,
+        integer.value, 0, ERROR_NONE);
+}
+
+pub fun decoder_stream_feed(decoder: *DecoderStreamDecoder, input: *u8,
+    length: usize, eof: bool) Instruction {
+    if (decoder == nil || !decoder.initialized || decoder.error != ERROR_NONE
+     || (input == nil && length != 0)) {
+        ret instruction_result(INSTRUCTION_ERROR, 0, 0, 0, 0, ERROR_STATE);
+    }
+    var consumed: usize = 0;
+    for (consumed < length) {
+        if (decoder.input_length >= decoder.input_capacity
+         || decoder.input_length >= decoder.limits.max_instruction_bytes) {
+            decoder.error = ERROR_DECODER_STREAM;
+            ret instruction_result(INSTRUCTION_ERROR, 0, consumed, 0, 0,
+                decoder.error);
+        }
+        decoder.input[decoder.input_length] = input[consumed];
+        decoder.input_length = decoder.input_length + 1; consumed = consumed + 1;
+        var result: Instruction = parse_decoder_instruction(decoder);
+        if (result.status == INSTRUCTION_ERROR) {
+            decoder.error = ERROR_DECODER_STREAM; result.error = ERROR_DECODER_STREAM;
+            result.consumed = consumed; ret result;
+        }
+        if (result.status == INSTRUCTION_COMPLETE) {
+            decoder.input_length = 0; result.consumed = consumed; ret result;
+        }
+    }
+    if (eof && decoder.input_length != 0) {
+        decoder.error = ERROR_DECODER_STREAM;
+        ret instruction_result(INSTRUCTION_ERROR, 0, consumed, 0, 0,
+            ERROR_DECODER_STREAM);
+    }
+    ret instruction_result(INSTRUCTION_NEED_INPUT, 0, consumed, 0, 0, ERROR_NONE);
+}
+
+pub fun encode_section_ack(stream_id: u64, output: *u8, capacity: usize) usize {
+    if (stream_id > MAX_INTEGER) { ret 0; }
+    ret hpack.encode_integer(stream_id, 7, 0x80, output, capacity);
+}
+
+pub fun encode_stream_cancel(stream_id: u64, output: *u8, capacity: usize) usize {
+    if (stream_id > MAX_INTEGER) { ret 0; }
+    ret hpack.encode_integer(stream_id, 6, 0x40, output, capacity);
+}
+
+pub fun encode_insert_count_increment(increment: u64,
+    output: *u8, capacity: usize) usize {
+    if (increment == 0 || increment > MAX_INTEGER) { ret 0; }
+    ret hpack.encode_integer(increment, 6, 0, output, capacity);
+}
+
+fun decode_result(status: DecodeStatus, decoder: *FieldDecoder,
+    consumed: usize, error: Error) Decode {
+    var count: usize = 0; var bytes: usize = 0; var required: u64 = 0;
+    if (decoder != nil) {
+        count = decoder.field_count; bytes = decoder.field_bytes;
+        required = decoder.required_insert_count;
+    }
+    ret Decode{status: status, consumed: consumed, count: count,
+        bytes: bytes, required_insert_count: required, error: error};
+}
+
+pub fun field_decoder_init(decoder: *FieldDecoder, table: *DynamicTable,
+    sections: *Sections, stream_id: u64, encoded: *u8,
+    encoded_capacity: usize, fields: *field.Field, field_capacity: usize,
+    storage: *u8, storage_capacity: usize, scratch: *u8,
+    scratch_capacity: usize, limits: Limits) bool {
+    if (decoder == nil || decoder.initialized || !limits_valid(limits)
+     || table == nil || !table.valid || sections == nil || !sections.valid
+     || encoded == nil || encoded_capacity < limits.max_encoded_section_bytes
+     || fields == nil || field_capacity < limits.max_field_count
+     || storage == nil || storage_capacity < limits.max_field_section_bytes
+     || scratch == nil || scratch_capacity < limits.max_field_bytes * 2) { ret false; }
+    decoder.limits = limits; decoder.table = table; decoder.sections = sections;
+    decoder.stream_id = stream_id; decoder.encoded = encoded;
+    decoder.encoded_capacity = encoded_capacity; decoder.encoded_length = 0;
+    decoder.fields = fields; decoder.field_capacity = field_capacity;
+    decoder.field_count = 0; decoder.storage = storage;
+    decoder.storage_capacity = storage_capacity; decoder.storage_length = 0;
+    decoder.scratch = scratch; decoder.scratch_capacity = scratch_capacity;
+    decoder.field_bytes = 0; decoder.required_insert_count = 0; decoder.base = 0;
+    decoder.section_slot = (-1)::usize; decoder.blocked = false;
+    decoder.finished = false; decoder.error = ERROR_NONE; decoder.initialized = true;
+    ret true;
+}
+
+fun decoder_fail(decoder: *FieldDecoder, consumed: usize, error: Error) Decode {
+    decoder.error = error; decoder.finished = true; decoder.field_count = 0;
+    decoder.storage_length = 0; decoder.field_bytes = 0;
+    if (decoder.section_slot != (-1)::usize) {
+        release_section(decoder.sections, decoder.section_slot);
+        decoder.section_slot = (-1)::usize;
+    }
+    ret decode_result(DECODE_ERROR, decoder, consumed, error);
+}
+
+fun append_field(decoder: *FieldDecoder, name: view.View,
+    value: view.View, sensitive: bool) Error {
+    if (name.len > decoder.limits.max_field_bytes
+     || value.len > decoder.limits.max_field_bytes) { ret ERROR_STRING_LIMIT; }
+    val size: usize = entry_size(name, value);
+    if (size == (-1)::usize || size > decoder.limits.max_field_section_bytes
+     || decoder.field_bytes > decoder.limits.max_field_section_bytes - size
+     || decoder.field_count >= decoder.limits.max_field_count
+     || decoder.field_count >= decoder.field_capacity) { ret ERROR_FIELD_LIMIT; }
+    val physical: usize = name.len + value.len;
+    if (physical > decoder.storage_capacity - decoder.storage_length) {
+        ret ERROR_FIELD_LIMIT;
+    }
+    val start: usize = decoder.storage_length;
+    memory.raw_copy(?decoder.storage[start], name.data, name.len);
+    memory.raw_copy(?decoder.storage[start + name.len], value.data, value.len);
+    decoder.fields[decoder.field_count] = field.Field{
+        name: view.view(?decoder.storage[start], name.len),
+        value: view.view(?decoder.storage[start + name.len], value.len),
+        sensitive: sensitive,
+    };
+    decoder.storage_length = decoder.storage_length + physical;
+    decoder.field_count = decoder.field_count + 1;
+    decoder.field_bytes = decoder.field_bytes + size;
+    ret ERROR_NONE;
+}
+
+fun dynamic_for_section(decoder: *FieldDecoder, absolute: u64) *Entry {
+    if (absolute >= decoder.required_insert_count) { ret nil; }
+    ret table_find_absolute(decoder.table, absolute);
+}
+
+fun relative_absolute(base: u64, relative: u64) u64 {
+    if (base == 0 || relative >= base) { ret (-1)::u64; }
+    ret base - relative - 1;
+}
+
+fun post_base_absolute(base: u64, post: u64) u64 {
+    if (base > (-1)::u64 - post) { ret (-1)::u64; }
+    ret base + post;
+}
+
+fun decode_field_lines(decoder: *FieldDecoder, offset: usize) Error {
+    var next: usize = offset;
+    for (next < decoder.encoded_length) {
+        val first: u8 = decoder.encoded[next];
+        if ((first & 0x80) != 0) {
+            val index: hpack.Integer = decode_integer(decoder.encoded,
+                decoder.encoded_length, next, 6);
+            if (index.error != hpack.ERROR_NONE) { ret ERROR_DECOMPRESSION; }
+            var source: *Entry = nil; var fixed: Entry;
+            if ((first & 0x40) != 0) {
+                if (index.value > 98) { ret ERROR_DECOMPRESSION; }
+                fixed = static_entry(index.value::usize); source = ?fixed;
+            } or {
+                val absolute: u64 = relative_absolute(decoder.base, index.value);
+                source = dynamic_for_section(decoder, absolute);
+                if (source == nil) { ret ERROR_DECOMPRESSION; }
+            }
+            val error: Error = append_field(decoder, source.name, source.value, false);
+            if (error != ERROR_NONE) { ret error; }
+            next = index.next;
+        } or ((first & 0xf0) == 0x10) {
+            val index: hpack.Integer = decode_integer(decoder.encoded,
+                decoder.encoded_length, next, 4);
+            if (index.error != hpack.ERROR_NONE) { ret ERROR_DECOMPRESSION; }
+            val source: *Entry = dynamic_for_section(decoder,
+                post_base_absolute(decoder.base, index.value));
+            if (source == nil) { ret ERROR_DECOMPRESSION; }
+            val error: Error = append_field(decoder, source.name, source.value, false);
+            if (error != ERROR_NONE) { ret error; }
+            next = index.next;
+        } or ((first & 0xc0) == 0x40) {
+            val index: hpack.Integer = decode_integer(decoder.encoded,
+                decoder.encoded_length, next, 4);
+            if (index.error != hpack.ERROR_NONE) { ret ERROR_DECOMPRESSION; }
+            var source: *Entry = nil; var fixed: Entry;
+            if ((first & 0x10) != 0) {
+                if (index.value > 98) { ret ERROR_DECOMPRESSION; }
+                fixed = static_entry(index.value::usize); source = ?fixed;
+            } or {
+                val absolute: u64 = relative_absolute(decoder.base, index.value);
+                source = dynamic_for_section(decoder, absolute);
+                if (source == nil) { ret ERROR_DECOMPRESSION; }
+            }
+            val value: StringValue = decode_string(decoder.encoded,
+                decoder.encoded_length, index.next, 7, 0x80, decoder.scratch,
+                decoder.scratch_capacity, decoder.limits.max_field_bytes);
+            if (value.error != ERROR_NONE) { ret ERROR_DECOMPRESSION; }
+            val error: Error = append_field(decoder, source.name, value.value,
+                (first & 0x20) != 0);
+            if (error != ERROR_NONE) { ret error; }
+            next = value.next;
+        } or ((first & 0xf0) == 0) {
+            val index: hpack.Integer = decode_integer(decoder.encoded,
+                decoder.encoded_length, next, 3);
+            if (index.error != hpack.ERROR_NONE) { ret ERROR_DECOMPRESSION; }
+            val source: *Entry = dynamic_for_section(decoder,
+                post_base_absolute(decoder.base, index.value));
+            if (source == nil) { ret ERROR_DECOMPRESSION; }
+            val value: StringValue = decode_string(decoder.encoded,
+                decoder.encoded_length, index.next, 7, 0x80, decoder.scratch,
+                decoder.scratch_capacity, decoder.limits.max_field_bytes);
+            if (value.error != ERROR_NONE) { ret ERROR_DECOMPRESSION; }
+            val error: Error = append_field(decoder, source.name, value.value,
+                (first & 0x08) != 0);
+            if (error != ERROR_NONE) { ret error; }
+            next = value.next;
+        } or ((first & 0xe0) == 0x20) {
+            val name: StringValue = decode_string(decoder.encoded,
+                decoder.encoded_length, next, 3, 0x08, decoder.scratch,
+                decoder.scratch_capacity, decoder.limits.max_field_bytes);
+            if (name.error != ERROR_NONE) { ret ERROR_DECOMPRESSION; }
+            val value: StringValue = decode_string(decoder.encoded,
+                decoder.encoded_length, name.next, 7, 0x80,
+                ?decoder.scratch[name.value.len],
+                decoder.scratch_capacity - name.value.len,
+                decoder.limits.max_field_bytes);
+            if (value.error != ERROR_NONE) { ret ERROR_DECOMPRESSION; }
+            val error: Error = append_field(decoder, name.value, value.value,
+                (first & 0x10) != 0);
+            if (error != ERROR_NONE) { ret error; }
+            next = value.next;
+        } or { ret ERROR_DECOMPRESSION; }
+    }
+    ret ERROR_NONE;
+}
+
+fun decode_section(decoder: *FieldDecoder) Decode {
+    decoder.field_count = 0; decoder.storage_length = 0; decoder.field_bytes = 0;
+    val encoded_required: hpack.Integer = decode_integer(decoder.encoded,
+        decoder.encoded_length, 0, 8);
+    if (encoded_required.error != hpack.ERROR_NONE) {
+        ret decoder_fail(decoder, 0, ERROR_DECOMPRESSION);
+    }
+    decoder.required_insert_count = decode_required_insert_count(encoded_required.value,
+        decoder.table.insert_count, decoder.table.max_capacity);
+    if (decoder.required_insert_count == (-1)::u64
+     || encoded_required.next >= decoder.encoded_length) {
+        ret decoder_fail(decoder, 0, ERROR_DECOMPRESSION);
+    }
+    val sign: bool = (decoder.encoded[encoded_required.next] & 0x80) != 0;
+    val delta: hpack.Integer = decode_integer(decoder.encoded,
+        decoder.encoded_length, encoded_required.next, 7);
+    if (delta.error != hpack.ERROR_NONE) {
+        ret decoder_fail(decoder, 0, ERROR_DECOMPRESSION);
+    }
+    if (sign) {
+        if (delta.value >= decoder.required_insert_count) {
+            ret decoder_fail(decoder, 0, ERROR_DECOMPRESSION);
+        }
+        decoder.base = decoder.required_insert_count - delta.value - 1;
+    } or {
+        if (decoder.required_insert_count > (-1)::u64 - delta.value) {
+            ret decoder_fail(decoder, 0, ERROR_DECOMPRESSION);
+        }
+        decoder.base = decoder.required_insert_count + delta.value;
+    }
+    if (decoder.required_insert_count > decoder.table.insert_count) {
+        if (decoder.section_slot == (-1)::usize) {
+            decoder.section_slot = allocate_section(decoder.sections, decoder.stream_id,
+                decoder.required_insert_count, decoder.base, true);
+            if (decoder.section_slot == (-1)::usize) {
+                ret decoder_fail(decoder, 0, ERROR_BLOCKED_STREAMS);
+            }
+        }
+        decoder.blocked = true;
+        ret decode_result(DECODE_BLOCKED, decoder, 0, ERROR_NONE);
+    }
+    val error: Error = decode_field_lines(decoder, delta.next);
+    if (error != ERROR_NONE) { ret decoder_fail(decoder, 0, error); }
+    if (decoder.section_slot != (-1)::usize) {
+        release_section(decoder.sections, decoder.section_slot);
+        decoder.section_slot = (-1)::usize;
+    }
+    decoder.blocked = false; decoder.finished = true;
+    ret decode_result(DECODE_COMPLETE, decoder, 0, ERROR_NONE);
+}
+
+pub fun field_decoder_feed(decoder: *FieldDecoder, input: *u8,
+    length: usize, final: bool) Decode {
+    if (decoder == nil || !decoder.initialized || decoder.finished || decoder.blocked
+     || decoder.error != ERROR_NONE || (input == nil && length != 0)) {
+        ret decode_result(DECODE_ERROR, decoder, 0, ERROR_STATE);
+    }
+    if (length > decoder.encoded_capacity - decoder.encoded_length
+     || decoder.encoded_length + length > decoder.limits.max_encoded_section_bytes) {
+        ret decoder_fail(decoder, 0, ERROR_FIELD_LIMIT);
+    }
+    memory.raw_copy(?decoder.encoded[decoder.encoded_length], input, length);
+    decoder.encoded_length = decoder.encoded_length + length;
+    if (!final) { ret decode_result(DECODE_NEED_INPUT, decoder, length, ERROR_NONE); }
+    var result: Decode = decode_section(decoder); result.consumed = length; ret result;
+}
+
+pub fun field_decoder_retry(decoder: *FieldDecoder) Decode {
+    if (decoder == nil || !decoder.initialized || !decoder.blocked
+     || decoder.finished || decoder.error != ERROR_NONE) {
+        ret decode_result(DECODE_ERROR, decoder, 0, ERROR_STATE);
+    }
+    if (decoder.required_insert_count > decoder.table.insert_count) {
+        ret decode_result(DECODE_BLOCKED, decoder, 0, ERROR_NONE);
+    }
+    decoder.blocked = false;
+    if (decoder.section_slot != (-1)::usize) {
+        sections_unblock(decoder.sections);
+    }
+    ret decode_section(decoder);
+}
+
+pub fun field_decoder_cancel(decoder: *FieldDecoder) bool {
+    if (decoder == nil || !decoder.initialized || decoder.finished) { ret false; }
+    if (decoder.section_slot != (-1)::usize) {
+        release_section(decoder.sections, decoder.section_slot);
+        decoder.section_slot = (-1)::usize;
+    }
+    decoder.finished = true; decoder.blocked = false; ret true;
+}
+
+val FIELD_PREFIX_RESERVE: usize = 24;
+
+pub fun field_encoder_init(encoder: *FieldEncoder, table: *DynamicTable,
+    sections: *Sections, stream_id: u64, output: *u8,
+    output_capacity: usize, references: *u64, reference_capacity: usize,
+    limits: Limits) bool {
+    if (encoder == nil || encoder.initialized || !limits_valid(limits)
+     || table == nil || !table.valid || sections == nil || !sections.valid
+     || output == nil || output_capacity < FIELD_PREFIX_RESERVE
+     || output_capacity > limits.max_encoded_section_bytes
+     || references == nil || reference_capacity < limits.max_field_count) { ret false; }
+    encoder.limits = limits; encoder.table = table; encoder.sections = sections;
+    encoder.stream_id = stream_id; encoder.output = output;
+    encoder.output_capacity = output_capacity; encoder.output_length = FIELD_PREFIX_RESERVE;
+    encoder.fields = 0; encoder.field_bytes = 0; encoder.base = table.insert_count;
+    encoder.max_reference = 0; encoder.references = references;
+    encoder.reference_capacity = reference_capacity; encoder.reference_count = 0;
+    encoder.finished = false; encoder.error = ERROR_NONE; encoder.initialized = true;
+    ret true;
+}
+
+fun encoder_fail(encoder: *FieldEncoder, error: Error) Encode {
+    encoder.error = error;
+    ret Encode{ok: false, written: 0, required_insert_count: 0, error: error};
+}
+
+fun output_integer(encoder: *FieldEncoder, value: u64,
+    prefix: u8, pattern: u8) bool {
+    val written: usize = hpack.encode_integer(value, prefix, pattern,
+        ?encoder.output[encoder.output_length],
+        encoder.output_capacity - encoder.output_length);
+    if (written == 0) { ret false; }
+    encoder.output_length = encoder.output_length + written; ret true;
+}
+
+fun output_string(encoder: *FieldEncoder, value: view.View,
+    prefix: u8, pattern: u8, huffman_bit: u8, huffman_enabled: bool) bool {
+    val written: usize = encode_string(value, prefix, pattern, huffman_bit,
+        huffman_enabled, ?encoder.output[encoder.output_length],
+        encoder.output_capacity - encoder.output_length);
+    if (written == 0) { ret false; }
+    encoder.output_length = encoder.output_length + written; ret true;
+}
+
+fun static_find(name: view.View, value: view.View, exact: bool) usize {
+    var i: usize = 0;
+    for (i < 99) {
+        val item: Entry = static_entry(i);
+        if (same(item.name, name) && (!exact || same(item.value, value))) { ret i; }
+        i = i + 1;
+    }
+    ret (-1)::usize;
+}
+
+fun dynamic_find(table: *DynamicTable, name: view.View,
+    value: view.View, exact: bool) *Entry {
+    var i: usize = 0;
+    for (i < table.count) {
+        if (same(table.items[i].name, name)
+         && (!exact || same(table.items[i].value, value))) { ret ?table.items[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun current_stream_blocked(encoder: *FieldEncoder) bool {
+    if (encoder.reference_count != 0) {
+        var i: usize = 0;
+        for (i < encoder.reference_count) {
+            if (encoder.references[i] >= encoder.sections.known_received) { ret true; }
+            i = i + 1;
+        }
+    }
+    ret stream_blocked(encoder.sections, encoder.stream_id, (-1)::usize);
+}
+
+fun can_reference(encoder: *FieldEncoder, absolute: u64) bool {
+    if (absolute < encoder.sections.known_received) { ret true; }
+    if (current_stream_blocked(encoder)) { ret true; }
+    ret encoder.sections.blocked_count < encoder.sections.max_blocked_streams;
+}
+
+fun remember_reference(encoder: *FieldEncoder, absolute: u64) bool {
+    var i: usize = 0;
+    for (i < encoder.reference_count) {
+        if (encoder.references[i] == absolute) { ret true; }
+        i = i + 1;
+    }
+    if (encoder.reference_count >= encoder.reference_capacity) { ret false; }
+    encoder.references[encoder.reference_count] = absolute;
+    encoder.reference_count = encoder.reference_count + 1;
+    if (encoder.reference_count == 1 || absolute > encoder.max_reference) {
+        encoder.max_reference = absolute;
+    }
+    ret true;
+}
+
+pub fun field_encoder_field(encoder: *FieldEncoder, item: field.Field,
+    huffman_enabled: bool) Encode {
+    if (encoder == nil || !encoder.initialized || encoder.finished
+     || encoder.error != ERROR_NONE || (item.name.data == nil && item.name.len != 0)
+     || (item.value.data == nil && item.value.len != 0)) {
+        ret encoder_fail(encoder, ERROR_STATE);
+    }
+    if (item.name.len > encoder.limits.max_field_bytes
+     || item.value.len > encoder.limits.max_field_bytes) {
+        ret encoder_fail(encoder, ERROR_STRING_LIMIT);
+    }
+    val size: usize = entry_size(item.name, item.value);
+    if (size == (-1)::usize || size > encoder.limits.max_field_section_bytes
+     || encoder.field_bytes > encoder.limits.max_field_section_bytes - size
+     || encoder.fields >= encoder.limits.max_field_count) {
+        ret encoder_fail(encoder, ERROR_FIELD_LIMIT);
+    }
+    val exact_static: usize = static_find(item.name, item.value, true);
+    val exact_dynamic: *Entry = dynamic_find(encoder.table, item.name, item.value, true);
+    if (!item.sensitive && exact_static != (-1)::usize) {
+        if (!output_integer(encoder, exact_static::u64, 6, 0xc0)) {
+            ret encoder_fail(encoder, ERROR_OUTPUT);
+        }
+    } or (!item.sensitive && exact_dynamic != nil
+        && exact_dynamic.absolute < encoder.base
+        && can_reference(encoder, exact_dynamic.absolute)) {
+        val relative: u64 = encoder.base - exact_dynamic.absolute - 1;
+        if (!output_integer(encoder, relative, 6, 0x80)
+         || !remember_reference(encoder, exact_dynamic.absolute)) {
+            ret encoder_fail(encoder, ERROR_OUTPUT);
+        }
+    } or {
+        val static_name: usize = static_find(item.name, item.value, false);
+        val dynamic_name: *Entry = dynamic_find(encoder.table, item.name,
+            item.value, false);
+        var never_pattern: u8 = 0;
+        if (item.sensitive) { never_pattern = 0x20; }
+        if (static_name != (-1)::usize) {
+            if (!output_integer(encoder, static_name::u64, 4,
+                0x50 | never_pattern)
+             || !output_string(encoder, item.value, 7, 0, 0x80,
+                huffman_enabled)) { ret encoder_fail(encoder, ERROR_OUTPUT); }
+        } or (!item.sensitive && dynamic_name != nil
+            && dynamic_name.absolute < encoder.base
+            && can_reference(encoder, dynamic_name.absolute)) {
+            val relative: u64 = encoder.base - dynamic_name.absolute - 1;
+            if (!output_integer(encoder, relative, 4, 0x40)
+             || !output_string(encoder, item.value, 7, 0, 0x80, huffman_enabled)
+             || !remember_reference(encoder, dynamic_name.absolute)) {
+                ret encoder_fail(encoder, ERROR_OUTPUT);
+            }
+        } or {
+            var literal_pattern: u8 = 0x20;
+            if (item.sensitive) { literal_pattern = literal_pattern | 0x10; }
+            if (!output_string(encoder, item.name, 3, literal_pattern, 0x08,
+                huffman_enabled)
+             || !output_string(encoder, item.value, 7, 0, 0x80,
+                huffman_enabled)) { ret encoder_fail(encoder, ERROR_OUTPUT); }
+        }
+    }
+    encoder.fields = encoder.fields + 1; encoder.field_bytes = encoder.field_bytes + size;
+    ret Encode{ok: true, written: encoder.output_length,
+        required_insert_count: 0, error: ERROR_NONE};
+}
+
+pub fun field_encoder_finish(encoder: *FieldEncoder) Encode {
+    if (encoder == nil || !encoder.initialized || encoder.finished
+     || encoder.error != ERROR_NONE) { ret encoder_fail(encoder, ERROR_STATE); }
+    var required: u64 = 0;
+    if (encoder.reference_count != 0) { required = encoder.max_reference + 1; }
+    val encoded_required: u64 = encode_required_insert_count(required,
+        encoder.table.max_capacity);
+    if (encoded_required == (-1)::u64) { ret encoder_fail(encoder, ERROR_DECOMPRESSION); }
+    var prefix: [24]u8;
+    val first: usize = hpack.encode_integer(encoded_required, 8, 0, ?prefix[0], 24);
+    var delta: u64 = 0; var pattern: u8 = 0;
+    if (required == 0) { delta = 0; }
+    or (encoder.base >= required) { delta = encoder.base - required; }
+    or { delta = required - encoder.base - 1; pattern = 0x80; }
+    val second: usize = hpack.encode_integer(delta, 7, pattern,
+        ?prefix[first], 24 - first);
+    if (first == 0 || second == 0) { ret encoder_fail(encoder, ERROR_OUTPUT); }
+    val prefix_length: usize = first + second;
+    val lines: usize = encoder.output_length - FIELD_PREFIX_RESERVE;
+    if (prefix_length + lines > encoder.output_capacity) {
+        ret encoder_fail(encoder, ERROR_OUTPUT);
+    }
+    memory.raw_move(?encoder.output[prefix_length],
+        ?encoder.output[FIELD_PREFIX_RESERVE], lines);
+    memory.raw_copy(encoder.output, ?prefix[0], prefix_length);
+    if (required != 0) {
+        val blocked: bool = required > encoder.sections.known_received;
+        val slot: usize = allocate_section(encoder.sections, encoder.stream_id,
+            required, encoder.base, blocked);
+        if (slot == (-1)::usize) { ret encoder_fail(encoder, ERROR_BLOCKED_STREAMS); }
+        var i: usize = 0;
+        for (i < encoder.reference_count) {
+            if (!add_reference(encoder.sections, slot, encoder.references[i])) {
+                release_section(encoder.sections, slot);
+                ret encoder_fail(encoder, ERROR_TABLE_BLOCKED);
+            }
+            i = i + 1;
+        }
+    }
+    encoder.finished = true;
+    ret Encode{ok: true, written: prefix_length + lines,
+        required_insert_count: required, error: ERROR_NONE};
+}
+
+pub fun field_encoder_abort(encoder: *FieldEncoder) bool {
+    if (encoder == nil || !encoder.initialized || encoder.finished) { ret false; }
+    encoder.finished = true; encoder.output_length = 0; ret true;
+}
+
+fun test_limits() Limits {
+    ret Limits{max_table_capacity: 220, max_blocked_streams: 2,
+        max_field_bytes: 64, max_field_count: 8,
+        max_field_section_bytes: 512, max_encoded_section_bytes: 512,
+        max_instruction_bytes: 128, max_outstanding_sections: 8,
+        max_references: 32};
+}
+
+test "http.h3.qpack: rfc static literal field section is incremental" {
+    val limits: Limits = test_limits();
+    var entries: [8]Entry; var table_storage: [220]u8; var table_scratch: [220]u8;
+    var table: DynamicTable;
+    if (!table_init(?table, ?entries[0], 8, ?table_storage[0], 220,
+        ?table_scratch[0], 220, 220)) { ret 1; }
+    var section_items: [8]Section; var references: [32]Reference; var sections: Sections;
+    if (!sections_init(?sections, ?section_items[0], 8, ?references[0], 32,
+        ?table, limits)) { ret 2; }
+    var encoded: [512]u8; var fields: [8]field.Field; var storage: [512]u8;
+    var scratch: [128]u8; var decoder: FieldDecoder;
+    if (!field_decoder_init(?decoder, ?table, ?sections, 0, ?encoded[0], 512,
+        ?fields[0], 8, ?storage[0], 512, ?scratch[0], 128, limits)) { ret 3; }
+    var block: [15]u8;
+    block[0] = 0x00; block[1] = 0x00; block[2] = 0x51; block[3] = 0x0b;
+    memory.raw_copy(?block[4], "/index.html", 11);
+    var i: usize = 0;
+    for (i < 15) {
+        val result: Decode = field_decoder_feed(?decoder, ?block[i], 1, i == 14);
+        if (i < 14 && result.status != DECODE_NEED_INPUT) { ret 4; }
+        if (i == 14 && (result.status != DECODE_COMPLETE || result.count != 1)) {
+            ret 5;
+        }
+        i = i + 1;
+    }
+    if (!same(fields[0].name, text(":path"))
+     || !same(fields[0].value, text("/index.html")) || decoder.field_bytes != 48) {
+        ret 6;
+    }
+    ret 0;
+}
+
+test "http.h3.qpack: rfc encoder stream and post-base vector round trip" {
+    val limits: Limits = test_limits();
+    var entries: [8]Entry; var table_storage: [220]u8; var table_scratch: [220]u8;
+    var table: DynamicTable;
+    table_init(?table, ?entries[0], 8, ?table_storage[0], 220,
+        ?table_scratch[0], 220, 220);
+    var instruction_input: [128]u8; var instruction_scratch: [128]u8;
+    var stream: EncoderStreamDecoder;
+    encoder_stream_decoder_init(?stream, ?table, ?instruction_input[0], 128,
+        ?instruction_scratch[0], 128, limits);
+    var wire: [34]u8;
+    wire[0] = 0x3f; wire[1] = 0xbd; wire[2] = 0x01;
+    wire[3] = 0xc0; wire[4] = 0x0f;
+    memory.raw_copy(?wire[5], "www.example.com", 15);
+    wire[20] = 0xc1; wire[21] = 0x0c;
+    memory.raw_copy(?wire[22], "/sample/path", 12);
+    var i: usize = 0; var completed: usize = 0;
+    for (i < 34) {
+        val result: Instruction = encoder_stream_feed(?stream, ?wire[i], 1, false);
+        if (result.status == INSTRUCTION_ERROR) { ret 1; }
+        if (result.status == INSTRUCTION_COMPLETE) { completed = completed + 1; }
+        i = i + 1;
+    }
+    if (completed != 3 || table.capacity != 220 || table.count != 2
+     || table.bytes != 106 || table.insert_count != 2) { ret 2; }
+    var section_items: [8]Section; var refs: [32]Reference; var sections: Sections;
+    sections_init(?sections, ?section_items[0], 8, ?refs[0], 32, ?table, limits);
+    var encoded: [512]u8; var fields: [8]field.Field; var storage: [512]u8;
+    var scratch: [128]u8; var decoder: FieldDecoder;
+    field_decoder_init(?decoder, ?table, ?sections, 4, ?encoded[0], 512,
+        ?fields[0], 8, ?storage[0], 512, ?scratch[0], 128, limits);
+    var block: [4]u8; block[0] = 0x03; block[1] = 0x81;
+    block[2] = 0x10; block[3] = 0x11;
+    val decoded: Decode = field_decoder_feed(?decoder, ?block[0], 4, true);
+    if (decoded.status != DECODE_COMPLETE || decoded.count != 2
+     || decoded.required_insert_count != 2
+     || !same(fields[0].name, text(":authority"))
+     || !same(fields[0].value, text("www.example.com"))
+     || !same(fields[1].name, text(":path"))
+     || !same(fields[1].value, text("/sample/path"))) { ret 3; }
+    ret 0;
+}
+
+test "http.h3.qpack: blocked streams retain bounded state and retry exactly" {
+    var limits: Limits = test_limits(); limits.max_blocked_streams = 1;
+    var entries: [8]Entry; var table_storage: [220]u8; var table_scratch: [220]u8;
+    var table: DynamicTable;
+    table_init(?table, ?entries[0], 8, ?table_storage[0], 220,
+        ?table_scratch[0], 220, 220);
+    var section_items: [8]Section; var refs: [32]Reference; var sections: Sections;
+    sections_init(?sections, ?section_items[0], 8, ?refs[0], 32, ?table, limits);
+    var encoded_one: [512]u8; var fields_one: [8]field.Field;
+    var storage_one: [512]u8; var scratch_one: [128]u8; var first: FieldDecoder;
+    field_decoder_init(?first, ?table, ?sections, 4, ?encoded_one[0], 512,
+        ?fields_one[0], 8, ?storage_one[0], 512, ?scratch_one[0], 128, limits);
+    var block: [3]u8; block[0] = 0x03; block[1] = 0x81; block[2] = 0x10;
+    if (field_decoder_feed(?first, ?block[0], 3, true).status != DECODE_BLOCKED
+     || sections.blocked_count != 1) { ret 1; }
+    var encoded_two: [512]u8; var fields_two: [8]field.Field;
+    var storage_two: [512]u8; var scratch_two: [128]u8; var second: FieldDecoder;
+    field_decoder_init(?second, ?table, ?sections, 8, ?encoded_two[0], 512,
+        ?fields_two[0], 8, ?storage_two[0], 512, ?scratch_two[0], 128, limits);
+    if (field_decoder_feed(?second, ?block[0], 3, true).error
+        != ERROR_BLOCKED_STREAMS || sections.blocked_count != 1) { ret 2; }
+    table_set_capacity(?table, 220);
+    table_insert(?table, text(":authority"), text("www.example.com"));
+    table_insert(?table, text(":path"), text("/sample/path"));
+    val retried: Decode = field_decoder_retry(?first);
+    if (retried.status != DECODE_COMPLETE || retried.count != 1
+     || sections.blocked_count != 0
+     || !same(fields_one[0].value, text("www.example.com"))) { ret 3; }
+    ret 0;
+}
+
+test "http.h3.qpack: field encoder differentially round trips static table" {
+    var limits: Limits = limits_default(); limits.max_table_capacity = 0;
+    limits.max_blocked_streams = 0; limits.max_field_bytes = 128;
+    limits.max_field_count = 100; limits.max_field_section_bytes = 8192;
+    limits.max_encoded_section_bytes = 2048; limits.max_instruction_bytes = 256;
+    limits.max_outstanding_sections = 4; limits.max_references = 4;
+    var encoder_table: DynamicTable;
+    table_init(?encoder_table, nil, 0, nil, 0, nil, 0, 0);
+    var encoder_section_items: [4]Section; var encoder_refs: [4]Reference;
+    var encoder_sections: Sections;
+    sections_init(?encoder_sections, ?encoder_section_items[0], 4,
+        ?encoder_refs[0], 4, ?encoder_table, limits);
+    var output: [2048]u8; var field_refs: [100]u64; var encoder: FieldEncoder;
+    field_encoder_init(?encoder, ?encoder_table, ?encoder_sections, 0,
+        ?output[0], 2048, ?field_refs[0], 100, limits);
+    var i: usize = 0;
+    for (i < 99) {
+        val item: Entry = static_entry(i);
+        if (!field_encoder_field(?encoder, field.Field{name: item.name,
+            value: item.value, sensitive: false}, true).ok) { ret 1; }
+        i = i + 1;
+    }
+    val encoded: Encode = field_encoder_finish(?encoder);
+    if (!encoded.ok || encoded.required_insert_count != 0) { ret 2; }
+    var decoder_table: DynamicTable;
+    table_init(?decoder_table, nil, 0, nil, 0, nil, 0, 0);
+    var decoder_section_items: [4]Section; var decoder_refs: [4]Reference;
+    var decoder_sections: Sections;
+    sections_init(?decoder_sections, ?decoder_section_items[0], 4,
+        ?decoder_refs[0], 4, ?decoder_table, limits);
+    var block: [2048]u8; var fields: [100]field.Field; var storage: [8192]u8;
+    var scratch: [256]u8; var decoder: FieldDecoder;
+    field_decoder_init(?decoder, ?decoder_table, ?decoder_sections, 0,
+        ?block[0], 2048, ?fields[0], 100, ?storage[0], 8192,
+        ?scratch[0], 256, limits);
+    val decoded: Decode = field_decoder_feed(?decoder, ?output[0],
+        encoded.written, true);
+    if (decoded.status != DECODE_COMPLETE || decoded.count != 99) { ret 3; }
+    for (i < 99) {
+        val expected: Entry = static_entry(i);
+        if (!same(fields[i].name, expected.name)
+         || !same(fields[i].value, expected.value)) { ret 4; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "http.h3.qpack: dynamic references are protected through decoder feedback" {
+    val limits: Limits = test_limits();
+    var table_entries: [8]Entry; var table_storage: [220]u8;
+    var table_scratch: [220]u8; var table: DynamicTable;
+    table_init(?table, ?table_entries[0], 8, ?table_storage[0], 220,
+        ?table_scratch[0], 220, 220);
+    table_set_capacity(?table, 220);
+    table_insert(?table, text(":authority"), text("www.example.com"));
+    table_insert(?table, text(":path"), text("/sample/path"));
+    var section_items: [8]Section; var references: [32]Reference; var sections: Sections;
+    sections_init(?sections, ?section_items[0], 8, ?references[0], 32,
+        ?table, limits);
+    var output: [512]u8; var field_refs: [8]u64; var encoder: FieldEncoder;
+    field_encoder_init(?encoder, ?table, ?sections, 8, ?output[0], 512,
+        ?field_refs[0], 8, limits);
+    if (!field_encoder_field(?encoder, field.Field{name: text(":authority"),
+        value: text("www.example.com"), sensitive: false}, false).ok
+     || !field_encoder_field(?encoder, field.Field{name: text(":path"),
+        value: text("/sample/path"), sensitive: false}, false).ok) { ret 1; }
+    val finished: Encode = field_encoder_finish(?encoder);
+    if (!finished.ok) { ret 21; }
+    if (finished.required_insert_count != 2) { ret 22; }
+    if (sections.count != 1) { ret 23; }
+    if (sections.blocked_count != 1) { ret 24; }
+    if (table.items[0].references != 1) { ret 25; }
+    if (table.items[1].references != 1) { ret 26; }
+    if (finished.written != 4 || output[0] != 0x03 || output[1] != 0x00
+     || output[2] != 0x81 || output[3] != 0x80) { ret 27; }
+    if (table_set_capacity(?table, 32) != ERROR_TABLE_BLOCKED) { ret 3; }
+    var decoder_input: [128]u8; var feedback: DecoderStreamDecoder;
+    decoder_stream_decoder_init(?feedback, ?table, ?sections,
+        ?decoder_input[0], 128, limits);
+    var ack: [8]u8; val ack_length: usize = encode_section_ack(8, ?ack[0], 8);
+    val result: Instruction = decoder_stream_feed(?feedback, ?ack[0], ack_length, false);
+    if (result.status != INSTRUCTION_COMPLETE || sections.count != 0
+     || sections.known_received != 2 || table.items[0].references != 0
+     || table.items[1].references != 0
+     || table_set_capacity(?table, 32) != ERROR_NONE) { ret 4; }
+    ret 0;
+}
+
+test "http.h3.qpack: instruction encoders reproduce rfc wire and copy evicted references" {
+    val limits: Limits = test_limits();
+    var entries: [8]Entry; var storage: [220]u8; var table_scratch: [220]u8;
+    var table: DynamicTable;
+    table_init(?table, ?entries[0], 8, ?storage[0], 220,
+        ?table_scratch[0], 220, 220);
+    var output: [64]u8;
+    val capacity: Encode = encode_set_capacity(?table, 220, ?output[0], 64);
+    if (!capacity.ok || capacity.written != 3 || output[0] != 0x3f
+     || output[1] != 0xbd || output[2] != 0x01) { ret 1; }
+    val authority: Encode = encode_insert_name_reference(?table, true, 0,
+        text("www.example.com"), false, ?output[0], 64);
+    if (!authority.ok || authority.written != 17 || output[0] != 0xc0
+     || output[1] != 0x0f
+     || !memory.raw_equal(?output[2], "www.example.com", 15)) { ret 2; }
+    val path: Encode = encode_insert_name_reference(?table, true, 1,
+        text("/sample/path"), false, ?output[0], 64);
+    val custom: Encode = encode_insert_literal_name(?table, text("custom-key"),
+        text("custom-value"), false, ?output[0], 64);
+    if (!path.ok || !custom.ok || table.count != 3 || table.bytes != 160) { ret 3; }
+    val duplicate: Encode = encode_duplicate(?table, 2, ?output[0], 64);
+    if (!duplicate.ok || duplicate.written != 1 || output[0] != 0x02
+     || table.count != 4 || table.bytes != 217
+     || !same(table.items[0].name, text(":authority"))) { ret 4; }
+    val eviction: Encode = encode_insert_name_reference(?table, false, 1,
+        text("custom-value2"), false, ?output[0], 64);
+    if (!eviction.ok || output[0] != 0x81 || table.count != 4
+     || table.bytes != 215 || table.dropped_count != 1
+     || !same(table.items[0].name, text("custom-key"))
+     || !same(table.items[0].value, text("custom-value2"))) { ret 5; }
+    var eviction_entries: [4]Entry; var eviction_storage: [220]u8;
+    var eviction_scratch: [220]u8; var eviction_table: DynamicTable;
+    table_init(?eviction_table, ?eviction_entries[0], 4,
+        ?eviction_storage[0], 220, ?eviction_scratch[0], 220, 220);
+    table_set_capacity(?eviction_table, 114);
+    table_insert(?eviction_table, text(":authority"), text("www.example.com"));
+    table_insert(?eviction_table, text(":path"), text("/sample/path"));
+    val copied: Encode = encode_duplicate(?eviction_table, 1, ?output[0], 64);
+    if (!copied.ok || eviction_table.dropped_count != 1
+     || eviction_table.count != 2
+     || !same(eviction_table.items[0].name, text(":authority"))
+     || !same(eviction_table.items[0].value, text("www.example.com"))) { ret 6; }
+    ret 0;
+}
+
+test "http.h3.qpack: hostile limits and decompression failures fail closed" {
+    var limits: Limits = test_limits(); limits.max_field_count = 1;
+    var table_entries: [8]Entry; var table_storage: [220]u8;
+    var table_scratch: [220]u8; var table: DynamicTable;
+    table_init(?table, ?table_entries[0], 8, ?table_storage[0], 220,
+        ?table_scratch[0], 220, 220);
+    var section_items: [8]Section; var refs: [32]Reference; var sections: Sections;
+    sections_init(?sections, ?section_items[0], 8, ?refs[0], 32, ?table, limits);
+    var encoded: [512]u8; var fields: [1]field.Field; var storage: [512]u8;
+    var scratch: [128]u8; var count_decoder: FieldDecoder;
+    field_decoder_init(?count_decoder, ?table, ?sections, 0, ?encoded[0], 512,
+        ?fields[0], 1, ?storage[0], 512, ?scratch[0], 128, limits);
+    var two: [4]u8; two[0] = 0; two[1] = 0; two[2] = 0xc1; two[3] = 0xc1;
+    if (field_decoder_feed(?count_decoder, ?two[0], 4, true).error
+        != ERROR_FIELD_LIMIT) { ret 1; }
+    limits.max_field_count = 8;
+    var invalid_fields: [8]field.Field; var invalid: FieldDecoder;
+    field_decoder_init(?invalid, ?table, ?sections, 4, ?encoded[0], 512,
+        ?invalid_fields[0], 8, ?storage[0], 512, ?scratch[0], 128, limits);
+    var bad_index: [4]u8; bad_index[0] = 0; bad_index[1] = 0;
+    bad_index[2] = 0xff; bad_index[3] = 0x24;
+    if (field_decoder_feed(?invalid, ?bad_index[0], 4, true).error
+        != ERROR_DECOMPRESSION) { ret 2; }
+    var huffman_fields: [8]field.Field; var huffman_decoder: FieldDecoder;
+    field_decoder_init(?huffman_decoder, ?table, ?sections, 8,
+        ?encoded[0], 512, ?huffman_fields[0], 8, ?storage[0], 512,
+        ?scratch[0], 128, limits);
+    var eos: [8]u8; eos[0] = 0; eos[1] = 0; eos[2] = 0x51; eos[3] = 0x84;
+    eos[4] = 0xff; eos[5] = 0xff; eos[6] = 0xff; eos[7] = 0xff;
+    if (field_decoder_feed(?huffman_decoder, ?eos[0], 8, true).error
+        != ERROR_DECOMPRESSION) { ret 3; }
+    var instruction_input: [128]u8; var instruction_scratch: [128]u8;
+    var encoder_stream: EncoderStreamDecoder;
+    encoder_stream_decoder_init(?encoder_stream, ?table, ?instruction_input[0], 128,
+        ?instruction_scratch[0], 128, limits);
+    var duplicate: [1]u8; duplicate[0] = 0;
+    if (encoder_stream_feed(?encoder_stream, ?duplicate[0], 1, false).error
+        != ERROR_ENCODER_STREAM) { ret 4; }
+    ret 0;
 }
