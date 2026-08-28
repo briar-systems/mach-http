@@ -1,0 +1,259 @@
+# one http/3 endpoint driven over a real quic driver, plus the two-endpoint fabric
+
+use h3quic.adapter;
+use h3quic.loopback;
+
+use h3: http.h3.connection;
+use http.h3.frame;
+use http.h3.qpack;
+use http.core.body;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.target;
+use qt: quic.transport;
+
+use std.chrono.time;
+use std.sync.cancel;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+pub val STREAM_SLOTS: usize = 10;
+pub val EVENT_KINDS: usize = 16;
+
+pub def HandlerFun: fun(ptr, h3.Event) bool;
+
+pub rec Session {
+    io: adapter.Adapter;
+    scope: cancel.Scope;
+    streams: [10]h3.Stream;
+    memories: [10]h3.StreamMemory;
+    reads: [10][192]u8;
+    settings: [10][5]frame.Setting;
+    encoded: [10][256]u8;
+    fields: [10][16]field.Field;
+    strings: [10][512]u8;
+    scratch: [10][256]u8;
+    output: [10][384]u8;
+    references: [10][16]u64;
+    inbound_entries: [8]qpack.Entry;
+    inbound_storage: [256]u8;
+    inbound_scratch: [256]u8;
+    inbound_sections: [8]qpack.Section;
+    inbound_references: [64]qpack.Reference;
+    outbound_entries: [8]qpack.Entry;
+    outbound_storage: [256]u8;
+    outbound_scratch: [256]u8;
+    outbound_sections: [8]qpack.Section;
+    outbound_references: [64]qpack.Reference;
+    control_queue: [256]u8;
+    encoder_queue: [256]u8;
+    decoder_queue: [256]u8;
+    engine: h3.Engine;
+    handler: HandlerFun;
+    context: ptr;
+    counts: [16]usize;
+    rejected: usize;
+}
+
+pub fun session_config() h3.Config {
+    var configured: h3.Config = h3.config_default();
+    configured.max_requests = 6;
+    configured.max_peer_unidirectional = 3;
+    configured.frames.max_frame_payload = 192;
+    configured.frames.max_settings = 5;
+    configured.local.qpack_max_table_capacity = 128;
+    configured.local.max_field_section_size = 512;
+    configured.local.qpack_blocked_streams = 2;
+    configured.inbound_qpack.max_table_capacity = 128;
+    configured.inbound_qpack.max_blocked_streams = 2;
+    configured.inbound_qpack.max_field_bytes = 128;
+    configured.inbound_qpack.max_field_count = 16;
+    configured.inbound_qpack.max_field_section_bytes = 512;
+    configured.inbound_qpack.max_encoded_section_bytes = 256;
+    configured.inbound_qpack.max_instruction_bytes = 128;
+    configured.inbound_qpack.max_outstanding_sections = 8;
+    configured.inbound_qpack.max_references = 64;
+    configured.outbound_qpack = configured.inbound_qpack;
+    configured.messages.max_informational = 2;
+    ret configured;
+}
+
+pub fun make_session(session: *Session, driver: *qt.Driver, clock: *u64,
+                     role: h3.Role, configured: h3.Config) bool {
+    if (!cancel.make_root(?session.scope, false,
+        time.Time{sec: 0, nsec: 0})) { ret false; }
+    var i: usize = 0;
+    for (i < STREAM_SLOTS) {
+        session.memories[i] = h3.StreamMemory{
+            read: ?session.reads[i][0], read_capacity: 192,
+            settings: ?session.settings[i][0], setting_capacity: 5,
+            encoded: ?session.encoded[i][0], encoded_capacity: 256,
+            fields: ?session.fields[i][0], field_capacity: 16,
+            strings: ?session.strings[i][0], string_capacity: 512,
+            scratch: ?session.scratch[i][0], scratch_capacity: 256,
+            output: ?session.output[i][0], output_capacity: 384,
+            references: ?session.references[i][0], reference_capacity: 16};
+        i = i + 1;
+    }
+    val storage: h3.Storage = h3.Storage{
+        streams: ?session.streams[0], memories: ?session.memories[0],
+        stream_capacity: STREAM_SLOTS,
+        inbound_entries: ?session.inbound_entries[0], inbound_entry_capacity: 8,
+        inbound_storage: ?session.inbound_storage[0], inbound_storage_capacity: 256,
+        inbound_scratch: ?session.inbound_scratch[0], inbound_scratch_capacity: 256,
+        inbound_sections: ?session.inbound_sections[0], inbound_section_capacity: 8,
+        inbound_references: ?session.inbound_references[0],
+        inbound_reference_capacity: 64,
+        outbound_entries: ?session.outbound_entries[0], outbound_entry_capacity: 8,
+        outbound_storage: ?session.outbound_storage[0], outbound_storage_capacity: 256,
+        outbound_scratch: ?session.outbound_scratch[0], outbound_scratch_capacity: 256,
+        outbound_sections: ?session.outbound_sections[0], outbound_section_capacity: 8,
+        outbound_references: ?session.outbound_references[0],
+        outbound_reference_capacity: 64,
+        control_queue: ?session.control_queue[0], control_queue_capacity: 256,
+        encoder_queue: ?session.encoder_queue[0], encoder_queue_capacity: 256,
+        decoder_queue: ?session.decoder_queue[0], decoder_queue_capacity: 256};
+    val transport: h3.Transport = adapter.bind(?session.io, driver, clock);
+    ret h3.init(?session.engine, role, transport, ?session.scope, storage,
+        configured);
+}
+
+pub fun count_of(session: *Session, kind: h3.EventKind) usize {
+    if (kind::usize >= EVENT_KINDS) { ret 0; }
+    ret session.counts[kind::usize];
+}
+
+fun record(session: *Session, event: h3.Event) {
+    if (event.kind::usize < EVENT_KINDS) {
+        session.counts[event.kind::usize] = session.counts[event.kind::usize] + 1;
+    }
+    if (session.handler == nil || event.kind == h3.EVENT_NONE) { ret; }
+    if (!session.handler(session.context, event)) {
+        session.rejected = session.rejected + 1;
+    }
+}
+
+pub fun poll(session: *Session) h3.Event {
+    val event: h3.Event = h3.process(?session.engine);
+    record(session, event);
+    ret event;
+}
+
+pub fun tick(session: *Session) h3.Event {
+    val event: h3.Event = h3.tick(?session.engine);
+    record(session, event);
+    ret event;
+}
+
+pub rec Fabric {
+    client_wire: loopback.Endpoint;
+    server_wire: loopback.Endpoint;
+    link: loopback.Link;
+    client: Session;
+    server: Session;
+}
+
+pub fun make_fabric(fabric: *Fabric, configured: h3.Config, window: u64) usize {
+    val client_ready: usize = loopback.init_endpoint(?fabric.client_wire, 301,
+        true, window);
+    if (client_ready != 0) { ret client_ready; }
+    val server_ready: usize = loopback.init_endpoint(?fabric.server_wire, 302,
+        false, window);
+    if (server_ready != 0) { ret 8 + server_ready; }
+    loopback.init_link(?fabric.link, ?fabric.client_wire, ?fabric.server_wire);
+    if (!make_session(?fabric.client, ?fabric.client_wire.driver,
+        ?fabric.link.now_ns, h3.CLIENT, configured)) { ret 20; }
+    if (!make_session(?fabric.server, ?fabric.server_wire.driver,
+        ?fabric.link.now_ns, h3.SERVER, configured)) { ret 21; }
+    ret 0;
+}
+
+# one turn: drain both engines' event queues, then move datagrams both ways
+pub fun turn(fabric: *Fabric) bool {
+    var busy: bool = false;
+    var i: usize = 0;
+    for (i < 64) {
+        val client_event: h3.Event = poll(?fabric.client);
+        val server_event: h3.Event = poll(?fabric.server);
+        if (client_event.kind == h3.EVENT_NONE
+         && server_event.kind == h3.EVENT_NONE) { brk; }
+        busy = true;
+        i = i + 1;
+    }
+    if (loopback.flush(?fabric.link, 128) != 0) { busy = true; }
+    ret busy;
+}
+
+pub fun run(fabric: *Fabric, rounds: usize) usize {
+    var i: usize = 0;
+    for (i < rounds) {
+        if (!turn(fabric)) { ret i; }
+        i = i + 1;
+    }
+    ret i;
+}
+
+pub fun handshake(fabric: *Fabric, rounds: usize) bool {
+    run(fabric, rounds);
+    ret fabric.client.engine.state == h3.OPEN
+        && fabric.server.engine.state == h3.OPEN;
+}
+
+pub rec ExchangeMemory {
+    scope: cancel.Scope;
+    request: message.Request;
+    response: message.Response;
+    reader: body.Reader;
+    response_fields: [16]field.Field;
+    response_trailers: [8]field.Field;
+    informationals: [4]message.Informational;
+    exchange: exchange.Exchange;
+}
+
+pub fun make_exchange(storage: *ExchangeMemory, generation: u64, id: u64) bool {
+    val configured: message.Limits = message.limits_default();
+    val none: time.Time = time.Time{sec: 0, nsec: 0};
+    if (!cancel.make_root(?storage.scope, false, none)) { ret false; }
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    storage.reader = body.empty_reader(generation);
+    val metadata: message.Metadata = message.Metadata{
+        version: message.version_h3(), secure: true, early_data: false,
+        peer: message.unspecified_endpoint(), local: message.unspecified_endpoint(),
+        received_at: time.Time{sec: 1, nsec: 0}, has_deadline: false,
+        deadline: none, request_index: id};
+    if (!message.init_request(?storage.request, method.from_kind(method.GET),
+        target.origin(view.view("/", 1), view.view("/", 1),
+            view.view(nil, 0)), metadata, fields, trailers,
+        ?storage.reader, generation, configured)
+     || !message.init_response(?storage.response, ?storage.response_fields[0], 16,
+        ?storage.response_trailers[0], 8, generation, configured)
+     || !exchange.init(?storage.exchange, ?storage.request, ?storage.response,
+        ?storage.informationals[0], 4, ?storage.scope, generation, configured)) {
+        ret false;
+    }
+    ret true;
+}
+
+pub fun request_fields(items: *field.Field, path: view.View) usize {
+    items[0] = field.Field{name: view.view(":method", 7),
+        value: view.view("GET", 3), sensitive: false};
+    items[1] = field.Field{name: view.view(":scheme", 7),
+        value: view.view("https", 5), sensitive: false};
+    items[2] = field.Field{name: view.view(":authority", 10),
+        value: view.view("example.test", 12), sensitive: false};
+    items[3] = field.Field{name: view.view(":path", 5), value: path,
+        sensitive: false};
+    ret 4;
+}
+
+pub fun response_fields(items: *field.Field, code: view.View) usize {
+    items[0] = field.Field{name: view.view(":status", 7), value: code,
+        sensitive: false};
+    ret 1;
+}

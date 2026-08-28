@@ -19,7 +19,10 @@ DATA. An adapter that grants credit during `read` does not satisfy this contract
 
 Writes copy every accepted byte before returning. Partial acceptance leaves the
 remaining bytes in the stream's caller-owned output buffer. HTTP retains no
-application payload pointer across the adapter call.
+application payload pointer across the adapter call. A write status answers
+whether the call made progress, not whether the whole offer was taken: any
+accepted byte is reported as success with the accepted count, and a blocked
+status means no byte was accepted.
 
 Successful FIN reports must carry the exact delivered final size. Resets may name a
 larger final size but never one below already delivered bytes. Stale handles, invalid
@@ -27,10 +30,12 @@ status combinations, duplicate local stream IDs, or failed cancellation and rele
 operations close the connection as transport failures. A blocked connection close
 is retried and is never reported complete early.
 
-The released `mach-quic` v0.1.0 tag predates its full connection driver. The current
-driver development API also combines delivery with flow-control credit. A direct
-binding therefore requires a tagged QUIC release with split delivery and credit.
-No packet, TLS, or recovery API needs to cross this boundary.
+`test/h3-quic` binds this adapter to the `mach-quic` connection driver and drives
+two real drivers against each other. Stream handle identity, delivery, and receive
+credit map one to one, and the driver's own uncredited total proves that `read`
+returns no window. Only the write status needs translating, because the QUIC status
+answers whether the entire write was accepted. No packet, TLS, or recovery API
+crosses this boundary.
 
 The engine does not advertise HTTP Datagrams because the adapter intentionally has
 no datagram surface. A peer may advertise datagram support without changing request

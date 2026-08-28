@@ -1,0 +1,589 @@
+# a real quic protocol core that frames stream work onto loopback datagrams
+#
+# mach-quic's own simulated core encodes a stream id, offset, and fin in single
+# bytes, which cannot carry http/3. this core pulls the driver's prepared stream
+# and flow-control work, frames it with rfc 9000 variable-length integers, and
+# lets the harness deliver, drop, or reorder each datagram between two drivers.
+
+use qt: quic.transport;
+use sm: quic.stream.stream;
+use dq: quic.stream.datagram;
+use quic.wire.varint;
+
+use std.encoding.binary;
+use std.sync.cancel;
+use std.chrono.time;
+use std.net.ip;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result;
+use std.types.size.usize;
+use std.types.string.str;
+
+pub val STREAM_CAPACITY: usize = 16;
+pub val SEND_STRIDE: usize = 512;
+pub val RECEIVE_STRIDE: usize = 512;
+pub val ATTEMPT_CAPACITY: usize = 32;
+pub val SEND_SLOTS: usize = 4;
+pub val OWNER_SLOTS: usize = 8;
+pub val DATAGRAM_BYTES: usize = 256;
+
+val FRAME_STREAM: u8 = 1;
+val FRAME_RESET: u8 = 2;
+val FRAME_STOP: u8 = 3;
+val FRAME_MAX_DATA: u8 = 4;
+val FRAME_MAX_STREAM_DATA: u8 = 5;
+val FRAME_MAX_STREAMS_BIDI: u8 = 6;
+val FRAME_MAX_STREAMS_UNI: u8 = 7;
+
+# reserved for the frame kind, stream id, offset, fin, and length prefix
+val FRAME_OVERHEAD: usize = 32;
+
+pub rec Core {
+    manager: *sm.Manager;
+    owner_tokens: [8]sm.AttemptToken;
+    owner_used: [8]bool;
+    next_owner: u64;
+    next_stream: usize;
+    outstanding: usize;
+    delivered: usize;
+    lost: usize;
+    closing: bool;
+    closed: bool;
+}
+
+fun state_of(core: *Core) qt.ConnectionState {
+    if (core.closing) { ret qt.DRAINING; }
+    ret qt.ACTIVE;
+}
+
+fun core_result(core: *Core, status: qt.Status, error: u64) qt.CoreResult {
+    ret qt.CoreResult{status: status, error: error, provider_error: 0,
+        state: state_of(core)};
+}
+
+fun wrote(value: result.Result[usize, str]) bool {
+    ret result.is_ok[usize, str](value);
+}
+
+fun put_varint(b: *binary.Builder, value: u64) bool {
+    ret result.is_ok[usize, u8](varint.write(b, value, 0));
+}
+
+fun take_varint(d: *binary.Decoder, out: *u64) bool {
+    val decoded: varint.Decoded = varint.read(d, true);
+    if (decoded.status != varint.STATUS_DONE) { ret false; }
+    out[0] = decoded.value;
+    ret true;
+}
+
+fun take_u8(d: *binary.Decoder, out: *u8) bool {
+    val read: result.Result[u8, str] = binary.read_u8(d);
+    if (!result.is_ok[u8, str](read)) { ret false; }
+    out[0] = result.unwrap_ok[u8, str](read);
+    ret true;
+}
+
+fun encode_prepared(prepared: *sm.Prepared, output: *u8, capacity: usize) usize {
+    var b: binary.Builder = binary.builder(output, capacity, binary.BIG);
+    if (prepared.kind == sm.SEND_STREAM) {
+        var end: u8 = 0;
+        if (prepared.fin) { end = 1; }
+        if (!wrote(binary.builder_write_u8(?b, FRAME_STREAM))
+         || !put_varint(?b, prepared.handle.id)
+         || !put_varint(?b, prepared.offset)
+         || !wrote(binary.builder_write_u8(?b, end))
+         || !put_varint(?b, prepared.data.len::u64)) { ret 0; }
+        if (prepared.data.len != 0
+         && !wrote(binary.builder_write_bytes(?b, prepared.data.data,
+            prepared.data.len))) { ret 0; }
+        ret b.len;
+    }
+    if (prepared.kind == sm.SEND_RESET) {
+        if (!wrote(binary.builder_write_u8(?b, FRAME_RESET))
+         || !put_varint(?b, prepared.handle.id)
+         || !put_varint(?b, prepared.application_error)
+         || !put_varint(?b, prepared.final_size)) { ret 0; }
+        ret b.len;
+    }
+    if (prepared.kind == sm.SEND_STOP) {
+        if (!wrote(binary.builder_write_u8(?b, FRAME_STOP))
+         || !put_varint(?b, prepared.handle.id)
+         || !put_varint(?b, prepared.application_error)) { ret 0; }
+        ret b.len;
+    }
+    if (prepared.kind == sm.SEND_MAX_DATA) {
+        if (!wrote(binary.builder_write_u8(?b, FRAME_MAX_DATA))
+         || !put_varint(?b, prepared.maximum)) { ret 0; }
+        ret b.len;
+    }
+    if (prepared.kind == sm.SEND_MAX_STREAM_DATA) {
+        if (!wrote(binary.builder_write_u8(?b, FRAME_MAX_STREAM_DATA))
+         || !put_varint(?b, prepared.handle.id)
+         || !put_varint(?b, prepared.maximum)) { ret 0; }
+        ret b.len;
+    }
+    if (prepared.kind == sm.SEND_MAX_STREAMS_BIDI) {
+        if (!wrote(binary.builder_write_u8(?b, FRAME_MAX_STREAMS_BIDI))
+         || !put_varint(?b, prepared.maximum)) { ret 0; }
+        ret b.len;
+    }
+    if (prepared.kind == sm.SEND_MAX_STREAMS_UNI) {
+        if (!wrote(binary.builder_write_u8(?b, FRAME_MAX_STREAMS_UNI))
+         || !put_varint(?b, prepared.maximum)) { ret 0; }
+        ret b.len;
+    }
+    ret 0;
+}
+
+fun stream_handle(core: *Core, index: usize) sm.Handle {
+    val stream: sm.Stream = core.manager.storage.streams[index];
+    ret sm.Handle{source: core.manager.config.source, index: index,
+        generation: stream.generation, id: stream.id};
+}
+
+# round-robin so no single stream starves the others
+fun prepare_stream(core: *Core, budget: usize) sm.Prepared {
+    var offset: usize = 0;
+    for (offset < STREAM_CAPACITY) {
+        val index: usize = (core.next_stream + offset) % STREAM_CAPACITY;
+        if (core.manager.storage.streams[index].active) {
+            val prepared: sm.Prepared = sm.prepare(core.manager,
+                stream_handle(core, index), budget, false);
+            if (prepared.status == sm.STATUS_OK) {
+                core.next_stream = (index + 1) % STREAM_CAPACITY;
+                ret prepared;
+            }
+            if (prepared.status == sm.STATUS_ERROR) { ret prepared; }
+        }
+        offset = offset + 1;
+    }
+    var empty: sm.Prepared;
+    empty.status = sm.STATUS_EMPTY;
+    ret empty;
+}
+
+fun core_generate(context: ptr, output: *u8, capacity: usize,
+                  now_ns: u64) qt.CoreDatagram {
+    val core: *Core = context::*Core;
+    var result_value: qt.CoreDatagram;
+    result_value.state = state_of(core);
+    if (core.closed || core.closing || output == nil
+     || capacity <= FRAME_OVERHEAD) {
+        result_value.status = qt.STATUS_EMPTY;
+        ret result_value;
+    }
+    val slot: usize = (core.next_owner % OWNER_SLOTS::u64)::usize;
+    if (core.owner_used[slot]) {
+        result_value.status = qt.STATUS_BLOCKED;
+        ret result_value;
+    }
+    var prepared: sm.Prepared = sm.prepare_control(core.manager);
+    if (prepared.status == sm.STATUS_EMPTY) {
+        prepared = prepare_stream(core, capacity - FRAME_OVERHEAD);
+    }
+    if (prepared.status == sm.STATUS_EMPTY) {
+        result_value.status = qt.STATUS_EMPTY;
+        ret result_value;
+    }
+    if (prepared.status != sm.STATUS_OK) {
+        result_value.status = qt.STATUS_BLOCKED;
+        result_value.error = prepared.error::u64;
+        ret result_value;
+    }
+    val written: usize = encode_prepared(?prepared, output, capacity);
+    if (written == 0 || written > capacity) {
+        sm.cancel_prepared(core.manager, prepared);
+        result_value.status = qt.STATUS_ERROR;
+        result_value.error = 10;
+        ret result_value;
+    }
+    if (sm.publish(core.manager, prepared).status != sm.STATUS_OK) {
+        result_value.status = qt.STATUS_ERROR;
+        result_value.error = 11;
+        ret result_value;
+    }
+    core.owner_tokens[slot] = prepared.token;
+    core.owner_used[slot] = true;
+    core.outstanding = core.outstanding + 1;
+    result_value.status = qt.STATUS_OK;
+    result_value.owner = core.next_owner;
+    result_value.count = written;
+    result_value.local = ip.endpoint(127, 0, 0, 1, 4433);
+    result_value.peer = ip.endpoint(127, 0, 0, 1, 4434);
+    core.next_owner = core.next_owner + 1;
+    ret result_value;
+}
+
+fun core_receive(context: ptr, input: *qt.Datagram) qt.CoreResult {
+    val core: *Core = context::*Core;
+    if (input == nil || input.data == nil || input.length == 0) {
+        ret core_result(core, qt.STATUS_ERROR, 1);
+    }
+    # a draining endpoint has already cancelled every stream
+    if (core.closing || core.closed) { ret core_result(core, qt.STATUS_OK, 0); }
+    var d: binary.Decoder = binary.decoder(input.data, input.length, binary.BIG);
+    var kind: u8 = 0;
+    if (!take_u8(?d, ?kind)) { ret core_result(core, qt.STATUS_ERROR, 2); }
+    var id: u64 = 0;
+    var first: u64 = 0;
+    var second: u64 = 0;
+    if (kind == FRAME_STREAM) {
+        var end_byte: u8 = 0;
+        if (!take_varint(?d, ?id) || !take_varint(?d, ?first)
+         || !take_u8(?d, ?end_byte) || !take_varint(?d, ?second)
+         || second::usize > d.len - d.pos) {
+            ret core_result(core, qt.STATUS_ERROR, 3);
+        }
+        var payload: *u8 = nil;
+        if (second != 0) {
+            val bytes: result.Result[*u8, str] = binary.read_bytes(?d, second::usize);
+            if (!result.is_ok[*u8, str](bytes)) {
+                ret core_result(core, qt.STATUS_ERROR, 4);
+            }
+            payload = result.unwrap_ok[*u8, str](bytes);
+        }
+        val received: sm.ReceiveResult = sm.receive_stream(core.manager, id,
+            first, payload, second::usize, end_byte != 0);
+        if (!received.ok) {
+            ret core_result(core, qt.STATUS_ERROR, received.error::u64);
+        }
+        core.delivered = core.delivered + 1;
+        ret core_result(core, qt.STATUS_OK, 0);
+    }
+    if (kind == FRAME_RESET) {
+        if (!take_varint(?d, ?id) || !take_varint(?d, ?first)
+         || !take_varint(?d, ?second)) {
+            ret core_result(core, qt.STATUS_ERROR, 5);
+        }
+        val received: sm.ReceiveResult = sm.receive_reset(core.manager, id,
+            first, second);
+        if (!received.ok) {
+            ret core_result(core, qt.STATUS_ERROR, received.error::u64);
+        }
+        core.delivered = core.delivered + 1;
+        ret core_result(core, qt.STATUS_OK, 0);
+    }
+    if (kind == FRAME_STOP) {
+        if (!take_varint(?d, ?id) || !take_varint(?d, ?first)) {
+            ret core_result(core, qt.STATUS_ERROR, 6);
+        }
+        val received: sm.ReceiveResult = sm.receive_stop(core.manager, id, first);
+        if (!received.ok) {
+            ret core_result(core, qt.STATUS_ERROR, received.error::u64);
+        }
+        core.delivered = core.delivered + 1;
+        ret core_result(core, qt.STATUS_OK, 0);
+    }
+    if (kind == FRAME_MAX_DATA) {
+        if (!take_varint(?d, ?first)
+         || sm.update_max_data(core.manager, first).status != sm.STATUS_OK) {
+            ret core_result(core, qt.STATUS_ERROR, 7);
+        }
+        core.delivered = core.delivered + 1;
+        ret core_result(core, qt.STATUS_OK, 0);
+    }
+    if (kind == FRAME_MAX_STREAM_DATA) {
+        if (!take_varint(?d, ?id) || !take_varint(?d, ?first)) {
+            ret core_result(core, qt.STATUS_ERROR, 8);
+        }
+        val received: sm.ReceiveResult = sm.receive_max_stream_data(core.manager,
+            id, first);
+        if (!received.ok) {
+            ret core_result(core, qt.STATUS_ERROR, received.error::u64);
+        }
+        core.delivered = core.delivered + 1;
+        ret core_result(core, qt.STATUS_OK, 0);
+    }
+    if (kind == FRAME_MAX_STREAMS_BIDI || kind == FRAME_MAX_STREAMS_UNI) {
+        var direction: u8 = sm.DIRECTION_BIDIRECTIONAL;
+        if (kind == FRAME_MAX_STREAMS_UNI) { direction = sm.DIRECTION_UNIDIRECTIONAL; }
+        if (!take_varint(?d, ?first)
+         || sm.update_max_streams(core.manager, direction,
+            first).status != sm.STATUS_OK) {
+            ret core_result(core, qt.STATUS_ERROR, 9);
+        }
+        core.delivered = core.delivered + 1;
+        ret core_result(core, qt.STATUS_OK, 0);
+    }
+    ret core_result(core, qt.STATUS_ERROR, 12);
+}
+
+fun core_timeout(context: ptr, generation: u64, now_ns: u64) qt.CoreResult {
+    val core: *Core = context::*Core;
+    ret core_result(core, qt.STATUS_ERROR, 13);
+}
+
+fun core_complete(context: ptr, owner: u64, status: qt.SendStatus, count: usize,
+                  now_ns: u64) qt.CoreResult {
+    val core: *Core = context::*Core;
+    val slot: usize = (owner % OWNER_SLOTS::u64)::usize;
+    if (!core.owner_used[slot]) { ret core_result(core, qt.STATUS_ERROR, 14); }
+    var terminal: u8 = sm.TERMINAL_LOST;
+    if (status == qt.SEND_SENT) { terminal = sm.TERMINAL_ACKED; }
+    val settled: sm.OperationResult = sm.on_terminal(core.manager,
+        core.owner_tokens[slot], terminal);
+    core.owner_used[slot] = false;
+    if (core.outstanding > 0) { core.outstanding = core.outstanding - 1; }
+    if (settled.status != sm.STATUS_OK) {
+        ret core_result(core, qt.STATUS_ERROR, 15);
+    }
+    if (terminal == sm.TERMINAL_LOST) { core.lost = core.lost + 1; }
+    ret core_result(core, qt.STATUS_OK, 0);
+}
+
+fun core_begin_close(context: ptr, abortive: bool, application_error: u64,
+                     reason: *u8, reason_length: usize,
+                     now_ns: u64) qt.CoreResult {
+    val core: *Core = context::*Core;
+    if (reason_length > 0 && reason == nil) {
+        ret core_result(core, qt.STATUS_ERROR, 16);
+    }
+    core.closing = true;
+    ret core_result(core, qt.STATUS_OK, 0);
+}
+
+fun core_ready(context: ptr) bool {
+    val core: *Core = context::*Core;
+    ret core.closing && core.outstanding == 0;
+}
+
+fun core_finish(context: ptr) bool {
+    val core: *Core = context::*Core;
+    if (!core_ready(context)) { ret false; }
+    core.closed = true;
+    ret true;
+}
+
+fun core_timer(context: ptr) qt.CoreTimer {
+    var value: qt.CoreTimer;
+    ret value;
+}
+
+pub rec Endpoint {
+    stream_records: [16]sm.Stream;
+    send_data: [8192]u8;
+    send_pending: [8192]bool;
+    send_acked: [8192]bool;
+    send_inflight: [8192]u8;
+    receive_data: [8192]u8;
+    receive_present: [8192]bool;
+    attempts: [32]sm.Attempt;
+    manager: sm.Manager;
+    datagrams: dq.Queue;
+    sends: [4]qt.SendSlot;
+    core: Core;
+    scope: cancel.Scope;
+    driver: qt.Driver;
+}
+
+fun stream_config(source: u64, role: u8, window: u64) sm.Config {
+    var value: sm.Config;
+    value.source = source;
+    value.role = role;
+    value.local_bidirectional_limit = 4;
+    value.local_unidirectional_limit = 4;
+    value.peer_bidirectional_limit = 4;
+    value.peer_unidirectional_limit = 4;
+    value.send_max_data = 4096;
+    value.receive_max_data = 4096;
+    value.send_local_bidirectional_limit = window;
+    value.send_peer_bidirectional_limit = window;
+    value.send_unidirectional_limit = window;
+    value.receive_local_bidirectional_limit = window;
+    value.receive_peer_bidirectional_limit = window;
+    value.receive_unidirectional_limit = window;
+    ret value;
+}
+
+# window bounds each stream's initial flow-control allowance, so a small one
+# forces the driver to accept writes partially until credit catches up
+pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
+                      window: u64) usize {
+    var role: u8 = sm.ROLE_SERVER;
+    if (client) { role = sm.ROLE_CLIENT; }
+    val stream_storage: sm.Storage = sm.Storage{
+        streams: ?endpoint.stream_records[0], stream_capacity: STREAM_CAPACITY,
+        send_data: ?endpoint.send_data[0], send_data_length: 8192,
+        send_pending: ?endpoint.send_pending[0],
+        send_acked: ?endpoint.send_acked[0],
+        send_inflight: ?endpoint.send_inflight[0], send_state_length: 8192,
+        send_stride: SEND_STRIDE,
+        receive_data: ?endpoint.receive_data[0], receive_data_length: 8192,
+        receive_present: ?endpoint.receive_present[0], receive_state_length: 8192,
+        receive_stride: RECEIVE_STRIDE,
+        attempts: ?endpoint.attempts[0], attempt_capacity: ATTEMPT_CAPACITY};
+    if (window == 0 || window > SEND_STRIDE::u64
+     || !sm.initialize(?endpoint.manager, stream_config(source, role, window),
+        stream_storage)) { ret 1; }
+    # the engine deliberately has no datagram surface, so the queue stays empty
+    var datagram_storage: dq.Storage;
+    if (!dq.initialize(?endpoint.datagrams, dq.Config{source: source,
+        peer_max_frame_size: 0, local_max_frame_size: 0, enabled: false},
+        datagram_storage)) { ret 2; }
+    endpoint.core.manager = ?endpoint.manager;
+    endpoint.core.next_owner = 1;
+    if (!cancel.make_root(?endpoint.scope, false,
+        time.Time{sec: 0, nsec: 0})) { ret 3; }
+    val protocol: qt.Protocol = qt.Protocol{context: (?endpoint.core)::ptr,
+        context_size: $size_of(Core), receive: core_receive,
+        timeout: core_timeout, generate: core_generate,
+        complete_send: core_complete, begin_close: core_begin_close,
+        close_ready: core_ready, finish_close: core_finish, timer: core_timer};
+    val config: qt.Config = qt.Config{source: source, max_udp_payload: 1500,
+        max_close_reason: 64};
+    val storage: qt.Storage = qt.Storage{sends: ?endpoint.sends[0],
+        send_capacity: SEND_SLOTS};
+    if (client) {
+        if (!qt.init_client(?endpoint.driver, config, protocol,
+            ?endpoint.manager, ?endpoint.datagrams, ?endpoint.scope, storage)) {
+            ret 4;
+        }
+        ret 0;
+    }
+    if (!qt.init_server(?endpoint.driver, config, protocol, ?endpoint.manager,
+        ?endpoint.datagrams, ?endpoint.scope, storage)) { ret 5; }
+    ret 0;
+}
+
+pub val NO_HOLD: u64 = (-1)::u64;
+pub val HOLD_SLOTS: usize = 4;
+
+pub rec Link {
+    client: *Endpoint;
+    server: *Endpoint;
+    buffer: [256]u8;
+    held: [4][256]u8;
+    held_length: [4]usize;
+    held_count: usize;
+    hold_id: u64;
+    now_ns: u64;
+    drop_next: usize;
+    dropped: usize;
+    transfers: usize;
+    reordered: usize;
+    errors: usize;
+}
+
+pub fun init_link(link: *Link, client: *Endpoint, server: *Endpoint) {
+    link.client = client;
+    link.server = server;
+    link.now_ns = 1;
+    link.drop_next = 0;
+    link.dropped = 0;
+    link.transfers = 0;
+    link.reordered = 0;
+    link.errors = 0;
+    link.held_count = 0;
+    link.hold_id = NO_HOLD;
+}
+
+# reads back the stream id a generated datagram carries, so the harness can
+# delay one stream's frames while the rest of the connection keeps moving
+fun carried_stream(data: *u8, length: usize, out: *u64) bool {
+    if (data == nil || length < 2 || data[0] != FRAME_STREAM) { ret false; }
+    var d: binary.Decoder = binary.decoder(data, length, binary.BIG);
+    var kind: u8 = 0;
+    if (!take_u8(?d, ?kind)) { ret false; }
+    ret take_varint(?d, out);
+}
+
+fun deliver(link: *Link, to: *Endpoint, data: *u8, length: usize) bool {
+    var datagram: qt.Datagram;
+    datagram.local = ip.endpoint(127, 0, 0, 1, 4434);
+    datagram.peer = ip.endpoint(127, 0, 0, 1, 4433);
+    datagram.data = data;
+    datagram.length = length;
+    datagram.received_at_ns = link.now_ns;
+    if (qt.receive_datagram(?to.driver, ?datagram).status != qt.STATUS_OK) {
+        ret false;
+    }
+    link.transfers = link.transfers + 1;
+    ret true;
+}
+
+# delivers every datagram parked by the hold filter, in the order it was sent
+pub fun release_held(link: *Link, to: *Endpoint) bool {
+    link.hold_id = NO_HOLD;
+    var i: usize = 0;
+    for (i < link.held_count) {
+        if (!deliver(link, to, ?link.held[i][0], link.held_length[i])) {
+            link.errors = link.errors + 1;
+            ret false;
+        }
+        i = i + 1;
+    }
+    link.held_count = 0;
+    ret true;
+}
+
+# moves at most one datagram from one driver to the other, dropping it when the
+# harness has asked for loss so the sender must retransmit
+fun carry(link: *Link, from: *Endpoint, to: *Endpoint) bool {
+    link.now_ns = link.now_ns + 1;
+    val generated: qt.Generated = qt.generate(?from.driver, ?from.scope,
+        ?link.buffer[0], DATAGRAM_BYTES, link.now_ns, 0);
+    if (generated.status != qt.STATUS_OK) { ret false; }
+    var lost: bool = false;
+    if (link.drop_next != 0) {
+        link.drop_next = link.drop_next - 1;
+        link.dropped = link.dropped + 1;
+        lost = true;
+    }
+    var parked: bool = false;
+    var carried: u64 = 0;
+    if (!lost && link.hold_id != NO_HOLD && link.held_count < HOLD_SLOTS
+     && carried_stream(generated.buffer, generated.count, ?carried)
+     && carried == link.hold_id) {
+        var i: usize = 0;
+        for (i < generated.count) {
+            link.held[link.held_count][i] = generated.buffer[i];
+            i = i + 1;
+        }
+        link.held_length[link.held_count] = generated.count;
+        link.held_count = link.held_count + 1;
+        link.reordered = link.reordered + 1;
+        parked = true;
+    }
+    if (!lost && !parked
+     && !deliver(link, to, generated.buffer, generated.count)) {
+        link.errors = link.errors + 1;
+        qt.complete_send(?from.driver, generated.token, qt.SEND_FAILED, 0,
+            link.now_ns);
+        ret false;
+    }
+    var status: qt.SendStatus = qt.SEND_SENT;
+    var count: usize = generated.count;
+    if (lost) { status = qt.SEND_FAILED; count = 0; }
+    if (qt.complete_send(?from.driver, generated.token, status, count,
+        link.now_ns).status != qt.STATUS_OK) {
+        link.errors = link.errors + 1;
+        ret false;
+    }
+    ret true;
+}
+
+# drains both directions until neither driver has anything left to send
+pub fun flush(link: *Link, budget: usize) usize {
+    var moved: usize = 0;
+    var i: usize = 0;
+    for (i < budget) {
+        var progress: bool = false;
+        if (carry(link, link.client, link.server)) { progress = true; }
+        if (carry(link, link.server, link.client)) { progress = true; }
+        if (!progress) { ret moved; }
+        moved = moved + 1;
+        i = i + 1;
+    }
+    ret moved;
+}
+
+pub fun close_endpoint(endpoint: *Endpoint, now_ns: u64) bool {
+    if (qt.snapshot(?endpoint.driver).state != qt.DRAINING
+     && qt.begin_close(?endpoint.driver, 0, nil, 0, now_ns).status != qt.STATUS_OK) {
+        ret false;
+    }
+    if (qt.finish_close(?endpoint.driver).status != qt.STATUS_OK) { ret false; }
+    ret cancel.destroy(?endpoint.scope);
+}

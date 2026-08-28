@@ -17,6 +17,7 @@
 - Bounded client protocol selection, DNS resolution, connection pooling, retry classification, cancellation scopes, and complete exchange lifecycle management.
 - Allocation-free HTTP/3 client and server engines with critical streams, request multiplexing, common exchange binding, cancellation, GOAWAY, and two-stage graceful close.
 - Split-delivery QUIC stream adapter contract with copied partial writes, explicit receive credit, generation-safe handles, and exact final-size validation.
+- Qualification of the HTTP/3 engine against the real `mach-quic` connection driver over a loopback protocol, covering bodies in both directions, sustained multiplexing, QPACK-blocked credit retention, reset, cancellation, GOAWAY, datagram loss, and partial I/O.
 
 ### Security
 
