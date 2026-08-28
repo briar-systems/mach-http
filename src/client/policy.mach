@@ -508,8 +508,8 @@ pub fun failure_valid(failure: Failure) bool {
         ret failure.response_started && failure.response_complete
             && !failure.definitely_unprocessed;
     }
-    ret failure.definitely_unprocessed && !failure.response_started
-        && !failure.response_complete;
+    ret !failure.response_complete
+        && (!failure.definitely_unprocessed || !failure.response_started);
 }
 
 fun policy_allows(configured: RetryPolicy, reason: RetryReason) bool {
@@ -531,7 +531,10 @@ pub fun retry(configured: RetryPolicy, replay: Replay, failure: Failure,
         ret RetryDecision{status: RETRY_LIMITED, delay_ns: 0,
             consume_budget: false};
     }
-    if (!policy_allows(configured, failure.reason) || !replayable(replay)) {
+    if ((!response_retry_reason(failure.reason)
+            && !failure.definitely_unprocessed)
+        || !policy_allows(configured, failure.reason)
+        || !replayable(replay)) {
         ret RetryDecision{status: RETRY_DENIED, delay_ns: 0,
             consume_budget: false};
     }
@@ -613,11 +616,11 @@ test "http.client.policy: retries require explicit and unambiguous replay safety
         || retry(configured, streaming, refused, 1).status != RETRY_DENIED
         || retry(configured, Replay{explicit: false, body: BODY_EMPTY},
             refused, 1).status != RETRY_DENIED
-        || retry(configured, safe, ambiguous, 1).status != RETRY_INVALID
+        || retry(configured, safe, ambiguous, 1).status != RETRY_DENIED
         || retry(configured, safe, Failure{reason: RETRY_GOAWAY,
             definitely_unprocessed: false, response_started: false,
             response_complete: false, retry_after_ns: 0}, 1).status
-            != RETRY_INVALID
+            != RETRY_DENIED
         || retry(configured, safe, refused, 3).status != RETRY_LIMITED
         || retry(response_policy, safe, server, 1).status != RETRY_ALLOWED
         || retry(response_policy, safe, Failure{reason: RETRY_SERVER,
