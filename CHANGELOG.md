@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0] - 2026-08-28
+
+### Changed
+
+- **Breaking.** `http.h3.connection.Storage` requires a caller-owned pending-release array and `Config` requires its `max_pending_release` bound. Every caller of `http.h3.connection.init` must supply both.
+
+### Fixed
+
+- A rejected HTTP/3 request no longer fails the connection. `release` means the stream is settled on the wire, which a stream this side has just reset cannot be until the peer acknowledges it, so blocked releases are now retried from `process` instead of being treated as transport failures. Exhausting the pending-release bound is a defined excessive-load failure.
+- A QPACK Stream Cancellation naming a stream with no outstanding section is a no-op rather than a decoder-stream connection error, matching RFC 9204, which defines that error only for Section Acknowledgment. A peer rejecting a request always cancels, whether or not the field section used the dynamic table.
+- The in-file HTTP/3 transport fake models the real release precondition instead of accepting any live stream, so its results cannot disagree with the driver again.
+
 ## [0.4.0] - 2026-08-28
 
 ### Added
@@ -15,6 +27,9 @@
 - Incremental HTTP/3 frame, SETTINGS, control-stream, and unidirectional stream codecs with exact borrowed payload ownership.
 - Complete QPACK static and dynamic tables, encoder and decoder instruction streams, all field-line representations, Huffman strings, blocked-section retry, and protected reference lifetimes.
 - Bounded client protocol selection, DNS resolution, connection pooling, retry classification, cancellation scopes, and complete exchange lifecycle management.
+- Allocation-free HTTP/3 client and server engines with critical streams, request multiplexing, common exchange binding, cancellation, GOAWAY, and two-stage graceful close.
+- Split-delivery QUIC stream adapter contract with copied partial writes, explicit receive credit, generation-safe handles, and exact final-size validation.
+- Qualification of the HTTP/3 engine against the real `mach-quic` connection driver over a loopback protocol, covering bodies in both directions, sustained multiplexing, QPACK-blocked credit retention, reset, cancellation, GOAWAY, datagram loss, and partial I/O.
 
 ### Security
 
@@ -25,6 +40,8 @@
 - Rejected misplaced and reserved HTTP/3 frames, duplicate or reserved settings, duplicate critical streams, client push streams, malformed typed payloads, and truncated variable-length integers.
 - Bounded QPACK table bytes, physical entries, wire instructions, encoded sections, blocked streams, outstanding sections, references, field count, decompressed field-list size, individual strings, and Huffman expansion independently.
 - Required terminal request and response bodies before exchange completion, forbade reuse after upgrades and tunnels, and rejected overlapping ownership descriptors before dereference.
+- Enforced independent HTTP/3 request, response, informational, trailer, target, body byte, DATA frame, and stream admission limits.
+- Rejected duplicate or closed critical streams, invalid frame sequences, hostile final sizes, blocked-stream saturation, QPACK cancellation abuse, nonmonotonic GOAWAY, and stale transport outcomes.
 
 ## [0.3.0] - 2026-08-28
 
