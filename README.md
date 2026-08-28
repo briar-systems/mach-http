@@ -13,7 +13,9 @@ negotiation, framing, and completion-driven connections are implemented for HTTP
 upgrade and HTTP/2 or HTTP/3 extended CONNECT. The HTTP/2 frame, HPACK, connection,
 and stream engines are complete. HTTP/3 frame, SETTINGS, critical-stream, and QPACK
 codecs are complete. HTTP/3 connection and request-stream state remains under
-development.
+development. The bounded client orchestrator, asynchronous DNS cache, origin-isolated
+connection pool, protocol selection, retries, redirects, cancellation, and graceful
+drain are implemented.
 
 ## Design
 
@@ -89,6 +91,16 @@ development.
 - QPACK encoders protect every referenced dynamic entry until Section Acknowledgment
   or Stream Cancellation. Insert Count Increment advances only through inserts that
   were actually sent.
+- Client requests use caller-owned fixed slots and stable generation tokens. Routes
+  are copied, while request fields, targets, and bodies remain borrowed for one exact
+  request generation.
+- DNS refresh, connection creation, HTTP exchange, replay, waits, completion, and
+  shutdown are explicit actions. The client retains no hidden runtime operation.
+- Connection pools isolate origins and complete proxy identities. Total, per-route,
+  lease, stream, idle, and idle-lifetime budgets are independent.
+- Retries require explicit replay authorization. Streaming bodies are never buffered
+  or retried. Cross-origin and cross-proxy redirects require sensitive fields to be
+  removed from a fresh request generation.
 - TLS belongs below the transport contract and is not a dependency of this package.
 
 ## Routing
@@ -160,6 +172,14 @@ eviction, both instruction streams, field-section prefixes, all indexed and lite
 representations, Huffman strings, blocked-section retry, reference protection, and
 decoder feedback. Tables and sections use caller-owned arrays and arenas. See
 [doc/h3-codecs.md](doc/h3-codecs.md) for memory, lifetime, and flow-control contracts.
+
+## HTTP client
+
+`http.client.client` composes protocol policy, the asynchronous DNS cache, bounded
+connection pool, cancellation scopes, retries, redirects, and exact transport
+ownership. Its event-loop actions bind directly to the system resolver, connector,
+and HTTP version engines. See [doc/client.md](doc/client.md) for memory, replay,
+proxy, cancellation-race, and graceful-drain contracts.
 
 ## Layout
 
