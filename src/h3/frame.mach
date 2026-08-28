@@ -508,9 +508,10 @@ pub fun stream_parser_init(parser: *StreamParser, critical: *CriticalStreams,
 }
 
 fun stream_fail(parser: *StreamParser, consumed: usize, error: Error) StreamEvent {
-    parser.error = error;
+    var stream_type: u64 = 0;
+    if (parser != nil) { parser.error = error; stream_type = parser.stream_type; }
     ret StreamEvent{kind: STREAM_EVENT_ERROR, consumed: consumed,
-        stream_type: parser.stream_type, push_id: 0, error: error};
+        stream_type: stream_type, push_id: 0, error: error};
 }
 
 pub fun stream_feed(parser: *StreamParser, input: *u8, length: usize,
@@ -615,6 +616,9 @@ test "http.h3.frame: placement missing settings and exact payloads fail closed" 
 }
 
 test "http.h3.frame: critical stream types and push direction are enforced" {
+    val null_result: StreamEvent = stream_feed(nil, nil, 0, false);
+    if (null_result.kind != STREAM_EVENT_ERROR
+     || null_result.error != ERROR_STATE || null_result.consumed != 0) { ret 4; }
     var critical: CriticalStreams; critical_init(?critical);
     var first: StreamParser; stream_parser_init(?first, ?critical, false);
     var control: [1]u8; control[0] = STREAM_CONTROL::u8;

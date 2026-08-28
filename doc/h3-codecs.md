@@ -103,5 +103,10 @@ the section and each unique entry reference. A reference that could block is use
 when the peer's blocked-stream limit permits it. Referenced entries remain ineligible
 for eviction until decoder feedback releases the section.
 
+Output storage may be larger than `max_encoded_section_bytes`. Initialization caps the
+encoder's usable view to that configured limit. Invalid non-empty views with a null
+data pointer and arithmetic-overflowing limit configurations are rejected before any
+input byte is read.
+
 Do not transmit output unless finish succeeds. `field_encoder_abort` discards an
 unfinished section without registering references.
