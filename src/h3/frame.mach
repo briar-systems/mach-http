@@ -434,8 +434,8 @@ pub fun begin(writer: *Writer, header: Header, output: *u8,
 
 pub fun write(writer: *Writer, output: *u8, output_capacity: usize,
     payload: *u8, payload_length: usize) Write {
-    if (writer == nil || !writer.active || output == nil || output_capacity == 0
-     || (payload == nil && payload_length != 0)) {
+    if (writer == nil || !writer.active || (payload == nil && payload_length != 0)
+     || (writer.parser.remaining != 0 && (output == nil || output_capacity == 0))) {
         ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_STATE};
     }
     var take: usize = payload_length;
@@ -601,6 +601,9 @@ test "http.h3.frame: placement missing settings and exact payloads fail closed" 
     var request: Parser; parser_init(?request, KIND_REQUEST, ?settings[0], 4, limits);
     data[0] = FRAME_SETTINGS::u8;
     if (feed(?request, ?data[0], 2, false).error != ERROR_FRAME_UNEXPECTED) { ret 2; }
+    var reserved: Parser; parser_init(?reserved, KIND_REQUEST, ?settings[0], 4, limits);
+    data[0] = 0x2;
+    if (feed(?reserved, ?data[0], 2, false).error != ERROR_FRAME_UNEXPECTED) { ret 4; }
     var malformed: Parser; parser_init(?malformed, KIND_CONTROL, ?settings[0], 4, limits);
     var pair: [3]u8; pair[0] = FRAME_SETTINGS::u8; pair[1] = 1; pair[2] = 1;
     if (feed(?malformed, ?pair[0], 2, false).kind != EVENT_HEADER

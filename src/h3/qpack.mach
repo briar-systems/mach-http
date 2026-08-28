@@ -681,7 +681,7 @@ pub fun decode_required_insert_count(encoded: u64, total_inserts: u64,
         if (required <= full_range) { ret (-1)::u64; }
         required = required - full_range;
     }
-    if (required == 0) { ret (-1)::u64; }
+    if (required == 0 || required > MAX_INTEGER) { ret (-1)::u64; }
     ret required;
 }
 
@@ -701,7 +701,9 @@ fun decode_string(input: *u8, length: usize, offset: usize, prefix: u8,
     maximum: usize) StringValue {
     val encoded_length: hpack.Integer = decode_integer(input, length, offset, prefix);
     if (encoded_length.error != hpack.ERROR_NONE) {
-        ret StringValue{value: view.view(nil, 0), next: offset, error: ERROR_INPUT};
+        var error: Error = ERROR_INPUT;
+        if (encoded_length.error == hpack.ERROR_INTEGER) { error = ERROR_INTEGER; }
+        ret StringValue{value: view.view(nil, 0), next: offset, error: error};
     }
     if (encoded_length.value > ((-1)::usize)::u64) {
         ret StringValue{value: view.view(nil, 0), next: offset, error: ERROR_INTEGER};
@@ -1284,7 +1286,7 @@ fun decode_section(decoder: *FieldDecoder) Decode {
         }
         decoder.base = decoder.required_insert_count - delta.value - 1;
     } or {
-        if (decoder.required_insert_count > (-1)::u64 - delta.value) {
+        if (decoder.required_insert_count > MAX_INTEGER - delta.value) {
             ret decoder_fail(decoder, 0, ERROR_DECOMPRESSION);
         }
         decoder.base = decoder.required_insert_count + delta.value;
