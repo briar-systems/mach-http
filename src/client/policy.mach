@@ -479,8 +479,24 @@ pub fun retry_policy_default() RetryPolicy {
         retry_server: false};
 }
 
-fun retry_reason_valid(reason: RetryReason) bool {
+pub fun retry_reason_valid(reason: RetryReason) bool {
     ret reason >= RETRY_DNS_TEMPORARY && reason <= RETRY_SERVER;
+}
+
+pub fun response_retry_reason(reason: RetryReason) bool {
+    ret reason == RETRY_REQUEST_TIMEOUT || reason == RETRY_TOO_EARLY
+        || reason == RETRY_RATE_LIMIT || reason == RETRY_SERVER;
+}
+
+pub fun failure_valid(failure: Failure) bool {
+    if (!retry_reason_valid(failure.reason)) { ret false; }
+    val response_reason: bool = response_retry_reason(failure.reason);
+    if (response_reason) {
+        ret failure.response_started && failure.response_complete
+            && !failure.definitely_unprocessed;
+    }
+    ret failure.definitely_unprocessed && !failure.response_started
+        && !failure.response_complete;
 }
 
 fun policy_allows(configured: RetryPolicy, reason: RetryReason) bool {
@@ -494,8 +510,7 @@ fun policy_allows(configured: RetryPolicy, reason: RetryReason) bool {
 pub fun retry(configured: RetryPolicy, replay: Replay, failure: Failure,
     attempts: usize) RetryDecision {
     if (configured.max_attempts == 0 || !replay_valid(replay)
-        || !retry_reason_valid(failure.reason)
-        || (failure.response_complete && !failure.response_started)) {
+        || !failure_valid(failure)) {
         ret RetryDecision{status: RETRY_INVALID, delay_ns: 0,
             consume_budget: false};
     }
@@ -504,18 +519,6 @@ pub fun retry(configured: RetryPolicy, replay: Replay, failure: Failure,
             consume_budget: false};
     }
     if (!policy_allows(configured, failure.reason) || !replayable(replay)) {
-        ret RetryDecision{status: RETRY_DENIED, delay_ns: 0,
-            consume_budget: false};
-    }
-    val response_reason: bool = failure.reason == RETRY_REQUEST_TIMEOUT
-        || failure.reason == RETRY_TOO_EARLY
-        || failure.reason == RETRY_RATE_LIMIT
-        || failure.reason == RETRY_SERVER;
-    if ((response_reason && (!failure.response_started
-            || !failure.response_complete))
-        || (!response_reason && failure.response_started)
-        || (failure.reason == RETRY_TRANSPORT
-            && !failure.definitely_unprocessed)) {
         ret RetryDecision{status: RETRY_DENIED, delay_ns: 0,
             consume_budget: false};
     }
@@ -597,12 +600,16 @@ test "http.client.policy: retries require explicit and unambiguous replay safety
         || retry(configured, streaming, refused, 1).status != RETRY_DENIED
         || retry(configured, Replay{explicit: false, body: BODY_EMPTY},
             refused, 1).status != RETRY_DENIED
-        || retry(configured, safe, ambiguous, 1).status != RETRY_DENIED
+        || retry(configured, safe, ambiguous, 1).status != RETRY_INVALID
+        || retry(configured, safe, Failure{reason: RETRY_GOAWAY,
+            definitely_unprocessed: false, response_started: false,
+            response_complete: false, retry_after_ns: 0}, 1).status
+            != RETRY_INVALID
         || retry(configured, safe, refused, 3).status != RETRY_LIMITED
         || retry(response_policy, safe, server, 1).status != RETRY_ALLOWED
         || retry(response_policy, safe, Failure{reason: RETRY_SERVER,
             definitely_unprocessed: false, response_started: true,
             response_complete: false, retry_after_ns: 0}, 1).status
-            != RETRY_DENIED) { ret 1; }
+            != RETRY_INVALID) { ret 1; }
     ret 0;
 }
