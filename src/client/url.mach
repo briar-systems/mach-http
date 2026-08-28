@@ -379,7 +379,13 @@ test "http.client.url: authority literals and unsafe forms are distinguished" {
             limits_default()).status != URL_PERCENT_ENCODING
         || parse(view.view("https://example.com:0/", 22),
             limits_default()).status != URL_PORT
+        || parse(view.view("https://example.com:65536/", 26),
+            limits_default()).status != URL_PORT
         || parse(view.view("ftp://example.com/", 18),
             limits_default()).status != URL_SCHEME) { ret 2; }
+    var bounded: Limits = limits_default();
+    bounded.max_url_bytes = 8;
+    if (parse(view.view("https://example.com/", 20), bounded).status
+        != URL_LIMIT) { ret 3; }
     ret 0;
 }
