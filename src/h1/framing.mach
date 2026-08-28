@@ -28,6 +28,7 @@ pub val FRAME_REQUEST_TRANSFER_ENCODING: Error = 8;
 pub val FRAME_FORBIDDEN_TRANSFER_ENCODING: Error = 9;
 pub val FRAME_INVALID_CONNECTION: Error = 10;
 pub val FRAME_FORBIDDEN_CONTENT_LENGTH: Error = 11;
+pub val FRAME_INVALID_FIELDS: Error = 12;
 
 pub rec Plan {
     mode: Mode;
@@ -156,7 +157,7 @@ pub fun connect_authority(value: view.View) bool {
 
 pub fun request_host(version: message.Version, fields: *field.Fields) bool {
     if (version.major != 1 || (version.minor != 0 && version.minor != 1)
-     || fields == nil || !fields.valid) { ret false; }
+     || fields == nil || !field.validate(fields, fields.limits, false)) { ret false; }
     if (version.minor == 0) { ret true; }
     var count: usize = 0;
     var valid: bool = false;
@@ -351,6 +352,7 @@ pub fun none(keep_alive: bool) Plan {
 fun inspect(version: message.Version, fields: *field.Fields, content_present: *bool,
     length: *u64, transfer: *Transfer, keep_alive: *bool) Error {
     if (!message.valid_version(version) || version.wire != message.WIRE_H1) { ret FRAME_INVALID_VERSION; }
+    if (fields == nil || !field.validate(fields, fields.limits, false)) { ret FRAME_INVALID_FIELDS; }
     val connection: Connection = connection_fields(fields);
     if (!connection.valid) { ret FRAME_INVALID_CONNECTION; }
     @keep_alive = persistent(version, connection);
