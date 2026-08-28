@@ -94,6 +94,9 @@ drain are implemented.
 - Client requests use caller-owned fixed slots and stable generation tokens. Routes
   are copied, while request fields, targets, and bodies remain borrowed for one exact
   request generation.
+- Public client pointers, views, counts, and capacities are address-space checked
+  before dereference. Raw URLs reject embedded NUL bytes, and bracketed authorities
+  require a valid IPv6 literal.
 - DNS refresh, connection creation, HTTP exchange, replay, waits, completion, and
   shutdown are explicit actions. The client retains no hidden runtime operation.
 - Published DNS work remains generation-owned until its submission is acknowledged,
@@ -101,11 +104,15 @@ drain are implemented.
 - Connection pools isolate origins and complete proxy identities. Total, per-route,
   lease, stream, idle, and idle-lifetime budgets are independent.
 - Pool maintenance publishes close ownership during normal service. Live HTTP/2 and
-  HTTP/3 stream capacity follows generation-bound peer credit updates.
+  HTTP/3 stream capacity, including zero peer credit, follows generation-bound
+  updates. Driver ownership transfers exactly once, so stale or duplicate connect
+  callbacks cannot close a live connection.
 - Retries require explicit replay authorization. Streaming bodies are never buffered
-  or retried. Complete response retries preserve the final response when policy is
-  denied or exhausted. Cross-origin and cross-proxy redirects require sensitive
-  fields and trailers to be removed from a fresh request generation.
+  or retried. Retry callbacks return the exact published exchange lease and complete
+  response retries prove terminal body ownership and reuse. Cross-origin and
+  cross-proxy redirects require sensitive fields and trailers to be removed from a
+  fresh request generation. Redirects retain the original protocol policy, preserve
+  a live lease on release failure, and settle cancellation before redirect outcomes.
 - The pool route is the canonical authority. Host, CONNECT authority-form, and
   forward-proxy absolute-form inputs are checked against it before exchange.
 - TLS belongs below the transport contract and is not a dependency of this package.

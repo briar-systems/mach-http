@@ -15,6 +15,12 @@ provider contexts, and body cancellation scopes that overlap client-owned storag
 Response completion rejects the response object, fields, trailers, bodies, provider
 contexts, and scopes on the same basis before ownership changes.
 
+Every public borrowed pointer, view, array count, and capacity is checked for
+address-space representability before the first dereference. Zero-length ranges may
+use a null pointer. Non-empty ranges must not be null or wrap the address space.
+The supplied parent cancellation scope is range-checked and rejected if it overlaps
+client-owned storage before the client queries its cancellation reason.
+
 The client owns the cache and pool lifecycle after initialization. Drain and destroy
 them through the client, then destroy the empty dependencies. A `Request` and all of
 its borrowed method, target, field, trailer, and body storage remain fixed until the
@@ -40,14 +46,21 @@ Call `submit`, then call `next` until it publishes an external action or complet
 - `ACTION_CONNECT` owns one pool reservation. The connector derives its TLS or QUIC
   ALPN offers with `policy.offers`. Report success through `connected`, or report a
   failed endpoint through `connect_failed`. `Connected.close_driver` tells the
-  connector whether it still owns and must close a late driver.
+  connector whether it still owns and must close a late driver. The pool accepts a
+  driver pointer exactly once. A duplicate or aliased pointer is rejected, and a
+  pointer already transferred to any live connection is never returned to the
+  connector for closure.
 - `ACTION_EXCHANGE` transfers one exact lease and request generation to the selected
   HTTP/1, HTTP/2, or HTTP/3 engine. Complete it with `exchange_complete` or
-  `exchange_failed`. A complete retryable HTTP response enters through
+  `exchange_failed`, returning the exact published lease value. Stale lease,
+  connection, driver, and wire evidence is rejected without consuming the live
+  exchange. Protocol reasons such as refused-stream and GOAWAY are accepted only
+  for HTTP/2 and HTTP/3. A complete retryable HTTP response enters through
   `exchange_response_retry`, which either schedules replay or preserves that exact
   response as the final successful HTTP outcome when policy denies or exhausts the
-  retry. The completion supplies the body reuse decision that controls pool
-  retention.
+  retry. Response completion and retry require the owned response body to be in a
+  terminal state whose reuse decision exactly matches the callback. The completion
+  supplies that body reuse decision to control pool retention.
 - `ACTION_WAIT_DNS`, `ACTION_WAIT_POOL`, and `ACTION_WAIT_TIMER` retain no new caller
   buffer. Drive `next` again after the corresponding state changes or absolute time
   arrives.
@@ -69,6 +82,8 @@ port. Other forward-proxy requests use matching absolute-form targets. If a call
 supplies a Host field, it must also match and may occur only once. Version adapters
 generate their wire authority from the route when Host is absent. Target component
 views must describe the exact raw target rather than an unrelated borrowed string.
+Bracketed authorities contain only validated IPv6 literals. Embedded NUL bytes are
+invalid in raw URLs and are rejected before any component view is published.
 
 ## DNS, pools, and proxies
 
@@ -84,7 +99,9 @@ tunneling, SOCKS5, and CONNECT-UDP declare TCP and datagram capabilities explici
 HTTP/1 leases are exclusive. HTTP/2 and HTTP/3 leases share a connection up to the
 reported peer and configured stream limits. `pool.update_max_streams` applies a
 generation-bound peer SETTINGS or transport-credit change. Reducing the limit below
-current use preserves existing leases and blocks only new acquisition.
+current use preserves existing leases and blocks only new acquisition. A live peer
+limit of zero is represented exactly and blocks every new lease until peer credit
+increases again.
 
 Total connections, connections per route, leases, idle connections, idle connections
 per route, idle lifetime, and streams per connection are independently bounded. Idle
@@ -112,16 +129,20 @@ fields and trailers, Authorization, and Cookie. Cross-proxy replacements must om
 Proxy-Authorization from fields and trailers. A redirect that removes a body changes
 the stored replay classification to empty. Other replacements must preserve the
 declared replay class. A maximum of zero disables redirects and yields the normal
-redirect-limit result.
+redirect-limit result. A followed route must also remain usable by the original
+protocol policy, including after an allowed HTTPS-to-HTTP downgrade. Release failure
+is transactional and retains the exact live exchange. Once release succeeds,
+cancellation wins over both following and publishing a redirect error.
 
 ## Cancellation and shutdown
 
 Every request owns a child of the supplied cancellation scope. The effective
 deadline must exactly match the request metadata. Call `cancel_request` or
 `expire_request`, or drive the same child scope directly. Cancellation wins a late
-connect or exchange callback. Late connect drivers return to the connector for
-closure. Late exchange responses release their connection but do not replace the
-cancelled outcome.
+connect or exchange callback. A late untransferred connect driver returns to the
+connector for closure. A driver already owned by another connection does not. Late
+exchange responses release their connection but do not replace the cancelled
+outcome.
 
 `drain` stops admission while existing tokens finish. After every completion is
 released, `drain_dependencies` stops DNS and pool admission. Repeatedly consume
