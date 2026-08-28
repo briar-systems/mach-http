@@ -76,6 +76,101 @@ fun field_is(item: *field.Field, name: *u8, name_len: usize) bool {
     ret item != nil && equal_token(item.name.data, item.name.len, name, name_len);
 }
 
+fun host_char(c: u8) bool {
+    ret (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+        || c == '-' || c == '.' || c == '_' || c == '~' || c == '!' || c == '$'
+        || c == '&' || c == 39 || c == '(' || c == ')' || c == '*' || c == '+'
+        || c == ';' || c == '=';
+}
+
+fun hex_char(c: u8) bool {
+    ret (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+}
+
+fun valid_host_part(value: view.View, start: usize, finish: usize, literal: bool) bool {
+    if (start == finish) { ret false; }
+    var i: usize = start;
+    for (i < finish) {
+        val c: u8 = value.data[i];
+        if (host_char(c) || (literal && c == ':')) {
+            i = i + 1;
+        } or {
+            if (c != '%' || i + 2 >= finish || !hex_char(value.data[i + 1])
+             || !hex_char(value.data[i + 2])) { ret false; }
+            i = i + 3;
+        }
+    }
+    ret true;
+}
+
+fun valid_port(value: view.View, start: usize) bool {
+    if (start >= value.len) { ret false; }
+    var i: usize = start;
+    var port: u32 = 0;
+    for (i < value.len) {
+        if (value.data[i] < '0' || value.data[i] > '9') { ret false; }
+        val digit: u32 = (value.data[i] - '0')::u32;
+        if (port > (65535 - digit) / 10) { ret false; }
+        port = port * 10 + digit;
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun host_value(value: view.View) bool {
+    if (value.data == nil || value.len == 0) { ret false; }
+    if (value.data[0] == '[') {
+        var close: usize = 1;
+        for (close < value.len && value.data[close] != ']') { close = close + 1; }
+        if (close == value.len || !valid_host_part(value, 1, close, true)) { ret false; }
+        if (close + 1 == value.len) { ret true; }
+        ret value.data[close + 1] == ':' && valid_port(value, close + 2);
+    }
+    var colon: usize = value.len;
+    var i: usize = 0;
+    for (i < value.len) {
+        if (value.data[i] == ':') {
+            if (colon != value.len) { ret false; }
+            colon = i;
+        }
+        i = i + 1;
+    }
+    if (!valid_host_part(value, 0, colon, false)) { ret false; }
+    ret colon == value.len || valid_port(value, colon + 1);
+}
+
+pub fun connect_authority(value: view.View) bool {
+    if (!host_value(value)) { ret false; }
+    if (value.data[0] == '[') {
+        var close: usize = 1;
+        for (close < value.len && value.data[close] != ']') { close = close + 1; }
+        ret close + 1 < value.len && value.data[close + 1] == ':';
+    }
+    var i: usize = 0;
+    for (i < value.len) {
+        if (value.data[i] == ':') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun request_host(version: message.Version, fields: *field.Fields) bool {
+    if (version.major != 1 || (version.minor != 0 && version.minor != 1)
+     || fields == nil || !fields.valid) { ret false; }
+    if (version.minor == 0) { ret true; }
+    var count: usize = 0;
+    var valid: bool = false;
+    var i: usize = 0;
+    for (i < fields.len) {
+        if (field_is(?fields.items[i], "host", 4)) {
+            count = count + 1;
+            valid = host_value(fields.items[i].value);
+        }
+        i = i + 1;
+    }
+    ret count == 1 && valid;
+}
+
 fun ows(c: u8) bool {
     ret c == ' ' || c == '\t';
 }
@@ -378,5 +473,21 @@ test "http.h1.framing: transfer coding is strict and version aware" {
     field.append(?fields, field.Field{name: view.view("Transfer-Encoding", 17),
         value: view.view("chunked, gzip", 13), sensitive: false});
     if (request(message.version_h1(1, 1), ?fields).error != FRAME_REQUEST_TRANSFER_ENCODING) { ret 3; }
+    ret 0;
+}
+
+test "http.h1.framing: host authority is singular and syntax checked" {
+    var items: [2]field.Field;
+    var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 128, 32, 64));
+    field.append(?fields, field.Field{name: view.view("Host", 4),
+        value: view.view("[::1]:8080", 10), sensitive: false});
+    if (!request_host(message.version_h1(1, 1), ?fields)) { ret 1; }
+    field.append(?fields, field.Field{name: view.view("host", 4),
+        value: view.view("example.com", 11), sensitive: false});
+    if (request_host(message.version_h1(1, 1), ?fields)) { ret 2; }
+    field.reset(?fields);
+    field.append(?fields, field.Field{name: view.view("Host", 4),
+        value: view.view("example.com:99999", 17), sensitive: false});
+    if (request_host(message.version_h1(1, 1), ?fields)) { ret 3; }
     ret 0;
 }

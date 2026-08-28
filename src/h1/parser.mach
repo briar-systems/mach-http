@@ -173,11 +173,16 @@ fun feed_result(parser: *Parser, status: FeedStatus, consumed: usize) Feed {
         body_final: false, error: parser.error, error_offset: parser.error_offset};
 }
 
+fun account_wire(parser: *Parser, amount: u64) {
+    if (amount > (-1)::u64 - parser.wire_bytes) { parser.wire_bytes = (-1)::u64; }
+    or { parser.wire_bytes = parser.wire_bytes + amount; }
+}
+
 fun take_line(parser: *Parser, input: *u8, input_length: usize, offset: *usize) u8 {
     for (@offset < input_length) {
         val c: u8 = input[@offset];
         @offset = @offset + 1;
-        parser.wire_bytes = parser.wire_bytes + 1;
+        account_wire(parser, 1);
         if (parser.saw_cr) {
             if (c != '\n') { fail(parser, ERROR_INVALID_LINE_ENDING); ret LINE_ERROR; }
             parser.saw_cr = false;
@@ -258,24 +263,25 @@ fun ascii_target(data: *u8, length: usize) bool {
     ret true;
 }
 
-fun authority_target(raw: view.View) bool {
-    if (!ascii_target(raw.data, raw.len)) { ret false; }
-    var colon: usize = raw.len;
-    var close_bracket: usize = raw.len;
-    var i: usize = 0;
-    for (i < raw.len) {
-        if (raw.data[i] == '@' || raw.data[i] == '/' || raw.data[i] == '?'
-         || raw.data[i] == '#') { ret false; }
-        if (raw.data[i] == ']') { close_bracket = i; }
-        if (raw.data[i] == ':') { colon = i; }
-        i = i + 1;
-    }
-    if (colon == raw.len || colon == 0 || colon + 1 == raw.len) { ret false; }
-    if (raw.data[0] == '[' && (close_bracket + 1 != colon || close_bracket == raw.len)) { ret false; }
-    i = colon + 1;
-    for (i < raw.len) {
-        if (raw.data[i] < '0' || raw.data[i] > '9') { ret false; }
-        i = i + 1;
+fun uri_component(data: *u8, start: usize, finish: usize, query: bool) bool {
+    var i: usize = start;
+    for (i < finish) {
+        val c: u8 = data[i];
+        val ordinary: bool = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
+            || (c >= 'a' && c <= 'z') || c == '-' || c == '.' || c == '_'
+            || c == '~' || c == '!' || c == '$' || c == '&' || c == 39
+            || c == '(' || c == ')' || c == '*' || c == '+' || c == ','
+            || c == ';' || c == '=' || c == ':' || c == '@' || c == '/'
+            || (query && c == '?');
+        if (ordinary) {
+            i = i + 1;
+        } or {
+            var first: u8;
+            var second: u8;
+            if (c != '%' || i + 2 >= finish || !hex(data[i + 1], ?first)
+             || !hex(data[i + 2], ?second)) { ret false; }
+            i = i + 3;
+        }
     }
     ret true;
 }
@@ -312,6 +318,8 @@ fun parse_absolute(raw: view.View, parsed: *target.Target) bool {
         i = i + 1;
     }
     if (authority_end == authority_start) { ret false; }
+    val authority: view.View = subview(raw, authority_start, authority_end - authority_start);
+    if (!framing.host_value(authority)) { ret false; }
     var query_at: usize = raw.len;
     i = authority_end;
     for (i < raw.len) {
@@ -322,10 +330,12 @@ fun parse_absolute(raw: view.View, parsed: *target.Target) bool {
     val path_end: usize = query_at;
     val path_length: usize = path_end - authority_end;
     if (path_length != 0 && raw.data[authority_end] != '/') { ret false; }
+    if (!uri_component(raw.data, authority_end, path_end, false)
+     || (query_at != raw.len && !uri_component(raw.data, query_at + 1, raw.len, true))) { ret false; }
     var query_start: usize = query_at;
     if (query_at != raw.len) { query_start = query_start + 1; }
     @parsed = target.absolute(raw, subview(raw, 0, scheme_end),
-        subview(raw, authority_start, authority_end - authority_start),
+        authority,
         subview(raw, authority_end, path_length),
         subview(raw, query_start, raw.len - query_start));
     ret true;
@@ -339,7 +349,7 @@ fun parse_target(raw: view.View, request_method: method.Kind, parsed: *target.Ta
         ret request_method == method.OPTIONS;
     }
     if (request_method == method.CONNECT) {
-        if (!authority_target(raw)) { ret false; }
+        if (!framing.connect_authority(raw)) { ret false; }
         @parsed = target.authority(raw);
         ret true;
     }
@@ -351,6 +361,8 @@ fun parse_target(raw: view.View, request_method: method.Kind, parsed: *target.Ta
             if (raw.data[i] == '?' && query_at == raw.len) { query_at = i; }
             i = i + 1;
         }
+        if (!uri_component(raw.data, 0, query_at, false)
+         || (query_at != raw.len && !uri_component(raw.data, query_at + 1, raw.len, true))) { ret false; }
         var query_start: usize = query_at;
         if (query_at != raw.len) { query_start = query_start + 1; }
         @parsed = target.origin(raw, subview(raw, 0, query_at),
@@ -518,31 +530,9 @@ fun parse_field_line(parser: *Parser, trailers: bool) bool {
     ret true;
 }
 
-fun host_valid(value: view.View) bool {
-    if (value.data == nil || value.len == 0) { ret false; }
-    var i: usize = 0;
-    for (i < value.len) {
-        val c: u8 = value.data[i];
-        if (c <= ' ' || c >= 127 || c == ',' || c == '@' || c == '/' || c == '?' || c == '#') { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
 fun validate_host(parser: *Parser) bool {
-    if (parser.kind != REQUEST || parser.parsed.version.minor == 0) { ret true; }
-    var count: usize = 0;
-    var valid: bool = false;
-    var i: usize = 0;
-    val host_name: view.View = view.view("host", 4);
-    for (i < parser.parsed.fields.len) {
-        if (field.name_equal(parser.parsed.fields.items[i].name, host_name)) {
-            count = count + 1;
-            valid = host_valid(parser.parsed.fields.items[i].value);
-        }
-        i = i + 1;
-    }
-    ret count == 1 && valid;
+    ret parser.kind != REQUEST
+        || framing.request_host(parser.parsed.version, ?parser.parsed.fields);
 }
 
 fun headers_complete(parser: *Parser) bool {
@@ -777,7 +767,7 @@ pub fun feed(parser: *Parser, input: *u8, input_length: usize) Feed {
             }
             val body_start: usize = offset;
             offset = offset + available;
-            parser.wire_bytes = parser.wire_bytes + available::u64;
+            account_wire(parser, available::u64);
             parser.body_bytes = parser.body_bytes + available::u64;
             var final: bool = false;
             if (parser.phase == FIXED_BODY) {
@@ -800,12 +790,12 @@ pub fun feed(parser: *Parser, input: *u8, input_length: usize) Feed {
             var expected: u8 = '\n';
             if (parser.phase == CHUNK_DATA_CR) { expected = '\r'; }
             if (input[offset] != expected) {
-                parser.wire_bytes = parser.wire_bytes + 1;
+                account_wire(parser, 1);
                 offset = offset + 1;
                 fail(parser, ERROR_INVALID_CHUNK_TERMINATOR);
                 ret feed_result(parser, PARSE_ERROR, offset);
             }
-            parser.wire_bytes = parser.wire_bytes + 1;
+            account_wire(parser, 1);
             offset = offset + 1;
             if (parser.phase == CHUNK_DATA_CR) { parser.phase = CHUNK_DATA_LF; }
             or { parser.phase = CHUNK_SIZE; }
@@ -1006,6 +996,18 @@ test "http.h1.parser: whole and fragmented chunked responses agree" {
      || bytewise.body_length != whole.body_length || bytewise.consumed != whole.consumed
      || !memory.raw_equal(?whole_body[0], ?byte_body[0], whole.body_length)
      || !memory.raw_equal(?whole_body[0], "Wikipedia", 9)) { ret 3; }
+    var stride: usize = 2;
+    for (stride < str_len(wire)) {
+        var candidate_body: [32]u8;
+        var candidate: ParseSummary;
+        if (!response_summary(wire, stride, ?candidate_body[0], 32, ?candidate)
+         || candidate.code != whole.code || candidate.mode != whole.mode
+         || candidate.field_count != whole.field_count
+         || candidate.trailer_count != whole.trailer_count
+         || candidate.body_length != whole.body_length || candidate.consumed != whole.consumed
+         || !memory.raw_equal(?whole_body[0], ?candidate_body[0], whole.body_length)) { ret 4; }
+        stride = stride + 1;
+    }
     ret 0;
 }
 
@@ -1028,6 +1030,12 @@ test "http.h1.parser: hostile framing and request smuggling corpus is rejected" 
     if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 1\r\n\r\n")) { ret 16; }
     if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1 ;x=y\r\na\r\n0\r\n\r\n")) { ret 17; }
     if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1; x=y\r\na\r\n0\r\n\r\n")) { ret 18; }
+    if (!rejected_request("GET / HTTP/1.1\r\nHost: x:abc\r\n\r\n")) { ret 19; }
+    if (!rejected_request("GET / HTTP/1.1\r\nHost: x:99999\r\n\r\n")) { ret 20; }
+    if (!rejected_request("GET / HTTP/1.1\r\nHost: ::1\r\n\r\n")) { ret 21; }
+    if (!rejected_request("GET /bad%zz HTTP/1.1\r\nHost: x\r\n\r\n")) { ret 22; }
+    if (!rejected_request("GET http://x:99999/ HTTP/1.1\r\nHost: x\r\n\r\n")) { ret 23; }
+    if (!rejected_request("CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n")) { ret 24; }
     ret 0;
 }
 

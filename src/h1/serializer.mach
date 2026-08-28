@@ -53,6 +53,8 @@ pub rec Serializer {
     trailer_start: usize;
     trailer_length: usize;
     trailer_offset: usize;
+    trailers: *field.Fields;
+    trailers_prepared: bool;
     body_written: u64;
     chunk_size: u64;
     chunk_remaining: u64;
@@ -115,32 +117,15 @@ fun reason_valid(reason: view.View) bool {
     ret true;
 }
 
-fun host_valid(value: view.View) bool {
-    if (value.data == nil || value.len == 0) { ret false; }
+fun target_wire_safe(request_target: target.Target) bool {
+    if (request_target.raw.data == nil || request_target.raw.len == 0) { ret false; }
     var i: usize = 0;
-    for (i < value.len) {
-        val c: u8 = value.data[i];
-        if (c <= ' ' || c >= 127 || c == ',' || c == '@' || c == '/'
-         || c == '?' || c == '#') { ret false; }
+    for (i < request_target.raw.len) {
+        if (request_target.raw.data[i] <= ' ' || request_target.raw.data[i] >= 127
+         || request_target.raw.data[i] == '#') { ret false; }
         i = i + 1;
     }
     ret true;
-}
-
-fun request_host_valid(version: message.Version, fields: *field.Fields) bool {
-    if (version.minor == 0) { ret true; }
-    var count: usize = 0;
-    var valid: bool = false;
-    var i: usize = 0;
-    val name: view.View = view.view("host", 4);
-    for (i < fields.len) {
-        if (field.name_equal(fields.items[i].name, name)) {
-            count = count + 1;
-            valid = host_valid(fields.items[i].value);
-        }
-        i = i + 1;
-    }
-    ret count == 1 && valid;
 }
 
 fun append_status(serializer: *Serializer, code: status.Status) bool {
@@ -165,6 +150,8 @@ fun begin(serializer: *Serializer, scratch: *u8, scratch_capacity: usize,
     serializer.trailer_start = 0;
     serializer.trailer_length = 0;
     serializer.trailer_offset = 0;
+    serializer.trailers = trailers;
+    serializer.trailers_prepared = false;
     serializer.body_written = 0;
     serializer.chunk_size = 0;
     serializer.chunk_remaining = 0;
@@ -194,25 +181,38 @@ fun begin(serializer: *Serializer, scratch: *u8, scratch_capacity: usize,
     ret true;
 }
 
-fun finish_head(serializer: *Serializer, fields: *field.Fields,
-    trailers: *field.Fields) bool {
+fun finish_head(serializer: *Serializer, fields: *field.Fields) bool {
     if (!append_fields(serializer, fields) || !append_text(serializer, "\r\n")) {
         serializer.phase = SERIALIZE_ERROR;
         serializer.error = ERROR_HEAD_LIMIT;
         serializer.initialized = false;
         ret false;
     }
-    val head_end: usize = serializer.head_length;
-    serializer.trailer_start = head_end;
-    if (trailers != nil && !append_fields(serializer, trailers)) {
-        serializer.phase = SERIALIZE_ERROR;
-        serializer.error = ERROR_HEAD_LIMIT;
-        serializer.initialized = false;
+    ret true;
+}
+
+fun prepare_trailers(serializer: *Serializer) bool {
+    if (serializer.trailers_prepared) { ret true; }
+    if (serializer.trailers == nil) { serializer.trailers_prepared = true; ret true; }
+    if (!field.validate(serializer.trailers, serializer.trailers.limits, true)) {
+        serializer.error = ERROR_INVALID_TRAILERS;
         ret false;
     }
-    serializer.trailer_length = serializer.head_length - head_end;
-    serializer.head_length = head_end;
+    serializer.trailer_start = serializer.head_length;
+    if (!append_fields(serializer, serializer.trailers)) {
+        serializer.error = ERROR_HEAD_LIMIT;
+        ret false;
+    }
+    serializer.trailer_length = serializer.head_length - serializer.trailer_start;
+    serializer.head_length = serializer.trailer_start;
+    serializer.trailers_prepared = true;
     ret true;
+}
+
+fun trailers_empty(serializer: *Serializer) bool {
+    ret serializer.trailers == nil
+        || (field.validate(serializer.trailers, serializer.trailers.limits, true)
+            && serializer.trailers.len == 0);
 }
 
 pub fun init_request(serializer: *Serializer, version: message.Version,
@@ -224,8 +224,9 @@ pub fun init_request(serializer: *Serializer, version: message.Version,
     if (serializer == nil || !message.valid_version(version) || version.wire != message.WIRE_H1
      || !method.valid(request_method, request_method.token.len)
      || !target.valid_for_method(request_target, request_method.kind, target_limits)
+     || !target_wire_safe(request_target)
      || fields == nil || !field.validate(fields, fields.limits, false)
-     || !request_host_valid(version, fields)) {
+     || !framing.request_host(version, fields)) {
         if (serializer != nil) { serializer.phase = SERIALIZE_ERROR; serializer.error = ERROR_INVALID_MESSAGE; }
         ret false;
     }
@@ -235,7 +236,7 @@ pub fun init_request(serializer: *Serializer, version: message.Version,
      || !append_text(serializer, " ")
      || !append_bytes(serializer, request_target.raw.data, request_target.raw.len)
      || !append_text(serializer, " ") || !append_version(serializer, version)
-     || !append_text(serializer, "\r\n") || !finish_head(serializer, fields, trailers)) {
+     || !append_text(serializer, "\r\n") || !finish_head(serializer, fields)) {
         serializer.phase = SERIALIZE_ERROR;
         if (serializer.error == ERROR_NONE) { serializer.error = ERROR_HEAD_LIMIT; }
         serializer.initialized = false;
@@ -261,7 +262,7 @@ pub fun init_response(serializer: *Serializer, message_version: message.Version,
     if (!append_version(serializer, message_version) || !append_text(serializer, " ")
      || !append_status(serializer, code) || !append_text(serializer, " ")
      || !append_bytes(serializer, reason.data, reason.len) || !append_text(serializer, "\r\n")
-     || !finish_head(serializer, fields, trailers)) {
+     || !finish_head(serializer, fields)) {
         serializer.phase = SERIALIZE_ERROR;
         if (serializer.error == ERROR_NONE) { serializer.error = ERROR_HEAD_LIMIT; }
         serializer.initialized = false;
@@ -328,6 +329,9 @@ pub fun write(serializer: *Serializer, output: *u8, output_capacity: usize,
                     ret write_fail(serializer, ERROR_BODY_FORBIDDEN, written, consumed);
                 }
                 if (!body_final) { ret write_result(serializer, WRITE_NEED_BODY, written, consumed); }
+                if (!trailers_empty(serializer)) {
+                    ret write_fail(serializer, ERROR_INVALID_TRAILERS, written, consumed);
+                }
                 serializer.phase = SERIALIZE_DONE;
                 ret write_result(serializer, WRITE_DONE, written, consumed);
             }
@@ -354,6 +358,9 @@ pub fun write(serializer: *Serializer, output: *u8, output_capacity: usize,
                 if (body_length == consumed) {
                     if (body_final) {
                         if (remaining != 0) { ret write_fail(serializer, ERROR_BODY_LENGTH, written, consumed); }
+                        if (!trailers_empty(serializer)) {
+                            ret write_fail(serializer, ERROR_INVALID_TRAILERS, written, consumed);
+                        }
                         serializer.phase = SERIALIZE_DONE;
                         ret write_result(serializer, WRITE_DONE, written, consumed);
                     }
@@ -373,6 +380,9 @@ pub fun write(serializer: *Serializer, output: *u8, output_capacity: usize,
             if (serializer.plan.mode == framing.FRAME_CLOSE) {
                 if (body_length == consumed) {
                     if (body_final) {
+                        if (!trailers_empty(serializer)) {
+                            ret write_fail(serializer, ERROR_INVALID_TRAILERS, written, consumed);
+                        }
                         serializer.phase = SERIALIZE_DONE;
                         ret write_result(serializer, WRITE_DONE, written, consumed);
                     }
@@ -383,6 +393,9 @@ pub fun write(serializer: *Serializer, output: *u8, output_capacity: usize,
                 }
                 var amount: usize = body_length - consumed;
                 if (amount > output_capacity - written) { amount = output_capacity - written; }
+                if (amount::u64 > (-1)::u64 - serializer.body_written) {
+                    ret write_fail(serializer, ERROR_BODY_LENGTH, written, consumed);
+                }
                 memory.raw_copy(?output[written], ?body[consumed], amount);
                 serializer.body_written = serializer.body_written + amount::u64;
                 consumed = consumed + amount;
@@ -420,6 +433,9 @@ pub fun write(serializer: *Serializer, output: *u8, output_capacity: usize,
             }
             var amount: usize = body_length - consumed;
             if (amount > output_capacity - written) { amount = output_capacity - written; }
+            if (amount::u64 > (-1)::u64 - serializer.body_written) {
+                ret write_fail(serializer, ERROR_BODY_LENGTH, written, consumed);
+            }
             memory.raw_copy(?output[written], ?body[consumed], amount);
             serializer.chunk_remaining = serializer.chunk_remaining - amount::u64;
             serializer.body_written = serializer.body_written + amount::u64;
@@ -447,6 +463,9 @@ pub fun write(serializer: *Serializer, output: *u8, output_capacity: usize,
             cnt;
         }
         if (serializer.phase == SERIALIZE_FINAL_PREFIX) {
+            if (!prepare_trailers(serializer)) {
+                ret write_fail(serializer, serializer.error, written, consumed);
+            }
             for (serializer.control_offset < 3 && written < output_capacity) {
                 if (serializer.control_offset == 0) { output[written] = '0'; }
                 or {
@@ -538,12 +557,12 @@ test "http.h1.serializer: chunked responses stream trailers canonically" {
         value: view.view("X-Sum", 5), sensitive: false});
     var trailer_items: [1]field.Field;
     var trailers: field.Fields = field.init(?trailer_items[0], 1, field.limits(1, 32, 16, 16));
-    field.append_trailer(?trailers, field.Field{name: view.view("X-Sum", 5),
-        value: view.view("9", 1), sensitive: false});
     var scratch: [256]u8;
     var serializer: Serializer;
     if (!init_response(?serializer, message.version_h1(1, 1), method.GET, status.OK,
         view.view("OK", 2), ?fields, ?trailers, ?scratch[0], 256)) { ret 1; }
+    field.append_trailer(?trailers, field.Field{name: view.view("X-Sum", 5),
+        value: view.view("9", 1), sensitive: false});
     var output: [256]u8;
     var output_length: usize = 0;
     var body_offset: usize = 0;
@@ -574,12 +593,20 @@ test "http.h1.serializer: splitting and framing violations never reach the wire"
     var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     if (init_response(?serializer, message.version_h1(1, 1), method.GET, status.OK,
         view.view("OK\r\nInjected", 12), ?no_fields, nil, ?scratch[0], 128)) { ret 2; }
+    var host_item: field.Field;
+    var host_fields: field.Fields = field.init(?host_item, 1, field.limits(1, 32, 16, 16));
+    field.append(?host_fields, field.Field{name: view.view("Host", 4),
+        value: view.view("example.com", 11), sensitive: false});
+    val split_target: target.Target = target.origin(view.view("/ HTTP/1.1\r\nInjected: yes", 25),
+        view.view("/ HTTP/1.1\r\nInjected: yes", 25), view.view(nil, 0));
+    if (init_request(?serializer, message.version_h1(1, 1), method.from_kind(method.GET),
+        split_target, ?host_fields, nil, ?scratch[0], 128)) { ret 3; }
     var length_item: field.Field;
     var length_fields: field.Fields = field.init(?length_item, 1, field.limits(1, 32, 16, 16));
     field.append(?length_fields, field.Field{name: view.view("Content-Length", 14),
         value: view.view("5", 1), sensitive: false});
     if (!init_response(?serializer, message.version_h1(1, 1), method.GET, status.OK,
-        view.view("OK", 2), ?length_fields, nil, ?scratch[0], 128)) { ret 3; }
+        view.view("OK", 2), ?length_fields, nil, ?scratch[0], 128)) { ret 4; }
     var output: [128]u8;
     var body_offset: usize = 0;
     var result: Write;
@@ -589,7 +616,7 @@ test "http.h1.serializer: splitting and framing violations never reach the wire"
             ("four"::usize + body_offset)::ptr::*u8, 4 - body_offset, true);
         body_offset = body_offset + result.consumed;
     }
-    if (result.status != WRITE_ERROR || result.error != ERROR_BODY_LENGTH) { ret 4; }
+    if (result.status != WRITE_ERROR || result.error != ERROR_BODY_LENGTH) { ret 5; }
     ret 0;
 }
 
