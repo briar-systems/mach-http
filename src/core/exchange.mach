@@ -204,7 +204,10 @@ pub fun finish(exchange: *Exchange) FinishStatus {
     }
     val reason: cancel.Reason = cancel.reason(exchange.scope);
     val outcome: Outcome = outcome_for(request_progress, response_result, reason);
-    val reuse: body.Reuse = combine_reuse(request_progress.reuse, response_result.reuse);
+    var reuse: body.Reuse = combine_reuse(request_progress.reuse, response_result.reuse);
+    if (exchange.response.status == status.SWITCHING_PROTOCOLS) {
+        reuse = body.REUSE_FORBIDDEN;
+    }
     if (reuse == body.REUSE_UNKNOWN) { ret FINISH_INVALID; }
     exchange.completion = Completion{
         outcome: outcome,
