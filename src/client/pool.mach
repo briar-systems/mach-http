@@ -868,6 +868,26 @@ pub fun mark_draining(pool: *Pool, token: ConnectionToken) bool {
     ret true;
 }
 
+pub fun update_max_streams(pool: *Pool, token: ConnectionToken,
+    max_streams: usize) bool {
+    if (pool == nil || !pool.initialized || max_streams == 0
+        || max_streams > pool.configured.max_streams_per_connection) {
+        ret false;
+    }
+    mutex.lock(?pool.lock);
+    val connection: *Connection = connection_for_locked(pool, token);
+    if (connection == nil
+        || (connection.state != CONNECTION_OPEN
+            && connection.state != CONNECTION_DRAINING)
+        || (connection.wire == message.WIRE_H1 && max_streams != 1)) {
+        mutex.unlock(?pool.lock);
+        ret false;
+    }
+    connection.max_streams = max_streams;
+    mutex.unlock(?pool.lock);
+    ret true;
+}
+
 fun expired_idle(connection: *Connection, now: time.Time) bool {
     ret connection.state == CONNECTION_OPEN && connection.active_streams == 0
         && time_before_or_equal(connection.idle_deadline, now);
@@ -1064,18 +1084,31 @@ test "http.client.pool: multiplexed leases release exactly once" {
         || connection_equal(first.lease.connection, empty_connection_token())
         || !connection_equal(first.lease.connection, second.lease.connection)
         || lease_equal(first.lease.token, second.lease.token)) { ret 2; }
-    if (release(?value, first.lease, body.REUSE_ALLOWED, now) != RELEASE_OK
+    if (!update_max_streams(?value, first.lease.connection, 1)
+        || acquire(?value, route, policy.protocols_default(), now).status
+            != ACQUIRE_MISS
+        || release(?value, first.lease, body.REUSE_ALLOWED, now) != RELEASE_OK
         || release(?value, first.lease, body.REUSE_ALLOWED, now)
             != RELEASE_INVALID
-        || release(?value, second.lease, body.REUSE_ALLOWED, now) != RELEASE_OK) {
+        || acquire(?value, route, policy.protocols_default(), now).status
+            != ACQUIRE_MISS
+        || !update_max_streams(?value, second.lease.connection, 3)) {
         ret 3;
+    }
+    val third: Acquire = acquire(?value, route, policy.protocols_default(), now);
+    if (third.status != ACQUIRE_OK
+        || release(?value, second.lease, body.REUSE_ALLOWED, now) != RELEASE_OK
+        || release(?value, third.lease, body.REUSE_ALLOWED, now) != RELEASE_OK) {
+        ret 4;
     }
     val state: Snapshot = snapshot(?value);
     if (state.live_connections != 1 || state.live_leases != 0
-        || state.idle != 1) { ret 4; }
-    if (!drain(?value)) { ret 5; }
+        || state.idle != 1) { ret 5; }
+    if (!drain(?value)
+        || update_max_streams(?value, first.lease.connection, 2)) { ret 6; }
     val close: Close = take_close(?value, now);
-    if (!close.found || !retire(?value, close) || !destroy(?value)) { ret 6; }
+    if (!close.found || !retire(?value, close) || !destroy(?value)
+        || update_max_streams(?value, first.lease.connection, 2)) { ret 7; }
     ret 0;
 }
 
