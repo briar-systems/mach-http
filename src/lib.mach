@@ -1,7 +1,7 @@
 use std.runtime;
 use std.types.string.str;
 
-pub val VERSION: str = "0.3.0";
+pub val VERSION: str = "0.4.0";
 
 fwd http.core.method;
 fwd http.core.status;
@@ -24,11 +24,15 @@ fwd h3_connection: http.h3.connection;
 fwd http.websocket;
 fwd http.websocket.negotiation;
 fwd http.server.server;
+fwd http.client.policy;
+fwd http.client.url;
+fwd http.client.pool;
+fwd http.client.dns;
 fwd http.client.client;
 fwd http.router.router;
 
 test "http: exported version is the release version" {
-    if (VERSION[0] != '0' || VERSION[1] != '.' || VERSION[2] != '3'
+    if (VERSION[0] != '0' || VERSION[1] != '.' || VERSION[2] != '4'
      || VERSION[3] != '.' || VERSION[4] != '0' || VERSION[5] != 0) { ret 1; }
     ret 0;
 }

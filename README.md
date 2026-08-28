@@ -12,7 +12,9 @@ Bounded route compilation and zero-allocation dispatch are implemented. WebSocke
 negotiation, framing, and completion-driven connections are implemented for HTTP/1
 upgrade and HTTP/2 or HTTP/3 extended CONNECT. The HTTP/2 frame, HPACK, connection,
 and stream engines are complete. HTTP/3 frame, SETTINGS, critical-stream, QPACK,
-connection, and request-stream engines are complete.
+connection, and request-stream engines are complete. The bounded client
+orchestrator, asynchronous DNS cache, origin-isolated connection pool, protocol
+selection, retries, redirects, cancellation, and graceful drain are implemented.
 
 ## Design
 
@@ -88,6 +90,34 @@ connection, and request-stream engines are complete.
 - QPACK encoders protect every referenced dynamic entry until Section Acknowledgment
   or Stream Cancellation. Insert Count Increment advances only through inserts that
   were actually sent.
+- Client requests use caller-owned fixed slots and stable generation tokens. Routes
+  are copied, while request fields, targets, and bodies remain borrowed for one exact
+  request generation. Field ownership includes complete backing capacities and body
+  trailer collections, not only populated entries.
+- Public client pointers, views, counts, and capacities are address-space checked
+  before dereference. Raw URLs reject embedded NUL bytes, and bracketed authorities
+  require a valid IPv6 literal.
+- DNS refresh, connection creation, HTTP exchange, replay, waits, completion, and
+  shutdown are explicit actions. The client retains no hidden runtime operation.
+- Published DNS work remains generation-owned until its submission is acknowledged,
+  so cancellation cannot strand a shared refresh or its waiters.
+- Connection pools isolate origins and complete proxy identities. Total, per-route,
+  lease, stream, idle, and idle-lifetime budgets are independent.
+- Pool maintenance publishes close ownership during normal service. Live HTTP/2 and
+  HTTP/3 stream capacity, including zero peer credit, follows generation-bound
+  updates. Driver ownership transfers exactly once, so stale or duplicate connect
+  callbacks cannot close a live connection.
+- Retries require explicit replay authorization. Streaming bodies are never buffered
+  or retried. Exchange callbacks return the exact published lease and require both
+  transferred bodies to be terminal. Client outcome and connection reuse combine
+  both body results through the common exchange contract. Ambiguous failures settle
+  without replay or reuse. HTTP 101 and successful HTTP/1 CONNECT never return their
+  upgraded transport to the pool. Cross-origin and cross-proxy redirects require
+  sensitive fields and trailers to be removed from a fresh request generation.
+  Redirects retain the original protocol policy, preserve a live lease on release
+  failure, and settle cancellation before redirect outcomes.
+- The pool route is the canonical authority. Host, CONNECT authority-form, and
+  forward-proxy absolute-form inputs are checked against it before exchange.
 - HTTP/3 connections open and validate all three critical streams, enforce bounded
   request and peer-stream admission, and keep QPACK-blocked field-section bytes out
   of QUIC flow-control credit while unrelated requests continue.
@@ -175,6 +205,14 @@ Reads separate delivery from flow-control credit, writes copy accepted bytes, an
 every server request must bind the common service exchange before its header event is
 released. See [doc/h3-connection.md](doc/h3-connection.md) for stream, memory, error,
 and graceful-close contracts.
+
+## HTTP client
+
+`http.client.client` composes protocol policy, the asynchronous DNS cache, bounded
+connection pool, cancellation scopes, retries, redirects, and exact transport
+ownership. Its event-loop actions bind directly to the system resolver, connector,
+and HTTP version engines. See [doc/client.md](doc/client.md) for memory, replay,
+proxy, cancellation-race, and graceful-drain contracts.
 
 ## Layout
 
