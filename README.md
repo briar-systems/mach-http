@@ -1,12 +1,13 @@
 # mach-http
 
-Lightweight HTTP protocol and application contracts for Mach.
+Lightweight HTTP protocol, transport, and application contracts for Mach.
 
 The version-neutral service exchange is implemented. It provides bounded methods,
 statuses, fields, targets, metadata, informational responses, trailers, response
 construction, hierarchical cancellation, and streaming body lifecycles shared by
-HTTP/1, HTTP/2, and HTTP/3. Protocol parsing, serialization, routing, connection
-engines, and network I/O remain under development.
+HTTP/1, HTTP/2, and HTTP/3. The ordered-byte transport boundary is also implemented
+with completion-driven plaintext and secured adapters. Protocol parsing,
+serialization, routing, and connection engines remain under development.
 
 ## Design
 
@@ -15,7 +16,14 @@ engines, and network I/O remain under development.
 - Bodies are streaming and bounded by caller-provided buffers.
 - Body readers and writers expose stable pending-operation tokens, exact completion,
   drain, rejection, cancellation, deadlines, trailers, and protocol-decided reuse.
-- Transports use stable operation tokens so readiness and completion backends fit.
+- Transports use caller-owned bounded slots and stable generation tokens. Three
+  slots is the minimum, reserving concurrent read, write-side, and close ownership.
+- Reads, writes, write half-close, and physical close preserve partial completion,
+  buffer ownership, hierarchical cancellation, and deadlines.
+- Plaintext runtime completions have a built-in adapter. Secured adapters may drive
+  handshake reads and writes internally before publishing one logical completion.
+- Data operations share one cancellation root. Physical close uses an independent
+  control scope, so close and cancellation races settle exactly once.
 - Routing storage is caller-owned. The router does not require a global allocator.
 - HTTP/1.1, HTTP/2, HTTP/3, and WebSocket state are isolated from the version-neutral application contract.
 - TLS belongs below the transport contract and is not a dependency of this package.
