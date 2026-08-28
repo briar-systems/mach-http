@@ -1,45 +1,136 @@
-use std.types.view;
-
+use std.chrono.time;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
-
+use std.types.view;
 use http.core.body;
+use http.core.field;
+use http.core.method;
+use http.core.status;
+use http.core.target;
 
-pub val WIRE_H1: u8 = 1;
-pub val WIRE_H2: u8 = 2;
-pub val WIRE_H3: u8 = 3;
+pub def Wire: u8;
+pub def EndpointKind: u8;
+pub def BodyKind: u8;
+pub def ResponseStatus: u8;
+pub def InformStatus: u8;
+pub def RequestStatus: u8;
+
+pub val WIRE_H1: Wire = 1;
+pub val WIRE_H2: Wire = 2;
+pub val WIRE_H3: Wire = 3;
+
+pub val ENDPOINT_UNSPECIFIED: EndpointKind = 0;
+pub val ENDPOINT_IP: EndpointKind = 1;
+pub val ENDPOINT_LOCAL: EndpointKind = 2;
+pub val ENDPOINT_FORWARDED: EndpointKind = 3;
+
+pub val BODY_NONE: BodyKind = 0;
+pub val BODY_READER: BodyKind = 1;
+pub val BODY_WRITER: BodyKind = 2;
+
+pub val RESPONSE_OK: ResponseStatus = 1;
+pub val RESPONSE_INVALID: ResponseStatus = 2;
+pub val RESPONSE_COMMITTED: ResponseStatus = 3;
+pub val RESPONSE_BODY_FORBIDDEN: ResponseStatus = 4;
+pub val RESPONSE_GENERATION: ResponseStatus = 5;
+pub val RESPONSE_LIMIT: ResponseStatus = 6;
+
+pub val INFORM_OK: InformStatus = 1;
+pub val INFORM_INVALID: InformStatus = 2;
+pub val INFORM_COUNT_LIMIT: InformStatus = 3;
+pub val INFORM_STORAGE_LIMIT: InformStatus = 4;
+
+pub val REQUEST_OK: RequestStatus = 1;
+pub val REQUEST_INVALID: RequestStatus = 2;
+pub val REQUEST_GENERATION: RequestStatus = 3;
+pub val REQUEST_METHOD: RequestStatus = 4;
+pub val REQUEST_TARGET: RequestStatus = 5;
+pub val REQUEST_METADATA: RequestStatus = 6;
+pub val REQUEST_FIELDS: RequestStatus = 7;
+pub val REQUEST_TRAILERS: RequestStatus = 8;
+pub val REQUEST_BODY: RequestStatus = 9;
+pub val REQUEST_METHOD_BODY: RequestStatus = 10;
 
 pub rec Version {
-    wire: u8;
+    wire:  Wire;
     major: u8;
     minor: u8;
 }
 
-pub rec Header {
-    name: view.View;
-    value: view.View;
+pub rec Endpoint {
+    kind:    EndpointKind;
+    address: view.View;
+    port:    u16;
 }
 
-pub rec Headers {
-    items: *Header;
-    len: usize;
+pub rec Metadata {
+    version:       Version;
+    secure:        bool;
+    early_data:    bool;
+    peer:          Endpoint;
+    local:         Endpoint;
+    received_at:   time.Time;
+    has_deadline:  bool;
+    deadline:      time.Time;
+    request_index: u64;
 }
 
-# all views are borrowed from request-owned storage
+pub rec Limits {
+    max_method_bytes:      usize;
+    max_endpoint_bytes:    usize;
+    target:                target.Limits;
+    request_fields:        field.Limits;
+    request_trailers:      field.Limits;
+    response_fields:       field.Limits;
+    response_trailers:     field.Limits;
+    informational_fields:  field.Limits;
+    max_informational:     usize;
+    request_body:          body.Limits;
+    response_body:         body.Limits;
+}
+
+# request views and field storage remain borrowed for exactly one generation
 pub rec Request {
-    method: view.View;
-    scheme: view.View;
-    authority: view.View;
-    target: view.View;
-    version: Version;
-    headers: Headers;
-    body: body.Body;
+    method:     method.Method;
+    target:     target.Target;
+    metadata:   Metadata;
+    fields:     field.Fields;
+    trailers:   field.Fields;
+    body:       *body.Reader;
+    generation: u64;
 }
 
-# response storage remains owned by the handler or server arena
+# response fields use caller storage and become immutable when committed
 pub rec Response {
-    status: u16;
-    headers: Headers;
-    body: body.Body;
+    status:      status.Status;
+    fields:      field.Fields;
+    trailers:    field.Fields;
+    body_kind:   BodyKind;
+    body_reader: *body.Reader;
+    body_writer: *body.Writer;
+    generation:  u64;
+    committed:   bool;
+    committed_status: status.Status;
+    committed_field_len: usize;
+    committed_field_bytes: usize;
+    committed_body_kind: BodyKind;
+    committed_body_reader: *body.Reader;
+    committed_body_writer: *body.Writer;
+}
+
+pub rec Informational {
+    status: status.Status;
+    fields: field.Fields;
+}
+
+pub rec Informationals {
+    items:     *Informational;
+    len:       usize;
+    capacity:  usize;
+    max_count: usize;
+    valid:     bool;
 }
 
 pub fun version_h1(major: u8, minor: u8) Version {
@@ -54,13 +145,318 @@ pub fun version_h3() Version {
     ret Version{wire: WIRE_H3, major: 3, minor: 0};
 }
 
-pub fun headers(items: *Header, len: usize) Headers {
-    ret Headers{items: items, len: len};
+pub fun valid_version(version: Version) bool {
+    if (version.wire == WIRE_H1) { ret version.major == 1 && (version.minor == 0 || version.minor == 1); }
+    if (version.wire == WIRE_H2) { ret version.major == 2 && version.minor == 0; }
+    if (version.wire == WIRE_H3) { ret version.major == 3 && version.minor == 0; }
+    ret false;
 }
 
-test "http.core.message: protocol versions retain wire identity" {
-    if (version_h1(1, 1).wire != WIRE_H1) { ret 1; }
-    if (version_h2().wire != WIRE_H2) { ret 1; }
-    if (version_h3().wire != WIRE_H3) { ret 1; }
+pub fun endpoint(kind: EndpointKind, address: view.View, port: u16) Endpoint {
+    ret Endpoint{kind: kind, address: address, port: port};
+}
+
+pub fun unspecified_endpoint() Endpoint {
+    ret Endpoint{kind: ENDPOINT_UNSPECIFIED, address: view.view(nil, 0), port: 0};
+}
+
+pub fun limits_default() Limits {
+    ret Limits{
+        max_method_bytes: 32,
+        max_endpoint_bytes: 256,
+        target: target.limits(8192, 16, 1024, 8192, 4096),
+        request_fields: field.limits(100, 32768, 256, 8192),
+        request_trailers: field.limits(32, 8192, 256, 4096),
+        response_fields: field.limits(100, 32768, 256, 8192),
+        response_trailers: field.limits(32, 8192, 256, 4096),
+        informational_fields: field.limits(32, 8192, 256, 4096),
+        max_informational: 8,
+        request_body: body.limits(16777216, 65536, 65536),
+        response_body: body.limits(67108864, 65536, 1048576),
+    };
+}
+
+fun valid_time(value: time.Time) bool {
+    ret value.sec >= 0 && value.nsec >= 0 && value.nsec < 1000000000;
+}
+
+pub fun valid_metadata(metadata: Metadata, max_endpoint_bytes: usize) bool {
+    if (!valid_version(metadata.version) || !valid_time(metadata.received_at)
+     || (metadata.has_deadline && !valid_time(metadata.deadline))) { ret false; }
+    if (metadata.peer.kind > ENDPOINT_FORWARDED || metadata.local.kind > ENDPOINT_FORWARDED) { ret false; }
+    if ((metadata.peer.address.len != 0 && metadata.peer.address.data == nil)
+     || (metadata.local.address.len != 0 && metadata.local.address.data == nil)) { ret false; }
+    if (metadata.peer.address.len > max_endpoint_bytes || metadata.local.address.len > max_endpoint_bytes) { ret false; }
+    if ((metadata.peer.kind == ENDPOINT_UNSPECIFIED && (metadata.peer.address.len != 0 || metadata.peer.port != 0))
+     || (metadata.local.kind == ENDPOINT_UNSPECIFIED && (metadata.local.address.len != 0 || metadata.local.port != 0))) { ret false; }
+    if ((metadata.peer.kind != ENDPOINT_UNSPECIFIED && metadata.peer.address.len == 0)
+     || (metadata.local.kind != ENDPOINT_UNSPECIFIED && metadata.local.address.len == 0)) { ret false; }
+    ret true;
+}
+
+pub fun init_request(request: *Request, request_method: method.Method, request_target: target.Target,
+    metadata: Metadata, fields: field.Fields, trailers: field.Fields, reader: *body.Reader,
+    generation: u64, configured: Limits) bool {
+    if (request == nil) { ret false; }
+    request.method = request_method;
+    request.target = request_target;
+    request.metadata = metadata;
+    request.fields = fields;
+    request.trailers = trailers;
+    request.body = reader;
+    request.generation = generation;
+    if (reader != nil) { reader.trailers = ?request.trailers; }
+    ret validate_request(request, configured);
+}
+
+pub fun validate_request(request: *Request, configured: Limits) bool {
+    ret validate_request_status(request, configured) == REQUEST_OK;
+}
+
+pub fun validate_request_status(request: *Request, configured: Limits) RequestStatus {
+    if (request == nil) { ret REQUEST_INVALID; }
+    if (request.generation == 0) { ret REQUEST_GENERATION; }
+    if (request.body == nil) { ret REQUEST_BODY; }
+    if (request.body.generation != request.generation) { ret REQUEST_GENERATION; }
+    if (!body.validate_reader(request.body, configured.request_body, request.generation)) { ret REQUEST_BODY; }
+    if (!method.valid(request.method, configured.max_method_bytes)) { ret REQUEST_METHOD; }
+    if (!target.valid_for_method(request.target, request.method.kind, configured.target)) { ret REQUEST_TARGET; }
+    if (!valid_metadata(request.metadata, configured.max_endpoint_bytes)) { ret REQUEST_METADATA; }
+    if (!field.validate(?request.fields, configured.request_fields, false)) { ret REQUEST_FIELDS; }
+    if (!field.validate(?request.trailers, configured.request_trailers, true)) { ret REQUEST_TRAILERS; }
+    if (request.method.kind == method.TRACE && (!request.body.has_length || request.body.declared_length != 0)) {
+        ret REQUEST_METHOD_BODY;
+    }
+    if (request.body.trailers != nil && request.body.trailers != ?request.trailers) { ret REQUEST_BODY; }
+    ret REQUEST_OK;
+}
+
+pub fun init_response(response: *Response, fields: *field.Field, field_capacity: usize,
+    trailers: *field.Field, trailer_capacity: usize, generation: u64, configured: Limits) bool {
+    if (response == nil || generation == 0) { ret false; }
+    response.status = status.OK;
+    response.fields = field.init(fields, field_capacity, configured.response_fields);
+    response.trailers = field.init(trailers, trailer_capacity, configured.response_trailers);
+    response.body_kind = BODY_NONE;
+    response.body_reader = nil;
+    response.body_writer = nil;
+    response.generation = generation;
+    response.committed = false;
+    response.committed_status = 0;
+    response.committed_field_len = 0;
+    response.committed_field_bytes = 0;
+    response.committed_body_kind = BODY_NONE;
+    response.committed_body_reader = nil;
+    response.committed_body_writer = nil;
+    ret response.fields.valid && response.trailers.valid;
+}
+
+pub fun set_status(response: *Response, code: status.Status) ResponseStatus {
+    if (response == nil || !status.is_final(code)) { ret RESPONSE_INVALID; }
+    if (response.committed) { ret RESPONSE_COMMITTED; }
+    response.status = code;
+    ret RESPONSE_OK;
+}
+
+pub fun add_field(response: *Response, item: field.Field) field.AddStatus {
+    if (response == nil || response.committed) { ret field.ADD_INVALID; }
+    ret field.append(?response.fields, item);
+}
+
+pub fun add_trailer(response: *Response, item: field.Field) field.AddStatus {
+    if (response == nil || response.body_kind == BODY_NONE) { ret field.ADD_INVALID; }
+    if ((response.body_kind == BODY_READER && body.reader_terminal_state(response.body_reader))
+     || (response.body_kind == BODY_WRITER && body.writer_terminal_state(response.body_writer))) { ret field.ADD_INVALID; }
+    ret field.append_trailer(?response.trailers, item);
+}
+
+pub fun set_body_reader(response: *Response, reader: *body.Reader, configured: Limits) ResponseStatus {
+    if (response == nil || reader == nil) { ret RESPONSE_INVALID; }
+    if (response.committed) { ret RESPONSE_COMMITTED; }
+    if (reader.generation != response.generation) { ret RESPONSE_GENERATION; }
+    if (!body.validate_reader(reader, configured.response_body, response.generation)) { ret RESPONSE_INVALID; }
+    reader.trailers = ?response.trailers;
+    response.body_kind = BODY_READER;
+    response.body_reader = reader;
+    response.body_writer = nil;
+    ret RESPONSE_OK;
+}
+
+pub fun set_body_writer(response: *Response, writer: *body.Writer, configured: Limits) ResponseStatus {
+    if (response == nil || writer == nil) { ret RESPONSE_INVALID; }
+    if (response.committed) { ret RESPONSE_COMMITTED; }
+    if (writer.generation != response.generation) { ret RESPONSE_GENERATION; }
+    if (!body.validate_writer(writer, configured.response_body, response.generation)) { ret RESPONSE_INVALID; }
+    writer.trailers = ?response.trailers;
+    response.body_kind = BODY_WRITER;
+    response.body_reader = nil;
+    response.body_writer = writer;
+    ret RESPONSE_OK;
+}
+
+pub fun commit_response(response: *Response, method_kind: method.Kind, configured: Limits) ResponseStatus {
+    if (response == nil || response.generation == 0 || !status.is_final(response.status)) { ret RESPONSE_INVALID; }
+    if (response.committed) { ret RESPONSE_COMMITTED; }
+    if (!field.validate(?response.fields, configured.response_fields, false)
+     || !field.validate(?response.trailers, configured.response_trailers, true)) { ret RESPONSE_LIMIT; }
+    if (!status.permits_content(method_kind, response.status) && response.body_kind != BODY_NONE) { ret RESPONSE_BODY_FORBIDDEN; }
+    if (response.body_kind == BODY_READER) {
+        if (!body.validate_reader(response.body_reader, configured.response_body, response.generation)) { ret RESPONSE_INVALID; }
+    } or (response.body_kind == BODY_WRITER) {
+        if (!body.validate_writer(response.body_writer, configured.response_body, response.generation)) { ret RESPONSE_INVALID; }
+    } or (response.body_kind != BODY_NONE) { ret RESPONSE_INVALID; }
+    response.committed = true;
+    response.committed_status = response.status;
+    response.committed_field_len = response.fields.len;
+    response.committed_field_bytes = response.fields.bytes;
+    response.committed_body_kind = response.body_kind;
+    response.committed_body_reader = response.body_reader;
+    response.committed_body_writer = response.body_writer;
+    ret RESPONSE_OK;
+}
+
+pub fun validate_committed_response(response: *Response, method_kind: method.Kind, configured: Limits) bool {
+    if (response == nil || !response.committed || response.status != response.committed_status
+     || response.fields.len != response.committed_field_len || response.fields.bytes != response.committed_field_bytes
+     || response.body_kind != response.committed_body_kind
+     || response.body_reader != response.committed_body_reader
+     || response.body_writer != response.committed_body_writer
+     || !status.is_final(response.status)
+     || !field.validate(?response.fields, configured.response_fields, false)
+     || !field.validate(?response.trailers, configured.response_trailers, true)
+     || (!status.permits_content(method_kind, response.status) && response.body_kind != BODY_NONE)) { ret false; }
+    if (response.body_kind == BODY_READER) {
+        ret body.validate_reader(response.body_reader, configured.response_body, response.generation);
+    }
+    if (response.body_kind == BODY_WRITER) {
+        ret body.validate_writer(response.body_writer, configured.response_body, response.generation);
+    }
+    ret response.body_kind == BODY_NONE;
+}
+
+pub fun init_informational(information: *Informational, code: status.Status,
+    items: *field.Field, capacity: usize, configured: Limits) bool {
+    if (information == nil || !status.is_informational(code)) { ret false; }
+    information.status = code;
+    information.fields = field.init(items, capacity, configured.informational_fields);
+    ret information.fields.valid;
+}
+
+pub fun init_informationals(items: *Informational, capacity: usize, configured: Limits) Informationals {
+    var informationals: Informationals;
+    informationals.items = items;
+    informationals.len = 0;
+    informationals.capacity = capacity;
+    informationals.max_count = configured.max_informational;
+    informationals.valid = capacity == 0 || items != nil;
+    ret informationals;
+}
+
+pub fun append_informational(informationals: *Informationals, information: *Informational,
+    configured: Limits) InformStatus {
+    if (informationals == nil || information == nil || !informationals.valid
+     || !status.is_informational(information.status)
+     || !field.validate(?information.fields, configured.informational_fields, false)) { ret INFORM_INVALID; }
+    if (informationals.len >= informationals.max_count) { ret INFORM_COUNT_LIMIT; }
+    if (informationals.len >= informationals.capacity) { ret INFORM_STORAGE_LIMIT; }
+    informationals.items[informationals.len] = @information;
+    informationals.len = informationals.len + 1;
+    ret INFORM_OK;
+}
+
+test "http.core.message: protocol metadata preserves wire identity without engine ownership" {
+    val h1: Version = version_h1(1, 1);
+    val h2: Version = version_h2();
+    val h3: Version = version_h3();
+    if (!valid_version(h1) || !valid_version(h2) || !valid_version(h3)) { ret 1; }
+    if (h1.wire != WIRE_H1 || h2.wire != WIRE_H2 || h3.wire != WIRE_H3) { ret 2; }
+    if (valid_version(version_h1(2, 0))) { ret 3; }
+    ret 0;
+}
+
+test "http.core.message: every collection and body class has independent defaults" {
+    val configured: Limits = limits_default();
+    if (configured.max_method_bytes == 0 || configured.max_endpoint_bytes == 0 || configured.target.max_authority_bytes == 0
+     || configured.request_fields.max_count == 0 || configured.request_trailers.max_count == 0
+     || configured.response_fields.max_count == 0 || configured.response_trailers.max_count == 0
+     || configured.informational_fields.max_count == 0 || configured.max_informational == 0
+     || configured.request_body.max_bytes == 0 || configured.request_body.max_chunk_bytes == 0
+     || configured.request_body.max_chunks == 0 || configured.response_body.max_bytes == 0
+     || configured.response_body.max_chunk_bytes == 0 || configured.response_body.max_chunks == 0) { ret 1; }
+    ret 0;
+}
+
+test "http.core.message: request initialization validates bounds metadata and generations" {
+    val configured: Limits = limits_default();
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var reader: body.Reader = body.empty_reader(23);
+    val metadata: Metadata = Metadata{
+        version: version_h3(),
+        secure: true,
+        early_data: true,
+        peer: endpoint(ENDPOINT_IP, view.view("192.0.2.1", 9), 443),
+        local: endpoint(ENDPOINT_IP, view.view("192.0.2.2", 9), 443),
+        received_at: time.Time{sec: 10, nsec: 1},
+        has_deadline: true,
+        deadline: time.Time{sec: 11, nsec: 1},
+        request_index: 4,
+    };
+    var request: Request;
+    if (!init_request(?request, method.from_kind(method.GET),
+        target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)), metadata,
+        fields, trailers, ?reader, 23, configured)) { ret 1; }
+    request.generation = 24;
+    if (validate_request_status(?request, configured) != REQUEST_GENERATION) { ret 2; }
+    request.generation = 23;
+    var narrow: Limits = configured;
+    narrow.max_endpoint_bytes = 8;
+    if (validate_request_status(?request, narrow) != REQUEST_METADATA) { ret 3; }
+    request.method = method.from_kind(method.TRACE);
+    reader.declared_length = 1;
+    if (validate_request(?request, configured)) { ret 4; }
+    ret 0;
+}
+
+test "http.core.message: response construction freezes final fields and body rules" {
+    val configured: Limits = limits_default();
+    var fields: [100]field.Field;
+    var trailers: [32]field.Field;
+    var response: Response;
+    if (!init_response(?response, ?fields[0], 100, ?trailers[0], 32, 31, configured)) { ret 1; }
+    if (add_field(?response, field.Field{name: view.view("content-type", 12), value: view.view("text/plain", 10), sensitive: false}) != field.ADD_OK) { ret 2; }
+    if (set_status(?response, status.CREATED) != RESPONSE_OK
+     || commit_response(?response, method.POST, configured) != RESPONSE_OK) { ret 3; }
+    if (set_status(?response, status.OK) != RESPONSE_COMMITTED || add_field(?response,
+        field.Field{name: view.view("x", 1), value: view.view("y", 1), sensitive: false}) != field.ADD_INVALID) { ret 4; }
+    if (!init_response(?response, ?fields[0], 100, ?trailers[0], 32, 32, configured)) { ret 5; }
+    var wrong_generation: body.Writer = body.empty_writer(33);
+    if (set_body_writer(?response, ?wrong_generation, configured) != RESPONSE_GENERATION) { ret 6; }
+    var writer: body.Writer = body.empty_writer(32);
+    if (set_body_writer(?response, ?writer, configured) != RESPONSE_OK
+     || set_status(?response, status.NO_CONTENT) != RESPONSE_OK
+     || commit_response(?response, method.GET, configured) != RESPONSE_BODY_FORBIDDEN) { ret 7; }
+    ret 0;
+}
+
+test "http.core.message: informational responses are independently bounded" {
+    var configured: Limits = limits_default();
+    configured.max_informational = 2;
+    configured.informational_fields = field.limits(1, 16, 8, 8);
+    var info_fields: [1]field.Field;
+    var information: Informational;
+    if (!init_informational(?information, status.EARLY_HINTS, ?info_fields[0], 1, configured)) { ret 1; }
+    if (field.append(?information.fields, field.Field{name: view.view("link", 4), value: view.view("</a>", 4), sensitive: false}) != field.ADD_OK) { ret 2; }
+    var slots: [2]Informational;
+    var all: Informationals = init_informationals(?slots[0], 2, configured);
+    if (append_informational(?all, ?information, configured) != INFORM_OK
+     || append_informational(?all, ?information, configured) != INFORM_OK
+     || append_informational(?all, ?information, configured) != INFORM_COUNT_LIMIT) { ret 3; }
+    var one: [1]Informational;
+    var storage_limited: Informationals = init_informationals(?one[0], 1, configured);
+    if (append_informational(?storage_limited, ?information, configured) != INFORM_OK
+     || append_informational(?storage_limited, ?information, configured) != INFORM_STORAGE_LIMIT) { ret 4; }
+    information.status = status.OK;
+    if (append_informational(?all, ?information, configured) != INFORM_INVALID) { ret 5; }
     ret 0;
 }

@@ -1,42 +1,1003 @@
-use R: std.types.result;
-
+use std.chrono.time;
+use std.sync.cancel;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.view;
+use http.core.field;
 
-pub val READ_DATA: u8 = 1;
-pub val READ_END: u8 = 2;
-pub val READ_PENDING: u8 = 3;
+pub def Status: u8;
+pub def State: u8;
+pub def Mode: u8;
+pub def Reuse: u8;
+pub def Owner: u8;
+pub def Operation: u8;
 
-pub val LENGTH_UNKNOWN: u8 = 0;
-pub val LENGTH_KNOWN: u8 = 1;
+pub val DATA: Status = 1;
+pub val PENDING: Status = 2;
+pub val COMPLETE: Status = 3;
+pub val ERROR: Status = 4;
+pub val CANCELLED: Status = 5;
+pub val TIMED_OUT: Status = 6;
+pub val REJECTED: Status = 7;
+pub val LIMIT_REACHED: Status = 8;
+pub val INVALID: Status = 9;
 
-pub rec Read {
-    status: u8;
-    count: usize;
+pub val OPEN: State = 1;
+pub val DRAINING: State = 2;
+pub val REJECTING: State = 3;
+pub val FINISHING: State = 4;
+pub val CANCELLING: State = 5;
+pub val COMPLETE_STATE: State = 6;
+pub val REJECTED_STATE: State = 7;
+pub val CANCELLED_STATE: State = 8;
+pub val TIMED_OUT_STATE: State = 9;
+pub val ERROR_STATE: State = 10;
+
+pub val DRAIN: Mode = 1;
+pub val REJECT: Mode = 2;
+pub val FINISH: Mode = 3;
+pub val CANCEL: Mode = 4;
+pub val TIMEOUT: Mode = 5;
+
+pub val REUSE_UNKNOWN: Reuse = 0;
+pub val REUSE_ALLOWED: Reuse = 1;
+pub val REUSE_FORBIDDEN: Reuse = 2;
+
+pub val OWNER_NONE: Owner = 0;
+pub val OWNER_ENGINE: Owner = 1;
+pub val OWNER_APPLICATION: Owner = 2;
+
+pub val OP_NONE: Operation = 0;
+pub val OP_READ: Operation = 1;
+pub val OP_WRITE: Operation = 2;
+pub val OP_FINISH: Operation = 3;
+
+pub rec Limits {
+    max_bytes:       u64;
+    max_chunk_bytes: usize;
+    max_chunks:      usize;
 }
 
-pub def ReadFun: fun(ptr, *u8, usize) R.Result[Read, str];
-pub def CloseFun: fun(ptr) R.Result[bool, str];
-
-# body bytes are borrowed for each read and never accumulated by this contract
-pub rec Body {
-    ctx: ptr;
-    f_read: ReadFun;
-    f_close: CloseFun;
-    length_kind: u8;
-    length: u64;
+pub rec Progress {
+    status: Status;
+    count:  usize;
+    token:  u64;
+    reuse:  Reuse;
+    error:  str;
 }
 
-pub fun known_length(b: *Body) bool {
-    ret b.length_kind == LENGTH_KNOWN;
+# pending reads and writes retain their byte buffer until the matching token completes
+pub def ReadFun: fun(ptr, *u8, usize, *field.Fields) Progress;
+pub def WriteFun: fun(ptr, *u8, usize) Progress;
+pub def FinishFun: fun(ptr, Mode, *field.Fields) Progress;
+pub def CompleteFun: fun(ptr, u64, *field.Fields) Progress;
+pub def ReleaseFun: fun(ptr);
+
+# owner identifies the context provider and release returns its lease exactly once
+# readers stay fixed in memory and hold one provider lease until a terminal result
+pub rec Reader {
+    ctx:             ptr;
+    f_read:          ReadFun;
+    f_finish:        FinishFun;
+    f_complete:      CompleteFun;
+    f_release:       ReleaseFun;
+    state:           State;
+    owner:           Owner;
+    generation:      u64;
+    has_length:      bool;
+    declared_length: u64;
+    transferred:     u64;
+    chunks:          usize;
+    limits:          Limits;
+    trailers:        *field.Fields;
+    scope:           *cancel.Scope;
+    reuse:           Reuse;
+    terminal_status: Status;
+    error:           str;
+    pending_kind:    Operation;
+    pending_mode:    Mode;
+    pending_token:   u64;
+    pending_limit:   usize;
+    released:        bool;
+    valid:           bool;
 }
 
-test "http.core.body: known length is explicit" {
-    var b: Body;
-    b.length_kind = LENGTH_UNKNOWN;
-    if (known_length(?b)) { ret 1; }
-    b.length_kind = LENGTH_KNOWN;
-    if (!known_length(?b)) { ret 1; }
+# writers stay fixed in memory and hold one provider lease until a terminal result
+pub rec Writer {
+    ctx:             ptr;
+    f_write:         WriteFun;
+    f_finish:        FinishFun;
+    f_complete:      CompleteFun;
+    f_release:       ReleaseFun;
+    state:           State;
+    owner:           Owner;
+    generation:      u64;
+    has_length:      bool;
+    declared_length: u64;
+    transferred:     u64;
+    chunks:          usize;
+    limits:          Limits;
+    trailers:        *field.Fields;
+    scope:           *cancel.Scope;
+    reuse:           Reuse;
+    terminal_status: Status;
+    error:           str;
+    pending_kind:    Operation;
+    pending_mode:    Mode;
+    pending_token:   u64;
+    pending_limit:   usize;
+    released:        bool;
+    valid:           bool;
+}
+
+pub fun limits(max_bytes: u64, max_chunk_bytes: usize, max_chunks: usize) Limits {
+    ret Limits{max_bytes: max_bytes, max_chunk_bytes: max_chunk_bytes, max_chunks: max_chunks};
+}
+
+pub fun within_limits(actual: Limits, maximum: Limits) bool {
+    ret actual.max_bytes <= maximum.max_bytes && actual.max_chunk_bytes <= maximum.max_chunk_bytes
+        && actual.max_chunks <= maximum.max_chunks;
+}
+
+pub fun data(count: usize) Progress {
+    ret Progress{status: DATA, count: count, token: 0, reuse: REUSE_UNKNOWN, error: nil};
+}
+
+pub fun pending(token: u64) Progress {
+    ret Progress{status: PENDING, count: 0, token: token, reuse: REUSE_UNKNOWN, error: nil};
+}
+
+pub fun complete(reuse: Reuse) Progress {
+    ret Progress{status: COMPLETE, count: 0, token: 0, reuse: reuse, error: nil};
+}
+
+pub fun rejected(reuse: Reuse) Progress {
+    ret Progress{status: REJECTED, count: 0, token: 0, reuse: reuse, error: nil};
+}
+
+pub fun cancelled(reuse: Reuse) Progress {
+    ret Progress{status: CANCELLED, count: 0, token: 0, reuse: reuse, error: nil};
+}
+
+pub fun timed_out(reuse: Reuse) Progress {
+    ret Progress{status: TIMED_OUT, count: 0, token: 0, reuse: reuse, error: nil};
+}
+
+pub fun failed(error: str, reuse: Reuse) Progress {
+    ret Progress{status: ERROR, count: 0, token: 0, reuse: reuse, error: error};
+}
+
+fun invalid(error: str) Progress {
+    ret Progress{status: INVALID, count: 0, token: 0, reuse: REUSE_UNKNOWN, error: error};
+}
+
+pub fun limit_reached(error: str) Progress {
+    ret Progress{status: LIMIT_REACHED, count: 0, token: 0, reuse: REUSE_FORBIDDEN, error: error};
+}
+
+fun terminal(status: Status) bool {
+    ret status == COMPLETE || status == ERROR || status == CANCELLED || status == TIMED_OUT
+        || status == REJECTED || status == LIMIT_REACHED;
+}
+
+fun terminal_reuse(progress: Progress) bool {
+    ret !terminal(progress.status) || progress.reuse == REUSE_ALLOWED || progress.reuse == REUSE_FORBIDDEN;
+}
+
+fun valid_owner(owner: Owner, release: ReleaseFun) bool {
+    if (owner == OWNER_NONE) { ret release::usize == 0; }
+    ret (owner == OWNER_ENGINE || owner == OWNER_APPLICATION) && release::usize != 0;
+}
+
+pub fun init_reader(ctx: ptr, f_read: ReadFun, f_finish: FinishFun, f_complete: CompleteFun, f_release: ReleaseFun,
+    owner: Owner, generation: u64, has_length: bool, declared_length: u64,
+    configured: Limits, trailers: *field.Fields, scope: *cancel.Scope) Reader {
+    var reader: Reader;
+    reader.ctx = ctx;
+    reader.f_read = f_read;
+    reader.f_finish = f_finish;
+    reader.f_complete = f_complete;
+    reader.f_release = f_release;
+    reader.state = OPEN;
+    reader.owner = owner;
+    reader.generation = generation;
+    reader.has_length = has_length;
+    reader.declared_length = declared_length;
+    reader.transferred = 0;
+    reader.chunks = 0;
+    reader.limits = configured;
+    reader.trailers = trailers;
+    reader.scope = scope;
+    reader.reuse = REUSE_UNKNOWN;
+    reader.terminal_status = 0;
+    reader.error = nil;
+    reader.pending_kind = OP_NONE;
+    reader.pending_mode = 0;
+    reader.pending_token = 0;
+    reader.pending_limit = 0;
+    reader.released = false;
+    reader.valid = f_read::usize != 0 && f_finish::usize != 0 && f_complete::usize != 0 && valid_owner(owner, f_release)
+        && scope != nil && configured.max_chunk_bytes != 0
+        && (!has_length || declared_length <= configured.max_bytes);
+    ret reader;
+}
+
+pub fun init_writer(ctx: ptr, f_write: WriteFun, f_finish: FinishFun, f_complete: CompleteFun, f_release: ReleaseFun,
+    owner: Owner, generation: u64, has_length: bool, declared_length: u64,
+    configured: Limits, trailers: *field.Fields, scope: *cancel.Scope) Writer {
+    var writer: Writer;
+    writer.ctx = ctx;
+    writer.f_write = f_write;
+    writer.f_finish = f_finish;
+    writer.f_complete = f_complete;
+    writer.f_release = f_release;
+    writer.state = OPEN;
+    writer.owner = owner;
+    writer.generation = generation;
+    writer.has_length = has_length;
+    writer.declared_length = declared_length;
+    writer.transferred = 0;
+    writer.chunks = 0;
+    writer.limits = configured;
+    writer.trailers = trailers;
+    writer.scope = scope;
+    writer.reuse = REUSE_UNKNOWN;
+    writer.terminal_status = 0;
+    writer.error = nil;
+    writer.pending_kind = OP_NONE;
+    writer.pending_mode = 0;
+    writer.pending_token = 0;
+    writer.pending_limit = 0;
+    writer.released = false;
+    writer.valid = f_write::usize != 0 && f_finish::usize != 0 && f_complete::usize != 0 && valid_owner(owner, f_release)
+        && scope != nil && configured.max_chunk_bytes != 0
+        && (!has_length || declared_length <= configured.max_bytes);
+    ret writer;
+}
+
+pub fun empty_reader(generation: u64) Reader {
+    var reader: Reader;
+    reader.ctx = nil;
+    reader.f_read = (0::usize)::ReadFun;
+    reader.f_finish = (0::usize)::FinishFun;
+    reader.f_complete = (0::usize)::CompleteFun;
+    reader.f_release = (0::usize)::ReleaseFun;
+    reader.state = COMPLETE_STATE;
+    reader.owner = OWNER_NONE;
+    reader.generation = generation;
+    reader.has_length = true;
+    reader.declared_length = 0;
+    reader.transferred = 0;
+    reader.chunks = 0;
+    reader.limits = Limits{max_bytes: 0, max_chunk_bytes: 0, max_chunks: 0};
+    reader.trailers = nil;
+    reader.scope = nil;
+    reader.reuse = REUSE_ALLOWED;
+    reader.terminal_status = COMPLETE;
+    reader.error = nil;
+    reader.pending_kind = OP_NONE;
+    reader.pending_mode = 0;
+    reader.pending_token = 0;
+    reader.pending_limit = 0;
+    reader.released = true;
+    reader.valid = true;
+    ret reader;
+}
+
+pub fun empty_writer(generation: u64) Writer {
+    var writer: Writer;
+    writer.ctx = nil;
+    writer.f_write = (0::usize)::WriteFun;
+    writer.f_finish = (0::usize)::FinishFun;
+    writer.f_complete = (0::usize)::CompleteFun;
+    writer.f_release = (0::usize)::ReleaseFun;
+    writer.state = COMPLETE_STATE;
+    writer.owner = OWNER_NONE;
+    writer.generation = generation;
+    writer.has_length = true;
+    writer.declared_length = 0;
+    writer.transferred = 0;
+    writer.chunks = 0;
+    writer.limits = Limits{max_bytes: 0, max_chunk_bytes: 0, max_chunks: 0};
+    writer.trailers = nil;
+    writer.scope = nil;
+    writer.reuse = REUSE_ALLOWED;
+    writer.terminal_status = COMPLETE;
+    writer.error = nil;
+    writer.pending_kind = OP_NONE;
+    writer.pending_mode = 0;
+    writer.pending_token = 0;
+    writer.pending_limit = 0;
+    writer.released = true;
+    writer.valid = true;
+    ret writer;
+}
+
+fun reader_state_matches(reader: *Reader) bool {
+    if (reader.terminal_status == COMPLETE) { ret reader.state == COMPLETE_STATE; }
+    if (reader.terminal_status == REJECTED) { ret reader.state == REJECTED_STATE; }
+    if (reader.terminal_status == CANCELLED) { ret reader.state == CANCELLED_STATE; }
+    if (reader.terminal_status == TIMED_OUT) { ret reader.state == TIMED_OUT_STATE; }
+    if (reader.terminal_status == ERROR || reader.terminal_status == LIMIT_REACHED) { ret reader.state == ERROR_STATE; }
+    ret false;
+}
+
+fun writer_state_matches(writer: *Writer) bool {
+    if (writer.terminal_status == COMPLETE) { ret writer.state == COMPLETE_STATE; }
+    if (writer.terminal_status == CANCELLED) { ret writer.state == CANCELLED_STATE; }
+    if (writer.terminal_status == TIMED_OUT) { ret writer.state == TIMED_OUT_STATE; }
+    if (writer.terminal_status == ERROR || writer.terminal_status == LIMIT_REACHED) { ret writer.state == ERROR_STATE; }
+    ret false;
+}
+
+pub fun validate_reader(reader: *Reader, maximum: Limits, generation: u64) bool {
+    if (reader == nil || !reader.valid || generation == 0 || reader.generation != generation
+     || !within_limits(reader.limits, maximum) || reader.transferred > reader.limits.max_bytes
+     || reader.chunks > reader.limits.max_chunks
+     || (reader.has_length && (reader.declared_length > reader.limits.max_bytes
+         || reader.transferred > reader.declared_length))) { ret false; }
+    if (terminal(reader.terminal_status)) {
+        ret reader_state_matches(reader) && reader.released && reader.pending_kind == OP_NONE
+            && (reader.reuse == REUSE_ALLOWED || reader.reuse == REUSE_FORBIDDEN)
+            && (reader.terminal_status != COMPLETE || !reader.has_length
+                || reader.transferred == reader.declared_length);
+    }
+    if (reader.owner == OWNER_NONE || reader.scope == nil || reader.released || reader.limits.max_chunk_bytes == 0
+     || reader.f_read::usize == 0 || reader.f_finish::usize == 0 || reader.f_complete::usize == 0
+     || !valid_owner(reader.owner, reader.f_release)
+     || (reader.state != OPEN && reader.state != DRAINING && reader.state != REJECTING && reader.state != CANCELLING)) { ret false; }
+    if (reader.pending_kind == OP_NONE) { ret reader.pending_token == 0 && reader.pending_mode == 0; }
+    ret (reader.pending_kind == OP_READ || reader.pending_kind == OP_FINISH) && reader.pending_token != 0;
+}
+
+pub fun validate_writer(writer: *Writer, maximum: Limits, generation: u64) bool {
+    if (writer == nil || !writer.valid || generation == 0 || writer.generation != generation
+     || !within_limits(writer.limits, maximum) || writer.transferred > writer.limits.max_bytes
+     || writer.chunks > writer.limits.max_chunks
+     || (writer.has_length && (writer.declared_length > writer.limits.max_bytes
+         || writer.transferred > writer.declared_length))) { ret false; }
+    if (terminal(writer.terminal_status)) {
+        ret writer_state_matches(writer) && writer.released && writer.pending_kind == OP_NONE
+            && (writer.reuse == REUSE_ALLOWED || writer.reuse == REUSE_FORBIDDEN)
+            && (writer.terminal_status != COMPLETE || !writer.has_length
+                || writer.transferred == writer.declared_length);
+    }
+    if (writer.owner == OWNER_NONE || writer.scope == nil || writer.released || writer.limits.max_chunk_bytes == 0
+     || writer.f_write::usize == 0 || writer.f_finish::usize == 0 || writer.f_complete::usize == 0
+     || !valid_owner(writer.owner, writer.f_release)
+     || (writer.state != OPEN && writer.state != FINISHING && writer.state != CANCELLING)) { ret false; }
+    if (writer.pending_kind == OP_NONE) { ret writer.pending_token == 0 && writer.pending_mode == 0; }
+    ret (writer.pending_kind == OP_WRITE || writer.pending_kind == OP_FINISH) && writer.pending_token != 0;
+}
+
+fun reader_release(reader: *Reader) {
+    if (!reader.released) {
+        reader.released = true;
+        if (reader.f_release::usize != 0) { reader.f_release(reader.ctx); }
+    }
+}
+
+fun writer_release(writer: *Writer) {
+    if (!writer.released) {
+        writer.released = true;
+        if (writer.f_release::usize != 0) { writer.f_release(writer.ctx); }
+    }
+}
+
+fun reader_terminal(reader: *Reader, progress: Progress) Progress {
+    var settled: Progress = progress;
+    if (!terminal_reuse(settled)) { settled = failed("terminal body result omitted reuse policy", REUSE_FORBIDDEN); }
+    if (settled.status == COMPLETE && reader.has_length && reader.transferred != reader.declared_length) {
+        settled = failed("body ended at a different declared length", REUSE_FORBIDDEN);
+    }
+    if (settled.status == COMPLETE) { reader.state = COMPLETE_STATE; }
+    or (settled.status == REJECTED) { reader.state = REJECTED_STATE; }
+    or (settled.status == CANCELLED) { reader.state = CANCELLED_STATE; }
+    or (settled.status == TIMED_OUT) { reader.state = TIMED_OUT_STATE; }
+    or { reader.state = ERROR_STATE; }
+    reader.reuse = settled.reuse;
+    reader.terminal_status = settled.status;
+    reader.error = settled.error;
+    reader.pending_kind = OP_NONE;
+    reader.pending_mode = 0;
+    reader.pending_token = 0;
+    reader.pending_limit = 0;
+    reader_release(reader);
+    ret settled;
+}
+
+fun writer_terminal(writer: *Writer, progress: Progress) Progress {
+    var settled: Progress = progress;
+    if (!terminal_reuse(settled)) { settled = failed("terminal body result omitted reuse policy", REUSE_FORBIDDEN); }
+    if (settled.status == COMPLETE && writer.has_length && writer.transferred != writer.declared_length) {
+        settled = failed("body ended at a different declared length", REUSE_FORBIDDEN);
+    }
+    if (settled.status == COMPLETE) { writer.state = COMPLETE_STATE; }
+    or (settled.status == CANCELLED) { writer.state = CANCELLED_STATE; }
+    or (settled.status == TIMED_OUT) { writer.state = TIMED_OUT_STATE; }
+    or { writer.state = ERROR_STATE; }
+    writer.reuse = settled.reuse;
+    writer.terminal_status = settled.status;
+    writer.error = settled.error;
+    writer.pending_kind = OP_NONE;
+    writer.pending_mode = 0;
+    writer.pending_token = 0;
+    writer.pending_limit = 0;
+    writer_release(writer);
+    ret settled;
+}
+
+pub fun reader_result(reader: *Reader) Progress {
+    if (reader == nil || !reader.valid || !terminal(reader.terminal_status)) { ret invalid("body reader is not terminal"); }
+    ret Progress{status: reader.terminal_status, count: 0, token: 0, reuse: reader.reuse, error: reader.error};
+}
+
+pub fun writer_result(writer: *Writer) Progress {
+    if (writer == nil || !writer.valid || !terminal(writer.terminal_status)) { ret invalid("body writer is not terminal"); }
+    ret Progress{status: writer.terminal_status, count: 0, token: 0, reuse: writer.reuse, error: writer.error};
+}
+
+fun valid_pending(progress: Progress) bool {
+    ret progress.status == PENDING && progress.count == 0 && progress.token != 0
+        && progress.reuse == REUSE_UNKNOWN;
+}
+
+fun reader_pending(reader: *Reader, kind: Operation, limit: usize, progress: Progress) Progress {
+    if (!valid_pending(progress)) {
+        ret reader_terminal(reader, failed("invalid pending body operation", REUSE_FORBIDDEN));
+    }
+    reader.pending_kind = kind;
+    reader.pending_token = progress.token;
+    reader.pending_limit = limit;
+    ret progress;
+}
+
+fun writer_pending(writer: *Writer, kind: Operation, limit: usize, progress: Progress) Progress {
+    if (!valid_pending(progress)) {
+        ret writer_terminal(writer, failed("invalid pending body operation", REUSE_FORBIDDEN));
+    }
+    writer.pending_kind = kind;
+    writer.pending_token = progress.token;
+    writer.pending_limit = limit;
+    ret progress;
+}
+
+fun reader_read_result(reader: *Reader, progress: Progress, allowed: usize) Progress {
+    if (progress.status == PENDING) { ret reader_pending(reader, OP_READ, allowed, progress); }
+    if (progress.status == DATA) {
+        if (allowed == 0) { ret reader_terminal(reader, limit_reached("body read limit reached")); }
+        if (progress.count == 0 || progress.count > allowed) {
+            ret reader_terminal(reader, failed("body reader returned an invalid count", REUSE_FORBIDDEN));
+        }
+        if (reader.transferred > reader.limits.max_bytes - progress.count::u64) {
+            ret reader_terminal(reader, limit_reached("body byte limit reached"));
+        }
+        if (reader.chunks >= reader.limits.max_chunks) {
+            ret reader_terminal(reader, limit_reached("body chunk limit reached"));
+        }
+        reader.transferred = reader.transferred + progress.count::u64;
+        reader.chunks = reader.chunks + 1;
+        if (reader.has_length && reader.transferred > reader.declared_length) {
+            ret reader_terminal(reader, failed("body exceeded its declared length", REUSE_FORBIDDEN));
+        }
+        ret progress;
+    }
+    if (!terminal(progress.status) || progress.status == REJECTED || progress.count != 0) {
+        ret reader_terminal(reader, failed("invalid body read result", REUSE_FORBIDDEN));
+    }
+    ret reader_terminal(reader, progress);
+}
+
+fun writer_write_result(writer: *Writer, progress: Progress, allowed: usize) Progress {
+    if (progress.status == PENDING) { ret writer_pending(writer, OP_WRITE, allowed, progress); }
+    if (progress.status != DATA || progress.count == 0 || progress.count > allowed) {
+        ret writer_terminal(writer, failed("body writer returned an invalid count", REUSE_FORBIDDEN));
+    }
+    writer.transferred = writer.transferred + progress.count::u64;
+    writer.chunks = writer.chunks + 1;
+    if (writer.has_length && writer.transferred > writer.declared_length) {
+        ret writer_terminal(writer, failed("body exceeded its declared length", REUSE_FORBIDDEN));
+    }
+    ret progress;
+}
+
+fun valid_reader_finish(mode: Mode, result: Status) bool {
+    if (result == ERROR || result == LIMIT_REACHED || result == CANCELLED || result == TIMED_OUT) { ret true; }
+    if (mode == DRAIN) { ret result == COMPLETE; }
+    if (mode == REJECT) { ret result == REJECTED; }
+    ret false;
+}
+
+fun valid_writer_finish(mode: Mode, result: Status) bool {
+    if (result == ERROR || result == LIMIT_REACHED || result == CANCELLED || result == TIMED_OUT) { ret true; }
+    ret mode == FINISH && result == COMPLETE;
+}
+
+fun reader_finish(reader: *Reader, mode: Mode, expected_state: State) Progress {
+    if (reader == nil || !reader.valid) { ret invalid("invalid body reader"); }
+    if (terminal(reader.terminal_status)) { ret reader_result(reader); }
+    if (reader.pending_kind != OP_NONE && expected_state != CANCELLING) {
+        ret invalid("body reader operation requires completion");
+    }
+    if (reader.state != OPEN && reader.state != expected_state
+     && !(expected_state == CANCELLING && (reader.state == DRAINING || reader.state == REJECTING))) {
+        ret invalid("body reader has a conflicting disposition");
+    }
+    reader.pending_kind = OP_NONE;
+    reader.pending_mode = 0;
+    reader.pending_token = 0;
+    reader.pending_limit = 0;
+    reader.state = expected_state;
+    reader.pending_mode = mode;
+    val progress: Progress = reader.f_finish(reader.ctx, mode, reader.trailers);
+    if (progress.status == PENDING) { ret reader_pending(reader, OP_FINISH, 0, progress); }
+    reader.pending_mode = 0;
+    if (!terminal(progress.status) || progress.count != 0 || !valid_reader_finish(mode, progress.status)) {
+        ret reader_terminal(reader, failed("invalid body finish result", REUSE_FORBIDDEN));
+    }
+    ret reader_terminal(reader, progress);
+}
+
+fun writer_finish(writer: *Writer, mode: Mode, expected_state: State) Progress {
+    if (writer == nil || !writer.valid) { ret invalid("invalid body writer"); }
+    if (terminal(writer.terminal_status)) { ret writer_result(writer); }
+    if (writer.pending_kind != OP_NONE && expected_state != CANCELLING) {
+        ret invalid("body writer operation requires completion");
+    }
+    if (writer.state != OPEN && writer.state != expected_state
+     && !(expected_state == CANCELLING && writer.state == FINISHING)) {
+        ret invalid("body writer has a conflicting disposition");
+    }
+    writer.pending_kind = OP_NONE;
+    writer.pending_mode = 0;
+    writer.pending_token = 0;
+    writer.pending_limit = 0;
+    writer.state = expected_state;
+    writer.pending_mode = mode;
+    val progress: Progress = writer.f_finish(writer.ctx, mode, writer.trailers);
+    if (progress.status == PENDING) { ret writer_pending(writer, OP_FINISH, 0, progress); }
+    writer.pending_mode = 0;
+    if (!terminal(progress.status) || progress.count != 0 || !valid_writer_finish(mode, progress.status)) {
+        ret writer_terminal(writer, failed("invalid body finish result", REUSE_FORBIDDEN));
+    }
+    ret writer_terminal(writer, progress);
+}
+
+fun reader_scope(reader: *Reader) Progress {
+    val reason: cancel.Reason = cancel.reason(reader.scope);
+    if (reason == cancel.ACTIVE) { ret data(0); }
+    if (reason == cancel.TIMED_OUT) { ret reader_finish(reader, TIMEOUT, CANCELLING); }
+    ret reader_finish(reader, CANCEL, CANCELLING);
+}
+
+fun writer_scope(writer: *Writer) Progress {
+    val reason: cancel.Reason = cancel.reason(writer.scope);
+    if (reason == cancel.ACTIVE) { ret data(0); }
+    if (reason == cancel.TIMED_OUT) { ret writer_finish(writer, TIMEOUT, CANCELLING); }
+    ret writer_finish(writer, CANCEL, CANCELLING);
+}
+
+pub fun read(reader: *Reader, output: *u8, capacity: usize) Progress {
+    if (reader == nil || !reader.valid) { ret invalid("invalid body reader"); }
+    if (terminal(reader.terminal_status)) { ret reader_result(reader); }
+    val scoped: Progress = reader_scope(reader);
+    if (scoped.status != DATA) { ret scoped; }
+    if (reader.pending_kind != OP_NONE) { ret invalid("body reader operation requires completion"); }
+    if (reader.state != OPEN) { ret invalid("body reader is settling another disposition"); }
+    if (reader.transferred > reader.limits.max_bytes || reader.chunks > reader.limits.max_chunks) {
+        ret reader_terminal(reader, failed("body reader counters exceed their limits", REUSE_FORBIDDEN));
+    }
+    if (output == nil && capacity != 0) { ret invalid("body read buffer is nil"); }
+    var allowed: usize = capacity;
+    if (allowed > reader.limits.max_chunk_bytes) { allowed = reader.limits.max_chunk_bytes; }
+    val remaining: u64 = reader.limits.max_bytes - reader.transferred;
+    if (allowed::u64 > remaining) { allowed = remaining::usize; }
+    if (reader.chunks >= reader.limits.max_chunks) { allowed = 0; }
+    if (allowed == 0 && capacity != 0 && reader.transferred < reader.limits.max_bytes
+     && reader.chunks < reader.limits.max_chunks) { ret invalid("zero-sized body read"); }
+    ret reader_read_result(reader, reader.f_read(reader.ctx, output, allowed, reader.trailers), allowed);
+}
+
+pub fun write(writer: *Writer, input: *u8, length: usize) Progress {
+    if (writer == nil || !writer.valid) { ret invalid("invalid body writer"); }
+    if (terminal(writer.terminal_status)) { ret writer_result(writer); }
+    val scoped: Progress = writer_scope(writer);
+    if (scoped.status != DATA) { ret scoped; }
+    if (writer.pending_kind != OP_NONE) { ret invalid("body writer operation requires completion"); }
+    if (writer.state != OPEN) { ret invalid("body writer is settling another disposition"); }
+    if (writer.transferred > writer.limits.max_bytes || writer.chunks > writer.limits.max_chunks) {
+        ret writer_terminal(writer, failed("body writer counters exceed their limits", REUSE_FORBIDDEN));
+    }
+    if (input == nil || length == 0) { ret invalid("body write input is empty"); }
+    var allowed: usize = length;
+    if (allowed > writer.limits.max_chunk_bytes) { allowed = writer.limits.max_chunk_bytes; }
+    val remaining: u64 = writer.limits.max_bytes - writer.transferred;
+    if (allowed::u64 > remaining) { allowed = remaining::usize; }
+    if (writer.chunks >= writer.limits.max_chunks || allowed == 0) {
+        ret writer_terminal(writer, limit_reached("body write limit reached"));
+    }
+    ret writer_write_result(writer, writer.f_write(writer.ctx, input, allowed), allowed);
+}
+
+pub fun complete_reader(reader: *Reader, token: u64) Progress {
+    if (reader == nil || !reader.valid || reader.pending_kind == OP_NONE || token != reader.pending_token) {
+        ret invalid("invalid body reader completion token");
+    }
+    val kind: Operation = reader.pending_kind;
+    val mode: Mode = reader.pending_mode;
+    val limit: usize = reader.pending_limit;
+    val progress: Progress = reader.f_complete(reader.ctx, token, reader.trailers);
+    if (progress.status == PENDING) { ret reader_pending(reader, kind, limit, progress); }
+    reader.pending_kind = OP_NONE;
+    reader.pending_mode = 0;
+    reader.pending_token = 0;
+    reader.pending_limit = 0;
+    if (kind == OP_READ) { ret reader_read_result(reader, progress, limit); }
+    if (kind == OP_FINISH) {
+        if (!terminal(progress.status) || progress.count != 0 || !valid_reader_finish(mode, progress.status)) {
+            ret reader_terminal(reader, failed("invalid body finish completion", REUSE_FORBIDDEN));
+        }
+        ret reader_terminal(reader, progress);
+    }
+    ret reader_terminal(reader, failed("invalid body reader operation", REUSE_FORBIDDEN));
+}
+
+pub fun complete_writer(writer: *Writer, token: u64) Progress {
+    if (writer == nil || !writer.valid || writer.pending_kind == OP_NONE || token != writer.pending_token) {
+        ret invalid("invalid body writer completion token");
+    }
+    val kind: Operation = writer.pending_kind;
+    val mode: Mode = writer.pending_mode;
+    val limit: usize = writer.pending_limit;
+    val progress: Progress = writer.f_complete(writer.ctx, token, writer.trailers);
+    if (progress.status == PENDING) { ret writer_pending(writer, kind, limit, progress); }
+    writer.pending_kind = OP_NONE;
+    writer.pending_mode = 0;
+    writer.pending_token = 0;
+    writer.pending_limit = 0;
+    if (kind == OP_WRITE) { ret writer_write_result(writer, progress, limit); }
+    if (kind == OP_FINISH) {
+        if (!terminal(progress.status) || progress.count != 0 || !valid_writer_finish(mode, progress.status)) {
+            ret writer_terminal(writer, failed("invalid body finish completion", REUSE_FORBIDDEN));
+        }
+        ret writer_terminal(writer, progress);
+    }
+    ret writer_terminal(writer, failed("invalid body writer operation", REUSE_FORBIDDEN));
+}
+
+pub fun drain(reader: *Reader) Progress {
+    if (reader == nil || !reader.valid) { ret invalid("invalid body reader"); }
+    val scoped: Progress = reader_scope(reader);
+    if (scoped.status != DATA) { ret scoped; }
+    ret reader_finish(reader, DRAIN, DRAINING);
+}
+
+pub fun reject(reader: *Reader) Progress {
+    if (reader == nil || !reader.valid) { ret invalid("invalid body reader"); }
+    val scoped: Progress = reader_scope(reader);
+    if (scoped.status != DATA) { ret scoped; }
+    ret reader_finish(reader, REJECT, REJECTING);
+}
+
+pub fun cancel_reader(reader: *Reader) Progress {
+    ret reader_finish(reader, CANCEL, CANCELLING);
+}
+
+pub fun timeout_reader(reader: *Reader) Progress {
+    ret reader_finish(reader, TIMEOUT, CANCELLING);
+}
+
+pub fun finish(writer: *Writer) Progress {
+    if (writer == nil || !writer.valid) { ret invalid("invalid body writer"); }
+    val scoped: Progress = writer_scope(writer);
+    if (scoped.status != DATA) { ret scoped; }
+    ret writer_finish(writer, FINISH, FINISHING);
+}
+
+pub fun cancel_writer(writer: *Writer) Progress {
+    ret writer_finish(writer, CANCEL, CANCELLING);
+}
+
+pub fun timeout_writer(writer: *Writer) Progress {
+    ret writer_finish(writer, TIMEOUT, CANCELLING);
+}
+
+pub fun reader_terminal_state(reader: *Reader) bool {
+    ret reader != nil && reader.valid && terminal(reader.terminal_status);
+}
+
+pub fun writer_terminal_state(writer: *Writer) bool {
+    ret writer != nil && writer.valid && terminal(writer.terminal_status);
+}
+
+rec TestAdapter {
+    read_calls:    usize;
+    write_calls:   usize;
+    finish_calls:  usize;
+    release_calls: usize;
+    finish_mode:   Mode;
+    finish_reuse:  Reuse;
+    pending_once:  bool;
+    read_pending:  bool;
+    write_pending: bool;
+    emit_trailer:  bool;
+}
+
+fun test_adapter(reuse: Reuse, pending_once: bool) TestAdapter {
+    ret TestAdapter{
+        read_calls: 0,
+        write_calls: 0,
+        finish_calls: 0,
+        release_calls: 0,
+        finish_mode: 0,
+        finish_reuse: reuse,
+        pending_once: pending_once,
+        read_pending: false,
+        write_pending: false,
+        emit_trailer: false,
+    };
+}
+
+fun test_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) Progress {
+    val adapter: *TestAdapter = context::*TestAdapter;
+    adapter.read_calls = adapter.read_calls + 1;
+    if (adapter.read_pending && adapter.read_calls == 1) { ret pending(42); }
+    if (adapter.read_calls == 1 && capacity >= 2) { ret data(2); }
+    if (adapter.emit_trailer && trailers != nil) {
+        field.append_trailer(trailers, field.Field{
+            name: view.view("digest", 6),
+            value: view.view("ok", 2),
+            sensitive: false,
+        });
+    }
+    ret complete(REUSE_ALLOWED);
+}
+
+fun test_write(context: ptr, input: *u8, length: usize) Progress {
+    val adapter: *TestAdapter = context::*TestAdapter;
+    adapter.write_calls = adapter.write_calls + 1;
+    if (adapter.write_pending && adapter.write_calls == 1) { ret pending(43); }
+    ret data(length);
+}
+
+fun test_endless_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) Progress {
+    if (capacity == 0) { ret data(1); }
+    ret data(capacity);
+}
+
+fun test_overread(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) Progress {
+    ret data(capacity + 1);
+}
+
+fun test_finish(context: ptr, mode: Mode, trailers: *field.Fields) Progress {
+    val adapter: *TestAdapter = context::*TestAdapter;
+    adapter.finish_calls = adapter.finish_calls + 1;
+    adapter.finish_mode = mode;
+    if (adapter.pending_once && adapter.finish_calls == 1) { ret pending(41); }
+    if (mode == REJECT) { ret rejected(adapter.finish_reuse); }
+    if (mode == CANCEL) { ret cancelled(adapter.finish_reuse); }
+    if (mode == TIMEOUT) { ret timed_out(adapter.finish_reuse); }
+    ret complete(adapter.finish_reuse);
+}
+
+fun test_complete(context: ptr, token: u64, trailers: *field.Fields) Progress {
+    val adapter: *TestAdapter = context::*TestAdapter;
+    if (token == 42 || token == 43) { ret data(2); }
+    if (token != 41) { ret failed("unexpected test token", REUSE_FORBIDDEN); }
+    if (adapter.finish_mode == REJECT) { ret rejected(adapter.finish_reuse); }
+    if (adapter.finish_mode == CANCEL) { ret cancelled(adapter.finish_reuse); }
+    if (adapter.finish_mode == TIMEOUT) { ret timed_out(adapter.finish_reuse); }
+    ret complete(adapter.finish_reuse);
+}
+
+fun test_release(context: ptr) {
+    val adapter: *TestAdapter = context::*TestAdapter;
+    adapter.release_calls = adapter.release_calls + 1;
+}
+
+test "http.core.body: readers stream exact declared lengths and release once" {
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, false);
+    var reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 7, true, 2, limits(8, 4, 4), ?fields, ?scope);
+    var output: [4]u8;
+    if (read(?reader, ?output[0], 4).status != DATA || reader.transferred != 2) { ret 2; }
+    if (read(?reader, ?output[0], 4).status != COMPLETE || reader.state != COMPLETE_STATE
+     || reader.reuse != REUSE_ALLOWED || adapter.release_calls != 1) { ret 3; }
+    if (read(?reader, ?output[0], 4).status != COMPLETE || adapter.release_calls != 1) { ret 4; }
+    if (!cancel.destroy(?scope)) { ret 5; }
+    ret 0;
+}
+
+test "http.core.body: reader completion publishes bounded trailers" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var slots: [1]field.Field;
+    var fields: field.Fields = field.init(?slots[0], 1, field.limits(1, 16, 8, 8));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, false);
+    adapter.emit_trailer = true;
+    var reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 25, true, 2, limits(8, 4, 4), ?fields, ?scope);
+    var output: [4]u8;
+    if (read(?reader, ?output[0], 4).status != DATA || read(?reader, ?output[0], 4).status != COMPLETE) { ret 1; }
+    if (fields.len != 1 || field.find_first(?fields, view.view("Digest", 6)) == nil) { ret 2; }
+    if (!cancel.destroy(?scope)) { ret 3; }
+    ret 0;
+}
+
+test "http.core.body: pending reads and writes require matching completion tokens" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, false);
+    adapter.read_pending = true;
+    var reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 16, true, 2, limits(8, 4, 4), ?fields, ?scope);
+    var bytes: [4]u8;
+    if (read(?reader, ?bytes[0], 4).status != PENDING || reader.pending_token != 42) { ret 1; }
+    if (read(?reader, ?bytes[0], 4).status != INVALID || complete_reader(?reader, 41).status != INVALID) { ret 2; }
+    if (complete_reader(?reader, 42).status != DATA || reader.transferred != 2
+     || read(?reader, ?bytes[0], 4).status != COMPLETE || adapter.release_calls != 1) { ret 3; }
+    adapter = test_adapter(REUSE_ALLOWED, false);
+    adapter.write_pending = true;
+    var writer: Writer = init_writer(?adapter, test_write, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 17, true, 2, limits(8, 4, 4), ?fields, ?scope);
+    if (write(?writer, ?bytes[0], 2).status != PENDING || writer.pending_token != 43) { ret 4; }
+    if (finish(?writer).status != INVALID || complete_writer(?writer, 42).status != INVALID) { ret 5; }
+    if (complete_writer(?writer, 43).status != DATA || writer.transferred != 2
+     || finish(?writer).status != COMPLETE || adapter.release_calls != 1) { ret 6; }
+    if (!cancel.destroy(?scope)) { ret 7; }
+    ret 0;
+}
+
+test "http.core.body: drain and reject are retry-safe exclusive dispositions" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, true);
+    var reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 8, false, 0, limits(8, 4, 4), ?fields, ?scope);
+    if (drain(?reader).status != PENDING || reader.state != DRAINING) { ret 1; }
+    if (reject(?reader).status != INVALID || adapter.finish_calls != 1) { ret 2; }
+    if (complete_reader(?reader, 41).status != COMPLETE || adapter.finish_mode != DRAIN || adapter.release_calls != 1) { ret 3; }
+    var reject_adapter: TestAdapter = test_adapter(REUSE_FORBIDDEN, false);
+    var rejected_reader: Reader = init_reader(?reject_adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 9, false, 0, limits(8, 4, 4), ?fields, ?scope);
+    val rejected_result: Progress = reject(?rejected_reader);
+    if (rejected_result.status != REJECTED) { ret 4; }
+    if (rejected_reader.reuse != REUSE_FORBIDDEN) { ret 5; }
+    if (reject_adapter.release_calls != 1) { ret 6; }
+    if (!cancel.destroy(?scope)) { ret 7; }
+    ret 0;
+}
+
+test "http.core.body: cancellation scopes preserve cancelled and timed out outcomes" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, false);
+    var reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 10, false, 0, limits(8, 4, 4), ?fields, ?scope);
+    cancel.cancel(?scope);
+    var output: [4]u8;
+    if (read(?reader, ?output[0], 4).status != CANCELLED || adapter.finish_mode != CANCEL) { ret 1; }
+    if (!cancel.destroy(?scope)) { ret 2; }
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var timeout_adapter: TestAdapter = test_adapter(REUSE_FORBIDDEN, false);
+    var timeout_body: Reader = init_reader(?timeout_adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 11, false, 0, limits(8, 4, 4), ?fields, ?scope);
+    cancel.timeout(?scope);
+    if (read(?timeout_body, ?output[0], 4).status != TIMED_OUT || timeout_adapter.finish_mode != TIMEOUT) { ret 3; }
+    if (!cancel.destroy(?scope)) { ret 4; }
+    ret 0;
+}
+
+test "http.core.body: cancellation preempts pending drain and finish operations" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, true);
+    var reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 23, false, 0, limits(8, 4, 4), ?fields, ?scope);
+    if (drain(?reader).status != PENDING) { ret 1; }
+    cancel.cancel(?scope);
+    if (drain(?reader).status != CANCELLED || adapter.finish_mode != CANCEL || adapter.release_calls != 1) { ret 2; }
+    if (!cancel.destroy(?scope)) { ret 3; }
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    adapter = test_adapter(REUSE_FORBIDDEN, true);
+    var writer: Writer = init_writer(?adapter, test_write, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 24, true, 0, limits(8, 4, 4), ?fields, ?scope);
+    if (finish(?writer).status != PENDING) { ret 4; }
+    cancel.timeout(?scope);
+    if (finish(?writer).status != TIMED_OUT || adapter.finish_mode != TIMEOUT || adapter.release_calls != 1) { ret 5; }
+    if (!cancel.destroy(?scope)) { ret 6; }
+    ret 0;
+}
+
+test "http.core.body: readers enforce chunk counts bytes and producer counts" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, false);
+    var reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 12, false, 0, limits(2, 2, 1), ?fields, ?scope);
+    var output: [8]u8;
+    if (read(?reader, ?output[0], 8).status != DATA || reader.transferred != 2 || reader.chunks != 1) { ret 1; }
+    if (read(?reader, ?output[0], 8).status != COMPLETE) { ret 2; }
+    if (!cancel.destroy(?scope)) { ret 3; }
+    ret 0;
+}
+
+test "http.core.body: limit exhaustion and adapter violations settle ownership" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, false);
+    var reader: Reader = init_reader(?adapter, test_endless_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 18, false, 0, limits(2, 2, 1), ?fields, ?scope);
+    var bytes: [4]u8;
+    if (read(?reader, ?bytes[0], 4).status != DATA
+     || read(?reader, ?bytes[0], 4).status != LIMIT_REACHED
+     || reader.reuse != REUSE_FORBIDDEN || adapter.release_calls != 1) { ret 1; }
+    adapter = test_adapter(REUSE_ALLOWED, false);
+    var invalid_reader: Reader = init_reader(?adapter, test_overread, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 19, false, 0, limits(8, 4, 4), ?fields, ?scope);
+    if (read(?invalid_reader, ?bytes[0], 4).status != ERROR || adapter.release_calls != 1) { ret 2; }
+    val too_long: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 20, true, 9, limits(8, 4, 4), ?fields, ?scope);
+    if (too_long.valid) { ret 3; }
+    adapter = test_adapter(REUSE_UNKNOWN, false);
+    var missing_reuse: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 21, false, 0, limits(8, 4, 4), ?fields, ?scope);
+    if (reject(?missing_reuse).status != ERROR || missing_reuse.reuse != REUSE_FORBIDDEN) { ret 4; }
+    adapter = test_adapter(REUSE_ALLOWED, false);
+    var writer: Writer = init_writer(?adapter, test_write, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 22, false, 0, limits(2, 2, 1), ?fields, ?scope);
+    if (write(?writer, ?bytes[0], 2).status != DATA || write(?writer, ?bytes[0], 1).status != LIMIT_REACHED
+     || adapter.release_calls != 1) { ret 5; }
+    if (!cancel.destroy(?scope)) { ret 6; }
+    ret 0;
+}
+
+test "http.core.body: writers bound chunks and require exact completion" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, false);
+    var writer: Writer = init_writer(?adapter, test_write, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 13, true, 3, limits(8, 2, 3), ?fields, ?scope);
+    var input: [4]u8;
+    if (write(?writer, ?input[0], 3).count != 2 || writer.transferred != 2) { ret 1; }
+    if (write(?writer, ?input[0], 1).count != 1 || writer.transferred != 3) { ret 2; }
+    if (finish(?writer).status != COMPLETE || adapter.finish_mode != FINISH || adapter.release_calls != 1) { ret 3; }
+    adapter = test_adapter(REUSE_ALLOWED, false);
+    writer = init_writer(?adapter, test_write, test_finish, test_complete, test_release,
+        OWNER_APPLICATION, 14, true, 4, limits(8, 4, 2), ?fields, ?scope);
+    if (write(?writer, ?input[0], 2).status != DATA || finish(?writer).status != ERROR
+     || writer.reuse != REUSE_FORBIDDEN || adapter.release_calls != 1) { ret 4; }
+    if (!cancel.destroy(?scope)) { ret 5; }
+    ret 0;
+}
+
+test "http.core.body: body endpoint ownership requires one release authority" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter;
+    val missing: ReleaseFun = (0::usize)::ReleaseFun;
+    val reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, missing,
+        OWNER_ENGINE, 15, false, 0, limits(8, 4, 2), ?fields, ?scope);
+    if (reader.valid) { ret 1; }
+    var empty: Reader = empty_reader(15);
+    if (!empty.valid || empty.owner != OWNER_NONE || empty.reuse != REUSE_ALLOWED
+     || !validate_reader(?empty, limits(8, 4, 2), 15)) { ret 2; }
+    empty.declared_length = 1;
+    if (validate_reader(?empty, limits(8, 4, 2), 15)) { ret 3; }
+    if (!cancel.destroy(?scope)) { ret 4; }
     ret 0;
 }

@@ -1,0 +1,1674 @@
+use std.chrono.time;
+use std.sync.cancel;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.ok;
+use std.types.result.unwrap_ok;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view;
+use std.memory;
+use std.io.lifecycle;
+use io_error: std.io.error;
+use io_runtime: std.io.runtime;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.core.target;
+use http.core.transport;
+use http.h1.framing;
+use http.h1.parser;
+use http.h1.serializer;
+
+pub def Role: u8;
+pub val SERVER: Role = 1;
+pub val CLIENT: Role = 2;
+
+pub def State: u8;
+pub val OPEN: State = 1;
+pub val DRAINING: State = 2;
+pub val TUNNEL: State = 3;
+pub val CLOSING: State = 4;
+pub val CLOSED: State = 5;
+pub val FAILED: State = 6;
+
+pub def SlotState: u8;
+pub val SLOT_FREE: SlotState = 1;
+pub val SLOT_LIVE: SlotState = 2;
+
+pub def Disposition: u8;
+pub val BODY_DELIVER: Disposition = 1;
+pub val BODY_DRAIN: Disposition = 2;
+pub val BODY_REJECT: Disposition = 3;
+pub val BODY_CLOSE: Disposition = 4;
+
+pub def OutKind: u8;
+pub val OUT_NONE: OutKind = 0;
+pub val OUT_REQUEST: OutKind = 1;
+pub val OUT_INFORMATIONAL: OutKind = 2;
+pub val OUT_RESPONSE: OutKind = 3;
+
+pub def EventKind: u8;
+pub val EVENT_NONE: EventKind = 0;
+pub val EVENT_NEED_READ: EventKind = 1;
+pub val EVENT_SATURATED: EventKind = 2;
+pub val EVENT_REQUEST_HEADERS: EventKind = 3;
+pub val EVENT_REQUEST_BODY: EventKind = 4;
+pub val EVENT_REQUEST_COMPLETE: EventKind = 5;
+pub val EVENT_INFORMATIONAL: EventKind = 6;
+pub val EVENT_RESPONSE_HEADERS: EventKind = 7;
+pub val EVENT_RESPONSE_BODY: EventKind = 8;
+pub val EVENT_RESPONSE_COMPLETE: EventKind = 9;
+pub val EVENT_OUTBOUND_INFORMATIONAL: EventKind = 10;
+pub val EVENT_OUTBOUND_COMPLETE: EventKind = 11;
+pub val EVENT_TUNNEL: EventKind = 12;
+pub val EVENT_PEER_CLOSED: EventKind = 13;
+pub val EVENT_CLOSED: EventKind = 14;
+pub val EVENT_CANCELLED: EventKind = 15;
+pub val EVENT_TIMED_OUT: EventKind = 16;
+pub val EVENT_ERROR: EventKind = 17;
+
+pub def Error: u8;
+pub val ERROR_NONE: Error = 0;
+pub val ERROR_STATE: Error = 1;
+pub val ERROR_LIMIT: Error = 2;
+pub val ERROR_PROTOCOL: Error = 3;
+pub val ERROR_PARSER: Error = 4;
+pub val ERROR_SERIALIZER: Error = 5;
+pub val ERROR_TRANSPORT: Error = 6;
+pub val ERROR_NO_PROGRESS: Error = 7;
+pub val ERROR_HEADER_TIMEOUT: Error = 8;
+pub val ERROR_REQUEST_TIMEOUT: Error = 9;
+pub val ERROR_IDLE_TIMEOUT: Error = 10;
+pub val ERROR_WRITE_TIMEOUT: Error = 11;
+pub val ERROR_TOTAL_TIMEOUT: Error = 12;
+pub val ERROR_CANCELLED: Error = 13;
+
+pub def OfferStatus: u8;
+pub val OFFER_OUTPUT: OfferStatus = 1;
+pub val OFFER_BODY: OfferStatus = 2;
+pub val OFFER_DONE: OfferStatus = 3;
+pub val OFFER_BLOCKED: OfferStatus = 4;
+pub val OFFER_ERROR: OfferStatus = 5;
+
+pub rec Config {
+    parser: parser.Limits;
+    max_pipeline: usize;
+    max_drain_bytes: u64;
+    header_timeout_ns: u64;
+    request_timeout_ns: u64;
+    idle_timeout_ns: u64;
+    write_timeout_ns: u64;
+    total_timeout_ns: u64;
+}
+
+pub rec SlotMemory {
+    line: *u8;
+    line_capacity: usize;
+    storage: *u8;
+    storage_capacity: usize;
+    fields: *field.Field;
+    field_capacity: usize;
+    trailers: *field.Field;
+    trailer_capacity: usize;
+    scratch: *u8;
+    scratch_capacity: usize;
+}
+
+pub rec Deadline {
+    active: bool;
+    at: time.Time;
+}
+
+pub rec Slot {
+    state: SlotState;
+    sequence: u64;
+    memory: SlotMemory;
+    parser: parser.Parser;
+    serializer: serializer.Serializer;
+    request_method: method.Method;
+    headers_reported: bool;
+    informational: bool;
+    inbound_complete: bool;
+    inbound_abandoned: bool;
+    outbound_complete: bool;
+    serializer_active: bool;
+    final_prepared: bool;
+    released: bool;
+    disposition: Disposition;
+    drained: u64;
+    close_after: bool;
+    upgrade_requested: bool;
+    tunnel_ready: bool;
+    out_kind: OutKind;
+    header_deadline: Deadline;
+    request_deadline: Deadline;
+    write_deadline: Deadline;
+}
+
+pub rec Event {
+    kind: EventKind;
+    slot: usize;
+    sequence: u64;
+    body: *u8;
+    body_length: usize;
+    body_final: bool;
+    error: Error;
+}
+
+pub rec Offer {
+    status: OfferStatus;
+    consumed: usize;
+    produced: usize;
+    error: Error;
+}
+
+pub rec Engine {
+    role: Role;
+    state: State;
+    configured: Config;
+    transport: *transport.Transport;
+    scope: *cancel.Scope;
+    slots: *Slot;
+    capacity: usize;
+    head: usize;
+    count: usize;
+    next_sequence: u64;
+    receiving: usize;
+    read_buffer: *u8;
+    read_capacity: usize;
+    input_length: usize;
+    input_offset: usize;
+    input_eof: bool;
+    read_pending: bool;
+    read_token: transport.Token;
+    write_buffer: *u8;
+    write_capacity: usize;
+    write_length: usize;
+    write_offset: usize;
+    write_pending: bool;
+    write_terminal: bool;
+    write_slot: usize;
+    write_kind: OutKind;
+    write_token: transport.Token;
+    held_body: *u8;
+    held_length: usize;
+    held_final: bool;
+    held_slot: usize;
+    shutdown_pending: bool;
+    shutdown_done: bool;
+    shutdown_token: transport.Token;
+    close_pending: bool;
+    close_token: transport.Token;
+    graceful_requested: bool;
+    tunnel_slot: usize;
+    tunnel_reported: bool;
+    idle_deadline: Deadline;
+    total_deadline: Deadline;
+    error: Error;
+    initialized: bool;
+}
+
+pub val NO_SLOT: usize = (-1)::usize;
+
+pub fun config_default() Config {
+    ret Config{
+        parser: parser.limits_default(),
+        max_pipeline: 16,
+        max_drain_bytes: 1048576,
+        header_timeout_ns: 10000000000,
+        request_timeout_ns: 30000000000,
+        idle_timeout_ns: 60000000000,
+        write_timeout_ns: 30000000000,
+        total_timeout_ns: 300000000000,
+    };
+}
+
+fun valid_now(now: time.Time) bool {
+    ret now.sec >= 0 && now.nsec >= 0 && now.nsec < 1000000000;
+}
+
+fun duration_valid(value: u64) bool {
+    ret value != 0 && value <= 0x7fffffffffffffff;
+}
+
+fun deadline(now: time.Time, duration: u64) Deadline {
+    var seconds: u64 = duration / 1000000000;
+    var nanoseconds: i64 = now.nsec + (duration % 1000000000)::i64;
+    if (nanoseconds >= 1000000000) {
+        nanoseconds = nanoseconds - 1000000000;
+        seconds = seconds + 1;
+    }
+    if (seconds > 0x7fffffffffffffff - now.sec::u64) {
+        ret Deadline{active: true, at: time.Time{sec: 0x7fffffffffffffff, nsec: 999999999}};
+    }
+    ret Deadline{active: true, at: time.Time{sec: now.sec + seconds::i64, nsec: nanoseconds}};
+}
+
+fun expired(value: Deadline, now: time.Time) bool {
+    ret value.active && !time.time_before(now, value.at);
+}
+
+fun memory_valid(memory: SlotMemory, configured: parser.Limits) bool {
+    ret memory.line != nil && memory.line_capacity >= configured.max_start_line
+        && memory.line_capacity >= configured.max_header_line
+        && memory.line_capacity >= configured.max_chunk_line
+        && memory.storage != nil && memory.storage_capacity != 0
+        && memory.fields != nil && memory.field_capacity >= configured.max_headers
+        && memory.trailers != nil && memory.trailer_capacity >= configured.max_trailers
+        && memory.scratch != nil && memory.scratch_capacity != 0;
+}
+
+fun config_valid(configured: Config, capacity: usize) bool {
+    ret configured.max_pipeline != 0 && configured.max_pipeline <= capacity
+        && configured.max_drain_bytes != 0
+        && duration_valid(configured.header_timeout_ns)
+        && duration_valid(configured.request_timeout_ns)
+        && duration_valid(configured.idle_timeout_ns)
+        && duration_valid(configured.write_timeout_ns)
+        && duration_valid(configured.total_timeout_ns);
+}
+
+fun empty_event(engine: *Engine, kind: EventKind) Event {
+    ret Event{kind: kind, slot: NO_SLOT, sequence: 0, body: nil, body_length: 0,
+        body_final: false, error: engine.error};
+}
+
+fun slot_event(engine: *Engine, kind: EventKind, index: usize) Event {
+    val slot: *Slot = ?engine.slots[index];
+    ret Event{kind: kind, slot: index, sequence: slot.sequence, body: nil,
+        body_length: 0, body_final: false, error: engine.error};
+}
+
+fun body_event(engine: *Engine, kind: EventKind, index: usize) Event {
+    val slot: *Slot = ?engine.slots[index];
+    ret Event{kind: kind, slot: index, sequence: slot.sequence, body: engine.held_body,
+        body_length: engine.held_length, body_final: engine.held_final, error: engine.error};
+}
+
+fun slot_live(engine: *Engine, index: usize) bool {
+    ret engine != nil && engine.initialized && index < engine.capacity
+        && engine.slots[index].state == SLOT_LIVE;
+}
+
+pub fun parsed(engine: *Engine, index: usize) *parser.Parsed {
+    if (!slot_live(engine, index)) { ret nil; }
+    ret ?engine.slots[index].parser.parsed;
+}
+
+fun reset_slot(slot: *Slot, memory: SlotMemory) {
+    slot.state = SLOT_FREE;
+    slot.sequence = 0;
+    slot.memory = memory;
+    slot.request_method = method.Method{kind: 0, token: view.view(nil, 0)};
+    slot.headers_reported = false;
+    slot.informational = false;
+    slot.inbound_complete = false;
+    slot.inbound_abandoned = false;
+    slot.outbound_complete = false;
+    slot.serializer_active = false;
+    slot.final_prepared = false;
+    slot.released = false;
+    slot.disposition = BODY_DELIVER;
+    slot.drained = 0;
+    slot.close_after = false;
+    slot.upgrade_requested = false;
+    slot.tunnel_ready = false;
+    slot.out_kind = OUT_NONE;
+    slot.header_deadline.active = false;
+    slot.request_deadline.active = false;
+    slot.write_deadline.active = false;
+}
+
+pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Transport,
+    scope: *cancel.Scope, slots: *Slot, memories: *SlotMemory, capacity: usize,
+    read_buffer: *u8, read_capacity: usize, write_buffer: *u8, write_capacity: usize,
+    configured: Config, now: time.Time) bool {
+    if (engine == nil || engine.initialized || (role != SERVER && role != CLIENT)
+     || connection_transport == nil || !connection_transport.initialized || scope == nil
+     || scope.root != connection_transport.operation_root || cancel.reason(scope) != cancel.ACTIVE
+     || slots == nil || memories == nil || capacity == 0 || !config_valid(configured, capacity)
+     || read_buffer == nil || read_capacity == 0 || write_buffer == nil || write_capacity == 0
+     || !valid_now(now)) { ret false; }
+    var i: usize = 0;
+    for (i < configured.max_pipeline) {
+        if (!memory_valid(memories[i], configured.parser)) { ret false; }
+        reset_slot(?slots[i], memories[i]);
+        i = i + 1;
+    }
+    engine.role = role;
+    engine.state = OPEN;
+    engine.configured = configured;
+    engine.transport = connection_transport;
+    engine.scope = scope;
+    engine.slots = slots;
+    engine.capacity = configured.max_pipeline;
+    engine.head = 0;
+    engine.count = 0;
+    engine.next_sequence = 1;
+    engine.receiving = NO_SLOT;
+    engine.read_buffer = read_buffer;
+    engine.read_capacity = read_capacity;
+    engine.input_length = 0;
+    engine.input_offset = 0;
+    engine.input_eof = false;
+    engine.read_pending = false;
+    engine.write_buffer = write_buffer;
+    engine.write_capacity = write_capacity;
+    engine.write_length = 0;
+    engine.write_offset = 0;
+    engine.write_pending = false;
+    engine.write_terminal = false;
+    engine.write_slot = NO_SLOT;
+    engine.write_kind = OUT_NONE;
+    engine.held_body = nil;
+    engine.held_length = 0;
+    engine.held_final = false;
+    engine.held_slot = NO_SLOT;
+    engine.shutdown_pending = false;
+    engine.shutdown_done = false;
+    engine.close_pending = false;
+    engine.graceful_requested = false;
+    engine.tunnel_slot = NO_SLOT;
+    engine.tunnel_reported = false;
+    engine.idle_deadline = deadline(now, configured.idle_timeout_ns);
+    engine.total_deadline = deadline(now, configured.total_timeout_ns);
+    engine.error = ERROR_NONE;
+    engine.initialized = true;
+    ret true;
+}
+
+fun next_sequence(engine: *Engine) u64 {
+    val sequence: u64 = engine.next_sequence;
+    if (sequence == (-1)::u64) { engine.next_sequence = 0; }
+    or {
+        if (sequence != 0) { engine.next_sequence = sequence + 1; }
+    }
+    ret sequence;
+}
+
+fun tail_index(engine: *Engine) usize {
+    ret (engine.head + engine.count) % engine.capacity;
+}
+
+fun start_slot(engine: *Engine, index: usize, now: time.Time) *Slot {
+    if (engine.next_sequence == 0) { ret nil; }
+    val slot: *Slot = ?engine.slots[index];
+    val memory: SlotMemory = slot.memory;
+    reset_slot(slot, memory);
+    slot.state = SLOT_LIVE;
+    slot.sequence = next_sequence(engine);
+    slot.header_deadline = deadline(now, engine.configured.header_timeout_ns);
+    slot.request_deadline = deadline(now, engine.configured.request_timeout_ns);
+    engine.count = engine.count + 1;
+    engine.idle_deadline.active = false;
+    ret slot;
+}
+
+fun allocate_server(engine: *Engine, now: time.Time) usize {
+    if ((engine.state != OPEN && !(engine.state == DRAINING
+        && engine.graceful_requested && input_available(engine) != 0))
+     || engine.count >= engine.capacity) { ret NO_SLOT; }
+    val index: usize = tail_index(engine);
+    val slot: *Slot = start_slot(engine, index, now);
+    if (slot == nil) { ret NO_SLOT; }
+    val memory: SlotMemory = slot.memory;
+    if (!parser.init_request(?slot.parser, memory.line, memory.line_capacity,
+        memory.storage, memory.storage_capacity, memory.fields, memory.field_capacity,
+        memory.trailers, memory.trailer_capacity, engine.configured.parser)) {
+        slot.state = SLOT_FREE;
+        engine.count = engine.count - 1;
+        ret NO_SLOT;
+    }
+    engine.receiving = index;
+    ret index;
+}
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun token_equal(value: view.View, token: *u8, length: usize) bool {
+    if (value.data == nil || token == nil || value.len != length) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (lower(value.data[i]) != lower(token[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun value_has_token(value: view.View, token: *u8, length: usize) bool {
+    if (value.data == nil || value.len == 0) { ret false; }
+    var i: usize = 0;
+    for (true) {
+        for (i < value.len && (value.data[i] == ' ' || value.data[i] == '\t')) { i = i + 1; }
+        val start: usize = i;
+        for (i < value.len && value.data[i] != ',') { i = i + 1; }
+        var finish: usize = i;
+        for (finish > start && (value.data[finish - 1] == ' ' || value.data[finish - 1] == '\t')) {
+            finish = finish - 1;
+        }
+        if (finish - start == length
+         && token_equal(view.view(?value.data[start], length), token, length)) { ret true; }
+        if (i == value.len) { ret false; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun upgrade_requested(fields: *field.Fields) bool {
+    var connection: bool = false;
+    var upgrade: bool = false;
+    var i: usize = 0;
+    for (i < fields.len) {
+        val item: *field.Field = ?fields.items[i];
+        if (field.name_equal(item.name, view.view("connection", 10))
+         && value_has_token(item.value, "upgrade", 7)) { connection = true; }
+        if (field.name_equal(item.name, view.view("upgrade", 7)) && item.value.len != 0) {
+            upgrade = true;
+        }
+        i = i + 1;
+    }
+    ret connection && upgrade;
+}
+
+fun current_inbound(engine: *Engine) usize {
+    if (engine.role == SERVER) { ret engine.receiving; }
+    var offset: usize = 0;
+    for (offset < engine.count) {
+        val index: usize = (engine.head + offset) % engine.capacity;
+        if (engine.slots[index].state == SLOT_LIVE && !engine.slots[index].inbound_complete) {
+            ret index;
+        }
+        offset = offset + 1;
+    }
+    ret NO_SLOT;
+}
+
+fun current_outbound(engine: *Engine) usize {
+    var offset: usize = 0;
+    for (offset < engine.count) {
+        val index: usize = (engine.head + offset) % engine.capacity;
+        if (engine.slots[index].state == SLOT_LIVE && !engine.slots[index].outbound_complete) {
+            ret index;
+        }
+        offset = offset + 1;
+    }
+    ret NO_SLOT;
+}
+
+fun close_cause(error: Error) lifecycle.Cause {
+    if (error >= ERROR_HEADER_TIMEOUT && error <= ERROR_TOTAL_TIMEOUT) { ret lifecycle.DEADLINE; }
+    if (error == ERROR_CANCELLED) { ret lifecycle.CANCELLATION; }
+    ret lifecycle.FAILURE;
+}
+
+fun submit_abort(engine: *Engine) {
+    if (engine.close_pending || engine.state == CLOSED) { ret; }
+    val submitted: Result[transport.Token, io_error.Error] = transport.close_with_cause(
+        engine.transport, close_cause(engine.error), engine.next_sequence::usize);
+    if (!is_err[transport.Token, io_error.Error](submitted)) {
+        engine.close_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+        engine.close_pending = true;
+    } or {
+        engine.state = CLOSED;
+    }
+}
+
+fun fail(engine: *Engine, error: Error) Event {
+    engine.error = error;
+    engine.state = FAILED;
+    if (error >= ERROR_HEADER_TIMEOUT && error <= ERROR_TOTAL_TIMEOUT) {
+        cancel.timeout(engine.scope);
+    } or {
+        if (error == ERROR_CANCELLED) { cancel.cancel(engine.scope); }
+    }
+    submit_abort(engine);
+    if (error >= ERROR_HEADER_TIMEOUT && error <= ERROR_TOTAL_TIMEOUT) {
+        ret empty_event(engine, EVENT_TIMED_OUT);
+    }
+    if (error == ERROR_CANCELLED) { ret empty_event(engine, EVENT_CANCELLED); }
+    ret empty_event(engine, EVENT_ERROR);
+}
+
+pub fun tick(engine: *Engine, now: time.Time) Event {
+    if (engine == nil || !engine.initialized || !valid_now(now)) {
+        var invalid: Event;
+        invalid.kind = EVENT_ERROR;
+        invalid.error = ERROR_STATE;
+        ret invalid;
+    }
+    if (engine.state == CLOSED) { ret empty_event(engine, EVENT_CLOSED); }
+    if (engine.state == TUNNEL) { ret empty_event(engine, EVENT_NONE); }
+    if (engine.state == CLOSING) { ret empty_event(engine, EVENT_NONE); }
+    if (engine.state == FAILED) {
+        if (engine.error >= ERROR_HEADER_TIMEOUT && engine.error <= ERROR_TOTAL_TIMEOUT) {
+            ret empty_event(engine, EVENT_TIMED_OUT);
+        }
+        if (engine.error == ERROR_CANCELLED) { ret empty_event(engine, EVENT_CANCELLED); }
+        ret empty_event(engine, EVENT_ERROR);
+    }
+    val reason: cancel.Reason = cancel.reason(engine.scope);
+    if (reason == cancel.TIMED_OUT) { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
+    if (reason != cancel.ACTIVE) { ret fail(engine, ERROR_CANCELLED); }
+    if (expired(engine.total_deadline, now)) { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
+    if (engine.count == 0 && expired(engine.idle_deadline, now)) { ret fail(engine, ERROR_IDLE_TIMEOUT); }
+    var offset: usize = 0;
+    for (offset < engine.count) {
+        val index: usize = (engine.head + offset) % engine.capacity;
+        val slot: *Slot = ?engine.slots[index];
+        if (expired(slot.header_deadline, now)) { ret fail(engine, ERROR_HEADER_TIMEOUT); }
+        if (expired(slot.request_deadline, now)) { ret fail(engine, ERROR_REQUEST_TIMEOUT); }
+        if (expired(slot.write_deadline, now)) { ret fail(engine, ERROR_WRITE_TIMEOUT); }
+        offset = offset + 1;
+    }
+    ret empty_event(engine, EVENT_NONE);
+}
+
+pub fun enqueue_request(engine: *Engine, version: message.Version,
+    request_method: method.Method, request_target: target.Target, fields: *field.Fields,
+    trailers: *field.Fields, now: time.Time) usize {
+    if (engine == nil || !engine.initialized || engine.role != CLIENT || engine.state != OPEN
+     || engine.count >= engine.capacity || !valid_now(now)) { ret NO_SLOT; }
+    val index: usize = tail_index(engine);
+    val slot: *Slot = start_slot(engine, index, now);
+    if (slot == nil) { ret NO_SLOT; }
+    val memory: SlotMemory = slot.memory;
+    if (!parser.init_response(?slot.parser, request_method.kind, memory.line, memory.line_capacity,
+        memory.storage, memory.storage_capacity, memory.fields, memory.field_capacity,
+        memory.trailers, memory.trailer_capacity, engine.configured.parser)
+     || !serializer.init_request(?slot.serializer, version, request_method, request_target,
+        fields, trailers, memory.scratch, memory.scratch_capacity)) {
+        slot.state = SLOT_FREE;
+        engine.count = engine.count - 1;
+        ret NO_SLOT;
+    }
+    slot.request_method = request_method;
+    slot.serializer_active = true;
+    slot.out_kind = OUT_REQUEST;
+    slot.upgrade_requested = upgrade_requested(fields);
+    slot.close_after = !slot.serializer.plan.keep_alive;
+    slot.write_deadline = deadline(now, engine.configured.write_timeout_ns);
+    ret index;
+}
+
+pub fun prepare_informational(engine: *Engine, index: usize, code: status.Status,
+    reason: view.View, fields: *field.Fields, now: time.Time) bool {
+    if (!slot_live(engine, index) || engine.role != SERVER || engine.state == TUNNEL
+     || code < 100 || code >= 200 || code == status.SWITCHING_PROTOCOLS
+     || current_outbound(engine) != index || engine.slots[index].serializer_active
+     || engine.slots[index].final_prepared || !valid_now(now)) { ret false; }
+    val slot: *Slot = ?engine.slots[index];
+    if (!serializer.init_response(?slot.serializer, slot.parser.parsed.version,
+        slot.request_method.kind, code, reason, fields, nil,
+        slot.memory.scratch, slot.memory.scratch_capacity)) { ret false; }
+    slot.serializer_active = true;
+    slot.out_kind = OUT_INFORMATIONAL;
+    if (!slot.write_deadline.active) {
+        slot.write_deadline = deadline(now, engine.configured.write_timeout_ns);
+    }
+    ret true;
+}
+
+pub fun prepare_response(engine: *Engine, index: usize, code: status.Status,
+    reason: view.View, fields: *field.Fields, trailers: *field.Fields,
+    now: time.Time) bool {
+    if (!slot_live(engine, index) || engine.role != SERVER || engine.state == TUNNEL
+     || (code < 200 && code != status.SWITCHING_PROTOCOLS)
+     || engine.slots[index].serializer_active || engine.slots[index].final_prepared
+     || !valid_now(now)) { ret false; }
+    val slot: *Slot = ?engine.slots[index];
+    if (code == status.SWITCHING_PROTOCOLS
+     && (!slot.upgrade_requested || !upgrade_requested(fields))) { ret false; }
+    if (!serializer.init_response(?slot.serializer, slot.parser.parsed.version,
+        slot.request_method.kind, code, reason, fields, trailers,
+        slot.memory.scratch, slot.memory.scratch_capacity)) { ret false; }
+    slot.serializer_active = true;
+    slot.final_prepared = true;
+    slot.out_kind = OUT_RESPONSE;
+    slot.tunnel_ready = slot.serializer.plan.mode == framing.FRAME_TUNNEL
+        || code == status.SWITCHING_PROTOCOLS;
+    if (!slot.serializer.plan.keep_alive && !slot.tunnel_ready) { slot.close_after = true; }
+    if (!slot.write_deadline.active) {
+        slot.write_deadline = deadline(now, engine.configured.write_timeout_ns);
+    }
+    ret true;
+}
+
+pub fun offer(engine: *Engine, index: usize, body: *u8,
+    body_length: usize, body_final: bool) Offer {
+    if (!slot_live(engine, index) || current_outbound(engine) != index
+     || !engine.slots[index].serializer_active || engine.write_pending
+     || engine.write_length != 0 || (body == nil && body_length != 0)) {
+        ret Offer{status: OFFER_BLOCKED, consumed: 0, produced: 0, error: ERROR_STATE};
+    }
+    val slot: *Slot = ?engine.slots[index];
+    val result: serializer.Write = serializer.write(?slot.serializer,
+        engine.write_buffer, engine.write_capacity, body, body_length, body_final);
+    if (result.status == serializer.WRITE_ERROR) {
+        fail(engine, ERROR_SERIALIZER);
+        ret Offer{status: OFFER_ERROR, consumed: result.consumed,
+            produced: result.written, error: ERROR_SERIALIZER};
+    }
+    engine.write_length = result.written;
+    engine.write_offset = 0;
+    engine.write_terminal = result.status == serializer.WRITE_DONE;
+    engine.write_slot = index;
+    engine.write_kind = slot.out_kind;
+    if (result.written != 0) {
+        ret Offer{status: OFFER_OUTPUT, consumed: result.consumed,
+            produced: result.written, error: ERROR_NONE};
+    }
+    if (result.status == serializer.WRITE_DONE) {
+        mark_outbound(engine, index, slot.out_kind);
+        ret Offer{status: OFFER_DONE, consumed: result.consumed, produced: 0, error: ERROR_NONE};
+    }
+    ret Offer{status: OFFER_BODY, consumed: result.consumed, produced: 0, error: ERROR_NONE};
+}
+
+pub fun submit_read(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized || engine.read_pending || engine.input_eof
+     || engine.input_offset != engine.input_length || engine.held_length != 0
+     || (engine.state != OPEN && engine.state != DRAINING)
+     || (engine.state == DRAINING && current_inbound(engine) == NO_SLOT)
+     || (engine.role == CLIENT && current_inbound(engine) == NO_SLOT)
+     || (engine.role == SERVER && engine.count >= engine.capacity
+        && current_inbound(engine) == NO_SLOT)) { ret false; }
+    engine.input_length = 0;
+    engine.input_offset = 0;
+    val submitted: Result[transport.Token, io_error.Error] = transport.read(
+        engine.transport, engine.scope, engine.read_buffer, engine.read_capacity,
+        engine.next_sequence::usize);
+    if (is_err[transport.Token, io_error.Error](submitted)) { fail(engine, ERROR_TRANSPORT); ret false; }
+    engine.read_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    engine.read_pending = true;
+    ret true;
+}
+
+pub fun submit_write(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized || engine.write_pending
+     || engine.write_length == 0 || engine.write_offset >= engine.write_length
+     || (engine.state != OPEN && engine.state != DRAINING)) { ret false; }
+    val submitted: Result[transport.Token, io_error.Error] = transport.write(
+        engine.transport, engine.scope, ?engine.write_buffer[engine.write_offset],
+        engine.write_length - engine.write_offset, engine.slots[engine.write_slot].sequence::usize);
+    if (is_err[transport.Token, io_error.Error](submitted)) { fail(engine, ERROR_TRANSPORT); ret false; }
+    engine.write_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    engine.write_pending = true;
+    ret true;
+}
+
+fun set_input(engine: *Engine, count: usize, eof: bool) {
+    engine.input_length = count;
+    engine.input_offset = 0;
+    engine.input_eof = eof;
+}
+
+fun mark_outbound(engine: *Engine, index: usize, kind: OutKind) Event {
+    val slot: *Slot = ?engine.slots[index];
+    slot.serializer_active = false;
+    slot.out_kind = OUT_NONE;
+    if (kind == OUT_INFORMATIONAL) {
+        ret slot_event(engine, EVENT_OUTBOUND_INFORMATIONAL, index);
+    }
+    slot.outbound_complete = true;
+    slot.write_deadline.active = false;
+    if (slot.inbound_complete) { slot.request_deadline.active = false; }
+    if (slot.close_after && !slot.tunnel_ready) { engine.state = DRAINING; }
+    if (slot.tunnel_ready && slot.inbound_complete) {
+        engine.state = TUNNEL;
+        engine.tunnel_slot = index;
+    }
+    if (engine.role == SERVER && engine.state == DRAINING && !engine.graceful_requested
+     && !engine.input_eof && !slot.close_after && !slot.inbound_abandoned
+     && (slot.upgrade_requested || slot.request_method.kind == method.CONNECT)
+     && !slot.tunnel_ready) { engine.state = OPEN; }
+    ret slot_event(engine, EVENT_OUTBOUND_COMPLETE, index);
+}
+
+pub fun complete_io(engine: *Engine, completion: *transport.Completion,
+    now: time.Time) Event {
+    if (engine == nil || !engine.initialized || completion == nil || !valid_now(now)) {
+        var invalid: Event;
+        invalid.kind = EVENT_ERROR;
+        invalid.error = ERROR_STATE;
+        ret invalid;
+    }
+    if ((completion.kind == transport.READ
+         && (!engine.read_pending || !transport.token_equal(completion.token, engine.read_token)))
+     || (completion.kind == transport.WRITE
+         && (!engine.write_pending || !transport.token_equal(completion.token, engine.write_token)))
+     || (completion.kind == transport.SHUTDOWN_WRITE
+         && (!engine.shutdown_pending || !transport.token_equal(completion.token, engine.shutdown_token)))
+     || (completion.kind == transport.CLOSE
+         && (!engine.close_pending || !transport.token_equal(completion.token, engine.close_token)))) {
+        ret fail(engine, ERROR_STATE);
+    }
+    if (!transport.complete(engine.transport, completion)) { ret fail(engine, ERROR_TRANSPORT); }
+    if (completion.kind == transport.READ) { engine.read_pending = false; }
+    if (completion.kind == transport.WRITE) { engine.write_pending = false; }
+    if (completion.kind == transport.SHUTDOWN_WRITE) { engine.shutdown_pending = false; }
+    if (engine.state == FAILED || engine.state == CLOSING) {
+        if (completion.kind == transport.CLOSE) {
+            engine.close_pending = false;
+            engine.state = CLOSED;
+            ret empty_event(engine, EVENT_CLOSED);
+        }
+        ret empty_event(engine, EVENT_NONE);
+    }
+    val checked: Event = tick(engine, now);
+    if (checked.kind != EVENT_NONE) { ret checked; }
+    if (completion.kind == transport.READ) {
+        if (completion.status == transport.IO_COMPLETE) {
+            if (completion.count == 0) { ret fail(engine, ERROR_NO_PROGRESS); }
+            set_input(engine, completion.count, false);
+            ret process(engine, now);
+        }
+        if (completion.status == transport.IO_END) {
+            set_input(engine, completion.count, true);
+            ret process(engine, now);
+        }
+        if (completion.status == transport.IO_TIMED_OUT) { ret fail(engine, ERROR_REQUEST_TIMEOUT); }
+        if (completion.status == transport.IO_CANCELLED) { ret fail(engine, ERROR_CANCELLED); }
+        ret fail(engine, ERROR_TRANSPORT);
+    }
+    if (completion.kind == transport.WRITE) {
+        if (completion.status == transport.IO_COMPLETE) {
+            if (completion.count == 0) { ret fail(engine, ERROR_NO_PROGRESS); }
+            engine.write_offset = engine.write_offset + completion.count;
+            if (engine.write_offset < engine.write_length) { ret empty_event(engine, EVENT_NONE); }
+            val terminal: bool = engine.write_terminal;
+            val index: usize = engine.write_slot;
+            val kind: OutKind = engine.write_kind;
+            engine.write_length = 0;
+            engine.write_offset = 0;
+            engine.write_terminal = false;
+            engine.write_slot = NO_SLOT;
+            engine.write_kind = OUT_NONE;
+            if (terminal) { ret mark_outbound(engine, index, kind); }
+            ret empty_event(engine, EVENT_NONE);
+        }
+        if (completion.status == transport.IO_TIMED_OUT) { ret fail(engine, ERROR_WRITE_TIMEOUT); }
+        if (completion.status == transport.IO_CANCELLED) { ret fail(engine, ERROR_CANCELLED); }
+        ret fail(engine, ERROR_TRANSPORT);
+    }
+    if (completion.kind == transport.SHUTDOWN_WRITE) {
+        if (completion.status != transport.IO_COMPLETE) { ret fail(engine, ERROR_TRANSPORT); }
+        engine.shutdown_done = true;
+        ret empty_event(engine, EVENT_NONE);
+    }
+    engine.close_pending = false;
+    engine.state = CLOSED;
+    ret empty_event(engine, EVENT_CLOSED);
+}
+
+fun input_available(engine: *Engine) usize {
+    ret engine.input_length - engine.input_offset;
+}
+
+fun hold_body(engine: *Engine, index: usize, result: parser.Feed) Event {
+    engine.held_body = result.body;
+    engine.held_length = result.body_length;
+    engine.held_final = result.body_final;
+    engine.held_slot = index;
+    if (engine.role == SERVER) { ret body_event(engine, EVENT_REQUEST_BODY, index); }
+    ret body_event(engine, EVENT_RESPONSE_BODY, index);
+}
+
+fun finish_inbound(engine: *Engine, index: usize) Event {
+    val slot: *Slot = ?engine.slots[index];
+    if (engine.role == CLIENT && slot.informational) {
+        slot.informational = false;
+        slot.headers_reported = false;
+        parser.reset(?slot.parser);
+        ret empty_event(engine, EVENT_NONE);
+    }
+    slot.inbound_complete = true;
+    slot.header_deadline.active = false;
+    if (slot.outbound_complete) { slot.request_deadline.active = false; }
+    if (!slot.parser.parsed.plan.keep_alive && !slot.tunnel_ready) {
+        slot.close_after = true;
+        engine.state = DRAINING;
+    }
+    if (engine.role == SERVER) { engine.receiving = NO_SLOT; }
+    if (slot.tunnel_ready && slot.outbound_complete) {
+        engine.state = TUNNEL;
+        engine.tunnel_slot = index;
+    }
+    if (engine.role == SERVER && (slot.upgrade_requested
+        || slot.request_method.kind == method.CONNECT)) { engine.state = DRAINING; }
+    if (engine.role == SERVER) { ret slot_event(engine, EVENT_REQUEST_COMPLETE, index); }
+    ret slot_event(engine, EVENT_RESPONSE_COMPLETE, index);
+}
+
+fun eof_event(engine: *Engine, now: time.Time) Event {
+    val index: usize = current_inbound(engine);
+    if (index == NO_SLOT) {
+        engine.state = DRAINING;
+        ret empty_event(engine, EVENT_PEER_CLOSED);
+    }
+    val result: parser.Feed = parser.finish_eof(?engine.slots[index].parser, true);
+    if (result.status == parser.PARSE_MESSAGE) { ret finish_inbound(engine, index); }
+    ret fail(engine, ERROR_PROTOCOL);
+}
+
+pub fun process(engine: *Engine, now: time.Time) Event {
+    if (engine == nil || !engine.initialized || !valid_now(now)) {
+        var invalid: Event;
+        invalid.kind = EVENT_ERROR;
+        invalid.error = ERROR_STATE;
+        ret invalid;
+    }
+    val checked: Event = tick(engine, now);
+    if (checked.kind != EVENT_NONE) { ret checked; }
+    if (engine.state == TUNNEL) {
+        if (engine.tunnel_reported) { ret empty_event(engine, EVENT_NONE); }
+        engine.tunnel_reported = true;
+        var event: Event = empty_event(engine, EVENT_TUNNEL);
+        event.slot = engine.tunnel_slot;
+        if (engine.tunnel_slot != NO_SLOT) {
+            event.sequence = engine.slots[engine.tunnel_slot].sequence;
+        }
+        event.body = nil;
+        event.body_length = input_available(engine);
+        if (event.body_length != 0) { event.body = ?engine.read_buffer[engine.input_offset]; }
+        ret event;
+    }
+    if (engine.held_length != 0) {
+        var kind: EventKind = EVENT_RESPONSE_BODY;
+        if (engine.role == SERVER) { kind = EVENT_REQUEST_BODY; }
+        ret body_event(engine, kind, engine.held_slot);
+    }
+    for (true) {
+        val ready_index: usize = current_inbound(engine);
+        if (input_available(engine) == 0) {
+            if (ready_index == NO_SLOT
+             || engine.slots[ready_index].parser.phase != parser.MESSAGE_COMPLETE) {
+                if (engine.input_eof) { ret eof_event(engine, now); }
+                if (ready_index == NO_SLOT && engine.state == DRAINING) {
+                    ret empty_event(engine, EVENT_NONE);
+                }
+                if (ready_index == NO_SLOT && engine.role == CLIENT) {
+                    ret empty_event(engine, EVENT_NONE);
+                }
+                if (ready_index == NO_SLOT && engine.role == SERVER
+                 && engine.count >= engine.capacity) {
+                    ret empty_event(engine, EVENT_SATURATED);
+                }
+                ret empty_event(engine, EVENT_NEED_READ);
+            }
+        }
+        var index: usize = ready_index;
+        if (index == NO_SLOT && engine.role == SERVER) {
+            if (engine.state != OPEN && !(engine.state == DRAINING
+                && engine.graceful_requested && input_available(engine) != 0)) {
+                ret empty_event(engine, EVENT_NONE);
+            }
+            index = allocate_server(engine, now);
+            if (index == NO_SLOT) {
+                if (engine.count >= engine.capacity) { ret empty_event(engine, EVENT_SATURATED); }
+                ret fail(engine, ERROR_STATE);
+            }
+        }
+        if (index == NO_SLOT) { ret fail(engine, ERROR_PROTOCOL); }
+        val slot: *Slot = ?engine.slots[index];
+        if (slot.disposition == BODY_REJECT || slot.disposition == BODY_CLOSE) {
+            ret empty_event(engine, EVENT_NONE);
+        }
+        var input: *u8 = nil;
+        if (input_available(engine) != 0) { input = ?engine.read_buffer[engine.input_offset]; }
+        val result: parser.Feed = parser.feed(?slot.parser, input, input_available(engine));
+        engine.input_offset = engine.input_offset + result.consumed;
+        if (result.status == parser.PARSE_ERROR) { ret fail(engine, ERROR_PARSER); }
+        if (result.status == parser.PARSE_NEED_INPUT) {
+            if (input_available(engine) != 0 || result.consumed == 0) {
+                ret fail(engine, ERROR_NO_PROGRESS);
+            }
+            if (engine.input_eof) { ret eof_event(engine, now); }
+            ret empty_event(engine, EVENT_NEED_READ);
+        }
+        if (result.status == parser.PARSE_HEADERS) {
+            if (engine.role == SERVER) {
+                slot.request_method = slot.parser.parsed.method;
+                slot.upgrade_requested = upgrade_requested(?slot.parser.parsed.fields);
+                slot.headers_reported = true;
+                slot.header_deadline.active = false;
+                if (!slot.parser.parsed.plan.keep_alive) {
+                    slot.close_after = true;
+                    engine.state = DRAINING;
+                }
+                ret slot_event(engine, EVENT_REQUEST_HEADERS, index);
+            }
+            val informational: bool = status.is_informational(slot.parser.parsed.status)
+                && !(slot.parser.parsed.status == status.SWITCHING_PROTOCOLS
+                    && slot.upgrade_requested);
+            if (informational) {
+                slot.informational = true;
+                ret slot_event(engine, EVENT_INFORMATIONAL, index);
+            }
+            if (slot.parser.parsed.status == status.SWITCHING_PROTOCOLS
+             && !upgrade_requested(?slot.parser.parsed.fields)) {
+                ret fail(engine, ERROR_PROTOCOL);
+            }
+            slot.headers_reported = true;
+            slot.header_deadline.active = false;
+            slot.tunnel_ready = slot.parser.parsed.plan.mode == framing.FRAME_TUNNEL
+                || (slot.parser.parsed.status == status.SWITCHING_PROTOCOLS
+                    && slot.upgrade_requested);
+            ret slot_event(engine, EVENT_RESPONSE_HEADERS, index);
+        }
+        if (result.status == parser.PARSE_BODY) {
+            if (slot.disposition == BODY_DRAIN) {
+                if (result.body_length::u64 > engine.configured.max_drain_bytes - slot.drained) {
+                    ret fail(engine, ERROR_LIMIT);
+                }
+                slot.drained = slot.drained + result.body_length::u64;
+                cnt;
+            }
+            ret hold_body(engine, index, result);
+        }
+        if (result.status == parser.PARSE_MESSAGE) {
+            val finished: Event = finish_inbound(engine, index);
+            if (finished.kind == EVENT_NONE) { cnt; }
+            ret finished;
+        }
+        ret fail(engine, ERROR_STATE);
+    }
+    ret empty_event(engine, EVENT_NONE);
+}
+
+pub fun consume_body(engine: *Engine, index: usize, count: usize) bool {
+    if (!slot_live(engine, index) || engine.held_slot != index || count > engine.held_length) {
+        ret false;
+    }
+    if (count != 0) {
+        engine.held_body = (engine.held_body::usize + count)::ptr::*u8;
+        engine.held_length = engine.held_length - count;
+    }
+    if (engine.held_length == 0) {
+        engine.held_body = nil;
+        engine.held_final = false;
+        engine.held_slot = NO_SLOT;
+    }
+    ret true;
+}
+
+pub fun set_disposition(engine: *Engine, index: usize, disposition: Disposition) bool {
+    if (!slot_live(engine, index) || engine.role != SERVER
+     || disposition < BODY_DELIVER || disposition > BODY_CLOSE
+     || engine.slots[index].inbound_complete) { ret false; }
+    val slot: *Slot = ?engine.slots[index];
+    slot.disposition = disposition;
+    if (disposition == BODY_DRAIN && engine.held_slot == index) {
+        if (engine.held_length::u64 > engine.configured.max_drain_bytes - slot.drained) {
+            fail(engine, ERROR_LIMIT);
+            ret false;
+        }
+        slot.drained = slot.drained + engine.held_length::u64;
+        engine.held_body = nil;
+        engine.held_length = 0;
+        engine.held_final = false;
+        engine.held_slot = NO_SLOT;
+    }
+    if (disposition == BODY_REJECT) {
+        engine.held_body = nil;
+        engine.held_length = 0;
+        engine.held_final = false;
+        engine.held_slot = NO_SLOT;
+        slot.inbound_abandoned = true;
+        slot.inbound_complete = true;
+        slot.close_after = true;
+        slot.header_deadline.active = false;
+        engine.receiving = NO_SLOT;
+        engine.state = DRAINING;
+    }
+    if (disposition == BODY_CLOSE) {
+        fail(engine, ERROR_PROTOCOL);
+    }
+    ret true;
+}
+
+fun slot_done(engine: *Engine, slot: *Slot) bool {
+    ret slot.inbound_complete && slot.outbound_complete && slot.released;
+}
+
+fun sweep(engine: *Engine, now: time.Time) {
+    for (engine.count != 0 && slot_done(engine, ?engine.slots[engine.head])) {
+        val memory: SlotMemory = engine.slots[engine.head].memory;
+        reset_slot(?engine.slots[engine.head], memory);
+        engine.head = (engine.head + 1) % engine.capacity;
+        engine.count = engine.count - 1;
+    }
+    if (engine.count == 0 && engine.state == OPEN) {
+        engine.idle_deadline = deadline(now, engine.configured.idle_timeout_ns);
+    }
+}
+
+pub fun release(engine: *Engine, index: usize, now: time.Time) bool {
+    if (!slot_live(engine, index) || !valid_now(now)
+     || !engine.slots[index].inbound_complete || !engine.slots[index].outbound_complete) {
+        ret false;
+    }
+    engine.slots[index].released = true;
+    sweep(engine, now);
+    ret true;
+}
+
+pub fun begin_graceful(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized || engine.state != OPEN) { ret false; }
+    engine.state = DRAINING;
+    engine.graceful_requested = true;
+    ret true;
+}
+
+fun protocol_done(engine: *Engine) bool {
+    if (engine.write_pending || engine.write_length != 0 || engine.held_length != 0) { ret false; }
+    var offset: usize = 0;
+    for (offset < engine.count) {
+        val index: usize = (engine.head + offset) % engine.capacity;
+        if (!engine.slots[index].inbound_complete || !engine.slots[index].outbound_complete) {
+            ret false;
+        }
+        offset = offset + 1;
+    }
+    ret true;
+}
+
+pub fun progress_close(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized || engine.state != DRAINING
+     || !protocol_done(engine)) { ret false; }
+    if (!engine.shutdown_done && !engine.shutdown_pending) {
+        val submitted: Result[transport.Token, io_error.Error] = transport.shutdown_write(
+            engine.transport, engine.scope, engine.next_sequence::usize);
+        if (is_err[transport.Token, io_error.Error](submitted)) { fail(engine, ERROR_TRANSPORT); ret false; }
+        engine.shutdown_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+        engine.shutdown_pending = true;
+        ret true;
+    }
+    if (engine.shutdown_done && !engine.close_pending) {
+        engine.state = CLOSING;
+        engine.error = ERROR_NONE;
+        val submitted: Result[transport.Token, io_error.Error] = transport.close(
+            engine.transport, engine.next_sequence::usize);
+        if (is_err[transport.Token, io_error.Error](submitted)) { engine.state = CLOSED; ret false; }
+        engine.close_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+        engine.close_pending = true;
+        ret true;
+    }
+    ret false;
+}
+
+pub fun cancel_connection(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized || engine.state == CLOSED) { ret false; }
+    cancel.cancel(engine.scope);
+    fail(engine, ERROR_CANCELLED);
+    ret true;
+}
+
+rec TestIO {
+    read_token: transport.Token;
+    read_buffer: *u8;
+    read_length: usize;
+    read_calls: usize;
+    write_token: transport.Token;
+    write_buffer: *u8;
+    write_length: usize;
+    write_calls: usize;
+    shutdown_token: transport.Token;
+    shutdown_calls: usize;
+    close_token: transport.Token;
+    close_calls: usize;
+}
+
+fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
+    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    val state: *TestIO = context::*TestIO;
+    state.read_token = token;
+    state.read_buffer = buffer;
+    state.read_length = length;
+    state.read_calls = state.read_calls + 1;
+    ret ok[bool, io_error.Error](true);
+}
+
+fun test_write(context: ptr, token: transport.Token, scope: *cancel.Scope,
+    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    val state: *TestIO = context::*TestIO;
+    state.write_token = token;
+    state.write_buffer = buffer;
+    state.write_length = length;
+    state.write_calls = state.write_calls + 1;
+    ret ok[bool, io_error.Error](true);
+}
+
+fun test_shutdown(context: ptr, token: transport.Token,
+    scope: *cancel.Scope) Result[bool, io_error.Error] {
+    val state: *TestIO = context::*TestIO;
+    state.shutdown_token = token;
+    state.shutdown_calls = state.shutdown_calls + 1;
+    ret ok[bool, io_error.Error](true);
+}
+
+fun test_close(context: ptr, token: transport.Token,
+    scope: *cancel.Scope) Result[bool, io_error.Error] {
+    val state: *TestIO = context::*TestIO;
+    state.close_token = token;
+    state.close_calls = state.close_calls + 1;
+    ret ok[bool, io_error.Error](true);
+}
+
+rec Fixture {
+    runtime: io_runtime.Runtime;
+    operation_root: cancel.Scope;
+    control_root: cancel.Scope;
+    io: TestIO;
+    adapter: transport.Adapter;
+    transport_slots: [3]transport.Slot;
+    transport: transport.Transport;
+    slots: [3]Slot;
+    memories: [3]SlotMemory;
+    lines: [3][256]u8;
+    storage: [3][1024]u8;
+    fields: [3][8]field.Field;
+    trailers: [3][4]field.Field;
+    scratch: [3][512]u8;
+    read_buffer: [512]u8;
+    write_buffer: [128]u8;
+    engine: Engine;
+}
+
+fun test_config(pipeline: usize) Config {
+    var configured: Config = config_default();
+    configured.max_pipeline = pipeline;
+    configured.max_drain_bytes = 64;
+    configured.parser.max_start_line = 256;
+    configured.parser.max_method_bytes = 32;
+    configured.parser.max_target_bytes = 192;
+    configured.parser.max_header_line = 256;
+    configured.parser.max_header_bytes = 1024;
+    configured.parser.max_headers = 8;
+    configured.parser.max_trailer_bytes = 256;
+    configured.parser.max_trailers = 4;
+    configured.parser.max_chunk_line = 64;
+    configured.parser.max_body_bytes = 1024;
+    ret configured;
+}
+
+fun test_now(seconds: i64) time.Time {
+    ret time.Time{sec: seconds, nsec: 0};
+}
+
+fun make_fixture(fixture: *Fixture, role: Role, pipeline: usize) bool {
+    val none: time.Time = test_now(0);
+    if (!cancel.make_root(?fixture.operation_root, false, none)
+     || !cancel.make_root(?fixture.control_root, false, none)) { ret false; }
+    fixture.adapter.runtime = ?fixture.runtime;
+    fixture.adapter.context = (?fixture.io)::ptr;
+    fixture.adapter.security = transport.PLAINTEXT;
+    fixture.adapter.submit_read = test_read;
+    fixture.adapter.submit_write = test_write;
+    fixture.adapter.submit_shutdown_write = test_shutdown;
+    fixture.adapter.submit_close = test_close;
+    if (!transport.init(?fixture.transport, fixture.adapter, ?fixture.operation_root,
+        ?fixture.control_root, ?fixture.transport_slots[0], 3)) { ret false; }
+    val configured: Config = test_config(pipeline);
+    var i: usize = 0;
+    for (i < pipeline) {
+        fixture.memories[i] = SlotMemory{
+            line: ?fixture.lines[i][0], line_capacity: 256,
+            storage: ?fixture.storage[i][0], storage_capacity: 1024,
+            fields: ?fixture.fields[i][0], field_capacity: 8,
+            trailers: ?fixture.trailers[i][0], trailer_capacity: 4,
+            scratch: ?fixture.scratch[i][0], scratch_capacity: 512,
+        };
+        i = i + 1;
+    }
+    ret init(?fixture.engine, role, ?fixture.transport, ?fixture.operation_root,
+        ?fixture.slots[0], ?fixture.memories[0], pipeline,
+        ?fixture.read_buffer[0], 512, ?fixture.write_buffer[0], 128,
+        configured, test_now(100));
+}
+
+fun complete_read(fixture: *Fixture, wire: str, eof: bool, now: time.Time) Event {
+    val length: usize = str_len(wire);
+    if (!submit_read(?fixture.engine) || length > fixture.io.read_length) {
+        ret empty_event(?fixture.engine, EVENT_ERROR);
+    }
+    memory.raw_copy(fixture.io.read_buffer, wire, length);
+    var completion: transport.Completion;
+    if (eof) { completion = transport.end(fixture.io.read_token, length); }
+    or { completion = transport.completed(fixture.io.read_token, transport.READ, length); }
+    ret complete_io(?fixture.engine, ?completion, now);
+}
+
+fun complete_write(fixture: *Fixture, count: usize, now: time.Time) Event {
+    var completion: transport.Completion = transport.completed(
+        fixture.io.write_token, transport.WRITE, count);
+    ret complete_io(?fixture.engine, ?completion, now);
+}
+
+fun flush_offer(fixture: *Fixture, index: usize, body: *u8,
+    length: usize, final: bool, now: time.Time, partial: bool) bool {
+    var offset: usize = 0;
+    var done: bool = false;
+    for (!done) {
+        val offered: Offer = offer(?fixture.engine, index,
+            (body::usize + offset)::ptr::*u8, length - offset, final);
+        if (offered.status == OFFER_ERROR || offered.status == OFFER_BLOCKED) { ret false; }
+        offset = offset + offered.consumed;
+        if (offered.status == OFFER_DONE) { done = true; }
+        if (offered.status == OFFER_BODY && offset == length && !final) { ret true; }
+        if (offered.produced != 0) {
+            if (!submit_write(?fixture.engine)) { ret false; }
+            var first: usize = fixture.io.write_length;
+            if (partial && first > 1) { first = first / 2; }
+            val event: Event = complete_write(fixture, first, now);
+            if (event.kind == EVENT_ERROR || event.kind == EVENT_TIMED_OUT) { ret false; }
+            if (first < fixture.engine.write_length - fixture.engine.write_offset + first) {
+                if (!submit_write(?fixture.engine)) { ret false; }
+                val rest: usize = fixture.io.write_length;
+                val settled: Event = complete_write(fixture, rest, now);
+                if (settled.kind == EVENT_ERROR || settled.kind == EVENT_TIMED_OUT) { ret false; }
+            }
+            if (fixture.slots[index].outbound_complete
+             || (!fixture.slots[index].serializer_active && final)) { done = true; }
+        }
+    }
+    ret offset == length;
+}
+
+test "http.h1.connection: server pipeline is bounded and responses stay ordered" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 2)) { ret 1; }
+    val wire: str = "GET /1 HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\nGET /3 HTTP/1.1\r\nHost: x\r\n\r\n";
+    val first: Event = complete_read(?fixture, wire, false, now);
+    if (first.kind != EVENT_REQUEST_HEADERS || first.slot != 0) { ret 2; }
+    if (process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE) { ret 3; }
+    val second: Event = process(?fixture.engine, now);
+    if (second.kind != EVENT_REQUEST_HEADERS || second.slot != 1) { ret 4; }
+    if (process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE
+     || process(?fixture.engine, now).kind != EVENT_SATURATED) { ret 5; }
+    var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    if (!prepare_response(?fixture.engine, 1, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, now)) { ret 6; }
+    if (offer(?fixture.engine, 1, nil, 0, true).status != OFFER_BLOCKED) { ret 7; }
+    var length_item: field.Field;
+    var length_fields: field.Fields = field.init(?length_item, 1,
+        field.limits(1, 32, 16, 16));
+    field.append(?length_fields, field.Field{name: view.view("Content-Length", 14),
+        value: view.view("5", 1), sensitive: false});
+    if (!prepare_response(?fixture.engine, 0, status.OK, view.view("OK", 2),
+        ?length_fields, nil, now)
+     || !flush_offer(?fixture, 0, "hello", 5, true, now, true)
+     || !fixture.slots[0].outbound_complete) { ret 8; }
+    if (!release(?fixture.engine, 0, now) || fixture.engine.count != 1
+     || fixture.engine.head != 1) { ret 9; }
+    val third: Event = process(?fixture.engine, now);
+    if (third.kind != EVENT_REQUEST_HEADERS || third.slot != 0
+     || third.sequence <= second.sequence) { ret 10; }
+    ret 0;
+}
+
+test "http.h1.connection: body backpressure supports consume drain and reject" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    val wire: str = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    val headers: Event = complete_read(?fixture, wire, false, now);
+    if (headers.kind != EVENT_REQUEST_HEADERS) { ret 2; }
+    val body_part: Event = process(?fixture.engine, now);
+    if (body_part.kind != EVENT_REQUEST_BODY || body_part.body_length != 5
+     || submit_read(?fixture.engine)) { ret 3; }
+    if (!consume_body(?fixture.engine, body_part.slot, 2)) { ret 4; }
+    val remaining: Event = process(?fixture.engine, now);
+    if (remaining.kind != EVENT_REQUEST_BODY || remaining.body_length != 3) { ret 5; }
+    if (!set_disposition(?fixture.engine, remaining.slot, BODY_DRAIN)
+     || fixture.engine.held_length != 0
+     || process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE
+     || fixture.slots[remaining.slot].drained != 3) { ret 6; }
+    var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    if (!prepare_response(?fixture.engine, remaining.slot, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, now)
+     || !flush_offer(?fixture, remaining.slot, nil, 0, true, now, false)
+     || !release(?fixture.engine, remaining.slot, now)) { ret 7; }
+    val rejected_wire: str = "POST /reject HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    val rejected_headers: Event = complete_read(?fixture, rejected_wire, false, now);
+    if (rejected_headers.kind != EVENT_REQUEST_HEADERS
+     || !set_disposition(?fixture.engine, rejected_headers.slot, BODY_REJECT)
+     || fixture.engine.state != DRAINING || !fixture.slots[rejected_headers.slot].inbound_abandoned) {
+        ret 8;
+    }
+    var zero_item: field.Field;
+    var zero_fields: field.Fields = field.init(?zero_item, 1, field.limits(1, 32, 16, 16));
+    field.append(?zero_fields, field.Field{name: view.view("Content-Length", 14),
+        value: view.view("0", 1), sensitive: false});
+    if (!prepare_response(?fixture.engine, rejected_headers.slot, status.CONTENT_TOO_LARGE,
+        view.view("Content Too Large", 17), ?zero_fields, nil, now)
+     || !flush_offer(?fixture, rejected_headers.slot, nil, 0, true, now, false)
+     || !progress_close(?fixture.engine) || fixture.io.shutdown_calls != 1) { ret 9; }
+    var shutdown: transport.Completion = transport.completed(
+        fixture.io.shutdown_token, transport.SHUTDOWN_WRITE, 0);
+    if (complete_io(?fixture.engine, ?shutdown, now).kind != EVENT_NONE
+     || !progress_close(?fixture.engine) || fixture.io.close_calls != 1) { ret 10; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed, now).kind != EVENT_CLOSED) { ret 11; }
+    ret 0;
+}
+
+test "http.h1.connection: client handles informationals and close delimited eof" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, CLIENT, 2)) { ret 1; }
+    var host_item: field.Field;
+    var host_fields: field.Fields = field.init(?host_item, 1, field.limits(1, 32, 16, 16));
+    field.append(?host_fields, field.Field{name: view.view("Host", 4),
+        value: view.view("x", 1), sensitive: false});
+    val request_target: target.Target = target.origin(view.view("/", 1),
+        view.view("/", 1), view.view(nil, 0));
+    val first_slot: usize = enqueue_request(?fixture.engine, message.version_h1(1, 1),
+        method.from_kind(method.GET), request_target, ?host_fields, nil, now);
+    if (first_slot == NO_SLOT || !flush_offer(?fixture, first_slot, nil, 0, true, now, true)) { ret 2; }
+    val replies: str = "HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    if (complete_read(?fixture, replies, false, now).kind != EVENT_INFORMATIONAL) { ret 3; }
+    val final_headers: Event = process(?fixture.engine, now);
+    if (final_headers.kind != EVENT_RESPONSE_HEADERS
+     || fixture.slots[first_slot].parser.parsed.status != status.OK) { ret 4; }
+    if (process(?fixture.engine, now).kind != EVENT_RESPONSE_COMPLETE
+     || !release(?fixture.engine, first_slot, now)) { ret 5; }
+    val second_slot: usize = enqueue_request(?fixture.engine, message.version_h1(1, 1),
+        method.from_kind(method.GET), request_target, ?host_fields, nil, now);
+    if (second_slot == NO_SLOT || !flush_offer(?fixture, second_slot, nil, 0, true, now, false)) { ret 6; }
+    val close_reply: str = "HTTP/1.1 200 OK\r\n\r\nclose-body";
+    if (complete_read(?fixture, close_reply, true, now).kind != EVENT_RESPONSE_HEADERS) { ret 7; }
+    val content: Event = process(?fixture.engine, now);
+    if (content.kind != EVENT_RESPONSE_BODY || content.body_length != 10
+     || !memory.raw_equal(content.body, "close-body", 10)
+     || !consume_body(?fixture.engine, second_slot, 10)) { ret 8; }
+    if (process(?fixture.engine, now).kind != EVENT_RESPONSE_COMPLETE
+     || fixture.engine.state != DRAINING) { ret 9; }
+    ret 0;
+}
+
+test "http.h1.connection: connect switches protocols without consuming tunnel bytes" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, CLIENT, 1)) { ret 1; }
+    var host_item: field.Field;
+    var host_fields: field.Fields = field.init(?host_item, 1, field.limits(1, 32, 16, 16));
+    field.append(?host_fields, field.Field{name: view.view("Host", 4),
+        value: view.view("x:443", 5), sensitive: false});
+    val authority: target.Target = target.authority(view.view("x:443", 5));
+    val index: usize = enqueue_request(?fixture.engine, message.version_h1(1, 1),
+        method.from_kind(method.CONNECT), authority, ?host_fields, nil, now);
+    if (index == NO_SLOT || !flush_offer(?fixture, index, nil, 0, true, now, false)) { ret 2; }
+    val reply: str = "HTTP/1.1 200 Connection Established\r\n\r\nabc";
+    if (complete_read(?fixture, reply, false, now).kind != EVENT_RESPONSE_HEADERS
+     || process(?fixture.engine, now).kind != EVENT_RESPONSE_COMPLETE) { ret 3; }
+    val tunnel: Event = process(?fixture.engine, now);
+    if (tunnel.kind != EVENT_TUNNEL || tunnel.slot != index || tunnel.body_length != 3
+     || !memory.raw_equal(tunnel.body, "abc", 3)) { ret 4; }
+    ret 0;
+}
+
+test "http.h1.connection: absolute deadlines and hostile completions close once" {
+    var header_fixture: Fixture;
+    if (!make_fixture(?header_fixture, SERVER, 1)) { ret 1; }
+    if (complete_read(?header_fixture, "G", false, test_now(100)).kind != EVENT_NEED_READ) { ret 2; }
+    val expired_header: Event = tick(?header_fixture.engine, test_now(110));
+    if (expired_header.kind != EVENT_TIMED_OUT || expired_header.error != ERROR_HEADER_TIMEOUT
+     || header_fixture.io.close_calls != 1) { ret 3; }
+    var progress_fixture: Fixture;
+    if (!make_fixture(?progress_fixture, SERVER, 1) || !submit_read(?progress_fixture.engine)) { ret 4; }
+    var empty: transport.Completion = transport.completed(
+        progress_fixture.io.read_token, transport.READ, 0);
+    val stalled: Event = complete_io(?progress_fixture.engine, ?empty, test_now(100));
+    if (stalled.kind != EVENT_ERROR || stalled.error != ERROR_NO_PROGRESS
+     || progress_fixture.io.close_calls != 1) { ret 5; }
+    var cancel_fixture: Fixture;
+    if (!make_fixture(?cancel_fixture, SERVER, 1)
+     || !cancel.cancel(?cancel_fixture.operation_root)) { ret 6; }
+    val cancelled: Event = tick(?cancel_fixture.engine, test_now(100));
+    if (cancelled.kind != EVENT_CANCELLED || cancelled.error != ERROR_CANCELLED
+     || cancel_fixture.io.close_calls != 1) { ret 7; }
+    ret 0;
+}
+
+test "http.h1.connection: sustained keep alive and graceful close reuse bounded storage" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var i: usize = 0;
+    var prior_sequence: u64 = 0;
+    for (i < 64) {
+        val headers: Event = complete_read(?fixture,
+            "GET / HTTP/1.1\r\nHost: x\r\n\r\n", false, now);
+        if (headers.kind != EVENT_REQUEST_HEADERS || headers.sequence <= prior_sequence) { ret 2; }
+        prior_sequence = headers.sequence;
+        if (process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE
+         || !prepare_response(?fixture.engine, headers.slot, status.NO_CONTENT,
+            view.view("No Content", 10), ?no_fields, nil, now)
+         || !flush_offer(?fixture, headers.slot, nil, 0, true, now, i % 2 == 0)
+         || !release(?fixture.engine, headers.slot, now)) { ret 3; }
+        i = i + 1;
+    }
+    if (fixture.engine.count != 0 || fixture.engine.state != OPEN
+     || fixture.io.read_calls != 64) { ret 4; }
+    if (!begin_graceful(?fixture.engine) || !progress_close(?fixture.engine)
+     || fixture.io.shutdown_calls != 1) { ret 5; }
+    var shutdown: transport.Completion = transport.completed(
+        fixture.io.shutdown_token, transport.SHUTDOWN_WRITE, 0);
+    if (complete_io(?fixture.engine, ?shutdown, now).kind != EVENT_NONE
+     || !progress_close(?fixture.engine) || fixture.io.close_calls != 1) { ret 6; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed, now).kind != EVENT_CLOSED
+     || fixture.engine.state != CLOSED) { ret 7; }
+    ret 0;
+}
+
+test "http.h1.connection: server informationals and upgrade barriers preserve wire order" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    val request: str = "GET /chat HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nxyz";
+    val headers: Event = complete_read(?fixture, request, false, now);
+    if (headers.kind != EVENT_REQUEST_HEADERS || !fixture.slots[headers.slot].upgrade_requested
+     || process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE
+     || fixture.engine.state != DRAINING || process(?fixture.engine, now).kind != EVENT_NONE) { ret 2; }
+    var hint_item: field.Field;
+    var hints: field.Fields = field.init(?hint_item, 1, field.limits(1, 32, 16, 16));
+    field.append(?hints, field.Field{name: view.view("Link", 4),
+        value: view.view("</chat>", 7), sensitive: false});
+    if (!prepare_informational(?fixture.engine, headers.slot, status.EARLY_HINTS,
+        view.view("Early Hints", 11), ?hints, now)
+     || !flush_offer(?fixture, headers.slot, nil, 0, true, now, true)
+     || fixture.slots[headers.slot].outbound_complete
+     || fixture.slots[headers.slot].serializer_active) { ret 3; }
+    var upgrade_items: [2]field.Field;
+    var upgrade_fields: field.Fields = field.init(?upgrade_items[0], 2,
+        field.limits(2, 64, 16, 16));
+    field.append(?upgrade_fields, field.Field{name: view.view("Connection", 10),
+        value: view.view("Upgrade", 7), sensitive: false});
+    field.append(?upgrade_fields, field.Field{name: view.view("Upgrade", 7),
+        value: view.view("websocket", 9), sensitive: false});
+    if (!prepare_response(?fixture.engine, headers.slot, status.SWITCHING_PROTOCOLS,
+        view.view("Switching Protocols", 19), ?upgrade_fields, nil, now)
+     || !flush_offer(?fixture, headers.slot, nil, 0, true, now, true)) { ret 4; }
+    val tunnel: Event = process(?fixture.engine, now);
+    if (tunnel.kind != EVENT_TUNNEL || tunnel.slot != headers.slot || tunnel.body_length != 3
+     || !memory.raw_equal(tunnel.body, "xyz", 3)) { ret 5; }
+    ret 0;
+}
+
+test "http.h1.connection: client validates switching protocol response fields" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, CLIENT, 1)) { ret 1; }
+    var items: [3]field.Field;
+    var fields: field.Fields = field.init(?items[0], 3, field.limits(3, 96, 16, 16));
+    field.append(?fields, field.Field{name: view.view("Host", 4),
+        value: view.view("x", 1), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("Connection", 10),
+        value: view.view("Upgrade", 7), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("Upgrade", 7),
+        value: view.view("websocket", 9), sensitive: false});
+    val request_target: target.Target = target.origin(view.view("/chat", 5),
+        view.view("/chat", 5), view.view(nil, 0));
+    val index: usize = enqueue_request(?fixture.engine, message.version_h1(1, 1),
+        method.from_kind(method.GET), request_target, ?fields, nil, now);
+    if (index == NO_SLOT || !flush_offer(?fixture, index, nil, 0, true, now, false)) { ret 2; }
+    val response: str = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nframe";
+    if (complete_read(?fixture, response, false, now).kind != EVENT_RESPONSE_HEADERS
+     || process(?fixture.engine, now).kind != EVENT_RESPONSE_COMPLETE) { ret 3; }
+    val tunnel: Event = process(?fixture.engine, now);
+    if (tunnel.kind != EVENT_TUNNEL || tunnel.body_length != 5
+     || !memory.raw_equal(tunnel.body, "frame", 5)) { ret 4; }
+    var invalid_fixture: Fixture;
+    if (!make_fixture(?invalid_fixture, CLIENT, 1)) { ret 5; }
+    val invalid_index: usize = enqueue_request(?invalid_fixture.engine, message.version_h1(1, 1),
+        method.from_kind(method.GET), request_target, ?fields, nil, now);
+    if (invalid_index == NO_SLOT
+     || !flush_offer(?invalid_fixture, invalid_index, nil, 0, true, now, false)) { ret 6; }
+    val invalid_response: str = "HTTP/1.1 101 Switching Protocols\r\n\r\n";
+    val rejected: Event = complete_read(?invalid_fixture, invalid_response, false, now);
+    if (rejected.kind != EVENT_ERROR || rejected.error != ERROR_PROTOCOL) { ret 7; }
+    ret 0;
+}
+
+test "http.h1.connection: each deadline is absolute and never refreshed by progress" {
+    var slow_header: Fixture;
+    if (!make_fixture(?slow_header, SERVER, 1)) { ret 1; }
+    if (complete_read(?slow_header, "G", false, test_now(100)).kind != EVENT_NEED_READ
+     || complete_read(?slow_header, "E", false, test_now(105)).kind != EVENT_NEED_READ) { ret 2; }
+    val header_timeout: Event = tick(?slow_header.engine, test_now(110));
+    if (header_timeout.error != ERROR_HEADER_TIMEOUT) { ret 3; }
+    var request_fixture: Fixture;
+    if (!make_fixture(?request_fixture, SERVER, 1)) { ret 4; }
+    val request_headers: Event = complete_read(?request_fixture,
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n", false, test_now(100));
+    if (request_headers.kind != EVENT_REQUEST_HEADERS
+     || process(?request_fixture.engine, test_now(100)).kind != EVENT_REQUEST_COMPLETE) { ret 5; }
+    val request_timeout: Event = tick(?request_fixture.engine, test_now(130));
+    if (request_timeout.error != ERROR_REQUEST_TIMEOUT) { ret 6; }
+    var write_fixture: Fixture;
+    if (!make_fixture(?write_fixture, SERVER, 1)) { ret 7; }
+    val write_headers: Event = complete_read(?write_fixture,
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n", false, test_now(100));
+    if (write_headers.kind != EVENT_REQUEST_HEADERS
+     || process(?write_fixture.engine, test_now(100)).kind != EVENT_REQUEST_COMPLETE) { ret 8; }
+    var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    if (!prepare_response(?write_fixture.engine, write_headers.slot, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, test_now(100))) { ret 9; }
+    write_fixture.slots[write_headers.slot].request_deadline.at = test_now(200);
+    write_fixture.slots[write_headers.slot].write_deadline.at = test_now(105);
+    if (tick(?write_fixture.engine, test_now(105)).error != ERROR_WRITE_TIMEOUT) { ret 10; }
+    var idle_fixture: Fixture;
+    if (!make_fixture(?idle_fixture, SERVER, 1)
+     || tick(?idle_fixture.engine, test_now(160)).error != ERROR_IDLE_TIMEOUT) { ret 11; }
+    var total_fixture: Fixture;
+    if (!make_fixture(?total_fixture, SERVER, 1)
+     || tick(?total_fixture.engine, test_now(400)).error != ERROR_TOTAL_TIMEOUT) { ret 12; }
+    ret 0;
+}
+
+test "http.h1.connection: close disposition and stale completions are terminal" {
+    var close_fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?close_fixture, SERVER, 1)) { ret 1; }
+    val headers: Event = complete_read(?close_fixture,
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nx", false, now);
+    if (headers.kind != EVENT_REQUEST_HEADERS
+     || !set_disposition(?close_fixture.engine, headers.slot, BODY_CLOSE)
+     || close_fixture.engine.state != FAILED || close_fixture.io.close_calls != 1) { ret 2; }
+    var stale_fixture: Fixture;
+    if (!make_fixture(?stale_fixture, SERVER, 1) || !submit_read(?stale_fixture.engine)) { ret 3; }
+    var stale_token: transport.Token = stale_fixture.io.read_token;
+    stale_token.generation = stale_token.generation + 1;
+    var stale: transport.Completion = transport.completed(stale_token, transport.READ, 1);
+    val rejected: Event = complete_io(?stale_fixture.engine, ?stale, now);
+    if (rejected.kind != EVENT_ERROR || rejected.error != ERROR_STATE
+     || stale_fixture.io.close_calls != 1) { ret 4; }
+    var reset_fixture: Fixture;
+    if (!make_fixture(?reset_fixture, SERVER, 1) || !submit_read(?reset_fixture.engine)) { ret 5; }
+    var reset: transport.Completion = transport.failed(reset_fixture.io.read_token,
+        transport.READ, 0, io_error.Error{kind: io_error.RESET, code: 0,
+            operation: io_error.OP_READ});
+    val terminated: Event = complete_io(?reset_fixture.engine, ?reset, now);
+    if (terminated.kind != EVENT_ERROR || terminated.error != ERROR_TRANSPORT
+     || reset_fixture.engine.state != FAILED || reset_fixture.io.close_calls != 1) { ret 6; }
+    ret 0;
+}
+
+test "http.h1.connection: client pipeline is bounded and responses stay ordered" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, CLIENT, 2)) { ret 1; }
+    var host_item: field.Field;
+    var host_fields: field.Fields = field.init(?host_item, 1, field.limits(1, 32, 16, 16));
+    field.append(?host_fields, field.Field{name: view.view("Host", 4),
+        value: view.view("x", 1), sensitive: false});
+    val first_target: target.Target = target.origin(view.view("/1", 2),
+        view.view("/1", 2), view.view(nil, 0));
+    val second_target: target.Target = target.origin(view.view("/2", 2),
+        view.view("/2", 2), view.view(nil, 0));
+    val first: usize = enqueue_request(?fixture.engine, message.version_h1(1, 1),
+        method.from_kind(method.GET), first_target, ?host_fields, nil, now);
+    val second: usize = enqueue_request(?fixture.engine, message.version_h1(1, 1),
+        method.from_kind(method.GET), second_target, ?host_fields, nil, now);
+    if (first == NO_SLOT || second == NO_SLOT
+     || enqueue_request(?fixture.engine, message.version_h1(1, 1),
+        method.from_kind(method.GET), first_target, ?host_fields, nil, now) != NO_SLOT
+     || offer(?fixture.engine, second, nil, 0, true).status != OFFER_BLOCKED) { ret 2; }
+    if (!flush_offer(?fixture, first, nil, 0, true, now, true)
+     || !flush_offer(?fixture, second, nil, 0, true, now, false)) { ret 3; }
+    val replies: str = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+    val first_headers: Event = complete_read(?fixture, replies, false, now);
+    if (first_headers.kind != EVENT_RESPONSE_HEADERS || first_headers.slot != first
+     || fixture.slots[first].parser.parsed.status != status.OK
+     || process(?fixture.engine, now).kind != EVENT_RESPONSE_COMPLETE) { ret 4; }
+    val second_headers: Event = process(?fixture.engine, now);
+    if (second_headers.kind != EVENT_RESPONSE_HEADERS || second_headers.slot != second
+     || fixture.slots[first].parser.parsed.status != status.OK
+     || fixture.slots[second].parser.parsed.status != status.CREATED
+     || process(?fixture.engine, now).kind != EVENT_RESPONSE_COMPLETE) { ret 5; }
+    if (submit_read(?fixture.engine) || !release(?fixture.engine, second, now)
+     || fixture.engine.count != 2 || !release(?fixture.engine, first, now)
+     || fixture.engine.count != 0) { ret 6; }
+    ret 0;
+}
+
+test "http.h1.connection: graceful close finishes already buffered requests" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 2)) { ret 1; }
+    val requests: str = "GET /1 HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\n";
+    val first: Event = complete_read(?fixture, requests, false, now);
+    if (first.kind != EVENT_REQUEST_HEADERS
+     || process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE
+     || !begin_graceful(?fixture.engine)) { ret 2; }
+    val second: Event = process(?fixture.engine, now);
+    if (second.kind != EVENT_REQUEST_HEADERS || second.sequence <= first.sequence
+     || process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE
+     || process(?fixture.engine, now).kind != EVENT_NONE
+     || submit_read(?fixture.engine)) { ret 3; }
+    var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    if (!prepare_response(?fixture.engine, first.slot, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, now)
+     || !prepare_response(?fixture.engine, second.slot, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, now)
+     || !flush_offer(?fixture, first.slot, nil, 0, true, now, true)
+     || !flush_offer(?fixture, second.slot, nil, 0, true, now, false)
+     || !release(?fixture.engine, first.slot, now)
+     || !release(?fixture.engine, second.slot, now)
+     || !progress_close(?fixture.engine) || fixture.io.shutdown_calls != 1) { ret 4; }
+    ret 0;
+}

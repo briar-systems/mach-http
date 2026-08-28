@@ -3,12 +3,18 @@ use std.types.string.str;
 
 pub val VERSION: str = "0.1.0";
 
+fwd http.core.method;
+fwd http.core.status;
+fwd http.core.field;
+fwd http.core.target;
 fwd http.core.body;
 fwd http.core.message;
+fwd http.core.exchange;
 fwd http.core.transport;
 fwd http.h1.framing;
 fwd http.h1.parser;
 fwd http.h1.serializer;
+fwd http.h1.connection;
 fwd h2_frame: http.h2.frame;
 fwd http.h2.hpack;
 fwd h2_connection: http.h2.connection;
