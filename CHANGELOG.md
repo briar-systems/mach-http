@@ -12,6 +12,8 @@
 - HTTP/1 WebSocket upgrade and HTTP/2 or HTTP/3 extended CONNECT negotiation through the common service exchange.
 - Allocation-free incremental WebSocket decoding and encoding with masking, fragmentation, streaming UTF-8, control frames, and close validation.
 - Completion-driven WebSocket connections with exact borrowed-input release, copied-output ownership, partial I/O, backpressure, cancellation, timeout, and close outcomes.
+- Incremental HTTP/3 frame, SETTINGS, control-stream, and unidirectional stream codecs with exact borrowed payload ownership.
+- Complete QPACK static and dynamic tables, encoder and decoder instruction streams, all field-line representations, Huffman strings, blocked-section retry, and protected reference lifetimes.
 
 ### Security
 
@@ -19,6 +21,8 @@
 - Rejected oversized, truncated, mis-scoped, self-dependent, invalidly padded, duplicate-setting, and zero-window HTTP/2 frames.
 - Preserved HPACK state while refusing saturated streams and rejected invalid pseudo-fields, uppercase or connection-specific fields, hostile authorities, priority cycles, content-length mismatches, and DATA on bodyless responses.
 - Enforced mask direction, reserved bits and opcodes, minimally encoded lengths, independent frame and message limits, fragment limits, valid close codes, and protocol-correct 1002, 1007, 1009, and 1006 outcomes.
+- Rejected misplaced and reserved HTTP/3 frames, duplicate or reserved settings, duplicate critical streams, client push streams, malformed typed payloads, and truncated variable-length integers.
+- Bounded QPACK table bytes, physical entries, wire instructions, encoded sections, blocked streams, outstanding sections, references, field count, decompressed field-list size, individual strings, and Huffman expansion independently.
 
 ## [0.3.0] - 2026-08-28
 
