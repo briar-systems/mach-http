@@ -191,6 +191,7 @@ fun base_length(header: Header) usize {
 
 fun validate_header(header: Header, limits: Limits, continuation_stream: u32) Error {
     if (header.length > limits.max_frame_size) { ret ERROR_FRAME_SIZE; }
+    if (header.stream_id > 0x7fffffff) { ret ERROR_PROTOCOL; }
     if (continuation_stream != 0
      && (header.typ != FRAME_CONTINUATION || header.stream_id != continuation_stream)) {
         ret ERROR_PROTOCOL;
@@ -581,5 +582,53 @@ test "http.h2.frame: writer preserves partial output and sequence" {
     if (first.status != WRITE_OUTPUT || first.consumed != 1
      || second.status != WRITE_DONE || second.consumed != 2
      || output[9] != 1 || output[11] != 3) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.frame: padding and window attacks fail at frame boundary" {
+    var parser: Parser;
+    parser_init(?parser, limits_default());
+    var header: [9]u8;
+    header[2] = 2; header[3] = FRAME_DATA; header[4] = FLAG_PADDED; header[8] = 1;
+    if (feed(?parser, ?header[0], 9, false).kind != EVENT_HEADER) { ret 1; }
+    var padded: [2]u8;
+    padded[0] = 2;
+    if (feed(?parser, ?padded[0], 2, false).kind != EVENT_PAYLOAD
+     || !release(?parser) || feed(?parser, nil, 0, false).error != ERROR_PROTOCOL) {
+        ret 2;
+    }
+    var window_parser: Parser;
+    parser_init(?window_parser, limits_default());
+    memory.raw_zero(?header[0], 9);
+    header[2] = 4; header[3] = FRAME_WINDOW_UPDATE; header[8] = 1;
+    if (feed(?window_parser, ?header[0], 9, false).kind != EVENT_HEADER) { ret 3; }
+    var zero: [4]u8;
+    if (feed(?window_parser, ?zero[0], 4, false).kind != EVENT_PAYLOAD
+     || !release(?window_parser)
+     || feed(?window_parser, nil, 0, false).error != ERROR_PROTOCOL) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.frame: oversized and truncated frames are distinguished" {
+    var parser: Parser;
+    parser_init(?parser, limits_default());
+    var oversized: [9]u8;
+    oversized[0] = 0; oversized[1] = 0x40; oversized[2] = 1;
+    oversized[3] = FRAME_DATA; oversized[8] = 1;
+    if (feed(?parser, ?oversized[0], 9, false).error != ERROR_FRAME_SIZE) { ret 1; }
+    var truncated_header: Parser;
+    parser_init(?truncated_header, limits_default());
+    if (feed(?truncated_header, ?oversized[0], 8, true).error != ERROR_TRUNCATED) { ret 2; }
+    var truncated_payload: Parser;
+    parser_init(?truncated_payload, limits_default());
+    oversized[1] = 0; oversized[2] = 2;
+    if (feed(?truncated_payload, ?oversized[0], 9, false).kind != EVENT_HEADER
+     || feed(?truncated_payload, nil, 0, true).error != ERROR_TRUNCATED) { ret 3; }
+    var extension: Parser;
+    parser_init(?extension, limits_default());
+    memory.raw_zero(?oversized[0], 9);
+    oversized[3] = 0xf0;
+    if (feed(?extension, ?oversized[0], 9, false).kind != EVENT_HEADER
+     || feed(?extension, nil, 0, false).kind != EVENT_FRAME_END) { ret 4; }
     ret 0;
 }
