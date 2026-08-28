@@ -2,16 +2,19 @@
 
 Lightweight HTTP protocol and application contracts for Mach.
 
-This repository currently establishes the public shapes that the protocol engines,
-servers, clients, routers, and application frameworks share. It is scaffolding, not
-a working HTTP implementation. Parsing, serialization, routing, and network I/O are
-intentionally not represented as complete.
+The version-neutral service exchange is implemented. It provides bounded methods,
+statuses, fields, targets, metadata, informational responses, trailers, response
+construction, hierarchical cancellation, and streaming body lifecycles shared by
+HTTP/1, HTTP/2, and HTTP/3. Protocol parsing, serialization, routing, connection
+engines, and network I/O remain under development.
 
 ## Design
 
 - Core request and response types do not expose HTTP/1 connection details.
 - Header and target values are borrowed bounded views.
 - Bodies are streaming and bounded by caller-provided buffers.
+- Body readers and writers expose stable pending-operation tokens, exact completion,
+  drain, rejection, cancellation, deadlines, trailers, and protocol-decided reuse.
 - Transports use stable operation tokens so readiness and completion backends fit.
 - Routing storage is caller-owned. The router does not require a global allocator.
 - HTTP/1.1, HTTP/2, HTTP/3, and WebSocket state are isolated from the version-neutral application contract.
@@ -31,8 +34,7 @@ src/
   websocket   upgrade and message framing contracts
 ```
 
-The missing implementation and validation work is tracked in Hedge, which owns the
-production server roadmap and integration requirements.
+The remaining protocol and integration work is tracked in this repository.
 
 ## Development
 
