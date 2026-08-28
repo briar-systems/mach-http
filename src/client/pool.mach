@@ -9,6 +9,7 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.view;
 use http.client.policy;
+use http.client.memory;
 use http.core.body;
 use http.core.message;
 
@@ -140,6 +141,7 @@ pub def ActivateStatus: u8;
 pub val ACTIVATE_OK:      ActivateStatus = 1;
 pub val ACTIVATE_INVALID: ActivateStatus = 2;
 pub val ACTIVATE_CLOSE:   ActivateStatus = 3;
+pub val ACTIVATE_WAIT:    ActivateStatus = 4;
 
 pub rec Activated {
     status: ActivateStatus;
@@ -274,24 +276,23 @@ fun config_valid(configured: Config, capacity: usize,
         && configured.max_streams_per_connection != 0;
 }
 
-fun byte_ranges_overlap(first: ptr, first_size: usize,
-    second: ptr, second_size: usize) bool {
-    if (first == nil || second == nil || first_size == 0 || second_size == 0) {
-        ret false;
-    }
-    val first_start: usize = first::usize;
-    val second_start: usize = second::usize;
-    if (first_start > ~(0::usize) - first_size
-        || second_start > ~(0::usize) - second_size) { ret true; }
-    ret first_start < second_start + second_size
-        && second_start < first_start + first_size;
+fun pool_object(pool: *Pool) bool {
+    ret memory.range(pool::ptr, $size_of(Pool));
+}
+
+fun pool_ready(pool: *Pool) bool {
+    if (!pool_object(pool) || !pool.initialized) { ret false; }
+    ret memory.count(pool.connections::ptr, pool.capacity,
+            $size_of(Connection))
+        && memory.count(pool.leases::ptr, pool.lease_capacity,
+            $size_of(LeaseSlot));
 }
 
 fun overlaps_pool(pool: *Pool, value: ptr, size: usize) bool {
-    ret byte_ranges_overlap(value, size, pool::ptr, $size_of(Pool))
-        || byte_ranges_overlap(value, size, pool.connections::ptr,
+    ret memory.overlap(value, size, pool::ptr, $size_of(Pool))
+        || memory.overlap(value, size, pool.connections::ptr,
             pool.capacity * $size_of(Connection))
-        || byte_ranges_overlap(value, size, pool.leases::ptr,
+        || memory.overlap(value, size, pool.leases::ptr,
             pool.lease_capacity * $size_of(LeaseSlot));
 }
 
@@ -334,13 +335,16 @@ fun clear_connection(connection: *Connection) {
 
 pub fun init(pool: *Pool, connections: *Connection, capacity: usize,
     leases: *LeaseSlot, lease_capacity: usize, configured: Config) bool {
-    if (pool == nil || pool.initialized || connections == nil || leases == nil
+    if (!pool_object(pool)
+        || !memory.count(connections::ptr, capacity, $size_of(Connection))
+        || !memory.count(leases::ptr, lease_capacity, $size_of(LeaseSlot))
+        || pool.initialized
         || !config_valid(configured, capacity, lease_capacity)) { ret false; }
-    if (byte_ranges_overlap(pool::ptr, $size_of(Pool), connections::ptr,
+    if (memory.overlap(pool::ptr, $size_of(Pool), connections::ptr,
             capacity * $size_of(Connection))
-        || byte_ranges_overlap(pool::ptr, $size_of(Pool), leases::ptr,
+        || memory.overlap(pool::ptr, $size_of(Pool), leases::ptr,
             lease_capacity * $size_of(LeaseSlot))
-        || byte_ranges_overlap(connections::ptr,
+        || memory.overlap(connections::ptr,
             capacity * $size_of(Connection), leases::ptr,
             lease_capacity * $size_of(LeaseSlot))) { ret false; }
     pool.connections = connections;
@@ -513,7 +517,7 @@ fun better(first: *Connection, second: *Connection) bool {
 
 pub fun acquire(pool: *Pool, route: policy.Route,
     configured: policy.ProtocolPolicy, now: time.Time) Acquire {
-    if (pool == nil || !pool.initialized || !policy.route_valid(route, 253)
+    if (!pool_ready(pool) || !policy.route_valid(route, 253)
         || !policy.protocol_valid(configured) || !time_valid(now)
         || route_aliases_pool(pool, route)) {
         ret Acquire{status: ACQUIRE_INVALID, lease: empty_lease()};
@@ -633,7 +637,7 @@ pub fun reserve(pool: *Pool, route: policy.Route, endpoint: ip.Endpoint,
     transport: policy.TransportKind, now: time.Time) Reservation {
     var expected_port: u16 = route.origin.port;
     if (route.proxy.kind != policy.PROXY_NONE) { expected_port = route.proxy.port; }
-    if (pool == nil || !pool.initialized || !policy.route_valid(route, 253)
+    if (!pool_ready(pool) || !policy.route_valid(route, 253)
         || (transport != policy.TRANSPORT_TCP
             && transport != policy.TRANSPORT_QUIC)
         || !policy.proxy_supports(route.proxy, transport)
@@ -678,11 +682,30 @@ pub fun reserve(pool: *Pool, route: policy.Route, endpoint: ip.Endpoint,
         lease: lease_token, endpoint: endpoint, transport: transport};
 }
 
+fun driver_owned_locked(pool: *Pool, driver: ptr) bool {
+    var i: usize = 0;
+    for (i < pool.capacity) {
+        val connection: *Connection = ?pool.connections[i];
+        if (connection.state != CONNECTION_EMPTY
+            && connection.driver == driver) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun driver_owned(pool: *Pool, driver: ptr) bool {
+    if (!pool_ready(pool) || !memory.range(driver, 1)) { ret false; }
+    mutex.lock(?pool.lock);
+    val owned: bool = driver_owned_locked(pool, driver);
+    mutex.unlock(?pool.lock);
+    ret owned;
+}
+
 pub fun activate(pool: *Pool, reservation: Reservation,
     wire: message.Wire, driver: ptr, max_streams: usize,
     now: time.Time) Activated {
-    if (pool == nil || !pool.initialized || reservation.status != RESERVE_OK
-        || driver == nil || max_streams == 0 || !time_valid(now)
+    if (!pool_ready(pool) || reservation.status != RESERVE_OK
+        || !memory.range(driver, 1) || !time_valid(now)
         || overlaps_pool(pool, driver, 1)
         || (wire != message.WIRE_H1 && wire != message.WIRE_H2
             && wire != message.WIRE_H3)
@@ -695,6 +718,10 @@ pub fun activate(pool: *Pool, reservation: Reservation,
         ret Activated{status: ACTIVATE_INVALID, lease: empty_lease()};
     }
     mutex.lock(?pool.lock);
+    if (driver_owned_locked(pool, driver)) {
+        mutex.unlock(?pool.lock);
+        ret Activated{status: ACTIVATE_INVALID, lease: empty_lease()};
+    }
     val connection: *Connection = connection_for_locked(pool,
         reservation.connection);
     val lease: *LeaseSlot = lease_for_locked(pool, reservation.lease);
@@ -711,16 +738,30 @@ pub fun activate(pool: *Pool, reservation: Reservation,
     connection.wire = wire;
     connection.driver = driver;
     connection.max_streams = max_streams;
-    connection.active_streams = 1;
+    connection.active_streams = 0;
     connection.last_used_at = now;
     connection.idle_deadline = deadline(now, pool.configured.idle_timeout_ns);
     if (!pool.accepting) {
         release_lease_locked(pool, lease);
-        connection.active_streams = 0;
         connection.state = CONNECTION_CLOSING;
         mutex.unlock(?pool.lock);
         ret Activated{status: ACTIVATE_CLOSE, lease: empty_lease()};
     }
+    if (max_streams == 0) {
+        release_lease_locked(pool, lease);
+        if (pool.configured.max_idle == 0
+            || pool.configured.max_idle_per_route == 0
+            || idle_count_locked(pool) > pool.configured.max_idle
+            || idle_route_count_locked(pool, ?connection.route)
+                > pool.configured.max_idle_per_route) {
+            connection.state = CONNECTION_CLOSING;
+            mutex.unlock(?pool.lock);
+            ret Activated{status: ACTIVATE_CLOSE, lease: empty_lease()};
+        }
+        mutex.unlock(?pool.lock);
+        ret Activated{status: ACTIVATE_WAIT, lease: empty_lease()};
+    }
+    connection.active_streams = 1;
     lease.state = LEASE_LIVE;
     val value: Lease = lease_value(reservation.lease, lease, connection);
     mutex.unlock(?pool.lock);
@@ -728,7 +769,7 @@ pub fun activate(pool: *Pool, reservation: Reservation,
 }
 
 pub fun fail_connect(pool: *Pool, reservation: Reservation) bool {
-    if (pool == nil || !pool.initialized || reservation.status != RESERVE_OK) {
+    if (!pool_ready(pool) || reservation.status != RESERVE_OK) {
         ret false;
     }
     mutex.lock(?pool.lock);
@@ -810,7 +851,7 @@ fun idle_route_count_locked(pool: *Pool, route: *StoredRoute) usize {
 
 pub fun release(pool: *Pool, value: Lease, reuse: body.Reuse,
     now: time.Time) ReleaseStatus {
-    if (pool == nil || !pool.initialized || !time_valid(now)
+    if (!pool_ready(pool) || !time_valid(now)
         || (reuse != body.REUSE_ALLOWED && reuse != body.REUSE_FORBIDDEN)) {
         ret RELEASE_INVALID;
     }
@@ -851,7 +892,7 @@ pub fun release(pool: *Pool, value: Lease, reuse: body.Reuse,
 }
 
 pub fun mark_draining(pool: *Pool, token: ConnectionToken) bool {
-    if (pool == nil || !pool.initialized) { ret false; }
+    if (!pool_ready(pool)) { ret false; }
     mutex.lock(?pool.lock);
     val connection: *Connection = connection_for_locked(pool, token);
     if (connection == nil || connection.state == CONNECTION_CONNECTING
@@ -870,7 +911,7 @@ pub fun mark_draining(pool: *Pool, token: ConnectionToken) bool {
 
 pub fun update_max_streams(pool: *Pool, token: ConnectionToken,
     max_streams: usize) bool {
-    if (pool == nil || !pool.initialized || max_streams == 0
+    if (!pool_ready(pool)
         || max_streams > pool.configured.max_streams_per_connection) {
         ret false;
     }
@@ -894,7 +935,7 @@ fun expired_idle(connection: *Connection, now: time.Time) bool {
 }
 
 pub fun take_close(pool: *Pool, now: time.Time) Close {
-    if (pool == nil || !pool.initialized || !time_valid(now)) {
+    if (!pool_ready(pool) || !time_valid(now)) {
         ret empty_close();
     }
     mutex.lock(?pool.lock);
@@ -922,7 +963,7 @@ pub fun take_close(pool: *Pool, now: time.Time) Close {
 }
 
 pub fun retire(pool: *Pool, close: Close) bool {
-    if (pool == nil || !pool.initialized || !close.found) { ret false; }
+    if (!pool_ready(pool) || !close.found) { ret false; }
     mutex.lock(?pool.lock);
     val connection: *Connection = connection_for_locked(pool,
         close.connection);
@@ -939,7 +980,7 @@ pub fun retire(pool: *Pool, close: Close) bool {
 }
 
 pub fun drain(pool: *Pool) bool {
-    if (pool == nil || !pool.initialized) { ret false; }
+    if (!pool_ready(pool)) { ret false; }
     mutex.lock(?pool.lock);
     if (!pool.accepting) {
         mutex.unlock(?pool.lock);
@@ -963,7 +1004,7 @@ pub fun drain(pool: *Pool) bool {
 }
 
 pub fun take_connect_cancel(pool: *Pool) ConnectCancel {
-    if (pool == nil || !pool.initialized) {
+    if (!pool_ready(pool)) {
         ret empty_connect_cancel();
     }
     mutex.lock(?pool.lock);
@@ -1007,7 +1048,7 @@ pub fun snapshot(pool: *Pool) Snapshot {
     var result: Snapshot = Snapshot{accepting: false, live_connections: 0,
         connecting: 0, open: 0, draining: 0, closing: 0, idle: 0,
         live_leases: 0};
-    if (pool == nil || !pool.initialized) { ret result; }
+    if (!pool_ready(pool)) { ret result; }
     mutex.lock(?pool.lock);
     result.accepting = pool.accepting;
     result.live_connections = pool.live_connections;
@@ -1034,7 +1075,7 @@ pub fun snapshot(pool: *Pool) Snapshot {
 }
 
 pub fun destroy(pool: *Pool) bool {
-    if (pool == nil || !pool.initialized) { ret false; }
+    if (!pool_ready(pool)) { ret false; }
     mutex.lock(?pool.lock);
     if (pool.accepting || pool.live_connections != 0 || pool.live_leases != 0) {
         mutex.unlock(?pool.lock);
@@ -1084,7 +1125,7 @@ test "http.client.pool: multiplexed leases release exactly once" {
         || connection_equal(first.lease.connection, empty_connection_token())
         || !connection_equal(first.lease.connection, second.lease.connection)
         || lease_equal(first.lease.token, second.lease.token)) { ret 2; }
-    if (!update_max_streams(?value, first.lease.connection, 1)
+    if (!update_max_streams(?value, first.lease.connection, 0)
         || acquire(?value, route, policy.protocols_default(), now).status
             != ACQUIRE_MISS
         || release(?value, first.lease, body.REUSE_ALLOWED, now) != RELEASE_OK
@@ -1136,13 +1177,18 @@ test "http.client.pool: routes and proxy identities isolate retention" {
     val first_active: Activated = activate(?value, first, message.WIRE_H1,
         (?first_driver)::ptr, 1, now);
     if (first_active.status != ACTIVATE_OK
+        || !driver_owned(?value, (?first_driver)::ptr)
+        || update_max_streams(?value, first_active.lease.connection, 0)
         || reserve(?value, first_route, ip.endpoint(192, 0, 2, 2, 443),
             policy.TRANSPORT_TCP, now).status != RESERVE_SATURATED
         || acquire(?value, second_route, policy.protocols_default(), now).status
             != ACQUIRE_MISS) { ret 2; }
     val second: Reservation = reserve(?value, second_route,
         ip.endpoint(192, 0, 2, 3, 8443), policy.TRANSPORT_TCP, now);
-    if (second.status != RESERVE_OK || !fail_connect(?value, second)
+    if (second.status != RESERVE_OK
+        || activate(?value, second, message.WIRE_H1,
+            (?first_driver)::ptr, 1, now).status != ACTIVATE_INVALID
+        || !fail_connect(?value, second)
         || fail_connect(?value, second)) { ret 3; }
     if (release(?value, first_active.lease, body.REUSE_ALLOWED, now)
         != RELEASE_OK || !drain(?value)) { ret 4; }
