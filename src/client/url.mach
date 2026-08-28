@@ -1,0 +1,385 @@
+# strict borrowed HTTP URL parsing
+
+use std.net.ip;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use http.client.policy;
+
+pub def Status: u8;
+pub val URL_OK:              Status = 1;
+pub val URL_INVALID:         Status = 2;
+pub val URL_LIMIT:           Status = 3;
+pub val URL_SCHEME:          Status = 4;
+pub val URL_AUTHORITY:       Status = 5;
+pub val URL_HOST:            Status = 6;
+pub val URL_PORT:            Status = 7;
+pub val URL_PERCENT_ENCODING: Status = 8;
+
+pub rec Limits {
+    max_url_bytes:       usize;
+    max_authority_bytes: usize;
+    max_host_bytes:      usize;
+    max_path_bytes:      usize;
+    max_query_bytes:     usize;
+    max_fragment_bytes:  usize;
+}
+
+pub rec URL {
+    raw:          view.View;
+    scheme:       policy.Scheme;
+    scheme_text:  view.View;
+    authority:    view.View;
+    host:         view.View;
+    port:         u16;
+    explicit_port: bool;
+    ipv6_literal: bool;
+    path:         view.View;
+    query:        view.View;
+    has_query:    bool;
+    fragment:     view.View;
+    has_fragment: bool;
+}
+
+pub rec Parsed {
+    status: Status;
+    url:    URL;
+}
+
+pub fun limits_default() Limits {
+    ret Limits{max_url_bytes: 8192, max_authority_bytes: 1024,
+        max_host_bytes: 253, max_path_bytes: 4096, max_query_bytes: 4096,
+        max_fragment_bytes: 4096};
+}
+
+fun empty_url() URL {
+    val absent: view.View = view.view(nil, 0);
+    ret URL{raw: absent, scheme: 0, scheme_text: absent, authority: absent,
+        host: absent, port: 0, explicit_port: false, ipv6_literal: false,
+        path: absent, query: absent, has_query: false, fragment: absent,
+        has_fragment: false};
+}
+
+fun parsed_status(status: Status) Parsed {
+    ret Parsed{status: status, url: empty_url()};
+}
+
+fun limits_valid(configured: Limits) bool {
+    ret configured.max_url_bytes != 0
+        && configured.max_authority_bytes != 0
+        && configured.max_host_bytes != 0
+        && configured.max_host_bytes <= 253
+        && configured.max_path_bytes != 0
+        && configured.max_query_bytes != 0
+        && configured.max_fragment_bytes != 0;
+}
+
+fun fold(value: u8) u8 {
+    if (value >= 'A' && value <= 'Z') { ret value + 32; }
+    ret value;
+}
+
+fun text_fold(value: view.View, expected: *u8, expected_len: usize) bool {
+    if (value.data == nil || value.len != expected_len) { ret false; }
+    var i: usize = 0;
+    for (i < expected_len) {
+        if (fold(value.data[i]) != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun hex(value: u8) bool {
+    ret (value >= '0' && value <= '9') || (value >= 'A' && value <= 'F')
+        || (value >= 'a' && value <= 'f');
+}
+
+fun percent_valid(value: view.View) bool {
+    if (value.len != 0 && value.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val current: u8 = value.data[i];
+        if (current == '%') {
+            if (i + 2 >= value.len || !hex(value.data[i + 1])
+                || !hex(value.data[i + 2])) { ret false; }
+            i = i + 3;
+        } or {
+            if (current < 0x21 || current > 0x7e) { ret false; }
+            i = i + 1;
+        }
+    }
+    ret true;
+}
+
+fun reg_name_char(value: u8) bool {
+    ret (value >= '0' && value <= '9') || (value >= 'A' && value <= 'Z')
+        || (value >= 'a' && value <= 'z') || value == '-' || value == '.'
+        || value == '_' || value == '~' || value == '!' || value == '$'
+        || value == '&' || value == 39 || value == '(' || value == ')'
+        || value == '*' || value == '+' || value == ',' || value == ';'
+        || value == '=' || value == '%';
+}
+
+fun pchar(value: u8) bool {
+    ret (value >= '0' && value <= '9') || (value >= 'A' && value <= 'Z')
+        || (value >= 'a' && value <= 'z') || value == '-' || value == '.'
+        || value == '_' || value == '~' || value == '!' || value == '$'
+        || value == '&' || value == 39 || value == '(' || value == ')'
+        || value == '*' || value == '+' || value == ',' || value == ';'
+        || value == '=' || value == ':' || value == '@' || value == '%';
+}
+
+fun component_valid(value: view.View, allow_slash: bool,
+    allow_question: bool) bool {
+    if (!percent_valid(value)) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val current: u8 = value.data[i];
+        if (!pchar(current) && !(allow_slash && current == '/')
+            && !(allow_question && current == '?')) { ret false; }
+        if (current == '%') { i = i + 2; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun reg_name_valid(value: view.View) bool {
+    if (value.data == nil || value.len == 0 || value.data[0] == '.'
+        || value.data[value.len - 1] == '.' || !percent_valid(value)) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < value.len) {
+        if (!reg_name_char(value.data[i])) { ret false; }
+        if (value.data[i] == '%') { i = i + 2; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun ipv6_valid(value: view.View) bool {
+    if (value.data == nil || value.len == 0 || value.len > 253) { ret false; }
+    var text: [254]u8;
+    var i: usize = 0;
+    for (i < value.len) {
+        text[i] = value.data[i];
+        i = i + 1;
+    }
+    text[value.len] = 0;
+    val parsed: Result[ip.IPv6, str] = ip.ipv6_parse(?text[0]);
+    ret !is_err[ip.IPv6, str](parsed);
+}
+
+fun parse_port(value: view.View, output: *u16) bool {
+    if (value.data == nil || value.len == 0 || output == nil) { ret false; }
+    var number: u32 = 0;
+    var i: usize = 0;
+    for (i < value.len) {
+        val digit: u8 = value.data[i];
+        if (digit < '0' || digit > '9') { ret false; }
+        val unit: u32 = (digit - '0')::u32;
+        if (number > (65535 - unit) / 10) { ret false; }
+        number = number * 10 + unit;
+        i = i + 1;
+    }
+    if (number == 0) { ret false; }
+    @output = number::u16;
+    ret true;
+}
+
+fun first_of(input: view.View, start: usize, first: u8,
+    second: u8, third: u8) usize {
+    var i: usize = start;
+    for (i < input.len) {
+        val current: u8 = input.data[i];
+        if (current == first || current == second || current == third) {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret input.len;
+}
+
+pub fun parse(input: view.View, configured: Limits) Parsed {
+    if (!limits_valid(configured) || input.data == nil || input.len == 0) {
+        ret parsed_status(URL_INVALID);
+    }
+    if (input.len > configured.max_url_bytes) { ret parsed_status(URL_LIMIT); }
+    var scheme_end: usize = 0;
+    for (scheme_end < input.len && input.data[scheme_end] != ':') {
+        scheme_end = scheme_end + 1;
+    }
+    if (scheme_end == input.len || scheme_end + 2 >= input.len
+        || input.data[scheme_end + 1] != '/'
+        || input.data[scheme_end + 2] != '/') { ret parsed_status(URL_SCHEME); }
+    val scheme_text: view.View = view.view(input.data, scheme_end);
+    var scheme: policy.Scheme = 0;
+    var port: u16 = 0;
+    if (text_fold(scheme_text, "http", 4)) {
+        scheme = policy.HTTP;
+        port = 80;
+    } or (text_fold(scheme_text, "https", 5)) {
+        scheme = policy.HTTPS;
+        port = 443;
+    } or { ret parsed_status(URL_SCHEME); }
+    val authority_start: usize = scheme_end + 3;
+    val authority_end: usize = first_of(input, authority_start, '/', '?', '#');
+    if (authority_end == authority_start
+        || authority_end - authority_start > configured.max_authority_bytes) {
+        ret parsed_status(URL_AUTHORITY);
+    }
+    val authority: view.View = view.view(?input.data[authority_start],
+        authority_end - authority_start);
+    var i: usize = 0;
+    for (i < authority.len) {
+        if (authority.data[i] == '@' || authority.data[i] == '\\'
+            || authority.data[i] <= 0x20 || authority.data[i] == 0x7f) {
+            ret parsed_status(URL_AUTHORITY);
+        }
+        i = i + 1;
+    }
+    var host: view.View;
+    var explicit_port: bool = false;
+    var ipv6_literal: bool = false;
+    if (authority.data[0] == '[') {
+        var close: usize = 1;
+        for (close < authority.len && authority.data[close] != ']') {
+            close = close + 1;
+        }
+        if (close == authority.len || close == 1) {
+            ret parsed_status(URL_HOST);
+        }
+        host = view.view(?authority.data[1], close - 1);
+        ipv6_literal = true;
+        if (!ipv6_valid(host)) { ret parsed_status(URL_HOST); }
+        if (close + 1 < authority.len) {
+            if (authority.data[close + 1] != ':') {
+                ret parsed_status(URL_AUTHORITY);
+            }
+            explicit_port = true;
+            if (!parse_port(view.view(?authority.data[close + 2],
+                authority.len - close - 2), ?port)) {
+                ret parsed_status(URL_PORT);
+            }
+        } or (close + 1 != authority.len) {
+            ret parsed_status(URL_AUTHORITY);
+        }
+    } or {
+        var colon: usize = authority.len;
+        i = 0;
+        for (i < authority.len) {
+            if (authority.data[i] == ':') {
+                if (colon != authority.len) { ret parsed_status(URL_HOST); }
+                colon = i;
+            }
+            i = i + 1;
+        }
+        host = authority;
+        if (colon != authority.len) {
+            host = view.view(authority.data, colon);
+            explicit_port = true;
+            if (!parse_port(view.view(?authority.data[colon + 1],
+                authority.len - colon - 1), ?port)) {
+                ret parsed_status(URL_PORT);
+            }
+        }
+        if (!reg_name_valid(host)) { ret parsed_status(URL_HOST); }
+    }
+    if (host.len > configured.max_host_bytes) { ret parsed_status(URL_LIMIT); }
+    var path_end: usize = first_of(input, authority_end, '?', '#', 0);
+    if (authority_end < input.len && input.data[authority_end] != '/') {
+        path_end = authority_end;
+    }
+    val path: view.View = view.view(?input.data[authority_end],
+        path_end - authority_end);
+    if (path.len > configured.max_path_bytes || !percent_valid(path)) {
+        if (path.len > configured.max_path_bytes) { ret parsed_status(URL_LIMIT); }
+        ret parsed_status(URL_PERCENT_ENCODING);
+    }
+    if (!component_valid(path, true, false)) { ret parsed_status(URL_INVALID); }
+    var query: view.View = view.view(nil, 0);
+    var has_query: bool = false;
+    var fragment: view.View = view.view(nil, 0);
+    var has_fragment: bool = false;
+    var fragment_at: usize = input.len;
+    i = authority_end;
+    for (i < input.len) {
+        if (input.data[i] == '#') { fragment_at = i; brk; }
+        i = i + 1;
+    }
+    if (path_end < input.len && input.data[path_end] == '?') {
+        has_query = true;
+        query = view.view(?input.data[path_end + 1], fragment_at - path_end - 1);
+    }
+    if (fragment_at < input.len) {
+        has_fragment = true;
+        fragment = view.view(?input.data[fragment_at + 1],
+            input.len - fragment_at - 1);
+    }
+    if (query.len > configured.max_query_bytes
+        || fragment.len > configured.max_fragment_bytes) {
+        ret parsed_status(URL_LIMIT);
+    }
+    if (!percent_valid(query) || !percent_valid(fragment)) {
+        ret parsed_status(URL_PERCENT_ENCODING);
+    }
+    if (!component_valid(query, true, true)
+        || !component_valid(fragment, true, true)) {
+        ret parsed_status(URL_INVALID);
+    }
+    ret Parsed{status: URL_OK, url: URL{raw: input, scheme: scheme,
+        scheme_text: scheme_text, authority: authority, host: host, port: port,
+        explicit_port: explicit_port, ipv6_literal: ipv6_literal, path: path,
+        query: query, has_query: has_query, fragment: fragment,
+        has_fragment: has_fragment}};
+}
+
+pub fun route(value: URL, proxy: policy.Proxy) policy.Route {
+    ret policy.Route{origin: policy.Origin{scheme: value.scheme,
+        host: value.host, port: value.port}, proxy: proxy};
+}
+
+pub fun route_valid(value: URL, proxy: policy.Proxy) bool {
+    ret value.scheme != 0 && !value.has_fragment
+        && policy.route_valid(route(value, proxy), 253);
+}
+
+pub fun secure(value: URL) bool {
+    ret value.scheme == policy.HTTPS;
+}
+
+test "http.client.url: schemes are case insensitive and exact URLs remain borrowed" {
+    val parsed: Parsed = parse(view.view(
+        "HTTPS://Example.COM:8443/acme/new?x=1", 37), limits_default());
+    if (parsed.status != URL_OK || parsed.url.scheme != policy.HTTPS
+        || parsed.url.raw.data[0] != 'H' || parsed.url.host.len != 11
+        || parsed.url.port != 8443 || !parsed.url.explicit_port
+        || parsed.url.path.len != 9 || parsed.url.query.len != 3
+        || !route_valid(parsed.url, policy.no_proxy())) { ret 1; }
+    val clear: Parsed = parse(view.view("HtTp://example.com", 18),
+        limits_default());
+    if (clear.status != URL_OK || clear.url.port != 80
+        || clear.url.path.len != 0) { ret 2; }
+    ret 0;
+}
+
+test "http.client.url: authority literals and unsafe forms are distinguished" {
+    val literal: Parsed = parse(view.view("https://[2001:db8::1]/", 22),
+        limits_default());
+    if (literal.status != URL_OK || !literal.url.ipv6_literal
+        || literal.url.host.len != 11 || literal.url.port != 443) { ret 1; }
+    if (parse(view.view("https://user@example.com/", 25),
+            limits_default()).status != URL_AUTHORITY
+        || parse(view.view("https://example.com/%zz", 23),
+            limits_default()).status != URL_PERCENT_ENCODING
+        || parse(view.view("https://example.com:0/", 22),
+            limits_default()).status != URL_PORT
+        || parse(view.view("ftp://example.com/", 18),
+            limits_default()).status != URL_SCHEME) { ret 2; }
+    ret 0;
+}
