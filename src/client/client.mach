@@ -14,6 +14,7 @@ use http.client.memory;
 use http.client.policy;
 use http.client.pool;
 use http.core.body;
+use common_exchange: http.core.exchange;
 use http.core.field;
 use http.core.message;
 use http.core.method;
@@ -538,6 +539,9 @@ pub fun init(client: *Client, cache: *dns.Cache, connections: *pool.Pool,
         || !config_valid(configured, capacity, endpoint_capacity, cache)) {
         ret false;
     }
+    val dns_state: dns.Snapshot = dns.snapshot(cache);
+    val pool_state: pool.Snapshot = pool.snapshot(connections);
+    if (!dns_state.accepting || !pool_state.accepting) { ret false; }
     var regions: [9]MemoryRegion;
     regions[0] = region(client::ptr, 1, $size_of(Client));
     regions[1] = region(slots::ptr, capacity, $size_of(RequestSlot));
@@ -612,11 +616,16 @@ fun view_aliases(client: *Client, value: view.View) bool {
     ret value.len != 0 && overlaps_client(client, value.data::ptr, value.len);
 }
 
-fun fields_representable(fields: *field.Fields) bool {
+fun fields_storage_representable(fields: *field.Fields) bool {
     if (!memory.range(fields::ptr, $size_of(field.Fields))
         || fields.len > fields.capacity
         || !memory.count(fields.items::ptr, fields.capacity,
             $size_of(field.Field))) { ret false; }
+    ret true;
+}
+
+fun fields_representable(fields: *field.Fields) bool {
+    if (!fields_storage_representable(fields)) { ret false; }
     var i: usize = 0;
     for (i < fields.len) {
         if (!memory.borrowed(fields.items[i].name)
@@ -660,17 +669,31 @@ fun request_representable(request: *message.Request) bool {
     ret true;
 }
 
+fun request_storage_representable(request: *message.Request) bool {
+    if (!memory.range(request::ptr, $size_of(message.Request))) { ret false; }
+    if (!memory.range(request.body::ptr, $size_of(body.Reader))
+        || !memory.borrowed(request.method.token)
+        || !memory.borrowed(request.target.raw)
+        || !memory.borrowed(request.target.scheme)
+        || !memory.borrowed(request.target.authority)
+        || !memory.borrowed(request.target.path)
+        || !memory.borrowed(request.target.query)
+        || !memory.borrowed(request.metadata.peer.address)
+        || !memory.borrowed(request.metadata.local.address)
+        || !fields_storage_representable(?request.fields)
+        || !fields_storage_representable(?request.trailers)) { ret false; }
+    ret true;
+}
+
 fun route_representable(route: policy.Route) bool {
     ret memory.borrowed(route.origin.host)
         && memory.borrowed(route.proxy.host);
 }
 
-fun request_aliases(client: *Client, request: *message.Request) bool {
+fun request_aliases(client: *Client, request: *message.Request,
+    allowed_scope: *cancellation.Scope) bool {
     if (overlaps_client(client, request::ptr, $size_of(message.Request))
-        || overlaps_client(client, request.body::ptr, $size_of(body.Reader))
-        || overlaps_client(client, request.body.ctx, 1)
-        || overlaps_client(client, request.body.scope::ptr,
-            $size_of(cancellation.Scope))
+        || reader_alias(client, request.body, allowed_scope)
         || view_aliases(client, request.method.token)
         || view_aliases(client, request.target.raw)
         || view_aliases(client, request.target.scheme)
@@ -679,12 +702,12 @@ fun request_aliases(client: *Client, request: *message.Request) bool {
         || view_aliases(client, request.target.query)
         || view_aliases(client, request.metadata.peer.address)
         || view_aliases(client, request.metadata.local.address)) { ret true; }
-    if (request.fields.len > ~(0::usize) / $size_of(field.Field)
-        || request.trailers.len > ~(0::usize) / $size_of(field.Field)
+    if (request.fields.capacity > ~(0::usize) / $size_of(field.Field)
+        || request.trailers.capacity > ~(0::usize) / $size_of(field.Field)
         || overlaps_client(client, request.fields.items::ptr,
-            request.fields.len * $size_of(field.Field))
+            request.fields.capacity * $size_of(field.Field))
         || overlaps_client(client, request.trailers.items::ptr,
-            request.trailers.len * $size_of(field.Field))) { ret true; }
+            request.trailers.capacity * $size_of(field.Field))) { ret true; }
     var i: usize = 0;
     for (i < request.fields.len) {
         if (view_aliases(client, request.fields.items[i].name)
@@ -703,9 +726,12 @@ fun request_aliases(client: *Client, request: *message.Request) bool {
 }
 
 fun fields_alias(client: *Client, fields: *field.Fields) bool {
-    if (fields == nil || fields.len > ~(0::usize) / $size_of(field.Field)
+    if (fields == nil
+        || !memory.range(fields::ptr, $size_of(field.Fields))
+        || overlaps_client(client, fields::ptr, $size_of(field.Fields))
+        || !fields_storage_representable(fields)
         || overlaps_client(client, fields.items::ptr,
-            fields.len * $size_of(field.Field))) { ret true; }
+            fields.capacity * $size_of(field.Field))) { ret true; }
     var i: usize = 0;
     for (i < fields.len) {
         if (view_aliases(client, fields.items[i].name)
@@ -715,31 +741,42 @@ fun fields_alias(client: *Client, fields: *field.Fields) bool {
     ret false;
 }
 
-fun reader_alias(client: *Client, reader: *body.Reader) bool {
+fun reader_alias(client: *Client, reader: *body.Reader,
+    allowed_scope: *cancellation.Scope) bool {
     ret reader != nil
-        && (overlaps_client(client, reader::ptr, $size_of(body.Reader))
+        && (!memory.range(reader::ptr, $size_of(body.Reader))
+            || overlaps_client(client, reader::ptr, $size_of(body.Reader))
             || overlaps_client(client, reader.ctx, 1)
-            || overlaps_client(client, reader.scope::ptr,
-                $size_of(cancellation.Scope)));
+            || (reader.scope != allowed_scope
+                && overlaps_client(client, reader.scope::ptr,
+                    $size_of(cancellation.Scope)))
+            || (reader.trailers != nil
+                && fields_alias(client, reader.trailers)));
 }
 
-fun writer_alias(client: *Client, writer: *body.Writer) bool {
+fun writer_alias(client: *Client, writer: *body.Writer,
+    allowed_scope: *cancellation.Scope) bool {
     ret writer != nil
-        && (overlaps_client(client, writer::ptr, $size_of(body.Writer))
+        && (!memory.range(writer::ptr, $size_of(body.Writer))
+            || overlaps_client(client, writer::ptr, $size_of(body.Writer))
             || overlaps_client(client, writer.ctx, 1)
-            || overlaps_client(client, writer.scope::ptr,
-                $size_of(cancellation.Scope)));
+            || (writer.scope != allowed_scope
+                && overlaps_client(client, writer.scope::ptr,
+                    $size_of(cancellation.Scope)))
+            || (writer.trailers != nil
+                && fields_alias(client, writer.trailers)));
 }
 
-fun response_aliases(client: *Client, response: *message.Response) bool {
+fun response_aliases(client: *Client, response: *message.Response,
+    allowed_scope: *cancellation.Scope) bool {
     if (overlaps_client(client, response::ptr, $size_of(message.Response))
         || fields_alias(client, ?response.fields)
         || fields_alias(client, ?response.trailers)) { ret true; }
     if (response.body_kind == message.BODY_READER) {
-        ret reader_alias(client, response.body_reader);
+        ret reader_alias(client, response.body_reader, allowed_scope);
     }
     if (response.body_kind == message.BODY_WRITER) {
-        ret writer_alias(client, response.body_writer);
+        ret writer_alias(client, response.body_writer, allowed_scope);
     }
     ret false;
 }
@@ -753,6 +790,32 @@ fun response_representable(response: *message.Response) bool {
     }
     if (response.body_kind == message.BODY_WRITER) {
         ret writer_representable(response.body_writer);
+    }
+    ret true;
+}
+
+fun response_storage_representable(response: *message.Response) bool {
+    if (!memory.range(response::ptr, $size_of(message.Response))
+        || !fields_storage_representable(?response.fields)
+        || !fields_storage_representable(?response.trailers)) { ret false; }
+    if (response.body_kind == message.BODY_READER) {
+        ret memory.range(response.body_reader::ptr, $size_of(body.Reader));
+    }
+    if (response.body_kind == message.BODY_WRITER) {
+        ret memory.range(response.body_writer::ptr, $size_of(body.Writer));
+    }
+    ret true;
+}
+
+fun response_body_collections_representable(
+    response: *message.Response) bool {
+    if (response.body_kind == message.BODY_READER) {
+        ret response.body_reader.trailers == nil
+            || fields_representable(response.body_reader.trailers);
+    }
+    if (response.body_kind == message.BODY_WRITER) {
+        ret response.body_writer.trailers == nil
+            || fields_representable(response.body_writer.trailers);
     }
     ret true;
 }
@@ -968,6 +1031,30 @@ fun deadline_matches(request: *message.Request,
         && request.metadata.deadline.nsec == deadline.nsec);
 }
 
+fun submission_deadline_matches(request: *message.Request,
+    parent: *cancellation.Scope) bool {
+    var parent_deadline: time.Time;
+    var owner: *cancellation.Scope = nil;
+    val inherited: bool = cancellation.get_deadline(parent,
+        ?parent_deadline, ?owner);
+    if (!request.metadata.has_deadline) { ret !inherited; }
+    if (!inherited
+        || time.time_before(request.metadata.deadline, parent_deadline)) {
+        ret true;
+    }
+    ret time.time_equal(request.metadata.deadline, parent_deadline);
+}
+
+fun request_scope_matches(request: *message.Request,
+    scope: *cancellation.Scope) bool {
+    ret request.body.scope == nil || request.body.scope == scope;
+}
+
+fun bind_request_scope(request: *message.Request,
+    scope: *cancellation.Scope) {
+    if (request.body.scope != nil) { request.body.scope = scope; }
+}
+
 fun protocol_route_valid(route: policy.Route,
     protocols: policy.ProtocolPolicy) bool {
     if (!policy.protocol_valid(protocols)) { ret false; }
@@ -987,9 +1074,14 @@ pub fun submit(client: *Client, parent: *cancellation.Scope,
     redirect_policy: policy.RedirectPolicy) Submission {
     if (!client_ready(client)
         || !memory.range(parent::ptr, $size_of(cancellation.Scope))
-        || !request_representable(request) || !route_representable(route)
+        || !request_storage_representable(request)
+        || !route_representable(route)
         || overlaps_client(client, parent::ptr, $size_of(cancellation.Scope))
-        || request_aliases(client, request) || route_aliases(client, route)
+        || request_aliases(client, request, nil)
+        || route_aliases(client, route)
+        || !request_representable(request)
+        || !request_scope_matches(request, parent)
+        || !submission_deadline_matches(request, parent)
         || !message.validate_request(request,
             client.configured.message_limits)
         || !policy.route_valid(route, 253)
@@ -1024,12 +1116,12 @@ pub fun submit(client: *Client, parent: *cancellation.Scope,
     slot.completion = empty_completion();
     val scope_made: bool = cancellation.make_child(?slot.scope, parent,
         request.metadata.has_deadline, request.metadata.deadline);
-    if (!scope_made || !deadline_matches(request, ?slot.scope)) {
-        if (scope_made) { cancellation.destroy(?slot.scope); }
+    if (!scope_made) {
         clear_slot(client, token.index::usize);
         client.live_requests = client.live_requests - 1;
         ret Submission{status: SUBMIT_INVALID, token: empty_token()};
     }
+    bind_request_scope(request, ?slot.scope);
     ret Submission{status: SUBMIT_OK, token: token};
 }
 
@@ -1323,7 +1415,9 @@ pub fun resolution_submit_failed(client: *Client, token: Token,
 pub fun complete_resolution(client: *Client,
     completion: *resolver.Completion, now: time.Time) dns.CompleteStatus {
     if (!client_ready(client)
-        || !memory.range(completion::ptr, $size_of(resolver.Completion))) {
+        || !memory.range(completion::ptr, $size_of(resolver.Completion))
+        || overlaps_client(client, completion::ptr,
+            $size_of(resolver.Completion))) {
         ret dns.COMPLETE_INVALID;
     }
     ret dns.complete_bound(client.cache, completion, now);
@@ -1424,6 +1518,8 @@ pub fun connect_failed(client: *Client, token: Token,
     now: time.Time) ConnectStatus {
     if (!client_ready(client) || !time_valid(now)
         || failure.reason != policy.RETRY_CONNECT
+        || !failure.definitely_unprocessed || failure.response_started
+        || failure.response_complete
         || !policy.failure_valid(failure)) { ret CONNECT_INVALID; }
     val slot: *RequestSlot = slot_for(client, token);
     if (slot == nil || slot.state != STATE_CONNECTING
@@ -1455,16 +1551,78 @@ fun release_exchange(client: *Client, slot: *RequestSlot,
     ret true;
 }
 
-fun response_terminal_matches(response: *message.Response,
-    reuse: body.Reuse) bool {
+fun response_terminal(response: *message.Response) bool {
     if (response.body_kind == message.BODY_NONE) { ret true; }
-    if (response.body_kind == message.BODY_READER
-        && body.reader_terminal_state(response.body_reader)) {
-        ret body.reader_result(response.body_reader).reuse == reuse;
+    if (response.body_kind == message.BODY_READER) {
+        ret body.reader_terminal_state(response.body_reader);
     }
-    if (response.body_kind == message.BODY_WRITER
-        && body.writer_terminal_state(response.body_writer)) {
-        ret body.writer_result(response.body_writer).reuse == reuse;
+    if (response.body_kind == message.BODY_WRITER) {
+        ret body.writer_terminal_state(response.body_writer);
+    }
+    ret false;
+}
+
+fun response_progress(response: *message.Response) body.Progress {
+    if (response.body_kind == message.BODY_NONE) {
+        ret body.complete(body.REUSE_ALLOWED);
+    }
+    if (response.body_kind == message.BODY_READER) {
+        ret body.reader_result(response.body_reader);
+    }
+    ret body.writer_result(response.body_writer);
+}
+
+fun combine_reuse(request_reuse: body.Reuse,
+    response_reuse: body.Reuse) body.Reuse {
+    if (request_reuse == body.REUSE_FORBIDDEN
+        || response_reuse == body.REUSE_FORBIDDEN) {
+        ret body.REUSE_FORBIDDEN;
+    }
+    if (request_reuse == body.REUSE_ALLOWED
+        && response_reuse == body.REUSE_ALLOWED) {
+        ret body.REUSE_ALLOWED;
+    }
+    ret body.REUSE_UNKNOWN;
+}
+
+fun exchange_reuse(slot: *RequestSlot, exchange: pool.Lease,
+    response: *message.Response, request_result: body.Progress,
+    response_result: body.Progress) body.Reuse {
+    if (response.status == status.SWITCHING_PROTOCOLS
+        || (exchange.wire == message.WIRE_H1
+            && slot.request.method.kind == method.CONNECT
+            && response.status >= 200 && response.status < 300)) {
+        ret body.REUSE_FORBIDDEN;
+    }
+    ret combine_reuse(request_result.reuse, response_result.reuse);
+}
+
+fun settle_body_results(slot: *RequestSlot, request_result: body.Progress,
+    response_result: body.Progress, response: *message.Response,
+    retry_reason: policy.RetryReason) bool {
+    if (request_result.status == body.TIMED_OUT
+        || response_result.status == body.TIMED_OUT) {
+        set_terminal(slot, OUTCOME_TIMED_OUT, ERROR_TIMED_OUT,
+            no_resolver_error(), retry_reason, response);
+        ret true;
+    }
+    if (request_result.status == body.CANCELLED
+        || response_result.status == body.CANCELLED) {
+        set_terminal(slot, OUTCOME_CANCELLED, ERROR_CANCELLED,
+            no_resolver_error(), retry_reason, response);
+        ret true;
+    }
+    if (request_result.status == body.ERROR
+        || request_result.status == body.LIMIT_REACHED) {
+        set_terminal(slot, OUTCOME_FAILED, ERROR_TRANSPORT,
+            no_resolver_error(), retry_reason, response);
+        ret true;
+    }
+    if (response_result.status == body.ERROR
+        || response_result.status == body.LIMIT_REACHED) {
+        set_terminal(slot, OUTCOME_FAILED, ERROR_RESPONSE,
+            no_resolver_error(), retry_reason, response);
+        ret true;
     }
     ret false;
 }
@@ -1482,7 +1640,7 @@ fun exchange_failure_matches(wire: message.Wire,
 pub fun exchange_complete(client: *Client, token: Token, exchange: pool.Lease,
     response: *message.Response, reuse: body.Reuse,
     now: time.Time) bool {
-    if (!client_ready(client) || !response_representable(response)
+    if (!client_ready(client) || !response_storage_representable(response)
         || !time_valid(now)
         || (reuse != body.REUSE_ALLOWED && reuse != body.REUSE_FORBIDDEN)) {
         ret false;
@@ -1490,18 +1648,28 @@ pub fun exchange_complete(client: *Client, token: Token, exchange: pool.Lease,
     val slot: *RequestSlot = slot_for(client, token);
     if (slot == nil || slot.state != STATE_EXCHANGING
         || !exchange_equal(slot.lease, exchange)
-        || overlaps_client(client, response::ptr,
-            $size_of(message.Response))) { ret false; }
+        || response_aliases(client, response, ?slot.scope)
+        || !response_representable(response)
+        || !response_body_collections_representable(response)
+        || !body.reader_terminal_state(slot.request.body)
+        || !response_terminal(response)) { ret false; }
+    val request_result: body.Progress = body.reader_result(slot.request.body);
+    val response_result: body.Progress = response_progress(response);
+    val expected_reuse: body.Reuse = exchange_reuse(slot, exchange, response,
+        request_result, response_result);
+    if (expected_reuse == body.REUSE_UNKNOWN || reuse != expected_reuse) {
+        ret false;
+    }
     val valid: bool = response.generation == slot.request.generation
         && message.validate_committed_response(response,
-            slot.request.method.kind, client.configured.message_limits)
-        && response_terminal_matches(response, reuse);
-    if (valid && response_aliases(client, response)) { ret false; }
+            slot.request.method.kind, client.configured.message_limits);
     var connection_reuse: body.Reuse = body.REUSE_FORBIDDEN;
     if (valid) { connection_reuse = reuse; }
     val released: bool = release_exchange(client, slot, connection_reuse, now);
     if (!released) { ret false; }
     if (settle_cancel(slot)) { ret true; }
+    if (settle_body_results(slot, request_result, response_result, response,
+        0)) { ret true; }
     if (!valid) {
         set_terminal(slot, OUTCOME_FAILED, ERROR_RESPONSE,
             no_resolver_error(), 0, response);
@@ -1530,7 +1698,7 @@ fun response_failure_matches(response: *message.Response,
 pub fun exchange_response_retry(client: *Client, token: Token,
     exchange: pool.Lease, response: *message.Response, reuse: body.Reuse,
     failure: policy.Failure, now: time.Time) ExchangeResponseStatus {
-    if (!client_ready(client) || !response_representable(response)
+    if (!client_ready(client) || !response_storage_representable(response)
         || !time_valid(now)
         || (reuse != body.REUSE_ALLOWED && reuse != body.REUSE_FORBIDDEN)
         || !policy.failure_valid(failure)
@@ -1540,14 +1708,22 @@ pub fun exchange_response_retry(client: *Client, token: Token,
     val slot: *RequestSlot = slot_for(client, token);
     if (slot == nil || slot.state != STATE_EXCHANGING
         || !exchange_equal(slot.lease, exchange)
-        || overlaps_client(client, response::ptr,
-            $size_of(message.Response))
+        || response_aliases(client, response, ?slot.scope)
+        || !response_representable(response)
+        || !response_body_collections_representable(response)
         || response.generation != slot.request.generation
         || !message.validate_committed_response(response,
             slot.request.method.kind, client.configured.message_limits)
         || !response_failure_matches(response, failure)
-        || !response_terminal_matches(response, reuse)
-        || response_aliases(client, response)) { ret EXCHANGE_RESPONSE_INVALID; }
+        || !body.reader_terminal_state(slot.request.body)
+        || !response_terminal(response)) { ret EXCHANGE_RESPONSE_INVALID; }
+    val request_result: body.Progress = body.reader_result(slot.request.body);
+    val response_result: body.Progress = response_progress(response);
+    val expected_reuse: body.Reuse = exchange_reuse(slot, exchange, response,
+        request_result, response_result);
+    if (expected_reuse == body.REUSE_UNKNOWN || reuse != expected_reuse) {
+        ret EXCHANGE_RESPONSE_INVALID;
+    }
     val decision: policy.RetryDecision = policy.retry(slot.retry_policy,
         slot.replay, failure, slot.attempts);
     if (decision.status == policy.RETRY_INVALID
@@ -1555,6 +1731,13 @@ pub fun exchange_response_retry(client: *Client, token: Token,
         ret EXCHANGE_RESPONSE_INVALID;
     }
     if (settle_cancel(slot)) { ret EXCHANGE_RESPONSE_CANCELLED; }
+    if (settle_body_results(slot, request_result, response_result, response,
+        failure.reason)) {
+        if (slot.completion.outcome == OUTCOME_CANCELLED) {
+            ret EXCHANGE_RESPONSE_CANCELLED;
+        }
+        ret EXCHANGE_RESPONSE_COMPLETE;
+    }
     if (decision.status == policy.RETRY_ALLOWED) {
         if (!schedule_retry(slot, failure, now, true)) {
             set_terminal(slot, OUTCOME_FAILED, ERROR_INTERNAL,
@@ -1576,12 +1759,17 @@ pub fun exchange_failed(client: *Client, token: Token, exchange: pool.Lease,
     val slot: *RequestSlot = slot_for(client, token);
     if (slot == nil || slot.state != STATE_EXCHANGING
         || !exchange_equal(slot.lease, exchange)
-        || !exchange_failure_matches(exchange.wire, failure)) { ret false; }
+        || !exchange_failure_matches(exchange.wire, failure)
+        || !body.reader_terminal_state(slot.request.body)) { ret false; }
+    val request_result: body.Progress = body.reader_result(slot.request.body);
     val decision: policy.RetryDecision = policy.retry(slot.retry_policy,
         slot.replay, failure, slot.attempts);
     if (decision.status == policy.RETRY_INVALID
         || !release_exchange(client, slot, body.REUSE_FORBIDDEN, now)) { ret false; }
     if (settle_cancel(slot)) { ret true; }
+    val no_response: body.Progress = body.complete(body.REUSE_ALLOWED);
+    if (settle_body_results(slot, request_result, no_response, nil,
+        failure.reason)) { ret true; }
     if (decision.status == policy.RETRY_ALLOWED) {
         if (!schedule_retry(slot, failure, now, true)) {
             set_terminal(slot, OUTCOME_FAILED, ERROR_INTERNAL,
@@ -1613,17 +1801,21 @@ fun methods_equal(first: method.Method, second: method.Method) bool {
 
 pub fun replay_ready(client: *Client, token: Token,
     request: *message.Request) bool {
-    if (!client_ready(client) || !request_representable(request)) { ret false; }
+    if (!client_ready(client)
+        || !request_storage_representable(request)) { ret false; }
     val slot: *RequestSlot = slot_for(client, token);
     if (slot == nil || slot.state != STATE_REPLAY_PUBLISHED
         || request.generation == slot.request.generation
+        || request_aliases(client, request, ?slot.scope)
+        || !request_representable(request)
         || !methods_equal(request.method, slot.request.method)
         || !views_equal(request.target.raw, slot.request.target.raw)
         || !message.validate_request(request, client.configured.message_limits)
         || !request_route_valid(request, route_value(?slot.route))
         || !replay_matches_request(slot.replay, request)
         || !deadline_matches(request, ?slot.scope)
-        || request_aliases(client, request)) { ret false; }
+        || !request_scope_matches(request, ?slot.scope)) { ret false; }
+    bind_request_scope(request, ?slot.scope);
     slot.request = request;
     slot.state = STATE_ROUTING;
     ret true;
@@ -1657,8 +1849,8 @@ pub fun follow_redirect(client: *Client, token: Token, exchange: pool.Lease,
     response: *message.Response, reuse: body.Reuse,
     target_route: policy.Route, next_request: *message.Request,
     now: time.Time) policy.RedirectStatus {
-    if (!client_ready(client) || !response_representable(response)
-        || !request_representable(next_request)
+    if (!client_ready(client) || !response_storage_representable(response)
+        || !request_storage_representable(next_request)
         || !route_representable(target_route) || !time_valid(now)
         || (reuse != body.REUSE_ALLOWED && reuse != body.REUSE_FORBIDDEN)) {
         ret policy.REDIRECT_INVALID;
@@ -1666,13 +1858,21 @@ pub fun follow_redirect(client: *Client, token: Token, exchange: pool.Lease,
     val slot: *RequestSlot = slot_for(client, token);
     if (slot == nil || slot.state != STATE_EXCHANGING
         || !exchange_equal(slot.lease, exchange)
-        || overlaps_client(client, response::ptr,
-            $size_of(message.Response))
+        || response_aliases(client, response, ?slot.scope)
+        || !response_representable(response)
+        || !response_body_collections_representable(response)
         || response.generation != slot.request.generation
         || !message.validate_committed_response(response,
             slot.request.method.kind, client.configured.message_limits)
-        || !response_terminal_matches(response, reuse)
-        || response_aliases(client, response)) {
+        || !body.reader_terminal_state(slot.request.body)
+        || !response_terminal(response)) {
+        ret policy.REDIRECT_INVALID;
+    }
+    val request_result: body.Progress = body.reader_result(slot.request.body);
+    val response_result: body.Progress = response_progress(response);
+    val expected_reuse: body.Reuse = exchange_reuse(slot, exchange, response,
+        request_result, response_result);
+    if (expected_reuse == body.REUSE_UNKNOWN || reuse != expected_reuse) {
         ret policy.REDIRECT_INVALID;
     }
     val decision: policy.Redirect = policy.redirect(slot.redirect_policy,
@@ -1682,13 +1882,15 @@ pub fun follow_redirect(client: *Client, token: Token, exchange: pool.Lease,
         || (policy.route_valid(target_route, 253)
         && protocol_route_valid(target_route, slot.protocols)
         && !route_aliases(client, target_route)
+        && !request_aliases(client, next_request, ?slot.scope)
+        && request_representable(next_request)
         && next_request.generation != slot.request.generation
         && methods_equal(next_request.method, decision.next_method)
         && message.validate_request(next_request,
             client.configured.message_limits)
         && request_route_valid(next_request, target_route)
         && deadline_matches(next_request, ?slot.scope)
-        && !request_aliases(client, next_request)
+        && request_scope_matches(next_request, ?slot.scope)
         && !forbidden_redirect_fields(next_request,
             decision.strip_origin_sensitive,
             decision.strip_proxy_sensitive)
@@ -1700,6 +1902,13 @@ pub fun follow_redirect(client: *Client, token: Token, exchange: pool.Lease,
         ret policy.REDIRECT_INVALID;
     }
     if (settle_cancel(slot)) { ret policy.REDIRECT_CANCELLED; }
+    if (settle_body_results(slot, request_result, response_result, response,
+        0)) {
+        if (slot.completion.outcome == OUTCOME_CANCELLED) {
+            ret policy.REDIRECT_CANCELLED;
+        }
+        ret policy.REDIRECT_INVALID;
+    }
     if (decision.status != policy.REDIRECT_FOLLOW) {
         set_terminal(slot, OUTCOME_FAILED, ERROR_REDIRECT,
             no_resolver_error(), 0, response);
@@ -1710,6 +1919,7 @@ pub fun follow_redirect(client: *Client, token: Token, exchange: pool.Lease,
             no_resolver_error(), 0, response);
         ret policy.REDIRECT_INVALID;
     }
+    bind_request_scope(next_request, ?slot.scope);
     slot.request = next_request;
     if (decision.drop_body) { slot.replay.body = policy.BODY_EMPTY; }
     store_route(?slot.route, target_route);
@@ -1756,9 +1966,9 @@ pub fun drain_dependencies(client: *Client) bool {
     }
     val dns_state: dns.Snapshot = dns.snapshot(client.cache);
     val pool_state: pool.Snapshot = pool.snapshot(client.connections);
-    if (!dns_state.accepting || !pool_state.accepting) { ret false; }
-    val dns_started: bool = dns.drain(client.cache);
-    val pool_started: bool = pool.drain(client.connections);
+    val dns_started: bool = !dns_state.accepting || dns.drain(client.cache);
+    val pool_started: bool = !pool_state.accepting
+        || pool.drain(client.connections);
     if (!dns_started || !pool_started) { ret false; }
     client.dependencies_draining = true;
     ret true;
@@ -1859,8 +2069,16 @@ fun test_retry_body_read(context: ptr, output: *u8, capacity: usize,
     ret body.complete(body.REUSE_ALLOWED);
 }
 
+fun test_retry_body_write(context: ptr, input: *u8,
+    length: usize) body.Progress {
+    ret body.data(length);
+}
+
 fun test_retry_body_finish(context: ptr, mode: body.Mode,
     trailers: *field.Fields) body.Progress {
+    if (mode == body.CANCEL) { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    if (mode == body.REJECT) { ret body.rejected(body.REUSE_ALLOWED); }
     ret body.complete(body.REUSE_ALLOWED);
 }
 
@@ -2049,7 +2267,7 @@ test "http.client.client: hostile aliases and capacity overflow are transactiona
         = (?slots[1])::ptr::*message.Response;
     if (!test_response(aliased_response, 92, status.OK,
             configured.message_limits)
-        || !response_aliases(?client, aliased_response)) { ret 12; }
+        || !response_aliases(?client, aliased_response, nil)) { ret 12; }
     var external_response: message.Response;
     var response_field: field.Field;
     if (!message.init_response(?external_response, ?response_field, 1,
@@ -2063,7 +2281,7 @@ test "http.client.client: hostile aliases and capacity overflow are transactiona
             != message.RESPONSE_OK
         || message.commit_response(?external_response, method.GET,
             configured.message_limits) != message.RESPONSE_OK
-        || !response_aliases(?client, ?external_response)) { ret 14; }
+        || !response_aliases(?client, ?external_response, nil)) { ret 14; }
     if (!test_shutdown(?client, ?cache, ?connections, ?parent,
         time.Time{sec: 1, nsec: 0})) { ret 15; }
     ret 0;
@@ -2240,15 +2458,32 @@ test "http.client.client: dns alpn exchange and graceful drain preserve ownershi
         || exchange_complete(?client, submitted.token, exchange.lease,
             ?alias_response,
             body.REUSE_ALLOWED, now)) { ret 8; }
-    var response: message.Response;
-    if (!test_response(?response, 1, status.OK,
+    var pending_context: u8 = 0;
+    var pending_body: body.Reader = body.init_reader(
+        (?pending_context)::ptr, test_retry_body_read,
+        test_retry_body_finish, test_retry_body_complete,
+        test_retry_body_release, body.OWNER_APPLICATION, 1, true, 0,
+        client_config.message_limits.response_body, nil, exchange.scope);
+    var pending_response: message.Response;
+    if (!message.init_response(?pending_response, nil, 0, nil, 0, 1,
             client_config.message_limits)
-        || !exchange_complete(?client, submitted.token, exchange.lease, ?response,
-            body.REUSE_ALLOWED, now)) { ret 9; }
+        || message.set_status(?pending_response, status.OK)
+            != message.RESPONSE_OK
+        || message.set_body_reader(?pending_response, ?pending_body,
+            client_config.message_limits) != message.RESPONSE_OK
+        || message.commit_response(?pending_response, method.GET,
+            client_config.message_limits) != message.RESPONSE_OK
+        || exchange_complete(?client, submitted.token, exchange.lease,
+            ?pending_response, body.REUSE_ALLOWED, now)
+        || body.drain(?pending_body).status != body.COMPLETE
+        || exchange_complete(?client, submitted.token, exchange.lease,
+            ?pending_response, body.REUSE_FORBIDDEN, now)
+        || !exchange_complete(?client, submitted.token, exchange.lease,
+            ?pending_response, body.REUSE_ALLOWED, now)) { ret 9; }
     val completed: Action = next(?client, submitted.token, now);
     if (completed.kind != ACTION_COMPLETE
         || completed.completion.outcome != OUTCOME_OK
-        || completed.completion.response != ?response
+        || completed.completion.response != ?pending_response
         || !release_request(?client, submitted.token)) { ret 10; }
     val idle: time.Time = time.Time{sec: 62, nsec: 0};
     val routine: Maintenance = maintenance(?client, idle);
@@ -2569,6 +2804,14 @@ test "http.client.client: retries publish replay and never buffer streams" {
     var first_request: message.Request;
     if (!test_request(?first_request, ?first_reader, 41, false,
         time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 5; }
+    var first_body_context: u8 = 0;
+    first_reader = body.init_reader((?first_body_context)::ptr,
+        test_retry_body_read, test_retry_body_finish,
+        test_retry_body_complete, test_retry_body_release,
+        body.OWNER_APPLICATION, 41, true, 0,
+        client_config.message_limits.request_body,
+        ?first_request.trailers, ?parent);
+    first_request.body = ?first_reader;
     val first: Submission = submit(?client, ?parent, ?first_request, route,
         policy.protocols_default(), policy.Replay{explicit: true,
             body: policy.BODY_REWINDABLE}, retry_twice,
@@ -2585,8 +2828,16 @@ test "http.client.client: retries publish replay and never buffer streams" {
         connecting.reservation, true, view.view("h2", 2),
         (?first_driver)::ptr, 4, now);
     val first_exchange: Action = next(?client, first.token, now);
+    var common_response: message.Response;
+    var common_value: common_exchange.Exchange;
     if (first_connected.status != CONNECT_ACCEPTED
-        || first_exchange.kind != ACTION_EXCHANGE) { ret 7; }
+        || first_exchange.kind != ACTION_EXCHANGE
+        || first_reader.scope != first_exchange.scope
+        || !message.init_response(?common_response, nil, 0, nil, 0, 41,
+            client_config.message_limits)
+        || !common_exchange.init(?common_value, ?first_request,
+            ?common_response, nil, 0, first_exchange.scope, 41,
+            client_config.message_limits)) { ret 7; }
     val refused: policy.Failure = policy.Failure{
         reason: policy.RETRY_REFUSED_STREAM, definitely_unprocessed: true,
         response_started: false, response_complete: false,
@@ -2594,6 +2845,9 @@ test "http.client.client: retries publish replay and never buffer streams" {
     var wrong_exchange: pool.Lease = first_exchange.lease;
     wrong_exchange.token.generation = wrong_exchange.token.generation + 1;
     if (exchange_failed(?client, first.token, wrong_exchange, refused, now)
+        || exchange_failed(?client, first.token, first_exchange.lease,
+            refused, now)
+        || body.drain(?first_reader).status != body.COMPLETE
         || !exchange_failed(?client, first.token, first_exchange.lease,
             refused, now)) { ret 8; }
     val replay: Action = next(?client, first.token, now);
@@ -2602,7 +2856,17 @@ test "http.client.client: retries publish replay and never buffer streams" {
     var replay_reader: body.Reader;
     var replay_request: message.Request;
     if (!test_request(?replay_request, ?replay_reader, 42, false,
-            time.Time{sec: 0, nsec: 0}, client_config.message_limits)
+        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 10; }
+    var replay_context: u8 = 0;
+    replay_reader = body.init_reader((?replay_context)::ptr,
+        test_retry_body_read, test_retry_body_finish,
+        test_retry_body_complete, test_retry_body_release,
+        body.OWNER_APPLICATION, 42, true, 0,
+        client_config.message_limits.request_body,
+        ?replay_request.trailers, first_exchange.scope);
+    replay_request.body = ?replay_reader;
+    if (!message.validate_request(?replay_request,
+            client_config.message_limits)
         || !replay_ready(?client, first.token, ?replay_request)) { ret 10; }
     val retry_connect: Action = next(?client, first.token, now);
     val connect_failure: policy.Failure = policy.Failure{
@@ -2616,6 +2880,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
     if (retry_complete.kind != ACTION_COMPLETE
         || retry_complete.completion.attempts != 2
         || retry_complete.completion.retry_reason != policy.RETRY_CONNECT
+        || body.cancel_reader(?replay_reader).status != body.CANCELLED
         || !release_request(?client, first.token)) { ret 12; }
 
     var stream_reader: body.Reader;
@@ -2633,7 +2898,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
         (?stream_driver)::ptr, 1, now);
     val stream_exchange: Action = next(?client, streaming.token, now);
     val transport_failure: policy.Failure = policy.Failure{
-        reason: policy.RETRY_TRANSPORT, definitely_unprocessed: true,
+        reason: policy.RETRY_TRANSPORT, definitely_unprocessed: false,
         response_started: false, response_complete: false,
         retry_after_ns: 0};
     if (streaming.status != SUBMIT_OK || stream_connect.kind != ACTION_CONNECT
@@ -2753,8 +3018,36 @@ test "http.client.client: retries publish replay and never buffer streams" {
         || final_action.completion.retry_reason != policy.RETRY_SERVER
         || final_action.completion.attempts != 2
         || !release_request(?client, response_submission.token)) { ret 23; }
+
+    var upgrade_reader: body.Reader;
+    var upgrade_request: message.Request;
+    if (!test_request(?upgrade_request, ?upgrade_reader, 46, false,
+        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 24; }
+    val upgrade_submission: Submission = submit(?client, ?parent,
+        ?upgrade_request, route, policy.protocols_default(),
+        policy.Replay{explicit: true, body: policy.BODY_EMPTY},
+        policy.retry_policy_default(), policy.redirect_policy_default());
+    val upgrade_exchange: Action = next(?client, upgrade_submission.token,
+        now);
+    var upgrade_response: message.Response;
+    if (upgrade_submission.status != SUBMIT_OK
+        || upgrade_exchange.kind != ACTION_EXCHANGE
+        || !test_response(?upgrade_response, 46,
+            status.SWITCHING_PROTOCOLS, client_config.message_limits)
+        || exchange_complete(?client, upgrade_submission.token,
+            upgrade_exchange.lease, ?upgrade_response,
+            body.REUSE_ALLOWED, now)
+        || !exchange_complete(?client, upgrade_submission.token,
+            upgrade_exchange.lease, ?upgrade_response,
+            body.REUSE_FORBIDDEN, now)
+        || next(?client, upgrade_submission.token, now).kind
+            != ACTION_COMPLETE
+        || !release_request(?client, upgrade_submission.token)) { ret 25; }
+    val upgrade_close: Maintenance = maintenance(?client, now);
+    if (upgrade_close.kind != MAINTENANCE_CLOSE
+        || !pool.retire(?connections, upgrade_close.close)) { ret 26; }
     if (!test_shutdown(?client, ?cache, ?connections, ?parent, now)) {
-        ret 24;
+        ret 27;
     }
     ret 0;
 }
@@ -2952,7 +3245,7 @@ test "http.client.client: cancellation wins connect and exchange races" {
             ?cancelled_redirect_reader, 65, false,
             time.Time{sec: 0, nsec: 0}, client_config.message_limits)
         || follow_redirect(?client, second.token, second_exchange.lease,
-            ?response, body.REUSE_FORBIDDEN, route,
+            ?response, body.REUSE_ALLOWED, route,
             ?cancelled_redirect_request, now) != policy.REDIRECT_CANCELLED) {
         ret 14;
     }
@@ -2962,8 +3255,7 @@ test "http.client.client: cancellation wins connect and exchange races" {
         || completed.completion.response != nil
         || !release_request(?client, second.token)) { ret 15; }
     val closing: Maintenance = maintenance(?client, now);
-    if (closing.kind != MAINTENANCE_CLOSE
-        || !pool.retire(?connections, closing.close)) { ret 16; }
+    if (closing.kind != MAINTENANCE_NONE) { ret 16; }
 
     var owner_reader: body.Reader;
     var owner_request: message.Request;
@@ -3016,5 +3308,140 @@ test "http.client.client: cancellation wins connect and exchange races" {
     if (!test_shutdown(?client, ?cache, ?connections, ?parent, now)) {
         ret 21;
     }
+    ret 0;
+}
+
+test "http.client.client: hostile ownership and lifecycle inputs stay transactional" {
+    var cache_entries: [1]dns.Entry;
+    var cache_endpoints: [1]ip.Endpoint;
+    var cache: dns.Cache;
+    var cache_config: dns.Config = dns.config_default();
+    cache_config.max_entries = 1;
+    cache_config.max_endpoints_per_entry = 1;
+    var pool_connections: [1]pool.Connection;
+    var pool_leases: [1]pool.LeaseSlot;
+    var connections: pool.Pool;
+    var pool_config: pool.Config = pool.config_default();
+    pool_config.max_connections = 1;
+    pool_config.max_connections_per_route = 1;
+    pool_config.max_leases = 1;
+    pool_config.max_idle = 1;
+    pool_config.max_idle_per_route = 1;
+    var slots: [1]RequestSlot;
+    var request_endpoints: [1]ip.Endpoint;
+    var client: Client;
+    var client_config: Config = config_default();
+    client_config.max_requests = 1;
+    client_config.max_endpoints_per_request = 1;
+    if (!dns.init(?cache, ?cache_entries[0], 1, ?cache_endpoints[0], 1,
+            cache_config)
+        || !pool.init(?connections, ?pool_connections[0], 1,
+            ?pool_leases[0], 1, pool_config)
+        || !dns.drain(?cache)
+        || init(?client, ?cache, ?connections, ?slots[0], 1,
+            ?request_endpoints[0], 1, client_config)
+        || !pool.drain(?connections)
+        || !dns.destroy(?cache) || !pool.destroy(?connections)) { ret 1; }
+
+    if (!dns.init(?cache, ?cache_entries[0], 1, ?cache_endpoints[0], 1,
+            cache_config)
+        || !pool.init(?connections, ?pool_connections[0], 1,
+            ?pool_leases[0], 1, pool_config)
+        || !init(?client, ?cache, ?connections, ?slots[0], 1,
+            ?request_endpoints[0], 1, client_config)) { ret 2; }
+    if (complete_resolution(?client,
+            (?slots[0])::ptr::*resolver.Completion,
+            time.Time{sec: 1, nsec: 0}) != dns.COMPLETE_INVALID
+        || complete_resolution(?client,
+            (?request_endpoints[0])::ptr::*resolver.Completion,
+            time.Time{sec: 1, nsec: 0}) != dns.COMPLETE_INVALID) { ret 3; }
+    val parent_deadline: time.Time = time.Time{sec: 5, nsec: 0};
+    var parent: cancellation.Scope;
+    if (!cancellation.make_root(?parent, true, parent_deadline)) { ret 4; }
+    var deadline_reader: body.Reader;
+    var deadline_request: message.Request;
+    if (!test_request(?deadline_request, ?deadline_reader, 71, true,
+            time.Time{sec: 10, nsec: 0}, client_config.message_limits)
+        || submit(?client, ?parent, ?deadline_request,
+            test_route("hostile.example", 15), policy.protocols_default(),
+            policy.Replay{explicit: true, body: policy.BODY_EMPTY},
+            policy.retry_policy_default(), policy.redirect_policy_default())
+            .status != SUBMIT_INVALID
+        || parent.first_child != nil || client.live_requests != 0) { ret 5; }
+
+    var alias_reader: body.Reader;
+    var alias_request: message.Request;
+    if (!test_request(?alias_request, ?alias_reader, 72, true,
+            parent_deadline, client_config.message_limits)) { ret 6; }
+    alias_request.trailers = field.init(
+        (?request_endpoints[0])::ptr::*field.Field, 1,
+        client_config.message_limits.request_trailers);
+    alias_reader.trailers = ?alias_request.trailers;
+    if (submit(?client, ?parent, ?alias_request,
+        test_route("hostile.example", 15), policy.protocols_default(),
+        policy.Replay{explicit: true, body: policy.BODY_EMPTY},
+        policy.retry_policy_default(), policy.redirect_policy_default()).status
+        != SUBMIT_INVALID) { ret 7; }
+
+    var nested_fields: field.Fields = field.init(
+        (?request_endpoints[0])::ptr::*field.Field, 1,
+        client_config.message_limits.response_trailers);
+    var nested_context: u8 = 0;
+    var nested_reader: body.Reader = body.init_reader(
+        (?nested_context)::ptr, test_retry_body_read,
+        test_retry_body_finish, test_retry_body_complete,
+        test_retry_body_release, body.OWNER_APPLICATION, 73, true, 0,
+        client_config.message_limits.response_body, ?nested_fields, ?parent);
+    var nested_response: message.Response;
+    if (!message.init_response(?nested_response, nil, 0, nil, 0, 73,
+        client_config.message_limits)) { ret 7; }
+    if (message.set_status(?nested_response, status.OK)
+        != message.RESPONSE_OK) { ret 8; }
+    if (message.set_body_reader(?nested_response, ?nested_reader,
+        client_config.message_limits) != message.RESPONSE_OK) { ret 9; }
+    if (message.commit_response(?nested_response, method.GET,
+        client_config.message_limits) != message.RESPONSE_OK) { ret 10; }
+    nested_reader.trailers = ?nested_fields;
+    if (!response_aliases(?client, ?nested_response, nil)
+        || body.drain(?nested_reader).status != body.COMPLETE) { ret 11; }
+
+    var writer_fields: field.Fields = field.init(
+        (?request_endpoints[0])::ptr::*field.Field, 1,
+        client_config.message_limits.response_trailers);
+    var writer_context: u8 = 0;
+    var nested_writer: body.Writer = body.init_writer(
+        (?writer_context)::ptr, test_retry_body_write,
+        test_retry_body_finish, test_retry_body_complete,
+        test_retry_body_release, body.OWNER_APPLICATION, 74, true, 0,
+        client_config.message_limits.response_body, ?writer_fields, ?parent);
+    var writer_response: message.Response;
+    if (!message.init_response(?writer_response, nil, 0, nil, 0, 74,
+            client_config.message_limits)
+        || message.set_status(?writer_response, status.OK)
+            != message.RESPONSE_OK
+        || message.set_body_writer(?writer_response, ?nested_writer,
+            client_config.message_limits) != message.RESPONSE_OK
+        || message.commit_response(?writer_response, method.GET,
+            client_config.message_limits) != message.RESPONSE_OK) { ret 12; }
+    nested_writer.trailers = ?writer_fields;
+    if (!response_aliases(?client, ?writer_response, nil)
+        || body.finish(?nested_writer).status != body.COMPLETE) { ret 13; }
+
+    var connect_request: message.Request;
+    connect_request.method = method.from_kind(method.CONNECT);
+    var connect_slot: RequestSlot;
+    connect_slot.request = ?connect_request;
+    var connect_response: message.Response;
+    connect_response.status = status.OK;
+    val allowed: body.Progress = body.complete(body.REUSE_ALLOWED);
+    if (exchange_reuse(?connect_slot, pool.Lease{token: empty_lease_token(),
+            connection: empty_connection_token(), driver: nil,
+            wire: message.WIRE_H1}, ?connect_response, allowed, allowed)
+            != body.REUSE_FORBIDDEN
+        || combine_reuse(body.REUSE_FORBIDDEN, body.REUSE_ALLOWED)
+            != body.REUSE_FORBIDDEN) { ret 14; }
+
+    if (!test_shutdown(?client, ?cache, ?connections, ?parent,
+        parent_deadline)) { ret 15; }
     ret 0;
 }
