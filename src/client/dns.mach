@@ -767,6 +767,22 @@ pub fun complete(cache: *Cache, token: Token,
     ret result;
 }
 
+pub fun complete_bound(cache: *Cache, completion: *resolver.Completion,
+    now: time.Time) CompleteStatus {
+    if (cache == nil || !cache.initialized || completion == nil
+        || completion.context >= cache.capacity) { ret COMPLETE_INVALID; }
+    mutex.lock(?cache.lock);
+    val entry: *Entry = ?cache.entries[completion.context];
+    if (entry.state != ENTRY_PRESENT || !entry.resolving || !entry.bound
+        || !resolver_token_equal(entry.resolver_token, completion.token)) {
+        mutex.unlock(?cache.lock);
+        ret COMPLETE_INVALID;
+    }
+    val token: Token = token_for(completion.context, entry);
+    mutex.unlock(?cache.lock);
+    ret complete(cache, token, completion, now);
+}
+
 pub fun abandon(cache: *Cache, token: Token, failure: resolver.Error,
     now: time.Time) CompleteStatus {
     if (cache == nil || !cache.initialized || !time_valid(now)

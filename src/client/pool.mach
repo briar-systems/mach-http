@@ -258,6 +258,8 @@ pub fun config_default() Config {
 fun config_valid(configured: Config, capacity: usize,
     lease_capacity: usize) bool {
     ret capacity <= 0xffffffff && lease_capacity <= 0xffffffff
+        && capacity <= ~(0::usize) / $size_of(Connection)
+        && lease_capacity <= ~(0::usize) / $size_of(LeaseSlot)
         && configured.max_connections != 0
         && configured.max_connections <= capacity
         && configured.max_connections <= 0xffffffff
@@ -270,6 +272,34 @@ fun config_valid(configured: Config, capacity: usize,
         && configured.max_idle_per_route <= configured.max_connections_per_route
         && configured.idle_timeout_ns != 0
         && configured.max_streams_per_connection != 0;
+}
+
+fun byte_ranges_overlap(first: ptr, first_size: usize,
+    second: ptr, second_size: usize) bool {
+    if (first == nil || second == nil || first_size == 0 || second_size == 0) {
+        ret false;
+    }
+    val first_start: usize = first::usize;
+    val second_start: usize = second::usize;
+    if (first_start > ~(0::usize) - first_size
+        || second_start > ~(0::usize) - second_size) { ret true; }
+    ret first_start < second_start + second_size
+        && second_start < first_start + first_size;
+}
+
+fun overlaps_pool(pool: *Pool, value: ptr, size: usize) bool {
+    ret byte_ranges_overlap(value, size, pool::ptr, $size_of(Pool))
+        || byte_ranges_overlap(value, size, pool.connections::ptr,
+            pool.capacity * $size_of(Connection))
+        || byte_ranges_overlap(value, size, pool.leases::ptr,
+            pool.lease_capacity * $size_of(LeaseSlot));
+}
+
+fun route_aliases_pool(pool: *Pool, route: policy.Route) bool {
+    ret overlaps_pool(pool, route.origin.host.data::ptr, route.origin.host.len)
+        || (route.proxy.kind != policy.PROXY_NONE
+            && overlaps_pool(pool, route.proxy.host.data::ptr,
+                route.proxy.host.len));
 }
 
 fun clear_connection(connection: *Connection) {
@@ -306,6 +336,13 @@ pub fun init(pool: *Pool, connections: *Connection, capacity: usize,
     leases: *LeaseSlot, lease_capacity: usize, configured: Config) bool {
     if (pool == nil || pool.initialized || connections == nil || leases == nil
         || !config_valid(configured, capacity, lease_capacity)) { ret false; }
+    if (byte_ranges_overlap(pool::ptr, $size_of(Pool), connections::ptr,
+            capacity * $size_of(Connection))
+        || byte_ranges_overlap(pool::ptr, $size_of(Pool), leases::ptr,
+            lease_capacity * $size_of(LeaseSlot))
+        || byte_ranges_overlap(connections::ptr,
+            capacity * $size_of(Connection), leases::ptr,
+            lease_capacity * $size_of(LeaseSlot))) { ret false; }
     pool.connections = connections;
     pool.capacity = capacity;
     pool.leases = leases;
@@ -477,7 +514,8 @@ fun better(first: *Connection, second: *Connection) bool {
 pub fun acquire(pool: *Pool, route: policy.Route,
     configured: policy.ProtocolPolicy, now: time.Time) Acquire {
     if (pool == nil || !pool.initialized || !policy.route_valid(route, 253)
-        || !policy.protocol_valid(configured) || !time_valid(now)) {
+        || !policy.protocol_valid(configured) || !time_valid(now)
+        || route_aliases_pool(pool, route)) {
         ret Acquire{status: ACQUIRE_INVALID, lease: empty_lease()};
     }
     mutex.lock(?pool.lock);
@@ -599,7 +637,8 @@ pub fun reserve(pool: *Pool, route: policy.Route, endpoint: ip.Endpoint,
         || (transport != policy.TRANSPORT_TCP
             && transport != policy.TRANSPORT_QUIC)
         || !policy.proxy_supports(route.proxy, transport)
-        || !endpoint_valid(endpoint, expected_port) || !time_valid(now)) {
+        || !endpoint_valid(endpoint, expected_port) || !time_valid(now)
+        || route_aliases_pool(pool, route)) {
         ret empty_reservation(RESERVE_INVALID);
     }
     mutex.lock(?pool.lock);
@@ -644,6 +683,7 @@ pub fun activate(pool: *Pool, reservation: Reservation,
     now: time.Time) Activated {
     if (pool == nil || !pool.initialized || reservation.status != RESERVE_OK
         || driver == nil || max_streams == 0 || !time_valid(now)
+        || overlaps_pool(pool, driver, 1)
         || (wire != message.WIRE_H1 && wire != message.WIRE_H2
             && wire != message.WIRE_H3)
         || (wire == message.WIRE_H3
@@ -1014,7 +1054,8 @@ test "http.client.pool: multiplexed leases release exactly once" {
     val now: time.Time = time.Time{sec: 10, nsec: 0};
     val reserved: Reservation = reserve(?value, route,
         ip.endpoint(192, 0, 2, 1, 443), policy.TRANSPORT_TCP, now);
-    val driver: ptr = (?value)::ptr;
+    var driver_storage: u8 = 1;
+    val driver: ptr = (?driver_storage)::ptr;
     val first: Activated = activate(?value, reserved, message.WIRE_H2,
         driver, 3, now);
     val second: Acquire = acquire(?value, route, policy.protocols_default(), now);
@@ -1058,8 +1099,9 @@ test "http.client.pool: routes and proxy identities isolate retention" {
     val now: time.Time = time.Time{sec: 20, nsec: 0};
     val first: Reservation = reserve(?value, first_route,
         ip.endpoint(192, 0, 2, 1, 443), policy.TRANSPORT_TCP, now);
+    var first_driver: u8 = 1;
     val first_active: Activated = activate(?value, first, message.WIRE_H1,
-        (?connections[0])::ptr, 1, now);
+        (?first_driver)::ptr, 1, now);
     if (first_active.status != ACTIVATE_OK
         || reserve(?value, first_route, ip.endpoint(192, 0, 2, 2, 443),
             policy.TRANSPORT_TCP, now).status != RESERVE_SATURATED
@@ -1093,8 +1135,9 @@ test "http.client.pool: idle limits timeout and drain publish close once" {
     val now: time.Time = time.Time{sec: 30, nsec: 0};
     val first: Reservation = reserve(?value, route,
         ip.endpoint(192, 0, 2, 1, 443), policy.TRANSPORT_TCP, now);
+    var first_driver: u8 = 1;
     val activated: Activated = activate(?value, first, message.WIRE_H1,
-        (?connections[0])::ptr, 1, now);
+        (?first_driver)::ptr, 1, now);
     if (activated.status != ACTIVATE_OK
         || release(?value, activated.lease, body.REUSE_ALLOWED, now)
             != RELEASE_OK) { ret 2; }
@@ -1131,7 +1174,8 @@ test "http.client.pool: drain publishes connect cancellation and owns late drive
         || !connection_equal(cancellation.reservation.connection,
             reserved.connection)
         || take_connect_cancel(?value).found) { ret 3; }
-    val driver: ptr = (?value)::ptr;
+    var driver_storage: u8 = 1;
+    val driver: ptr = (?driver_storage)::ptr;
     val activated: Activated = activate(?value, reserved, message.WIRE_H2,
         driver, 8, now);
     if (activated.status != ACTIVATE_CLOSE || snapshot(?value).live_leases != 0
@@ -1166,8 +1210,9 @@ test "http.client.pool: proxy transport capabilities gate QUIC routes" {
         identity: 2, transports: policy.PROXY_DATAGRAM};
     val reserved: Reservation = reserve(?value, route,
         ip.endpoint(192, 0, 2, 5, 8443), policy.TRANSPORT_QUIC, now);
+    var driver_storage: u8 = 1;
     val activated: Activated = activate(?value, reserved, message.WIRE_H3,
-        (?connections[0])::ptr, 16, now);
+        (?driver_storage)::ptr, 16, now);
     if (reserved.status != RESERVE_OK || activated.status != ACTIVATE_OK
         || release(?value, activated.lease, body.REUSE_ALLOWED, now)
             != RELEASE_CLOSE) { ret 3; }
