@@ -11,8 +11,8 @@ serialization, and bounded client and server connection engines are implemented.
 Bounded route compilation and zero-allocation dispatch are implemented. WebSocket
 negotiation, framing, and completion-driven connections are implemented for HTTP/1
 upgrade and HTTP/2 or HTTP/3 extended CONNECT. The HTTP/2 and HTTP/3 wire layers
-remain under development. HTTP/2 frame and HPACK codecs are complete. HTTP/2
-connection and stream state remains under development.
+remain under development. HTTP/2 frame, HPACK, connection, and stream engines are
+complete. HTTP/3 connection and stream state remains under development.
 
 ## Design
 
@@ -62,6 +62,18 @@ connection and stream state remains under development.
   Dynamic table changes commit only after the complete field block validates.
 - HPACK field count, decompressed list size, encoded block size, individual string,
   table memory, and table-entry count have independent caller-selected bounds.
+- HTTP/2 connections validate the client preface and first SETTINGS boundary before
+  admitting streams. Settings, ping, reset, GOAWAY, push, and window updates remain
+  ordered with header-block continuations under partial transport completion.
+- HTTP/2 stream state is generation-bound and allocation-free. One physical stream
+  slot beyond `max_streams` is reserved to decode refused field blocks, preserving
+  the shared HPACK context under saturation.
+- Connection and stream receive windows replenish only after application data is
+  consumed. Outbound DATA is copied, flow-controlled, and selected by a bounded
+  weighted scheduler before transport ownership begins.
+- Request, response, informational, trailer, and push pseudo-fields are validated at
+  the connection boundary. Forbidden fields, authority conflicts, content-length
+  mismatches, and data on bodyless responses reset only the affected stream.
 - Header, request, idle, write, and total deadlines are absolute. Slow progress does
   not refresh them. Graceful close finishes admitted work before write half-close.
 - TLS belongs below the transport contract and is not a dependency of this package.
@@ -108,6 +120,19 @@ updates, insertions, and evictions are simulated in a bounded shadow and commit 
 after the block passes every limit and representation check. The encoder uses the
 same transaction rule. See [doc/h2-codecs.md](doc/h2-codecs.md) for API ownership and
 resource contracts.
+
+## HTTP/2 connections
+
+`http.h2.connection.Engine` binds the frame and HPACK codecs to the common ordered
+transport. Reads and writes retain the engine's buffers only through their exact
+transport completion tokens. Header and DATA events borrow caller storage until
+`release_event` or `consume_data` returns it.
+
+Each accepted request stream has one generation and must bind one
+`http.core.exchange.Exchange` before its request-header event is released. This
+keeps service cancellation, response construction, streaming bodies, and terminal
+completion version-neutral. See [doc/h2-connection.md](doc/h2-connection.md) for the
+state, memory, flow-control, and graceful-drain contracts.
 
 ## Layout
 
