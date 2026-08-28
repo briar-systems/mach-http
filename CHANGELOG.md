@@ -6,6 +6,9 @@
 
 - Strict incremental HTTP/2 frame parsing and serialization with continuation sequencing and typed payload validation.
 - Transactional HPACK decoding and encoding with the complete static table, dynamic table eviction, canonical integers, and RFC Huffman coding.
+- Allocation-free HTTP/2 client and server connection engines with preface and settings negotiation, stream state, push, ping, reset, GOAWAY, and two-phase graceful drain.
+- Completion-driven HTTP/2 reads and writes with partial I/O, copied outbound DATA, borrowed inbound events, generation-safe exchange binding, and retry handoff.
+- Independent connection and stream flow control with consumption-driven window replenishment and bounded weighted DATA scheduling.
 - HTTP/1 WebSocket upgrade and HTTP/2 or HTTP/3 extended CONNECT negotiation through the common service exchange.
 - Allocation-free incremental WebSocket decoding and encoding with masking, fragmentation, streaming UTF-8, control frames, and close validation.
 - Completion-driven WebSocket connections with exact borrowed-input release, copied-output ownership, partial I/O, backpressure, cancellation, timeout, and close outcomes.
@@ -14,6 +17,7 @@
 
 - Bounded HPACK encoded input, Huffman expansion, strings, field count, decompressed field-list size, dynamic memory, entries, indices, and table updates independently.
 - Rejected oversized, truncated, mis-scoped, self-dependent, invalidly padded, duplicate-setting, and zero-window HTTP/2 frames.
+- Preserved HPACK state while refusing saturated streams and rejected invalid pseudo-fields, uppercase or connection-specific fields, hostile authorities, priority cycles, content-length mismatches, and DATA on bodyless responses.
 - Enforced mask direction, reserved bits and opcodes, minimally encoded lengths, independent frame and message limits, fragment limits, valid close codes, and protocol-correct 1002, 1007, 1009, and 1006 outcomes.
 
 ## [0.3.0] - 2026-08-28
