@@ -229,6 +229,13 @@ fun overlaps_cache(cache: *Cache, value: ptr, size: usize) bool {
             cache.endpoint_capacity * $size_of(ip.Endpoint));
 }
 
+fun completion_descriptor_valid(cache: *Cache,
+    completion: *resolver.Completion) bool {
+    ret memory.range(completion::ptr, $size_of(resolver.Completion))
+        && !overlaps_cache(cache, completion::ptr,
+            $size_of(resolver.Completion));
+}
+
 fun empty_endpoint() ip.Endpoint {
     var result: ip.Endpoint;
     result.addr.is_v6 = 0;
@@ -734,7 +741,7 @@ fun finish_locked(cache: *Cache, entry: *Entry) {
 pub fun complete(cache: *Cache, token: Token,
     completion: *resolver.Completion, now: time.Time) CompleteStatus {
     if (!cache_ready(cache)
-        || !memory.range(completion::ptr, $size_of(resolver.Completion))
+        || !completion_descriptor_valid(cache, completion)
         || !time_valid(now)) { ret COMPLETE_INVALID; }
     mutex.lock(?cache.lock);
     val entry: *Entry = entry_for_locked(cache, token);
@@ -781,7 +788,7 @@ pub fun complete(cache: *Cache, token: Token,
 pub fun complete_bound(cache: *Cache, completion: *resolver.Completion,
     now: time.Time) CompleteStatus {
     if (!cache_ready(cache)
-        || !memory.range(completion::ptr, $size_of(resolver.Completion))
+        || !completion_descriptor_valid(cache, completion)
         || completion.context >= cache.capacity) { ret COMPLETE_INVALID; }
     mutex.lock(?cache.lock);
     val entry: *Entry = ?cache.entries[completion.context];
@@ -1011,5 +1018,45 @@ test "http.client.dns: capacity output and cancellation stay bounded" {
         error: resolver.Error{kind: resolver.CANCELLED, native_code: 0}};
     if (complete(?cache, first.query.token, ?completion, now)
         != COMPLETE_FAILURE || !destroy(?cache)) { ret 4; }
+    ret 0;
+}
+
+test "http.client.dns: completion descriptors cannot alias cache storage" {
+    var entries: [1]Entry;
+    var aliased: resolver.Completion;
+    var cache: Cache;
+    var configured: Config = config_default();
+    configured.max_entries = 1;
+    configured.max_endpoints_per_entry = 1;
+    if (!init(?cache, ?entries[0], 1,
+        (?aliased)::ptr::*ip.Endpoint, 1, configured)) { ret 1; }
+    val now: time.Time = time.Time{sec: 3, nsec: 0};
+    val query: Lookup = lookup(?cache,
+        test_key("alias.example", 13, 443), now, nil, 0);
+    val resolver_token: resolver.Token = resolver.Token{
+        index: 7, generation: 3};
+    if (query.status != LOOKUP_QUERY
+        || !bind(?cache, query.query.token, resolver_token)) { ret 2; }
+    var resolved: [1]ip.Endpoint;
+    resolved[0] = ip.endpoint(192, 0, 2, 3, 443);
+    aliased = test_completion(query.query, ?resolved[0], 1);
+    if (complete(?cache, query.query.token, ?aliased, now)
+            != COMPLETE_INVALID
+        || complete_bound(?cache, ?aliased, now) != COMPLETE_INVALID
+        || complete(?cache, query.query.token,
+            (?cache)::ptr::*resolver.Completion, now) != COMPLETE_INVALID
+        || complete_bound(?cache,
+            (?entries[0])::ptr::*resolver.Completion, now)
+            != COMPLETE_INVALID) { ret 3; }
+    var completion: resolver.Completion = test_completion(query.query,
+        ?resolved[0], 1);
+    if (complete(?cache, query.query.token, ?completion, now) != COMPLETE_OK) {
+        ret 4;
+    }
+    var output: [1]ip.Endpoint;
+    if (lookup(?cache, test_key("alias.example", 13, 443), now,
+            ?output[0], 1).status != LOOKUP_HIT
+        || output[0].addr.v4.octets[3] != 3
+        || !drain(?cache) || !destroy(?cache)) { ret 5; }
     ret 0;
 }
