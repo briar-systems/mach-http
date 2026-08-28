@@ -1,23 +1,610 @@
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view;
+use std.memory;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.core.target;
+use http.h1.framing;
 
-pub val SERIALIZE_HEAD: u8 = 1;
-pub val SERIALIZE_BODY: u8 = 2;
-pub val SERIALIZE_DONE: u8 = 3;
+pub def Phase: u8;
+pub val SERIALIZE_HEAD: Phase = 1;
+pub val SERIALIZE_BODY: Phase = 2;
+pub val SERIALIZE_CHUNK_PREFIX: Phase = 3;
+pub val SERIALIZE_CHUNK_DATA: Phase = 4;
+pub val SERIALIZE_CHUNK_SUFFIX: Phase = 5;
+pub val SERIALIZE_FINAL_PREFIX: Phase = 6;
+pub val SERIALIZE_TRAILERS: Phase = 7;
+pub val SERIALIZE_FINAL_END: Phase = 8;
+pub val SERIALIZE_DONE: Phase = 9;
+pub val SERIALIZE_ERROR: Phase = 10;
+
+pub def WriteStatus: u8;
+pub val WRITE_NEED_OUTPUT: WriteStatus = 1;
+pub val WRITE_NEED_BODY: WriteStatus = 2;
+pub val WRITE_DONE: WriteStatus = 3;
+pub val WRITE_ERROR: WriteStatus = 4;
+
+pub def Error: u8;
+pub val ERROR_NONE: Error = 0;
+pub val ERROR_STATE: Error = 1;
+pub val ERROR_INVALID_MESSAGE: Error = 2;
+pub val ERROR_INVALID_FIELDS: Error = 3;
+pub val ERROR_INVALID_TRAILERS: Error = 4;
+pub val ERROR_FRAMING: Error = 5;
+pub val ERROR_HEAD_LIMIT: Error = 6;
+pub val ERROR_BODY_FORBIDDEN: Error = 7;
+pub val ERROR_BODY_LENGTH: Error = 8;
+pub val ERROR_BODY_POINTER: Error = 9;
 
 pub rec Serializer {
-    phase: u8;
-    header_index: usize;
-    field_offset: usize;
+    phase: Phase;
+    plan: framing.Plan;
+    scratch: *u8;
+    scratch_capacity: usize;
+    head_length: usize;
+    head_offset: usize;
+    trailer_start: usize;
+    trailer_length: usize;
+    trailer_offset: usize;
     body_written: u64;
+    chunk_size: u64;
+    chunk_remaining: u64;
+    chunk_digits: usize;
+    control_offset: usize;
+    chunk_final: bool;
+    initialized: bool;
+    error: Error;
 }
 
-pub fun init() Serializer {
-    var s: Serializer;
-    s.phase = SERIALIZE_HEAD;
-    ret s;
+pub rec Write {
+    status: WriteStatus;
+    written: usize;
+    consumed: usize;
+    error: Error;
 }
 
-test "http.h1.serializer: starts at the message head" {
-    if (init().phase != SERIALIZE_HEAD) { ret 1; }
+fun append_bytes(serializer: *Serializer, data: *u8, length: usize) bool {
+    if (serializer == nil || (data == nil && length != 0)
+     || length > serializer.scratch_capacity - serializer.head_length) { ret false; }
+    if (length != 0) {
+        memory.raw_copy(?serializer.scratch[serializer.head_length], data, length);
+        serializer.head_length = serializer.head_length + length;
+    }
+    ret true;
+}
+
+fun append_text(serializer: *Serializer, text: str) bool {
+    ret append_bytes(serializer, text, str_len(text));
+}
+
+fun append_version(serializer: *Serializer, version: message.Version) bool {
+    if (!message.valid_version(version) || version.wire != message.WIRE_H1) { ret false; }
+    if (!append_text(serializer, "HTTP/1.")) { ret false; }
+    val digit: u8 = '0' + version.minor;
+    ret append_bytes(serializer, ?digit, 1);
+}
+
+fun append_fields(serializer: *Serializer, fields: *field.Fields) bool {
+    var i: usize = 0;
+    for (i < fields.len) {
+        val item: *field.Field = ?fields.items[i];
+        if (!append_bytes(serializer, item.name.data, item.name.len)
+         || !append_text(serializer, ": ")
+         || !append_bytes(serializer, item.value.data, item.value.len)
+         || !append_text(serializer, "\r\n")) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun reason_valid(reason: view.View) bool {
+    if (reason.data == nil && reason.len != 0) { ret false; }
+    var i: usize = 0;
+    for (i < reason.len) {
+        val c: u8 = reason.data[i];
+        if (c == 0 || c == 127 || c == '\r' || c == '\n' || (c < ' ' && c != '\t')) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun host_valid(value: view.View) bool {
+    if (value.data == nil || value.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val c: u8 = value.data[i];
+        if (c <= ' ' || c >= 127 || c == ',' || c == '@' || c == '/'
+         || c == '?' || c == '#') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun request_host_valid(version: message.Version, fields: *field.Fields) bool {
+    if (version.minor == 0) { ret true; }
+    var count: usize = 0;
+    var valid: bool = false;
+    var i: usize = 0;
+    val name: view.View = view.view("host", 4);
+    for (i < fields.len) {
+        if (field.name_equal(fields.items[i].name, name)) {
+            count = count + 1;
+            valid = host_valid(fields.items[i].value);
+        }
+        i = i + 1;
+    }
+    ret count == 1 && valid;
+}
+
+fun append_status(serializer: *Serializer, code: status.Status) bool {
+    var digits: [3]u8;
+    digits[0] = '0' + ((code / 100) % 10)::u8;
+    digits[1] = '0' + ((code / 10) % 10)::u8;
+    digits[2] = '0' + (code % 10)::u8;
+    ret append_bytes(serializer, ?digits[0], 3);
+}
+
+fun begin(serializer: *Serializer, scratch: *u8, scratch_capacity: usize,
+    fields: *field.Fields, trailers: *field.Fields, plan: framing.Plan) bool {
+    if (serializer == nil || scratch == nil || scratch_capacity == 0 || fields == nil
+     || !field.validate(fields, fields.limits, false)) {
+        if (serializer != nil) { serializer.phase = SERIALIZE_ERROR; serializer.error = ERROR_INVALID_FIELDS; }
+        ret false;
+    }
+    serializer.scratch = scratch;
+    serializer.scratch_capacity = scratch_capacity;
+    serializer.head_length = 0;
+    serializer.head_offset = 0;
+    serializer.trailer_start = 0;
+    serializer.trailer_length = 0;
+    serializer.trailer_offset = 0;
+    serializer.body_written = 0;
+    serializer.chunk_size = 0;
+    serializer.chunk_remaining = 0;
+    serializer.chunk_digits = 0;
+    serializer.control_offset = 0;
+    serializer.chunk_final = false;
+    serializer.initialized = false;
+    serializer.error = ERROR_NONE;
+    serializer.phase = SERIALIZE_HEAD;
+    serializer.plan = plan;
+    if (plan.error != framing.FRAME_OK) {
+        serializer.phase = SERIALIZE_ERROR;
+        serializer.error = ERROR_FRAMING;
+        ret false;
+    }
+    if (trailers != nil && !field.validate(trailers, trailers.limits, true)) {
+        serializer.phase = SERIALIZE_ERROR;
+        serializer.error = ERROR_INVALID_TRAILERS;
+        ret false;
+    }
+    if (trailers != nil && trailers.len != 0 && plan.mode != framing.FRAME_CHUNKED) {
+        serializer.phase = SERIALIZE_ERROR;
+        serializer.error = ERROR_INVALID_TRAILERS;
+        ret false;
+    }
+    serializer.initialized = true;
+    ret true;
+}
+
+fun finish_head(serializer: *Serializer, fields: *field.Fields,
+    trailers: *field.Fields) bool {
+    if (!append_fields(serializer, fields) || !append_text(serializer, "\r\n")) {
+        serializer.phase = SERIALIZE_ERROR;
+        serializer.error = ERROR_HEAD_LIMIT;
+        serializer.initialized = false;
+        ret false;
+    }
+    val head_end: usize = serializer.head_length;
+    serializer.trailer_start = head_end;
+    if (trailers != nil && !append_fields(serializer, trailers)) {
+        serializer.phase = SERIALIZE_ERROR;
+        serializer.error = ERROR_HEAD_LIMIT;
+        serializer.initialized = false;
+        ret false;
+    }
+    serializer.trailer_length = serializer.head_length - head_end;
+    serializer.head_length = head_end;
+    ret true;
+}
+
+pub fun init_request(serializer: *Serializer, version: message.Version,
+    request_method: method.Method, request_target: target.Target, fields: *field.Fields,
+    trailers: *field.Fields, scratch: *u8, scratch_capacity: usize) bool {
+    val target_limits: target.Limits = target.limits(request_target.raw.len,
+        request_target.scheme.len, request_target.authority.len, request_target.path.len,
+        request_target.query.len);
+    if (serializer == nil || !message.valid_version(version) || version.wire != message.WIRE_H1
+     || !method.valid(request_method, request_method.token.len)
+     || !target.valid_for_method(request_target, request_method.kind, target_limits)
+     || fields == nil || !field.validate(fields, fields.limits, false)
+     || !request_host_valid(version, fields)) {
+        if (serializer != nil) { serializer.phase = SERIALIZE_ERROR; serializer.error = ERROR_INVALID_MESSAGE; }
+        ret false;
+    }
+    val plan: framing.Plan = framing.request(version, fields);
+    if (!begin(serializer, scratch, scratch_capacity, fields, trailers, plan)) { ret false; }
+    if (!append_bytes(serializer, request_method.token.data, request_method.token.len)
+     || !append_text(serializer, " ")
+     || !append_bytes(serializer, request_target.raw.data, request_target.raw.len)
+     || !append_text(serializer, " ") || !append_version(serializer, version)
+     || !append_text(serializer, "\r\n") || !finish_head(serializer, fields, trailers)) {
+        serializer.phase = SERIALIZE_ERROR;
+        if (serializer.error == ERROR_NONE) { serializer.error = ERROR_HEAD_LIMIT; }
+        serializer.initialized = false;
+        ret false;
+    }
+    ret true;
+}
+
+pub fun init_response(serializer: *Serializer, message_version: message.Version,
+    request_method: method.Kind, code: status.Status, reason: view.View,
+    fields: *field.Fields, trailers: *field.Fields, scratch: *u8,
+    scratch_capacity: usize) bool {
+    if (serializer == nil || !message.valid_version(message_version)
+     || message_version.wire != message.WIRE_H1 || !status.valid(code)
+     || request_method < method.GET || request_method > method.EXTENSION
+     || !reason_valid(reason) || fields == nil
+     || !field.validate(fields, fields.limits, false)) {
+        if (serializer != nil) { serializer.phase = SERIALIZE_ERROR; serializer.error = ERROR_INVALID_MESSAGE; }
+        ret false;
+    }
+    val plan: framing.Plan = framing.response(message_version, code, request_method, fields);
+    if (!begin(serializer, scratch, scratch_capacity, fields, trailers, plan)) { ret false; }
+    if (!append_version(serializer, message_version) || !append_text(serializer, " ")
+     || !append_status(serializer, code) || !append_text(serializer, " ")
+     || !append_bytes(serializer, reason.data, reason.len) || !append_text(serializer, "\r\n")
+     || !finish_head(serializer, fields, trailers)) {
+        serializer.phase = SERIALIZE_ERROR;
+        if (serializer.error == ERROR_NONE) { serializer.error = ERROR_HEAD_LIMIT; }
+        serializer.initialized = false;
+        ret false;
+    }
+    ret true;
+}
+
+fun write_result(serializer: *Serializer, status: WriteStatus,
+    written: usize, consumed: usize) Write {
+    ret Write{status: status, written: written, consumed: consumed, error: serializer.error};
+}
+
+fun write_fail(serializer: *Serializer, error: Error, written: usize, consumed: usize) Write {
+    serializer.phase = SERIALIZE_ERROR;
+    serializer.error = error;
+    ret write_result(serializer, WRITE_ERROR, written, consumed);
+}
+
+fun hex_digits(value: u64) usize {
+    var digits: usize = 1;
+    var remaining: u64 = value;
+    for (remaining >= 16) { remaining = remaining / 16; digits = digits + 1; }
+    ret digits;
+}
+
+fun hex_digit(value: u8) u8 {
+    if (value < 10) { ret '0' + value; }
+    ret 'a' + value - 10;
+}
+
+pub fun write(serializer: *Serializer, output: *u8, output_capacity: usize,
+    body: *u8, body_length: usize, body_final: bool) Write {
+    if (serializer == nil || !serializer.initialized || (output == nil && output_capacity != 0)
+     || (body == nil && body_length != 0)) {
+        var invalid: Write;
+        invalid.status = WRITE_ERROR;
+        invalid.error = ERROR_STATE;
+        ret invalid;
+    }
+    if (serializer.phase == SERIALIZE_ERROR) { ret write_result(serializer, WRITE_ERROR, 0, 0); }
+    if (serializer.phase == SERIALIZE_DONE) { ret write_result(serializer, WRITE_DONE, 0, 0); }
+    var written: usize = 0;
+    var consumed: usize = 0;
+    for (true) {
+        if (serializer.phase == SERIALIZE_HEAD) {
+            if (serializer.head_offset == serializer.head_length) {
+                serializer.phase = SERIALIZE_BODY;
+                cnt;
+            }
+            if (written == output_capacity) {
+                ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+            }
+            var amount: usize = serializer.head_length - serializer.head_offset;
+            if (amount > output_capacity - written) { amount = output_capacity - written; }
+            memory.raw_copy(?output[written], ?serializer.scratch[serializer.head_offset], amount);
+            serializer.head_offset = serializer.head_offset + amount;
+            written = written + amount;
+            cnt;
+        }
+        if (serializer.phase == SERIALIZE_BODY) {
+            if (serializer.plan.mode == framing.FRAME_NONE || serializer.plan.mode == framing.FRAME_TUNNEL) {
+                if (body_length != consumed) {
+                    ret write_fail(serializer, ERROR_BODY_FORBIDDEN, written, consumed);
+                }
+                if (!body_final) { ret write_result(serializer, WRITE_NEED_BODY, written, consumed); }
+                serializer.phase = SERIALIZE_DONE;
+                ret write_result(serializer, WRITE_DONE, written, consumed);
+            }
+            if (serializer.plan.mode == framing.FRAME_CHUNKED) {
+                if (body_length == consumed) {
+                    if (!body_final) { ret write_result(serializer, WRITE_NEED_BODY, written, consumed); }
+                    serializer.phase = SERIALIZE_FINAL_PREFIX;
+                    serializer.control_offset = 0;
+                    cnt;
+                }
+                serializer.chunk_size = (body_length - consumed)::u64;
+                serializer.chunk_remaining = serializer.chunk_size;
+                serializer.chunk_digits = hex_digits(serializer.chunk_size);
+                serializer.control_offset = 0;
+                serializer.chunk_final = body_final;
+                serializer.phase = SERIALIZE_CHUNK_PREFIX;
+                cnt;
+            }
+            if (serializer.plan.mode == framing.FRAME_LENGTH) {
+                val remaining: u64 = serializer.plan.length - serializer.body_written;
+                if ((body_length - consumed)::u64 > remaining) {
+                    ret write_fail(serializer, ERROR_BODY_LENGTH, written, consumed);
+                }
+                if (body_length == consumed) {
+                    if (body_final) {
+                        if (remaining != 0) { ret write_fail(serializer, ERROR_BODY_LENGTH, written, consumed); }
+                        serializer.phase = SERIALIZE_DONE;
+                        ret write_result(serializer, WRITE_DONE, written, consumed);
+                    }
+                    ret write_result(serializer, WRITE_NEED_BODY, written, consumed);
+                }
+                if (written == output_capacity) {
+                    ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+                }
+                var amount: usize = body_length - consumed;
+                if (amount > output_capacity - written) { amount = output_capacity - written; }
+                memory.raw_copy(?output[written], ?body[consumed], amount);
+                serializer.body_written = serializer.body_written + amount::u64;
+                consumed = consumed + amount;
+                written = written + amount;
+                cnt;
+            }
+            if (serializer.plan.mode == framing.FRAME_CLOSE) {
+                if (body_length == consumed) {
+                    if (body_final) {
+                        serializer.phase = SERIALIZE_DONE;
+                        ret write_result(serializer, WRITE_DONE, written, consumed);
+                    }
+                    ret write_result(serializer, WRITE_NEED_BODY, written, consumed);
+                }
+                if (written == output_capacity) {
+                    ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+                }
+                var amount: usize = body_length - consumed;
+                if (amount > output_capacity - written) { amount = output_capacity - written; }
+                memory.raw_copy(?output[written], ?body[consumed], amount);
+                serializer.body_written = serializer.body_written + amount::u64;
+                consumed = consumed + amount;
+                written = written + amount;
+                cnt;
+            }
+            ret write_fail(serializer, ERROR_STATE, written, consumed);
+        }
+        if (serializer.phase == SERIALIZE_CHUNK_PREFIX) {
+            val prefix_length: usize = serializer.chunk_digits + 2;
+            for (serializer.control_offset < prefix_length && written < output_capacity) {
+                if (serializer.control_offset < serializer.chunk_digits) {
+                    val shift: usize = (serializer.chunk_digits - serializer.control_offset - 1) * 4;
+                    output[written] = hex_digit(((serializer.chunk_size >> shift) & 15)::u8);
+                } or {
+                    if (serializer.control_offset == serializer.chunk_digits) { output[written] = '\r'; }
+                    or { output[written] = '\n'; }
+                }
+                serializer.control_offset = serializer.control_offset + 1;
+                written = written + 1;
+            }
+            if (serializer.control_offset != prefix_length) {
+                ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+            }
+            serializer.phase = SERIALIZE_CHUNK_DATA;
+            serializer.control_offset = 0;
+            cnt;
+        }
+        if (serializer.phase == SERIALIZE_CHUNK_DATA) {
+            if ((body_length - consumed)::u64 != serializer.chunk_remaining) {
+                ret write_fail(serializer, ERROR_BODY_POINTER, written, consumed);
+            }
+            if (written == output_capacity) {
+                ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+            }
+            var amount: usize = body_length - consumed;
+            if (amount > output_capacity - written) { amount = output_capacity - written; }
+            memory.raw_copy(?output[written], ?body[consumed], amount);
+            serializer.chunk_remaining = serializer.chunk_remaining - amount::u64;
+            serializer.body_written = serializer.body_written + amount::u64;
+            consumed = consumed + amount;
+            written = written + amount;
+            if (serializer.chunk_remaining == 0) {
+                serializer.phase = SERIALIZE_CHUNK_SUFFIX;
+                serializer.control_offset = 0;
+            }
+            cnt;
+        }
+        if (serializer.phase == SERIALIZE_CHUNK_SUFFIX) {
+            for (serializer.control_offset < 2 && written < output_capacity) {
+                if (serializer.control_offset == 0) { output[written] = '\r'; }
+                or { output[written] = '\n'; }
+                serializer.control_offset = serializer.control_offset + 1;
+                written = written + 1;
+            }
+            if (serializer.control_offset != 2) {
+                ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+            }
+            if (serializer.chunk_final) { serializer.phase = SERIALIZE_FINAL_PREFIX; }
+            or { serializer.phase = SERIALIZE_BODY; }
+            serializer.control_offset = 0;
+            cnt;
+        }
+        if (serializer.phase == SERIALIZE_FINAL_PREFIX) {
+            for (serializer.control_offset < 3 && written < output_capacity) {
+                if (serializer.control_offset == 0) { output[written] = '0'; }
+                or {
+                    if (serializer.control_offset == 1) { output[written] = '\r'; }
+                    or { output[written] = '\n'; }
+                }
+                serializer.control_offset = serializer.control_offset + 1;
+                written = written + 1;
+            }
+            if (serializer.control_offset != 3) {
+                ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+            }
+            serializer.phase = SERIALIZE_TRAILERS;
+            serializer.control_offset = 0;
+            cnt;
+        }
+        if (serializer.phase == SERIALIZE_TRAILERS) {
+            if (serializer.trailer_offset == serializer.trailer_length) {
+                serializer.phase = SERIALIZE_FINAL_END;
+                cnt;
+            }
+            if (written == output_capacity) {
+                ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+            }
+            var amount: usize = serializer.trailer_length - serializer.trailer_offset;
+            if (amount > output_capacity - written) { amount = output_capacity - written; }
+            memory.raw_copy(?output[written],
+                ?serializer.scratch[serializer.trailer_start + serializer.trailer_offset], amount);
+            serializer.trailer_offset = serializer.trailer_offset + amount;
+            written = written + amount;
+            cnt;
+        }
+        if (serializer.phase == SERIALIZE_FINAL_END) {
+            for (serializer.control_offset < 2 && written < output_capacity) {
+                if (serializer.control_offset == 0) { output[written] = '\r'; }
+                or { output[written] = '\n'; }
+                serializer.control_offset = serializer.control_offset + 1;
+                written = written + 1;
+            }
+            if (serializer.control_offset != 2) {
+                ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+            }
+            serializer.phase = SERIALIZE_DONE;
+            ret write_result(serializer, WRITE_DONE, written, consumed);
+        }
+        ret write_fail(serializer, ERROR_STATE, written, consumed);
+    }
+    ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
+}
+
+test "http.h1.serializer: fixed requests drain one byte at a time" {
+    var items: [2]field.Field;
+    var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 64, 32, 32));
+    field.append(?fields, field.Field{name: view.view("Host", 4),
+        value: view.view("example.com", 11), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("Content-Length", 14),
+        value: view.view("5", 1), sensitive: false});
+    var trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var scratch: [256]u8;
+    var serializer: Serializer;
+    val request_target: target.Target = target.origin(view.view("/x", 2),
+        view.view("/x", 2), view.view(nil, 0));
+    if (!init_request(?serializer, message.version_h1(1, 1), method.from_kind(method.POST),
+        request_target, ?fields, ?trailers, ?scratch[0], 256)) { ret 1; }
+    var output: [256]u8;
+    var output_length: usize = 0;
+    var body_offset: usize = 0;
+    var done: bool = false;
+    for (!done) {
+        val result: Write = write(?serializer, ?output[output_length], 1,
+            ("hello"::usize + body_offset)::ptr::*u8, 5 - body_offset, true);
+        output_length = output_length + result.written;
+        body_offset = body_offset + result.consumed;
+        if (result.status == WRITE_ERROR) { ret 2; }
+        done = result.status == WRITE_DONE;
+    }
+    val expected: str = "POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello";
+    if (body_offset != 5 || output_length != str_len(expected)
+     || !memory.raw_equal(?output[0], expected, output_length)) { ret 3; }
+    ret 0;
+}
+
+test "http.h1.serializer: chunked responses stream trailers canonically" {
+    var items: [2]field.Field;
+    var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 64, 32, 32));
+    field.append(?fields, field.Field{name: view.view("Transfer-Encoding", 17),
+        value: view.view("chunked", 7), sensitive: false});
+    field.append(?fields, field.Field{name: view.view("Trailer", 7),
+        value: view.view("X-Sum", 5), sensitive: false});
+    var trailer_items: [1]field.Field;
+    var trailers: field.Fields = field.init(?trailer_items[0], 1, field.limits(1, 32, 16, 16));
+    field.append_trailer(?trailers, field.Field{name: view.view("X-Sum", 5),
+        value: view.view("9", 1), sensitive: false});
+    var scratch: [256]u8;
+    var serializer: Serializer;
+    if (!init_response(?serializer, message.version_h1(1, 1), method.GET, status.OK,
+        view.view("OK", 2), ?fields, ?trailers, ?scratch[0], 256)) { ret 1; }
+    var output: [256]u8;
+    var output_length: usize = 0;
+    var body_offset: usize = 0;
+    var done: bool = false;
+    for (!done) {
+        val result: Write = write(?serializer, ?output[output_length], 1,
+            ("Wikipedia"::usize + body_offset)::ptr::*u8, 9 - body_offset, true);
+        output_length = output_length + result.written;
+        body_offset = body_offset + result.consumed;
+        if (result.status == WRITE_ERROR) { ret 2; }
+        done = result.status == WRITE_DONE;
+    }
+    val expected: str = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n9\r\nWikipedia\r\n0\r\nX-Sum: 9\r\n\r\n";
+    if (body_offset != 9 || output_length != str_len(expected)
+     || !memory.raw_equal(?output[0], expected, output_length)) { ret 3; }
+    ret 0;
+}
+
+test "http.h1.serializer: splitting and framing violations never reach the wire" {
+    var bad_item: field.Field = field.Field{name: view.view("X-Test", 6),
+        value: view.view("ok\r\nInjected: yes", 17), sensitive: false};
+    var bad_fields: field.Fields = field.Fields{items: ?bad_item, len: 1, capacity: 1,
+        bytes: 23, limits: field.limits(1, 64, 16, 32), valid: true};
+    var scratch: [128]u8;
+    var serializer: Serializer;
+    if (init_response(?serializer, message.version_h1(1, 1), method.GET, status.OK,
+        view.view("OK", 2), ?bad_fields, nil, ?scratch[0], 128)) { ret 1; }
+    var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    if (init_response(?serializer, message.version_h1(1, 1), method.GET, status.OK,
+        view.view("OK\r\nInjected", 12), ?no_fields, nil, ?scratch[0], 128)) { ret 2; }
+    var length_item: field.Field;
+    var length_fields: field.Fields = field.init(?length_item, 1, field.limits(1, 32, 16, 16));
+    field.append(?length_fields, field.Field{name: view.view("Content-Length", 14),
+        value: view.view("5", 1), sensitive: false});
+    if (!init_response(?serializer, message.version_h1(1, 1), method.GET, status.OK,
+        view.view("OK", 2), ?length_fields, nil, ?scratch[0], 128)) { ret 3; }
+    var output: [128]u8;
+    var body_offset: usize = 0;
+    var result: Write;
+    result.status = 0;
+    for (result.status != WRITE_ERROR && result.status != WRITE_DONE) {
+        result = write(?serializer, ?output[0], 128,
+            ("four"::usize + body_offset)::ptr::*u8, 4 - body_offset, true);
+        body_offset = body_offset + result.consumed;
+    }
+    if (result.status != WRITE_ERROR || result.error != ERROR_BODY_LENGTH) { ret 4; }
+    ret 0;
+}
+
+test "http.h1.serializer: http 1.0 close responses complete on the caller boundary" {
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var scratch: [128]u8;
+    var serializer: Serializer;
+    if (!init_response(?serializer, message.version_h1(1, 0), method.GET, status.OK,
+        view.view("OK", 2), ?fields, nil, ?scratch[0], 128)) { ret 1; }
+    if (serializer.plan.mode != framing.FRAME_CLOSE || serializer.plan.keep_alive) { ret 2; }
+    var output: [128]u8;
+    val result: Write = write(?serializer, ?output[0], 128, "hello", 5, true);
+    val expected: str = "HTTP/1.0 200 OK\r\n\r\nhello";
+    if (result.status != WRITE_DONE || result.consumed != 5
+     || result.written != str_len(expected)
+     || !memory.raw_equal(?output[0], expected, result.written)) { ret 3; }
     ret 0;
 }
