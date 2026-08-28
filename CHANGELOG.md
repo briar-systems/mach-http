@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.0] - 2026-08-28
+
+### Added
+
+- Bounded compile-once routing with caller-owned route and segment storage.
+- Exact, wildcard, port-specific, and host-independent authority matching.
+- Literal, parameter, terminal catch-all, root, trailing-slash, asterisk-form, and authority-form routing.
+- Deterministic host, path, and method precedence independent of registration order.
+- Generation-bound captures, handler invocation, and caller-buffer percent decoding.
+- Actionable conflict and capacity diagnostics with zero dispatch allocation.
+
+### Security
+
+- Rejected malformed encodings, encoded separators, backslashes, controls, dot segments, hostile authorities, duplicate Host fields, invalid methods, and invalid target forms before dispatch.
+
 ## [0.2.1] - 2026-08-28
 
 ### Fixed
