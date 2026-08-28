@@ -96,11 +96,18 @@ drain are implemented.
   request generation.
 - DNS refresh, connection creation, HTTP exchange, replay, waits, completion, and
   shutdown are explicit actions. The client retains no hidden runtime operation.
+- Published DNS work remains generation-owned until its submission is acknowledged,
+  so cancellation cannot strand a shared refresh or its waiters.
 - Connection pools isolate origins and complete proxy identities. Total, per-route,
   lease, stream, idle, and idle-lifetime budgets are independent.
+- Pool maintenance publishes close ownership during normal service. Live HTTP/2 and
+  HTTP/3 stream capacity follows generation-bound peer credit updates.
 - Retries require explicit replay authorization. Streaming bodies are never buffered
-  or retried. Cross-origin and cross-proxy redirects require sensitive fields to be
-  removed from a fresh request generation.
+  or retried. Complete response retries preserve the final response when policy is
+  denied or exhausted. Cross-origin and cross-proxy redirects require sensitive
+  fields and trailers to be removed from a fresh request generation.
+- The pool route is the canonical authority. Host, CONNECT authority-form, and
+  forward-proxy absolute-form inputs are checked against it before exchange.
 - TLS belongs below the transport contract and is not a dependency of this package.
 
 ## Routing

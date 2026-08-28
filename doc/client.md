@@ -10,7 +10,10 @@ allocating or hiding transport work.
 The caller provides fixed arrays for request slots and per-request resolved
 endpoints. The DNS cache and connection pool have their own caller-provided arrays.
 `client.init` rejects overlap among all nine objects and backing regions before it
-writes any storage.
+writes any storage. Submission also rejects request views, body readers, body
+provider contexts, and body cancellation scopes that overlap client-owned storage.
+Response completion rejects the response object, fields, trailers, bodies, provider
+contexts, and scopes on the same basis before ownership changes.
 
 The client owns the cache and pool lifecycle after initialization. Drain and destroy
 them through the client, then destroy the empty dependencies. A `Request` and all of
@@ -30,15 +33,21 @@ Call `submit`, then call `next` until it publishes an external action or complet
 - `ACTION_RESOLVE` owns one cache query. Submit its resolver query and scope, then
   call `resolution_submitted` with the exact resolver token. If submission fails,
   call `resolution_submit_failed`. Resolver completions enter through
-  `complete_resolution` and are matched by both context and token.
+  `complete_resolution` and are matched by both context and token. Cancellation does
+  not retire the request token while this publication is unacknowledged. The
+  submission callback first transfers or abandons the shared cache query, then the
+  request publishes its cancellation outcome.
 - `ACTION_CONNECT` owns one pool reservation. The connector derives its TLS or QUIC
   ALPN offers with `policy.offers`. Report success through `connected`, or report a
   failed endpoint through `connect_failed`. `Connected.close_driver` tells the
   connector whether it still owns and must close a late driver.
 - `ACTION_EXCHANGE` transfers one exact lease and request generation to the selected
   HTTP/1, HTTP/2, or HTTP/3 engine. Complete it with `exchange_complete` or
-  `exchange_failed`. The completion supplies the body reuse decision that controls
-  pool retention.
+  `exchange_failed`. A complete retryable HTTP response enters through
+  `exchange_response_retry`, which either schedules replay or preserves that exact
+  response as the final successful HTTP outcome when policy denies or exhausts the
+  retry. The completion supplies the body reuse decision that controls pool
+  retention.
 - `ACTION_WAIT_DNS`, `ACTION_WAIT_POOL`, and `ACTION_WAIT_TIMER` retain no new caller
   buffer. Drive `next` again after the corresponding state changes or absolute time
   arrives.
@@ -54,6 +63,13 @@ An HTTP/3-only or HTTP/3 prior-knowledge policy selects QUIC directly. A mixed p
 starts on TCP until the caller applies an HTTP/3 discovery policy such as a cached
 alternative service.
 
+The route origin is the canonical outbound authority. Origin and asterisk targets
+carry it out of band. CONNECT always uses authority-form with an explicit matching
+port. Other forward-proxy requests use matching absolute-form targets. If a caller
+supplies a Host field, it must also match and may occur only once. Version adapters
+generate their wire authority from the route when Host is absent. Target component
+views must describe the exact raw target rather than an unrelated borrowed string.
+
 ## DNS, pools, and proxies
 
 DNS keys include host, port, and transport. Results are copied in resolver order,
@@ -66,26 +82,36 @@ Pool keys include the origin and complete proxy metadata. A proxy identity separ
 credentials and policy even when its address is the same. HTTP forwarding, HTTP
 tunneling, SOCKS5, and CONNECT-UDP declare TCP and datagram capabilities explicitly.
 HTTP/1 leases are exclusive. HTTP/2 and HTTP/3 leases share a connection up to the
-reported peer and configured stream limits.
+reported peer and configured stream limits. `pool.update_max_streams` applies a
+generation-bound peer SETTINGS or transport-credit change. Reducing the limit below
+current use preserves existing leases and blocks only new acquisition.
 
 Total connections, connections per route, leases, idle connections, idle connections
 per route, idle lifetime, and streams per connection are independently bounded. Idle
 and drained drivers are published exactly once as maintenance close actions. The
 caller closes the driver, then calls `pool.retire` with that exact close token.
+Drive `client.maintenance` during normal operation as well as shutdown. Routine calls
+publish expired, non-reusable, drained, and over-budget drivers. DNS and connector
+cancellation actions remain gated to dependency drain.
 
 ## Retry and redirect safety
 
 Retry permission is application data. `Replay.explicit` must be true and the body
 must be empty or externally rewindable. Streaming bodies are never retried. Transport
-retries additionally require proof that the request was not processed. Response
-retries require a complete response and an enabled status class. Retry-After delays
-and DNS negative-cache delays are absolute wait actions.
+and protocol retries additionally require exact proof that the request was not
+processed. Contradictory response or processing flags are invalid rather than a
+retry denial. Response retries require a complete response and an enabled status
+class. The response status must match the supplied response retry reason. A detached
+or contradictory reason is rejected without consuming the exchange. Retry-After
+delays and DNS negative-cache delays are absolute wait actions.
 
 Redirect evaluation distinguishes method rewriting, body removal, downgrade policy,
 origin credentials, and proxy credentials. `follow_redirect` accepts only a fresh,
 fully validated request generation. Cross-origin replacements must omit sensitive
-fields, Authorization, and Cookie. Cross-proxy replacements must omit
-Proxy-Authorization. A maximum of zero disables redirects and yields the normal
+fields and trailers, Authorization, and Cookie. Cross-proxy replacements must omit
+Proxy-Authorization from fields and trailers. A redirect that removes a body changes
+the stored replay classification to empty. Other replacements must preserve the
+declared replay class. A maximum of zero disables redirects and yields the normal
 redirect-limit result.
 
 ## Cancellation and shutdown
