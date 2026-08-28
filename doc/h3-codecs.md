@@ -48,6 +48,12 @@ advertised in SETTINGS. Entry size is name bytes plus value bytes plus 32. Byte
 capacity, physical entry capacity, arena capacity, and the 62-bit insertion space are
 all enforced.
 
+`Sections` binds permanently to one dynamic table and to the blocked-stream,
+outstanding-section, and reference limits supplied at initialization. Backing arrays
+may be larger than those limits, but the extra slots are never searched or allocated.
+Every field or decoder-stream codec must use the same table and an exactly compatible
+section policy.
+
 ## Instruction streams
 
 `EncoderStreamDecoder` accepts arbitrary fragments of Set Dynamic Table Capacity,

@@ -94,8 +94,10 @@ pub rec Section {
 pub rec Sections {
     items: *Section;
     capacity: usize;
+    section_limit: usize;
     references: *Reference;
     reference_capacity: usize;
+    reference_limit: usize;
     table: *DynamicTable;
     count: usize;
     blocked_count: usize;
@@ -521,7 +523,9 @@ pub fun sections_init(sections: *Sections, items: *Section, capacity: usize,
      || table == nil || !table.valid
      || table.max_capacity > limits.max_table_capacity) { ret false; }
     sections.items = items; sections.capacity = capacity;
+    sections.section_limit = limits.max_outstanding_sections;
     sections.references = references; sections.reference_capacity = reference_capacity;
+    sections.reference_limit = limits.max_references;
     sections.table = table; sections.count = 0; sections.blocked_count = 0;
     sections.known_received = 0; sections.next_sequence = 1;
     sections.max_blocked_streams = limits.max_blocked_streams; sections.valid = true;
@@ -533,9 +537,18 @@ pub fun sections_init(sections: *Sections, items: *Section, capacity: usize,
     ret true;
 }
 
+fun sections_compatible(sections: *Sections, table: *DynamicTable,
+    limits: Limits) bool {
+    ret sections != nil && sections.valid && table != nil && table.valid
+        && sections.table == table
+        && sections.max_blocked_streams == limits.max_blocked_streams
+        && sections.section_limit == limits.max_outstanding_sections
+        && sections.reference_limit == limits.max_references;
+}
+
 fun stream_blocked(sections: *Sections, stream_id: u64, except: usize) bool {
     var i: usize = 0;
-    for (i < sections.capacity) {
+    for (i < sections.section_limit) {
         if (i != except && sections.items[i].active && sections.items[i].blocked
          && sections.items[i].stream_id == stream_id) { ret true; }
         i = i + 1;
@@ -545,15 +558,17 @@ fun stream_blocked(sections: *Sections, stream_id: u64, except: usize) bool {
 
 fun allocate_section(sections: *Sections, stream_id: u64,
     required: u64, base: u64, blocked: bool) usize {
-    if (sections == nil || !sections.valid || sections.count >= sections.capacity
+    if (sections == nil || !sections.valid || sections.count >= sections.section_limit
      || sections.next_sequence == MAX_INTEGER) {
         ret (-1)::usize;
     }
     if (blocked && !stream_blocked(sections, stream_id, (-1)::usize)
      && sections.blocked_count >= sections.max_blocked_streams) { ret (-1)::usize; }
     var slot: usize = 0;
-    for (slot < sections.capacity && sections.items[slot].active) { slot = slot + 1; }
-    if (slot == sections.capacity) { ret (-1)::usize; }
+    for (slot < sections.section_limit && sections.items[slot].active) {
+        slot = slot + 1;
+    }
+    if (slot == sections.section_limit) { ret (-1)::usize; }
     sections.items[slot] = Section{stream_id: stream_id,
         required_insert_count: required, base: base,
         sequence: sections.next_sequence, blocked: blocked, active: true};
@@ -565,12 +580,12 @@ fun allocate_section(sections: *Sections, stream_id: u64,
 }
 
 fun release_section(sections: *Sections, slot: usize) bool {
-    if (sections == nil || !sections.valid || slot >= sections.capacity
+    if (sections == nil || !sections.valid || slot >= sections.section_limit
      || !sections.items[slot].active) { ret false; }
     val stream_id: u64 = sections.items[slot].stream_id;
     val was_blocked: bool = sections.items[slot].blocked;
     var i: usize = 0;
-    for (i < sections.reference_capacity) {
+    for (i < sections.reference_limit) {
         if (sections.references[i].active && sections.references[i].section == slot) {
             val entry: *Entry = table_find_absolute(sections.table,
                 sections.references[i].absolute);
@@ -592,16 +607,16 @@ fun add_reference(sections: *Sections, slot: usize, absolute: u64) bool {
     val entry: *Entry = table_find_absolute(sections.table, absolute);
     if (entry == nil) { ret false; }
     var i: usize = 0;
-    for (i < sections.reference_capacity) {
+    for (i < sections.reference_limit) {
         if (sections.references[i].active && sections.references[i].section == slot
          && sections.references[i].absolute == absolute) { ret true; }
         i = i + 1;
     }
     i = 0;
-    for (i < sections.reference_capacity && sections.references[i].active) {
+    for (i < sections.reference_limit && sections.references[i].active) {
         i = i + 1;
     }
-    if (i == sections.reference_capacity) { ret false; }
+    if (i == sections.reference_limit) { ret false; }
     sections.references[i] = Reference{section: slot, absolute: absolute, active: true};
     entry.references = entry.references + 1;
     ret true;
@@ -610,7 +625,7 @@ fun add_reference(sections: *Sections, slot: usize, absolute: u64) bool {
 pub fun sections_unblock(sections: *Sections) usize {
     if (sections == nil || !sections.valid) { ret 0; }
     var changed: usize = 0; var i: usize = 0;
-    for (i < sections.capacity) {
+    for (i < sections.section_limit) {
         if (sections.items[i].active && sections.items[i].blocked
          && sections.items[i].required_insert_count <= sections.table.insert_count) {
             val stream_id: u64 = sections.items[i].stream_id;
@@ -628,7 +643,7 @@ pub fun sections_acknowledge(sections: *Sections, stream_id: u64) Error {
     if (sections == nil || !sections.valid) { ret ERROR_STATE; }
     var slot: usize = (-1)::usize; var sequence: u64 = (-1)::u64;
     var i: usize = 0;
-    for (i < sections.capacity) {
+    for (i < sections.section_limit) {
         if (sections.items[i].active && sections.items[i].stream_id == stream_id
          && sections.items[i].required_insert_count != 0
          && sections.items[i].sequence < sequence) {
@@ -647,7 +662,7 @@ pub fun sections_acknowledge(sections: *Sections, stream_id: u64) Error {
 pub fun sections_cancel(sections: *Sections, stream_id: u64) Error {
     if (sections == nil || !sections.valid) { ret ERROR_STATE; }
     var found: bool = false; var i: usize = 0;
-    for (i < sections.capacity) {
+    for (i < sections.section_limit) {
         if (sections.items[i].active && sections.items[i].stream_id == stream_id) {
             release_section(sections, i); found = true;
         }
@@ -1022,7 +1037,7 @@ pub fun decoder_stream_decoder_init(decoder: *DecoderStreamDecoder,
     if (decoder == nil || decoder.initialized || !limits_valid(limits)
      || table == nil || !table.valid
      || table.max_capacity > limits.max_table_capacity
-     || sections == nil || !sections.valid
+     || !sections_compatible(sections, table, limits)
      || input == nil || input_capacity < limits.max_instruction_bytes) { ret false; }
     decoder.limits = limits; decoder.table = table; decoder.sections = sections;
     decoder.input = input; decoder.input_capacity = input_capacity;
@@ -1128,7 +1143,7 @@ pub fun field_decoder_init(decoder: *FieldDecoder, table: *DynamicTable,
     if (decoder == nil || decoder.initialized || !limits_valid(limits)
      || table == nil || !table.valid
      || table.max_capacity > limits.max_table_capacity
-     || sections == nil || !sections.valid
+     || !sections_compatible(sections, table, limits)
      || encoded == nil || encoded_capacity < limits.max_encoded_section_bytes
      || fields == nil || field_capacity < limits.max_field_count
      || storage == nil || storage_capacity < limits.max_field_section_bytes
@@ -1384,7 +1399,7 @@ pub fun field_encoder_init(encoder: *FieldEncoder, table: *DynamicTable,
     if (encoder == nil || encoder.initialized || !limits_valid(limits)
      || table == nil || !table.valid
      || table.max_capacity > limits.max_table_capacity
-     || sections == nil || !sections.valid
+     || !sections_compatible(sections, table, limits)
      || output == nil || output_capacity < FIELD_PREFIX_RESERVE
      || references == nil || reference_capacity < limits.max_field_count) { ret false; }
     encoder.limits = limits; encoder.table = table; encoder.sections = sections;
@@ -1956,5 +1971,96 @@ test "http.h3.qpack: public encoder contracts reject hostile callers safely" {
     if (field_encoder_init(?impossible, ?table, ?sections, 8,
         ?invalid_output[0], 512, ?invalid_references[0], 8,
         undersized_limit)) { ret 6; }
+    ret 0;
+}
+
+test "http.h3.qpack: composite initializers reject foreign section contexts" {
+    val limits: Limits = test_limits();
+    var entries_one: [8]Entry; var storage_one: [220]u8; var scratch_one: [220]u8;
+    var table_one: DynamicTable;
+    table_init(?table_one, ?entries_one[0], 8, ?storage_one[0], 220,
+        ?scratch_one[0], 220, 220);
+    var entries_two: [8]Entry; var storage_two: [220]u8; var scratch_two: [220]u8;
+    var table_two: DynamicTable;
+    table_init(?table_two, ?entries_two[0], 8, ?storage_two[0], 220,
+        ?scratch_two[0], 220, 220);
+    var section_items: [8]Section; var section_refs: [32]Reference;
+    var sections: Sections;
+    sections_init(?sections, ?section_items[0], 8, ?section_refs[0], 32,
+        ?table_one, limits);
+    var instruction_input: [128]u8; var foreign_stream: DecoderStreamDecoder;
+    if (decoder_stream_decoder_init(?foreign_stream, ?table_two, ?sections,
+        ?instruction_input[0], 128, limits)) { ret 1; }
+    var blocked_mismatch: Limits = limits;
+    blocked_mismatch.max_blocked_streams = limits.max_blocked_streams - 1;
+    var policy_stream: DecoderStreamDecoder;
+    if (decoder_stream_decoder_init(?policy_stream, ?table_one, ?sections,
+        ?instruction_input[0], 128, blocked_mismatch)) { ret 2; }
+    var encoded: [512]u8; var fields: [8]field.Field; var field_storage: [512]u8;
+    var field_scratch: [128]u8; var foreign_decoder: FieldDecoder;
+    if (field_decoder_init(?foreign_decoder, ?table_two, ?sections, 0,
+        ?encoded[0], 512, ?fields[0], 8, ?field_storage[0], 512,
+        ?field_scratch[0], 128, limits)) { ret 3; }
+    var section_mismatch: Limits = limits;
+    section_mismatch.max_outstanding_sections = limits.max_outstanding_sections + 1;
+    var policy_decoder: FieldDecoder;
+    if (field_decoder_init(?policy_decoder, ?table_one, ?sections, 0,
+        ?encoded[0], 512, ?fields[0], 8, ?field_storage[0], 512,
+        ?field_scratch[0], 128, section_mismatch)) { ret 4; }
+    var output: [512]u8; var references: [40]u64; var foreign_encoder: FieldEncoder;
+    if (field_encoder_init(?foreign_encoder, ?table_two, ?sections, 0,
+        ?output[0], 512, ?references[0], 40, limits)) { ret 5; }
+    var reference_mismatch: Limits = limits;
+    reference_mismatch.max_references = limits.max_references + 1;
+    var policy_encoder: FieldEncoder;
+    if (field_encoder_init(?policy_encoder, ?table_one, ?sections, 0,
+        ?output[0], 512, ?references[0], 40, reference_mismatch)) { ret 6; }
+    ret 0;
+}
+
+test "http.h3.qpack: configured section limits cap oversized backing arrays" {
+    var limits: Limits = test_limits();
+    limits.max_outstanding_sections = 1; limits.max_references = 1;
+    var entries: [8]Entry; var storage: [220]u8; var table_scratch: [220]u8;
+    var table: DynamicTable;
+    table_init(?table, ?entries[0], 8, ?storage[0], 220,
+        ?table_scratch[0], 220, 220);
+    table_set_capacity(?table, 220);
+    table_insert(?table, text(":authority"), text("www.example.com"));
+    table_insert(?table, text(":path"), text("/sample/path"));
+    var section_items: [8]Section; var section_refs: [8]Reference;
+    var sections: Sections;
+    if (!sections_init(?sections, ?section_items[0], 8, ?section_refs[0], 8,
+        ?table, limits) || sections.section_limit != 1
+     || sections.reference_limit != 1) { ret 1; }
+    var output_one: [512]u8; var refs_one: [8]u64; var first: FieldEncoder;
+    field_encoder_init(?first, ?table, ?sections, 4, ?output_one[0], 512,
+        ?refs_one[0], 8, limits);
+    field_encoder_field(?first, field.Field{name: text(":authority"),
+        value: text("www.example.com"), sensitive: false}, false);
+    if (!field_encoder_finish(?first).ok || sections.count != 1
+     || table.items[1].references != 1) { ret 2; }
+    var output_two: [512]u8; var refs_two: [8]u64; var second: FieldEncoder;
+    field_encoder_init(?second, ?table, ?sections, 8, ?output_two[0], 512,
+        ?refs_two[0], 8, limits);
+    field_encoder_field(?second, field.Field{name: text(":path"),
+        value: text("/sample/path"), sensitive: false}, false);
+    val section_overflow: Encode = field_encoder_finish(?second);
+    if (section_overflow.ok || section_overflow.error != ERROR_BLOCKED_STREAMS
+     || sections.count != 1 || table.items[0].references != 0
+     || table.items[1].references != 1) { ret 3; }
+    if (sections_cancel(?sections, 4) != ERROR_NONE || sections.count != 0
+     || table.items[1].references != 0) { ret 4; }
+    var output_three: [512]u8; var refs_three: [8]u64; var third: FieldEncoder;
+    field_encoder_init(?third, ?table, ?sections, 12, ?output_three[0], 512,
+        ?refs_three[0], 8, limits);
+    field_encoder_field(?third, field.Field{name: text(":authority"),
+        value: text("www.example.com"), sensitive: false}, false);
+    field_encoder_field(?third, field.Field{name: text(":path"),
+        value: text("/sample/path"), sensitive: false}, false);
+    val reference_overflow: Encode = field_encoder_finish(?third);
+    if (reference_overflow.ok || reference_overflow.error != ERROR_TABLE_BLOCKED
+     || sections.count != 0 || table.items[0].references != 0
+     || table.items[1].references != 0) { ret 5; }
     ret 0;
 }
