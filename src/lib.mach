@@ -24,6 +24,10 @@ fwd h3_connection: http.h3.connection;
 fwd http.websocket;
 fwd http.websocket.negotiation;
 fwd http.server.server;
+fwd http.client.policy;
+fwd http.client.url;
+fwd http.client.pool;
+fwd http.client.dns;
 fwd http.client.client;
 fwd http.router.router;
 
