@@ -1,5 +1,3 @@
-# strict http/1 message delimitation and persistence
-
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -29,6 +27,7 @@ pub val FRAME_HTTP10_TRANSFER_ENCODING: Error = 7;
 pub val FRAME_REQUEST_TRANSFER_ENCODING: Error = 8;
 pub val FRAME_FORBIDDEN_TRANSFER_ENCODING: Error = 9;
 pub val FRAME_INVALID_CONNECTION: Error = 10;
+pub val FRAME_FORBIDDEN_CONTENT_LENGTH: Error = 11;
 
 pub rec Plan {
     mode: Mode;
@@ -300,8 +299,13 @@ pub fun response(version: message.Version, code: status.Status, request_method: 
     val tunnel: bool = request_method == method.CONNECT && code >= 200 && code < 300;
     val bodyless: bool = request_method == method.HEAD || status.is_informational(code)
         || code == status.NO_CONTENT || code == status.RESET_CONTENT || code == status.NOT_MODIFIED;
-    if (transfer.present && (code == status.NO_CONTENT || status.is_informational(code) || tunnel)) {
+    if (transfer.present && (code == status.NO_CONTENT || code == status.RESET_CONTENT
+     || status.is_informational(code) || tunnel)) {
         ret error_plan(FRAME_FORBIDDEN_TRANSFER_ENCODING);
+    }
+    if (has_length && (code == status.NO_CONTENT || status.is_informational(code) || tunnel
+     || (code == status.RESET_CONTENT && length != 0))) {
+        ret error_plan(FRAME_FORBIDDEN_CONTENT_LENGTH);
     }
     if (tunnel) {
         ret Plan{mode: FRAME_TUNNEL, length: 0, keep_alive: false,
@@ -351,6 +355,14 @@ test "http.h1.framing: response rules preserve bodyless and persistence semantic
     field.reset(?fields);
     field.append(?fields, field.Field{name: view.view("Connection", 10), value: view.view("keep-alive", 10), sensitive: false});
     if (!request(message.version_h1(1, 0), ?fields).keep_alive) { ret 4; }
+    field.reset(?fields);
+    field.append(?fields, field.Field{name: view.view("Content-Length", 14), value: view.view("1", 1), sensitive: false});
+    if (response(message.version_h1(1, 1), status.NO_CONTENT, method.GET,
+        ?fields).error != FRAME_FORBIDDEN_CONTENT_LENGTH) { ret 5; }
+    field.reset(?fields);
+    field.append(?fields, field.Field{name: view.view("Content-Length", 14), value: view.view("0", 1), sensitive: false});
+    if (response(message.version_h1(1, 1), status.RESET_CONTENT, method.GET,
+        ?fields).mode != FRAME_NONE) { ret 6; }
     ret 0;
 }
 
