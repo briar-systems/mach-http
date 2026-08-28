@@ -8,7 +8,8 @@ construction, hierarchical cancellation, and streaming body lifecycles shared by
 HTTP/1, HTTP/2, and HTTP/3. The ordered-byte transport boundary is also implemented
 with completion-driven plaintext and secured adapters. HTTP/1 wire parsing, framing,
 serialization, and bounded client and server connection engines are implemented.
-Routing and the HTTP/2 and HTTP/3 wire layers remain under development.
+Bounded route compilation and zero-allocation dispatch are implemented. The HTTP/2
+and HTTP/3 wire layers remain under development.
 
 ## Design
 
@@ -25,7 +26,14 @@ Routing and the HTTP/2 and HTTP/3 wire layers remain under development.
   handshake reads and writes internally before publishing one logical completion.
 - Data operations share one cancellation root. Physical close uses an independent
   control scope, so close and cancellation races settle exactly once.
-- Routing storage is caller-owned. The router does not require a global allocator.
+- Routing storage is caller-owned. Routes compile once into caller-provided route and
+  segment arrays. Dispatch performs no allocation.
+- Route precedence is independent of registration order. Exact hosts precede suffix
+  hosts and host-independent routes. Literal path segments precede parameters and
+  terminal catch-alls. Exact methods precede method-independent routes.
+- Route parameters preserve bounded raw request views and may be percent-decoded into
+  caller storage. Malformed encodings, encoded separators, backslashes, controls, and
+  dot segments fail before matching.
 - HTTP/1.1, HTTP/2, HTTP/3, and WebSocket state are isolated from the version-neutral application contract.
 - HTTP/1 parser-owned message views live until reset. Body views borrow only the
   current input. Serializers retain no body pointer across calls and borrow trailer
@@ -39,6 +47,20 @@ Routing and the HTTP/2 and HTTP/3 wire layers remain under development.
   not refresh them. Graceful close finishes admitted work before write half-close.
 - TLS belongs below the transport contract and is not a dependency of this package.
 
+## Routing
+
+Route methods use an HTTP token, with `*` or an empty view matching any method. Hosts
+are case-insensitive exact authorities, `*.example.com` suffix patterns, `*`, or an
+empty view. An explicit route port is required to match that port. A route without a
+port matches the same host on any port.
+
+Path patterns begin with `/`. `:name` captures one non-empty segment and a terminal
+`*name` captures the remaining path. The standalone `*` pattern handles asterisk and
+authority request targets. Compiled routes borrow method, host, pattern, and parameter
+name views for the router generation. Dispatch captures borrow the request path for
+the request generation. Recompilation advances the router generation and invalidates
+prior matches. `decode_capture` writes decoded values into caller storage.
+
 ## Layout
 
 ```text
@@ -49,7 +71,7 @@ src/
   h3/         HTTP/3 frames, QPACK, control streams, and connection state
   server/     server configuration and lifecycle state
   client/     client configuration and lifecycle state
-  router/     handler and route storage contracts
+  router/     compiled routing, captures, dispatch, and handler invocation
   websocket   upgrade and message framing contracts
 ```
 
