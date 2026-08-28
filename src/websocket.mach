@@ -416,7 +416,7 @@ pub fun feed(decoder: *Decoder, input: *u8, length: usize, eof: bool) Event {
         decoder.frame_remaining = decoder.frame_remaining - take::u64;
         consumed = consumed + take;
         val final: bool = decoder.frame_remaining == 0 && decoder.frame.fin;
-        if (decoder.frame_remaining == 0) {
+    if (decoder.frame_remaining == 0) {
             val final_error: Error = finish_data(decoder);
             reset_frame(decoder);
             if (final_error != ERROR_NONE) {
@@ -424,7 +424,8 @@ pub fun feed(decoder: *Decoder, input: *u8, length: usize, eof: bool) Event {
             }
         }
         var event: Event = empty_event(EVENT_DATA, consumed);
-        event.data = ?input[consumed - take]; event.data_length = take;
+        if (take != 0) { event.data = ?input[consumed - take]; }
+        event.data_length = take;
         event.opcode = message_opcode; event.message_final = final;
         decoder.held = true;
         ret event;
@@ -497,11 +498,17 @@ fun header_size(payload_length: u64, masked: bool) usize {
 
 pub fun begin(encoder: *Encoder, fin: bool, opcode: u8, payload_length: u64,
     mask_key: *u8, output: *u8, output_capacity: usize) Write {
-    if (encoder == nil || !encoder.initialized || encoder.active || encoder.state == CLOSED
-     || encoder.state == FAILED || !opcode_valid(opcode)
-     || payload_length > encoder.limits.max_frame_bytes
-     || (encoder.role == CLIENT && mask_key == nil)) {
+    if (encoder == nil || !encoder.initialized || encoder.active
+     || encoder.state == CLOSED || encoder.state == CLOSE_SENT
+     || encoder.state == FAILED || (encoder.state == CLOSE_RECEIVED
+        && opcode != OPCODE_CLOSE) || (encoder.role == CLIENT && mask_key == nil)) {
         ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_STATE};
+    }
+    if (!opcode_valid(opcode)) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_PROTOCOL};
+    }
+    if (payload_length > encoder.limits.max_frame_bytes) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_LIMIT};
     }
     if (output == nil || output_capacity < header_size(payload_length, encoder.role == CLIENT)) {
         ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_NONE};
@@ -556,11 +563,14 @@ fun encoder_finish(encoder: *Encoder) Error {
                 val code: u16 = (encoder.control[0]::u16 << 8) | encoder.control[1]::u16;
                 var reason: Utf8;
                 utf8_reset(?reason);
-                if (!close_code_valid(code)
-                 || !utf8_feed(?reason, ?encoder.control[2], encoder.control_length - 2)
-                 || reason.needed != 0) {
+                if (!close_code_valid(code)) {
                     encoder.state = FAILED; encoder.error = ERROR_PROTOCOL;
                     ret ERROR_PROTOCOL;
+                }
+                if (!utf8_feed(?reason, ?encoder.control[2], encoder.control_length - 2)
+                 || reason.needed != 0) {
+                    encoder.state = FAILED; encoder.error = ERROR_UTF8;
+                    ret ERROR_UTF8;
                 }
             }
             if (encoder.state == CLOSE_RECEIVED) { encoder.state = CLOSED; }
@@ -702,6 +712,9 @@ pub fun poll(connection: *Connection) Event {
     val event: Event = feed(?connection.decoder, ?connection.input[connection.input_offset],
         connection.input_length - connection.input_offset, connection.input_eof);
     connection.input_offset = connection.input_offset + event.consumed;
+    if (event.kind == EVENT_ERROR || event.kind == EVENT_CLOSE) {
+        connection.input_offset = connection.input_length;
+    }
     if (connection.input_offset == connection.input_length && !connection.decoder.held) {
         connection.input = nil; connection.input_length = 0; connection.input_offset = 0;
         connection.input_borrowed = false;

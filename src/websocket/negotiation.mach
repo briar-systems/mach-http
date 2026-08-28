@@ -372,7 +372,7 @@ pub fun validate_h1_response(response: *message.Response, key: view.View,
     if (expected.len != 28
      || field_count(?response.fields, "sec-websocket-accept", 20, ?actual) != 1
      || !exact(expected, actual)) { ret failed(INVALID_KEY); }
-    var selected: view.View;
+    var selected: view.View = view.view(nil, 0);
     val selected_count: usize = field_count(?response.fields,
         "sec-websocket-protocol", 22, ?selected);
     if (selected_count > 1 || (selected_count == 1
@@ -394,7 +394,7 @@ pub fun validate_extended_response(response: *message.Response, wire: message.Wi
      || field_count(?response.fields, "sec-websocket-accept", 20, nil) != 0) {
         ret failed(INVALID_HEADERS);
     }
-    var selected: view.View;
+    var selected: view.View = view.view(nil, 0);
     val selected_count: usize = field_count(?response.fields,
         "sec-websocket-protocol", 22, ?selected);
     if (selected_count > 1 || (selected_count == 1
