@@ -65,8 +65,10 @@ and truncated input map to the QPACK encoder-stream failure surface.
 `DecoderStreamDecoder` incrementally processes Section Acknowledgment, Stream
 Cancellation, and Insert Count Increment. An acknowledgment releases the earliest
 unacknowledged dynamic field section on that stream. Cancellation releases all
-sections for the stream. An increment must be nonzero and cannot advance beyond the
-table's actual Insert Count.
+sections for the stream, and naming a stream that holds none is a no-op because a
+peer rejecting a request always cancels whether or not the section used the dynamic
+table. An increment must be nonzero and cannot advance beyond the table's actual
+Insert Count.
 
 The matching `encode_*` functions construct instructions without retaining output
 storage. Table-mutating encoder instructions update local state only after their

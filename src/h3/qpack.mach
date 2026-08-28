@@ -659,16 +659,19 @@ pub fun sections_acknowledge(sections: *Sections, stream_id: u64) Error {
     ret ERROR_NONE;
 }
 
+# a stream cancellation releases whatever the named stream still holds. rfc 9204
+# makes only section acknowledgment on an unused stream a connection error, so a
+# cancellation naming no outstanding section is a no-op: a peer that rejects a
+# request always sends one, whether or not the section used the dynamic table.
 pub fun sections_cancel(sections: *Sections, stream_id: u64) Error {
     if (sections == nil || !sections.valid) { ret ERROR_STATE; }
-    var found: bool = false; var i: usize = 0;
+    var i: usize = 0;
     for (i < sections.section_limit) {
         if (sections.items[i].active && sections.items[i].stream_id == stream_id) {
-            release_section(sections, i); found = true;
+            release_section(sections, i);
         }
         i = i + 1;
     }
-    if (!found) { ret ERROR_DECODER_STREAM; }
     ret ERROR_NONE;
 }
 
@@ -1827,11 +1830,25 @@ test "http.h3.qpack: dynamic references are protected through decoder feedback" 
     if (sections.count != 0) { ret 72; }
     if (table.items[0].references != 0) { ret 73; }
     if (table.items[1].references != 0) { ret 74; }
-    val invalid_cancel: Instruction = decoder_stream_feed(?feedback,
+    var unheld: [8]u8;
+    val unheld_length: usize = encode_stream_cancel(20, ?unheld[0], 8);
+    var survivor_output: [512]u8; var survivor_refs: [8]u64;
+    var survivor: FieldEncoder;
+    field_encoder_init(?survivor, ?table, ?sections, 16,
+        ?survivor_output[0], 512, ?survivor_refs[0], 8, limits);
+    field_encoder_field(?survivor, field.Field{name: text(":path"),
+        value: text("/sample/path"), sensitive: false}, false);
+    if (!field_encoder_finish(?survivor).ok || sections.count != 1) { ret 8; }
+    val repeated: Instruction = decoder_stream_feed(?feedback,
         ?cancel[0], cancel_length, false);
-    if (invalid_cancel.status != INSTRUCTION_ERROR
-     || invalid_cancel.error != ERROR_DECODER_STREAM
-     || table_set_capacity(?table, 32) != ERROR_NONE) { ret 8; }
+    val unknown: Instruction = decoder_stream_feed(?feedback,
+        ?unheld[0], unheld_length, false);
+    if (repeated.status != INSTRUCTION_COMPLETE
+     || unknown.status != INSTRUCTION_COMPLETE
+     || sections.count != 1 || table.items[0].references != 1) { ret 9; }
+    if (sections_cancel(?sections, 16) != ERROR_NONE || sections.count != 0
+     || table.items[0].references != 0
+     || table_set_capacity(?table, 32) != ERROR_NONE) { ret 10; }
     ret 0;
 }
 

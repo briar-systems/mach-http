@@ -585,3 +585,64 @@ test "h3quic: lost datagrams are retransmitted without disturbing the exchange" 
     if (!quiet(?app)) { ret 9; }
     ret 0;
 }
+
+test "h3quic: a request past the server budget is rejected without closing the connection" {
+    var fabric: session.Fabric;
+    var app: App;
+    var server_config: h3.Config = session.session_config();
+    server_config.max_requests = 1;
+    val ready: usize = session.make_fabric_with(?fabric,
+        session.session_config(), server_config, 512);
+    if (ready != 0) { ret (100 + ready)::i32; }
+    init_app(?app, ?fabric);
+    attach(?app, ?fabric);
+    app.release_streams = false;
+    app.withhold_response = true;
+    app.hold_body = true;
+    if (!session.handshake(?fabric, 64)) { ret 2; }
+    if (start_request(?app, true) != 0) { ret 3; }
+    if (start_request(?app, true) != 4) { ret 4; }
+    cycle(?app, 96);
+    if (fabric.server.engine.state != h3.OPEN
+     || fabric.client.engine.state != h3.OPEN) { ret 5; }
+    if (session.count_of(?fabric.server, h3.EVENT_ERROR) != 0
+     || session.count_of(?fabric.client, h3.EVENT_ERROR) != 0) { ret 6; }
+    if (session.count_of(?fabric.server, h3.EVENT_REQUEST_HEADERS) != 1) { ret 7; }
+    if (session.count_of(?fabric.server, h3.EVENT_STREAM_ERROR) != 1) { ret 8; }
+    if (app.last_reset_code != h3.H3_REQUEST_REJECTED) { ret 9; }
+    if (fabric.server.io.blocked_releases == 0) { ret 10; }
+    if (fabric.server.engine.pending_release_count != 0) { ret 11; }
+    if (fabric.server.io.close_calls != 0) { ret 12; }
+    ret 0;
+}
+
+test "h3quic: a drained unknown unidirectional stream releases over the driver" {
+    var fabric: session.Fabric;
+    var app: App;
+    var server_config: h3.Config = session.session_config();
+    server_config.max_peer_unidirectional = 4;
+    val ready: usize = session.make_fabric_with(?fabric,
+        session.session_config(), server_config, 512);
+    if (ready != 0) { ret (100 + ready)::i32; }
+    init_app(?app, ?fabric);
+    attach(?app, ?fabric);
+    if (!session.handshake(?fabric, 64)) { ret 2; }
+    if (fabric.server.engine.active_peer_unidirectional != 3) { ret 3; }
+    val opened: qt.OpenResult = qt.open_stream(?fabric.client_wire.driver,
+        qt.UNIDIRECTIONAL);
+    if (opened.status != qt.STATUS_OK) { ret 4; }
+    var bytes: [2]u8; bytes[0] = 0x21; bytes[1] = 'x';
+    if (qt.write_stream(?fabric.client_wire.driver, opened.stream,
+        ?bytes[0], 2).count != 2) { ret 5; }
+    if (qt.finish_stream(?fabric.client_wire.driver,
+        opened.stream).status != qt.STATUS_OK) { ret 6; }
+    cycle(?app, 64);
+    if (fabric.server.engine.state != h3.OPEN) { ret 7; }
+    if (session.count_of(?fabric.server, h3.EVENT_ERROR) != 0) { ret 8; }
+    if (fabric.server.engine.pending_release_count != 0) { ret 9; }
+    if (fabric.server.engine.active_peer_unidirectional != 3) { ret 10; }
+    # a peer unidirectional stream has no send side and its receive side is
+    # already closed at fin, so this release never has to be retried
+    if (fabric.server.io.blocked_releases != 0) { ret 11; }
+    ret 0;
+}

@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking.** `http.h3.connection.Storage` requires a caller-owned pending-release array and `Config` requires its `max_pending_release` bound. Every caller of `http.h3.connection.init` must supply both.
+
+### Fixed
+
+- A rejected HTTP/3 request no longer fails the connection. `release` means the stream is settled on the wire, which a stream this side has just reset cannot be until the peer acknowledges it, so blocked releases are now retried from `process` instead of being treated as transport failures. Exhausting the pending-release bound is a defined excessive-load failure.
+- A QPACK Stream Cancellation naming a stream with no outstanding section is a no-op rather than a decoder-stream connection error, matching RFC 9204, which defines that error only for Section Acknowledgment. A peer rejecting a request always cancels, whether or not the field section used the dynamic table.
+- The in-file HTTP/3 transport fake models the real release precondition instead of accepting any live stream, so its results cannot disagree with the driver again.
+
 ## [0.4.0] - 2026-08-28
 
 ### Added

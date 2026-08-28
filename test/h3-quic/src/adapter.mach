@@ -2,6 +2,7 @@
 
 use h3: http.h3.connection;
 use qt: quic.transport;
+use sm: quic.stream.stream;
 use std.types.bool.bool;
 use std.types.size.usize;
 
@@ -15,6 +16,7 @@ pub rec Adapter {
     partial_writes: usize;
     blocked_writes: usize;
     short_reads: usize;
+    blocked_releases: usize;
 }
 
 fun status(value: qt.Status) h3.TransportStatus {
@@ -120,9 +122,18 @@ fun adapter_cancel_receive(context: ptr, value: h3.StreamHandle,
     ret operation(qt.cancel_stream_receive(self.driver, to_quic(value), code));
 }
 
+# quic reports "not settled on the wire yet" as a stream state error; http/3
+# has a word for exactly that condition and retries it, so it is named here
 fun adapter_release(context: ptr, value: h3.StreamHandle) h3.TransportOperation {
     val self: *Adapter = context::*Adapter;
-    ret operation(qt.release_stream(self.driver, to_quic(value)));
+    val released: qt.OperationResult = qt.release_stream(self.driver,
+        to_quic(value));
+    if (released.status == qt.STATUS_ERROR && released.error == qt.ERROR_STREAM
+     && released.protocol_error == sm.ERROR_STATE::u64) {
+        self.blocked_releases = self.blocked_releases + 1;
+        ret h3.TransportOperation{status: h3.TRANSPORT_BLOCKED, error: 0};
+    }
+    ret operation(released);
 }
 
 fun adapter_close(context: ptr, code: u64) h3.TransportOperation {
@@ -145,6 +156,7 @@ pub fun bind(self: *Adapter, driver: *qt.Driver, clock: *u64) h3.Transport {
     self.partial_writes = 0;
     self.blocked_writes = 0;
     self.short_reads = 0;
+    self.blocked_releases = 0;
     ret h3.Transport{context: self::ptr, open: adapter_open,
         accept: adapter_accept, read: adapter_read, credit: adapter_credit,
         write: adapter_write, finish: adapter_finish,
