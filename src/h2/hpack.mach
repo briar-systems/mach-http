@@ -949,7 +949,8 @@ fun encode_string(output: *u8, capacity: usize, value: view.View,
 }
 
 pub fun encoder_table_size(encoder: *Encoder, max_bytes: usize) Encode {
-    if (encoder == nil || !encoder.initialized || encoder.finished || encoder.saw_field) {
+    if (encoder == nil || !encoder.initialized || encoder.finished
+     || encoder.error != ERROR_NONE || encoder.saw_field) {
         ret encoder_error(encoder, ERROR_STATE);
     }
     if (max_bytes > encoder.limits.max_dynamic_table_bytes
@@ -977,6 +978,7 @@ pub fun encoder_table_size(encoder: *Encoder, max_bytes: usize) Encode {
 pub fun encoder_field(encoder: *Encoder, item: field.Field,
     representation: Representation, use_huffman: bool) Encode {
     if (encoder == nil || !encoder.initialized || encoder.finished
+     || encoder.error != ERROR_NONE
      || !view_valid(item.name) || item.name.len == 0 || !view_valid(item.value)
      || representation < REPRESENT_AUTO || representation > REPRESENT_NEVER) {
         ret encoder_error(encoder, ERROR_STATE);
@@ -1051,7 +1053,8 @@ pub fun encoder_field(encoder: *Encoder, item: field.Field,
 }
 
 pub fun encoder_finish(encoder: *Encoder) Encode {
-    if (encoder == nil || !encoder.initialized || encoder.finished) {
+    if (encoder == nil || !encoder.initialized || encoder.finished
+     || encoder.error != ERROR_NONE) {
         ret encoder_error(encoder, ERROR_STATE);
     }
     if (encoder.update_required && !encoder.update_satisfied) {
@@ -1288,11 +1291,14 @@ test "http.h2.hpack: reduced table limit requires ordered update" {
     encoder_init(?encoder, ?encoder_table, ?output[0], 64,
         ?encoder_pending[0], 100, limits);
     if (encoder_table_size(?encoder, 256).error != ERROR_TABLE_UPDATE) { ret 1; }
-    encoder.error = ERROR_NONE;
-    if (!encoder_table_size(?encoder, 128).ok || !encoder_table_size(?encoder, 256).ok
-     || !encoder_field(?encoder, field.Field{name: text(":method"), value: text("GET"),
+    var valid_encoder: Encoder;
+    encoder_init(?valid_encoder, ?encoder_table, ?output[0], 64,
+        ?encoder_pending[0], 100, limits);
+    if (!encoder_table_size(?valid_encoder, 128).ok
+     || !encoder_table_size(?valid_encoder, 256).ok
+     || !encoder_field(?valid_encoder, field.Field{name: text(":method"), value: text("GET"),
         sensitive: false}, REPRESENT_AUTO, false).ok) { ret 2; }
-    val finished: Encode = encoder_finish(?encoder);
+    val finished: Encode = encoder_finish(?valid_encoder);
     if (!finished.ok || encoder_table.requires_update || encoder_table.max_bytes != 256) {
         ret 3;
     }
@@ -1414,5 +1420,41 @@ test "http.h2.hpack: index count and expansion attacks are bounded" {
     long_string[2] = 't'; long_string[3] = 'e'; long_string[4] = 's'; long_string[5] = 't';
     if (decoder_feed(?string_decoder, ?long_string[0], 6, true).error
         != ERROR_STRING_LIMIT) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.hpack: sensitive literals never enter dynamic state" {
+    val limits: Limits = limits_default();
+    var encoder_entries: [100]Entry;
+    var encoder_storage: [4096]u8;
+    var encoder_table: DynamicTable;
+    table_init(?encoder_table, ?encoder_entries[0], 100, ?encoder_storage[0],
+        4096, 4096, 4096);
+    var output: [64]u8;
+    var encoder_pending: [100]Entry;
+    var encoder: Encoder;
+    encoder_init(?encoder, ?encoder_table, ?output[0], 64,
+        ?encoder_pending[0], 100, limits);
+    if (!encoder_field(?encoder, field.Field{name: text("authorization"),
+        value: text("secret"), sensitive: true}, REPRESENT_INCREMENTAL, false).ok) {
+        ret 1;
+    }
+    val finished: Encode = encoder_finish(?encoder);
+    if (!finished.ok || (output[0] & 0xf0) != 0x10 || encoder_table.count != 0) { ret 2; }
+    var decoder_entries: [100]Entry;
+    var decoder_storage: [4096]u8;
+    var decoder_table: DynamicTable;
+    table_init(?decoder_table, ?decoder_entries[0], 100, ?decoder_storage[0],
+        4096, 4096, 4096);
+    var encoded: [64]u8;
+    var fields: [100]field.Field;
+    var field_storage: [256]u8;
+    var decoder_pending: [100]Entry;
+    var decoder: Decoder;
+    decoder_init(?decoder, ?decoder_table, ?encoded[0], 64, ?fields[0], 100,
+        ?field_storage[0], 256, ?decoder_pending[0], 100, limits);
+    val decoded: Decode = decoder_feed(?decoder, ?output[0], finished.written, true);
+    if (decoded.status != DECODE_COMPLETE || decoded.count != 1
+     || !fields[0].sensitive || decoder_table.count != 0) { ret 3; }
     ret 0;
 }
