@@ -11,7 +11,8 @@ serialization, and bounded client and server connection engines are implemented.
 Bounded route compilation and zero-allocation dispatch are implemented. WebSocket
 negotiation, framing, and completion-driven connections are implemented for HTTP/1
 upgrade and HTTP/2 or HTTP/3 extended CONNECT. The HTTP/2 and HTTP/3 wire layers
-remain under development.
+remain under development. HTTP/2 frame and HPACK codecs are complete. HTTP/2
+connection and stream state remains under development.
 
 ## Design
 
@@ -54,6 +55,13 @@ remain under development.
 - Frame, message, and fragmentation limits are independent. Mask direction,
   minimally encoded lengths, streaming UTF-8, control interleaving, close codes,
   and abnormal EOF outcomes are enforced before another frame is admitted.
+- HTTP/2 frame parsing is incremental across the nine-byte header and payload.
+  Continuation sequences, frame-specific lengths, settings, padding, dependencies,
+  and flow-control increments fail before connection state consumes the frame.
+- HPACK input may arrive in arbitrary chunks and is decoded transactionally.
+  Dynamic table changes commit only after the complete field block validates.
+- HPACK field count, decompressed list size, encoded block size, individual string,
+  table memory, and table-entry count have independent caller-selected bounds.
 - Header, request, idle, write, and total deadlines are absolute. Slow progress does
   not refresh them. Graceful close finishes admitted work before write half-close.
 - TLS belongs below the transport contract and is not a dependency of this package.
@@ -85,6 +93,21 @@ upgrade-buffer adoption, partial reads and writes, cancellation, timeout outcome
 and physical close. Clients must supply a fresh unpredictable four-byte mask key for
 every outbound frame. See [doc/websocket.md](doc/websocket.md) for lifecycle and
 ownership details.
+
+## HTTP/2 codecs
+
+`http.h2.frame.Parser` returns a validated header followed by borrowed payload views.
+Each payload must be released before parsing continues. Unknown extension frame types
+remain available to the caller while mandatory continuation sequencing still applies.
+The matching writer copies caller payload into output slices and retains no payload
+pointer between calls.
+
+`http.h2.hpack.Decoder` accepts fragmented encoded input into caller storage, then
+decodes the completed block into caller-owned fields and bytes. Dynamic table size
+updates, insertions, and evictions are simulated in a bounded shadow and commit only
+after the block passes every limit and representation check. The encoder uses the
+same transaction rule. See [doc/h2-codecs.md](doc/h2-codecs.md) for API ownership and
+resource contracts.
 
 ## Layout
 
