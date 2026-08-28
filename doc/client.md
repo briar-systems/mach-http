@@ -17,6 +17,8 @@ not only the populated length. It also covers the trailer collection referenced 
 body reader or writer, including that collection's descriptor, complete backing
 capacity, and populated name and value views. Response callbacks reject the response
 object and all of these nested regions on the same basis before ownership changes.
+The exact request child scope published with an exchange is the sole permitted
+client-owned overlap for a request or response body scope.
 
 Every public borrowed pointer, view, array count, and capacity is checked for
 address-space representability before the first dereference. Zero-length ranges may
