@@ -32,6 +32,7 @@ pub rec Session {
     scope: cancel.Scope;
     streams: [10]h3.Stream;
     memories: [10]h3.StreamMemory;
+    pending: [4]h3.StreamHandle;
     reads: [10][192]u8;
     settings: [10][5]frame.Setting;
     encoded: [10][256]u8;
@@ -64,6 +65,7 @@ pub fun session_config() h3.Config {
     var configured: h3.Config = h3.config_default();
     configured.max_requests = 6;
     configured.max_peer_unidirectional = 3;
+    configured.max_pending_release = 4;
     configured.frames.max_frame_payload = 192;
     configured.frames.max_settings = 5;
     configured.local.qpack_max_table_capacity = 128;
@@ -103,6 +105,7 @@ pub fun make_session(session: *Session, driver: *qt.Driver, clock: *u64,
     val storage: h3.Storage = h3.Storage{
         streams: ?session.streams[0], memories: ?session.memories[0],
         stream_capacity: STREAM_SLOTS,
+        pending_release: ?session.pending[0], pending_release_capacity: 4,
         inbound_entries: ?session.inbound_entries[0], inbound_entry_capacity: 8,
         inbound_storage: ?session.inbound_storage[0], inbound_storage_capacity: 256,
         inbound_scratch: ?session.inbound_scratch[0], inbound_scratch_capacity: 256,
@@ -158,7 +161,8 @@ pub rec Fabric {
     server: Session;
 }
 
-pub fun make_fabric(fabric: *Fabric, configured: h3.Config, window: u64) usize {
+pub fun make_fabric_with(fabric: *Fabric, client_config: h3.Config,
+                         server_config: h3.Config, window: u64) usize {
     val client_ready: usize = loopback.init_endpoint(?fabric.client_wire, 301,
         true, window);
     if (client_ready != 0) { ret client_ready; }
@@ -167,10 +171,14 @@ pub fun make_fabric(fabric: *Fabric, configured: h3.Config, window: u64) usize {
     if (server_ready != 0) { ret 8 + server_ready; }
     loopback.init_link(?fabric.link, ?fabric.client_wire, ?fabric.server_wire);
     if (!make_session(?fabric.client, ?fabric.client_wire.driver,
-        ?fabric.link.now_ns, h3.CLIENT, configured)) { ret 20; }
+        ?fabric.link.now_ns, h3.CLIENT, client_config)) { ret 20; }
     if (!make_session(?fabric.server, ?fabric.server_wire.driver,
-        ?fabric.link.now_ns, h3.SERVER, configured)) { ret 21; }
+        ?fabric.link.now_ns, h3.SERVER, server_config)) { ret 21; }
     ret 0;
+}
+
+pub fun make_fabric(fabric: *Fabric, configured: h3.Config, window: u64) usize {
+    ret make_fabric_with(fabric, configured, configured, window);
 }
 
 # one turn: drain both engines' event queues, then move datagrams both ways

@@ -7,7 +7,9 @@ and the QUIC dependency lives here so no consumer of the library has to build it
 ## Shape
 
 - `src/adapter.mach` binds `http.h3.connection.Transport` to `quic.transport`.
-  Handles carry across unchanged; statuses are mapped explicitly.
+  Handles carry across unchanged; statuses are mapped explicitly. Two need real
+  translation: a partially accepted write, and a release the driver refuses because
+  the stream is not yet settled on the wire.
 - `src/loopback.mach` implements the driver's pluggable `Protocol`. It pulls the
   driver's prepared stream and flow-control work, frames it with RFC 9000
   variable-length integers, and moves datagrams between two real drivers. The
@@ -27,8 +29,9 @@ Settings and critical streams, request and response bodies in both directions,
 sustained multiplexing across more requests than the initial stream and connection
 windows allow, QPACK-blocked field sections holding QUIC credit while unrelated
 requests complete, stream reset and application cancellation settling exactly once,
-GOAWAY with two-stage graceful close, datagram loss with retransmission, and
-partial writes with short reads under a small flow-control window.
+GOAWAY with two-stage graceful close, datagram loss with retransmission, partial
+writes with short reads under a small flow-control window, a request rejected past
+the server's budget, and a drained unknown unidirectional stream.
 
 ## What it does not cover
 

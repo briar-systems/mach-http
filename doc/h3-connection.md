@@ -26,16 +26,23 @@ status means no byte was accepted.
 
 Successful FIN reports must carry the exact delivered final size. Resets may name a
 larger final size but never one below already delivered bytes. Stale handles, invalid
-status combinations, duplicate local stream IDs, or failed cancellation and release
-operations close the connection as transport failures. A blocked connection close
-is retried and is never reported complete early.
+status combinations, duplicate local stream IDs, and failed cancellation close the
+connection as transport failures. A blocked connection close is retried and is never
+reported complete early.
+
+`release` means the stream is settled, not merely finished with. A stream this side
+has just reset still owes the peer's acknowledgment of that reset, so `release`
+reports `TRANSPORT_BLOCKED` until the transport can free the handle. The engine
+retries every blocked release on each `process` and only a stale or failing release
+closes the connection.
 
 `test/h3-quic` binds this adapter to the `mach-quic` connection driver and drives
 two real drivers against each other. Stream handle identity, delivery, and receive
 credit map one to one, and the driver's own uncredited total proves that `read`
-returns no window. Only the write status needs translating, because the QUIC status
-answers whether the entire write was accepted. No packet, TLS, or recovery API
-crosses this boundary.
+returns no window. Two statuses need translating: the QUIC write status answers
+whether the entire write was accepted rather than whether the call made progress,
+and QUIC names an unsettled release a stream state error rather than a blocked one.
+No packet, TLS, or recovery API crosses this boundary.
 
 The engine does not advertise HTTP Datagrams because the adapter intentionally has
 no datagram surface. A peer may advertise datagram support without changing request
@@ -44,12 +51,14 @@ without changing stream delivery or credit ownership.
 
 ## Memory and limits
 
-The caller provides the stream slots and one `StreamMemory` per slot. Each memory
+The caller provides the stream slots, one `StreamMemory` per slot, and the
+pending-release array that holds handles whose release the transport has not yet
+completed. Each memory
 record independently bounds read fragments, SETTINGS entries, encoded field
 sections, decoded fields, decoded string storage, QPACK scratch, output bytes, and
 field references. Connection storage separately owns both QPACK tables, table
-arenas, table scratch, outstanding section and reference arrays, and the three local
-critical-stream queues.
+arenas, table scratch, outstanding section and reference arrays, the pending-release
+array, and the three local critical-stream queues.
 
 The caller zero-initializes `Engine`, `Stream`, and codec records before their first
 initialization. `init` validates every configured table, section, queue, stream, and
@@ -58,9 +67,17 @@ generation until `release_stream` succeeds, then reuse advances the generation.
 
 `max_requests` and `max_peer_unidirectional` are enforced independently. A request
 beyond the request budget is rejected with `H3_REQUEST_REJECTED`, and a QPACK Stream
-Cancellation is queued without admitting the request. Exhausting the peer
-unidirectional budget is a connection-level excessive-load failure because doing
-otherwise could discard a required critical stream.
+Cancellation is queued without admitting the request. Rejecting a request never
+consumes a stream slot, so its handle is held in the pending-release array until the
+transport settles it. Exhausting the peer unidirectional budget is a connection-level
+excessive-load failure because doing otherwise could discard a required critical
+stream.
+
+`max_pending_release` bounds the handles awaiting release and must be sized against
+the peer-initiated streams the transport can hand over between two `process` calls,
+which in steady state is the peer's stream concurrency limit. Exhausting it is a
+connection-level excessive-load failure, because the alternative is abandoning a
+transport handle the peer is still owed credit for.
 
 Common HTTP limits remain independent of QPACK limits. Request, response,
 informational, and trailer regular fields use their own count, byte, name, and value
