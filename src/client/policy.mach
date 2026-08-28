@@ -438,8 +438,8 @@ pub fun redirect(configured: RedirectPolicy, code: status.Status,
         next_method: current_method, drop_body: false,
         strip_origin_sensitive: true, strip_proxy_sensitive: true};
     if (!redirect_code(code)) { result.status = REDIRECT_NOT_REDIRECT; ret result; }
-    if (configured.max_redirects == 0 || !method.valid(current_method, 32)
-        || !replay_valid(replay) || !route_valid(source, 253)
+    if (!method.valid(current_method, 32) || !replay_valid(replay)
+        || !route_valid(source, 253)
         || !route_valid(target, 253)) { ret result; }
     if (followed >= configured.max_redirects) {
         result.status = REDIRECT_LIMIT;
@@ -569,7 +569,12 @@ test "http.client.policy: redirects preserve replay and origin security" {
             != REDIRECT_FOLLOW
         || redirect(configured, status.FOUND, method.from_kind(method.GET),
             Replay{explicit: true, body: BODY_EMPTY}, secure, clear, 0).status
-            != REDIRECT_DOWNGRADE) { ret 1; }
+            != REDIRECT_DOWNGRADE
+        || redirect(RedirectPolicy{max_redirects: 0,
+            allow_http_downgrade: false, legacy_post_to_get: false},
+            status.FOUND, method.from_kind(method.GET),
+            Replay{explicit: true, body: BODY_EMPTY}, secure, secure, 0).status
+            != REDIRECT_LIMIT) { ret 1; }
     ret 0;
 }
 

@@ -178,6 +178,7 @@ pub val CONNECT_RETRY:    ConnectStatus = 2;
 pub val CONNECT_REJECTED: ConnectStatus = 3;
 pub val CONNECT_DRAINED:  ConnectStatus = 4;
 pub val CONNECT_INVALID:  ConnectStatus = 5;
+pub val CONNECT_CANCELLED: ConnectStatus = 6;
 
 pub rec Connected {
     status:       ConnectStatus;
@@ -323,6 +324,20 @@ fun time_add(now: time.Time, duration_ns: u64) time.Time {
         result.nsec = result.nsec - 1000000000;
     }
     ret result;
+}
+
+fun time_until(now: time.Time, future: time.Time) u64 {
+    if (time_before_or_equal(future, now)) { ret 0; }
+    var seconds: u64 = (future.sec - now.sec)::u64;
+    var nanoseconds: i64 = future.nsec - now.nsec;
+    if (nanoseconds < 0) {
+        seconds = seconds - 1;
+        nanoseconds = nanoseconds + 1000000000;
+    }
+    if (seconds > (~(0::u64) - nanoseconds::u64) / 1000000000) {
+        ret ~(0::u64);
+    }
+    ret seconds * 1000000000 + nanoseconds::u64;
 }
 
 fun byte_ranges_overlap(first: ptr, first_size: usize,
@@ -833,8 +848,16 @@ fun route_next(client: *Client, token: Token, slot: *RequestSlot,
             || resolved.status == dns.LOOKUP_SATURATED) {
             ret request_action(ACTION_WAIT_DNS, token, slot);
         } or (resolved.status == dns.LOOKUP_FAILED) {
-            set_terminal(slot, OUTCOME_FAILED, ERROR_DNS, resolved.error,
-                policy.RETRY_DNS_TEMPORARY, nil);
+            val failure: policy.Failure = policy.Failure{
+                reason: policy.RETRY_DNS_TEMPORARY,
+                definitely_unprocessed: true, response_started: false,
+                response_complete: false,
+                retry_after_ns: time_until(now, resolved.ready_at)};
+            if (!dns.error_temporary(resolved.error)
+                || !schedule_retry(slot, failure, now, false)) {
+                set_terminal(slot, OUTCOME_FAILED, ERROR_DNS, resolved.error,
+                    policy.RETRY_DNS_TEMPORARY, nil);
+            }
             ret empty_action();
         } or (resolved.status == dns.LOOKUP_DRAINING) {
             set_terminal(slot, OUTCOME_FAILED, ERROR_DRAINING,
@@ -976,6 +999,15 @@ pub fun connected(client: *Client, token: Token,
         || !reservation_equal(slot.reservation, reservation)) {
         ret Connected{status: CONNECT_INVALID, close_driver: true};
     }
+    if (settle_cancel(slot)) {
+        if (!pool.fail_connect(client.connections, reservation)) {
+            set_terminal(slot, OUTCOME_FAILED, ERROR_INTERNAL,
+                no_resolver_error(), 0, nil);
+            ret Connected{status: CONNECT_INVALID, close_driver: true};
+        }
+        slot.reservation = empty_reservation();
+        ret Connected{status: CONNECT_CANCELLED, close_driver: true};
+    }
     if (secure != (slot.route.origin.scheme == policy.HTTPS)) {
         pool.fail_connect(client.connections, reservation);
         set_terminal(slot, OUTCOME_FAILED, ERROR_PROTOCOL,
@@ -1036,7 +1068,7 @@ pub fun connect_failed(client: *Client, token: Token,
         ret CONNECT_INVALID;
     }
     slot.reservation = empty_reservation();
-    if (settle_cancel(slot)) { ret CONNECT_DRAINED; }
+    if (settle_cancel(slot)) { ret CONNECT_CANCELLED; }
     slot.endpoint_cursor = slot.endpoint_cursor + 1;
     if (slot.endpoint_cursor < slot.endpoint_len) {
         slot.state = STATE_ROUTING;
@@ -1074,6 +1106,7 @@ pub fun exchange_complete(client: *Client, token: Token,
             no_resolver_error(), 0, response);
         ret false;
     }
+    if (settle_cancel(slot)) { ret true; }
     if (!valid) {
         set_terminal(slot, OUTCOME_FAILED, ERROR_RESPONSE,
             no_resolver_error(), 0, response);
@@ -1774,6 +1807,169 @@ test "http.client.client: retries publish replay and never buffer streams" {
         || !release_request(?client, streaming.token)) { ret 15; }
     if (!test_shutdown(?client, ?cache, ?connections, ?parent, now)) {
         ret 16;
+    }
+    ret 0;
+}
+
+test "http.client.client: temporary dns failures wait for cache retry time" {
+    var cache_entries: [1]dns.Entry;
+    var cache_endpoints: [1]ip.Endpoint;
+    var cache: dns.Cache;
+    var cache_config: dns.Config = dns.config_default();
+    cache_config.max_entries = 1;
+    cache_config.max_endpoints_per_entry = 1;
+    cache_config.failure_ns = 10;
+    if (!dns.init(?cache, ?cache_entries[0], 1, ?cache_endpoints[0], 1,
+        cache_config)) { ret 1; }
+    var pool_connections: [1]pool.Connection;
+    var pool_leases: [1]pool.LeaseSlot;
+    var connections: pool.Pool;
+    var pool_config: pool.Config = pool.config_default();
+    pool_config.max_connections = 1;
+    pool_config.max_connections_per_route = 1;
+    pool_config.max_leases = 1;
+    pool_config.max_idle = 0;
+    pool_config.max_idle_per_route = 0;
+    if (!pool.init(?connections, ?pool_connections[0], 1,
+        ?pool_leases[0], 1, pool_config)) { ret 2; }
+    var slots: [1]RequestSlot;
+    var request_endpoints: [1]ip.Endpoint;
+    var client: Client;
+    var client_config: Config = config_default();
+    client_config.max_requests = 1;
+    client_config.max_endpoints_per_request = 1;
+    if (!init(?client, ?cache, ?connections, ?slots[0], 1,
+        ?request_endpoints[0], 1, client_config)) { ret 3; }
+    var parent: cancellation.Scope;
+    if (!cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0})) { ret 4; }
+    var reader: body.Reader;
+    var request: message.Request;
+    if (!test_request(?request, ?reader, 51, false,
+        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 5; }
+    val submitted: Submission = submit(?client, ?parent, ?request,
+        test_route("dns.example", 11), policy.protocols_default(),
+        policy.Replay{explicit: true, body: policy.BODY_EMPTY},
+        policy.RetryPolicy{max_attempts: 2, retry_request_timeout: false,
+            retry_too_early: false, retry_rate_limit: false,
+            retry_server: false}, policy.redirect_policy_default());
+    val now: time.Time = time.Time{sec: 11, nsec: 20};
+    val first_query: Action = next(?client, submitted.token, now);
+    if (submitted.status != SUBMIT_OK || first_query.kind != ACTION_RESOLVE
+        || !resolution_submit_failed(?client, submitted.token,
+            resolver.Error{kind: resolver.TEMPORARY, native_code: 1}, now)) {
+        ret 6;
+    }
+    val waiting: Action = next(?client, submitted.token, now);
+    val ready: time.Time = time.Time{sec: 11, nsec: 30};
+    if (waiting.kind != ACTION_WAIT_TIMER
+        || !time.time_equal(waiting.ready_at, ready)
+        || next(?client, submitted.token,
+            time.Time{sec: 11, nsec: 29}).kind != ACTION_WAIT_TIMER) { ret 7; }
+    val second_query: Action = next(?client, submitted.token, ready);
+    if (second_query.kind != ACTION_RESOLVE
+        || !resolution_submit_failed(?client, submitted.token,
+            resolver.Error{kind: resolver.NO_NAME, native_code: 2}, ready)) {
+        ret 8;
+    }
+    val completed: Action = next(?client, submitted.token, ready);
+    if (completed.kind != ACTION_COMPLETE
+        || completed.completion.error != ERROR_DNS
+        || completed.completion.attempts != 2
+        || completed.completion.resolver_error.kind != resolver.NO_NAME
+        || !release_request(?client, submitted.token)) { ret 9; }
+    if (!test_shutdown(?client, ?cache, ?connections, ?parent, ready)) {
+        ret 10;
+    }
+    ret 0;
+}
+
+test "http.client.client: cancellation wins connect and exchange races" {
+    var cache_entries: [1]dns.Entry;
+    var cache_endpoints: [1]ip.Endpoint;
+    var cache: dns.Cache;
+    var cache_config: dns.Config = dns.config_default();
+    cache_config.max_entries = 1;
+    cache_config.max_endpoints_per_entry = 1;
+    if (!dns.init(?cache, ?cache_entries[0], 1, ?cache_endpoints[0], 1,
+        cache_config)) { ret 1; }
+    var pool_connections: [1]pool.Connection;
+    var pool_leases: [1]pool.LeaseSlot;
+    var connections: pool.Pool;
+    var pool_config: pool.Config = pool.config_default();
+    pool_config.max_connections = 1;
+    pool_config.max_connections_per_route = 1;
+    pool_config.max_leases = 1;
+    pool_config.max_idle = 0;
+    pool_config.max_idle_per_route = 0;
+    if (!pool.init(?connections, ?pool_connections[0], 1,
+        ?pool_leases[0], 1, pool_config)) { ret 2; }
+    var slots: [1]RequestSlot;
+    var request_endpoints: [1]ip.Endpoint;
+    var client: Client;
+    var client_config: Config = config_default();
+    client_config.max_requests = 1;
+    client_config.max_endpoints_per_request = 1;
+    if (!init(?client, ?cache, ?connections, ?slots[0], 1,
+        ?request_endpoints[0], 1, client_config)) { ret 3; }
+    var parent: cancellation.Scope;
+    if (!cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0})) { ret 4; }
+    val route: policy.Route = test_route("race.example", 12);
+    val now: time.Time = time.Time{sec: 12, nsec: 0};
+    var first_reader: body.Reader;
+    var first_request: message.Request;
+    if (!test_request(?first_request, ?first_reader, 61, false,
+        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 5; }
+    val first: Submission = submit(?client, ?parent, ?first_request, route,
+        policy.protocols_default(),
+        policy.Replay{explicit: true, body: policy.BODY_EMPTY},
+        policy.retry_policy_default(), policy.redirect_policy_default());
+    val resolving: Action = next(?client, first.token, now);
+    if (first.status != SUBMIT_OK
+        || !test_publish_resolution(?client, first.token, resolving,
+            ip.endpoint(192, 0, 2, 61, 443),
+            resolver.Token{index: 6, generation: 1}, now)) { ret 6; }
+    val connecting: Action = next(?client, first.token, now);
+    var late_driver: u8 = 1;
+    if (!cancel_request(?client, first.token)) { ret 7; }
+    val connect_result: Connected = connected(?client, first.token,
+        connecting.reservation,
+        true, view.view("h2", 2), (?late_driver)::ptr, 4, now);
+    if (connect_result.status != CONNECT_CANCELLED
+        || !connect_result.close_driver
+        || next(?client, first.token, now).completion.outcome
+            != OUTCOME_CANCELLED
+        || !release_request(?client, first.token)) { ret 8; }
+
+    var second_reader: body.Reader;
+    var second_request: message.Request;
+    if (!test_request(?second_request, ?second_reader, 62, false,
+        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 9; }
+    val second: Submission = submit(?client, ?parent, ?second_request, route,
+        policy.protocols_default(),
+        policy.Replay{explicit: true, body: policy.BODY_EMPTY},
+        policy.retry_policy_default(), policy.redirect_policy_default());
+    val second_connect: Action = next(?client, second.token, now);
+    var driver: u8 = 2;
+    if (second.status != SUBMIT_OK || second_connect.kind != ACTION_CONNECT
+        || connected(?client, second.token, second_connect.reservation, true,
+            view.view("h2", 2), (?driver)::ptr, 4, now).status
+            != CONNECT_ACCEPTED
+        || next(?client, second.token, now).kind != ACTION_EXCHANGE
+        || !cancel_request(?client, second.token)) { ret 10; }
+    var response: message.Response;
+    if (!test_response(?response, 62, status.OK,
+            client_config.message_limits)
+        || !exchange_complete(?client, second.token, ?response,
+            body.REUSE_FORBIDDEN, now)) { ret 11; }
+    val completed: Action = next(?client, second.token, now);
+    if (completed.kind != ACTION_COMPLETE
+        || completed.completion.outcome != OUTCOME_CANCELLED
+        || completed.completion.response != nil
+        || !release_request(?client, second.token)) { ret 12; }
+    if (!test_shutdown(?client, ?cache, ?connections, ?parent, now)) {
+        ret 13;
     }
     ret 0;
 }

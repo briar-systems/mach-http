@@ -102,6 +102,7 @@ pub rec Lookup {
     status:  LookupStatus;
     written: usize;
     error:   resolver.Error;
+    ready_at: time.Time;
     query:   Query;
 }
 
@@ -156,6 +157,7 @@ fun empty_query() Query {
 
 fun lookup_value(status: LookupStatus) Lookup {
     ret Lookup{status: status, written: 0, error: no_error(),
+        ready_at: time.Time{sec: 0, nsec: 0},
         query: empty_query()};
 }
 
@@ -565,6 +567,7 @@ pub fun lookup(cache: *Cache, key: Key, now: time.Time,
     if (entry.failure_valid && time.time_before(now, entry.retry_after)) {
         var result: Lookup = lookup_value(LOOKUP_FAILED);
         result.error = entry.last_error;
+        result.ready_at = entry.retry_after;
         mutex.unlock(?cache.lock);
         ret result;
     }
@@ -691,7 +694,7 @@ fun publish_success_locked(cache: *Cache, index: usize,
     entry.last_error = no_error();
 }
 
-fun temporary_error(failure: resolver.Error) bool {
+pub fun error_temporary(failure: resolver.Error) bool {
     ret failure.kind == resolver.TEMPORARY
         || failure.kind == resolver.OVERLOADED
         || failure.kind == resolver.OUT_OF_MEMORY
@@ -702,7 +705,7 @@ fun temporary_error(failure: resolver.Error) bool {
 fun publish_failure_locked(cache: *Cache, index: usize,
     failure: resolver.Error, now: time.Time) {
     val entry: *Entry = ?cache.entries[index];
-    if (!temporary_error(failure)) {
+    if (!error_temporary(failure)) {
         entry.has_value = false;
         entry.endpoint_len = 0;
     }
