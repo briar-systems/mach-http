@@ -1,15 +1,648 @@
-# http/3 frame contracts
+# strict incremental http/3 frame and stream codec
 
-pub val FRAME_DATA:          u64 = 0x0;
-pub val FRAME_HEADERS:       u64 = 0x1;
-pub val FRAME_CANCEL_PUSH:   u64 = 0x3;
-pub val FRAME_SETTINGS:      u64 = 0x4;
-pub val FRAME_PUSH_PROMISE:  u64 = 0x5;
-pub val FRAME_GOAWAY:        u64 = 0x7;
-pub val FRAME_MAX_PUSH_ID:   u64 = 0xD;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.memory;
 
-pub rec Header {
-    typ:    u64;
-    length: u64;
+pub val FRAME_DATA: u64 = 0x0;
+pub val FRAME_HEADERS: u64 = 0x1;
+pub val FRAME_CANCEL_PUSH: u64 = 0x3;
+pub val FRAME_SETTINGS: u64 = 0x4;
+pub val FRAME_PUSH_PROMISE: u64 = 0x5;
+pub val FRAME_GOAWAY: u64 = 0x7;
+pub val FRAME_MAX_PUSH_ID: u64 = 0xd;
+
+pub val SETTING_QPACK_MAX_TABLE_CAPACITY: u64 = 0x1;
+pub val SETTING_MAX_FIELD_SECTION_SIZE: u64 = 0x6;
+pub val SETTING_QPACK_BLOCKED_STREAMS: u64 = 0x7;
+pub val SETTING_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
+pub val SETTING_H3_DATAGRAM: u64 = 0x33;
+
+pub val STREAM_CONTROL: u64 = 0x0;
+pub val STREAM_PUSH: u64 = 0x1;
+pub val STREAM_QPACK_ENCODER: u64 = 0x2;
+pub val STREAM_QPACK_DECODER: u64 = 0x3;
+
+pub def Error: u8;
+pub val ERROR_NONE: Error = 0;
+pub val ERROR_STATE: Error = 1;
+pub val ERROR_VARINT: Error = 2;
+pub val ERROR_FRAME_SIZE: Error = 3;
+pub val ERROR_FRAME_UNEXPECTED: Error = 4;
+pub val ERROR_FRAME: Error = 5;
+pub val ERROR_SETTINGS: Error = 6;
+pub val ERROR_MISSING_SETTINGS: Error = 7;
+pub val ERROR_STREAM_CREATION: Error = 8;
+pub val ERROR_EXCESSIVE_LOAD: Error = 9;
+pub val ERROR_TRUNCATED: Error = 10;
+pub val ERROR_OUTPUT: Error = 11;
+
+pub def StreamKind: u8;
+pub val KIND_REQUEST: StreamKind = 1;
+pub val KIND_CONTROL: StreamKind = 2;
+pub val KIND_PUSH: StreamKind = 3;
+
+pub rec Limits { max_frame_payload: u64; max_settings: usize; }
+pub rec Header { typ: u64; length: u64; }
+pub rec Setting { identifier: u64; value: u64; }
+
+pub rec Varint {
+    value: u64;
+    bytes: [8]u8;
+    length: usize;
+    needed: usize;
+    complete: bool;
 }
 
+pub def EventKind: u8;
+pub val EVENT_NEED_INPUT: EventKind = 1;
+pub val EVENT_HEADER: EventKind = 2;
+pub val EVENT_PAYLOAD: EventKind = 3;
+pub val EVENT_FRAME_END: EventKind = 4;
+pub val EVENT_ERROR: EventKind = 5;
+
+pub rec Event {
+    kind: EventKind;
+    consumed: usize;
+    header: Header;
+    data: *u8;
+    data_length: usize;
+    frame_final: bool;
+    value: u64;
+    error: Error;
+}
+
+pub rec Parser {
+    limits: Limits;
+    stream_kind: StreamKind;
+    state: u8;
+    integer: Varint;
+    header: Header;
+    remaining: u64;
+    payload_length: u64;
+    settings: *Setting;
+    settings_capacity: usize;
+    settings_count: usize;
+    setting_identifier: u64;
+    setting_has_identifier: bool;
+    control_started: bool;
+    settings_received: bool;
+    value: u64;
+    value_complete: bool;
+    held: bool;
+    error: Error;
+    initialized: bool;
+}
+
+pub def WriteStatus: u8;
+pub val WRITE_OUTPUT: WriteStatus = 1;
+pub val WRITE_DONE: WriteStatus = 2;
+pub val WRITE_BLOCKED: WriteStatus = 3;
+pub val WRITE_ERROR: WriteStatus = 4;
+
+pub rec Write { status: WriteStatus; consumed: usize; written: usize; error: Error; }
+pub rec Writer { parser: Parser; active: bool; }
+
+pub rec CriticalStreams {
+    control: bool;
+    qpack_encoder: bool;
+    qpack_decoder: bool;
+    initialized: bool;
+}
+
+pub def StreamEventKind: u8;
+pub val STREAM_EVENT_NEED_INPUT: StreamEventKind = 1;
+pub val STREAM_EVENT_TYPE: StreamEventKind = 2;
+pub val STREAM_EVENT_PUSH_ID: StreamEventKind = 3;
+pub val STREAM_EVENT_ERROR: StreamEventKind = 4;
+
+pub rec StreamEvent {
+    kind: StreamEventKind;
+    consumed: usize;
+    stream_type: u64;
+    push_id: u64;
+    error: Error;
+}
+
+pub rec StreamParser {
+    integer: Varint;
+    critical: *CriticalStreams;
+    stream_type: u64;
+    peer_is_client: bool;
+    has_type: bool;
+    complete: bool;
+    error: Error;
+    initialized: bool;
+}
+
+val STATE_TYPE: u8 = 1;
+val STATE_LENGTH: u8 = 2;
+val STATE_PAYLOAD: u8 = 3;
+val STATE_FAILED: u8 = 4;
+
+pub fun limits_default() Limits {
+    ret Limits{max_frame_payload: 16777216, max_settings: 64};
+}
+
+fun limits_valid(limits: Limits) bool {
+    ret limits.max_frame_payload != 0 && limits.max_frame_payload <= 0x3fffffffffffffff
+        && limits.max_settings != 0;
+}
+
+pub fun varint_reset(integer: *Varint) bool {
+    if (integer == nil) { ret false; }
+    integer.value = 0;
+    integer.length = 0;
+    integer.needed = 0;
+    integer.complete = false;
+    ret true;
+}
+
+pub fun varint_feed(integer: *Varint, byte: u8) Error {
+    if (integer == nil || integer.complete) { ret ERROR_STATE; }
+    if (integer.length == 0) {
+        integer.needed = 1::usize << (byte >> 6);
+        integer.bytes[0] = byte;
+        integer.length = 1;
+    } or {
+        if (integer.length >= integer.needed) { ret ERROR_STATE; }
+        integer.bytes[integer.length] = byte;
+        integer.length = integer.length + 1;
+    }
+    if (integer.length != integer.needed) { ret ERROR_NONE; }
+    integer.value = (integer.bytes[0] & 0x3f)::u64;
+    var i: usize = 1;
+    for (i < integer.needed) {
+        integer.value = (integer.value << 8) | integer.bytes[i]::u64;
+        i = i + 1;
+    }
+    integer.complete = true;
+    ret ERROR_NONE;
+}
+
+pub fun varint_size(value: u64) usize {
+    if (value < 64) { ret 1; }
+    if (value < 16384) { ret 2; }
+    if (value < 1073741824) { ret 4; }
+    if (value <= 0x3fffffffffffffff) { ret 8; }
+    ret 0;
+}
+
+pub fun encode_varint(value: u64, output: *u8, capacity: usize) usize {
+    val needed: usize = varint_size(value);
+    if (needed == 0 || output == nil || capacity < needed) { ret 0; }
+    var i: usize = needed;
+    var remaining: u64 = value;
+    for (i > 0) {
+        i = i - 1;
+        output[i] = remaining::u8;
+        remaining = remaining >> 8;
+    }
+    if (needed == 2) { output[0] = output[0] | 0x40; }
+    if (needed == 4) { output[0] = output[0] | 0x80; }
+    if (needed == 8) { output[0] = output[0] | 0xc0; }
+    ret needed;
+}
+
+fun empty_event(kind: EventKind, consumed: usize) Event {
+    var header: Header;
+    ret Event{kind: kind, consumed: consumed, header: header, data: nil,
+        data_length: 0, frame_final: false, value: 0, error: ERROR_NONE};
+}
+
+fun fail(parser: *Parser, consumed: usize, error: Error) Event {
+    var result: Event = empty_event(EVENT_ERROR, consumed);
+    result.error = error;
+    if (parser != nil) { parser.state = STATE_FAILED; parser.error = error; }
+    ret result;
+}
+
+fun frame_allowed(kind: StreamKind, typ: u64) bool {
+    if (typ == 0x2 || typ == 0x6 || typ == 0x8 || typ == 0x9) { ret false; }
+    if (typ == FRAME_DATA || typ == FRAME_HEADERS) {
+        ret kind == KIND_REQUEST || kind == KIND_PUSH;
+    }
+    if (typ == FRAME_CANCEL_PUSH || typ == FRAME_SETTINGS
+     || typ == FRAME_GOAWAY || typ == FRAME_MAX_PUSH_ID) { ret kind == KIND_CONTROL; }
+    if (typ == FRAME_PUSH_PROMISE) { ret kind == KIND_REQUEST; }
+    ret true;
+}
+
+fun setting_valid(identifier: u64, value: u64) bool {
+    if (identifier >= 0x2 && identifier <= 0x5) { ret false; }
+    if ((identifier == SETTING_ENABLE_CONNECT_PROTOCOL
+        || identifier == SETTING_H3_DATAGRAM) && value > 1) { ret false; }
+    ret true;
+}
+
+fun add_setting(parser: *Parser, identifier: u64, value: u64) Error {
+    if (!setting_valid(identifier, value)) { ret ERROR_SETTINGS; }
+    var i: usize = 0;
+    for (i < parser.settings_count) {
+        if (parser.settings[i].identifier == identifier) { ret ERROR_SETTINGS; }
+        i = i + 1;
+    }
+    if (parser.settings_count >= parser.settings_capacity
+     || parser.settings_count >= parser.limits.max_settings) { ret ERROR_EXCESSIVE_LOAD; }
+    parser.settings[parser.settings_count] = Setting{identifier: identifier, value: value};
+    parser.settings_count = parser.settings_count + 1;
+    ret ERROR_NONE;
+}
+
+fun header_complete(parser: *Parser, consumed: usize) Event {
+    if (parser.state == STATE_TYPE) {
+        parser.header.typ = parser.integer.value;
+        varint_reset(?parser.integer);
+        parser.state = STATE_LENGTH;
+        ret empty_event(EVENT_NEED_INPUT, consumed);
+    }
+    parser.header.length = parser.integer.value;
+    if (parser.header.length > parser.limits.max_frame_payload) {
+        ret fail(parser, consumed, ERROR_FRAME_SIZE);
+    }
+    if (!frame_allowed(parser.stream_kind, parser.header.typ)) {
+        ret fail(parser, consumed, ERROR_FRAME_UNEXPECTED);
+    }
+    if (parser.stream_kind == KIND_CONTROL) {
+        if (!parser.control_started && parser.header.typ != FRAME_SETTINGS) {
+            ret fail(parser, consumed, ERROR_MISSING_SETTINGS);
+        }
+        if (parser.header.typ == FRAME_SETTINGS && parser.settings_received) {
+            ret fail(parser, consumed, ERROR_FRAME_UNEXPECTED);
+        }
+        parser.control_started = true;
+    }
+    parser.remaining = parser.header.length;
+    parser.payload_length = 0;
+    parser.settings_count = 0;
+    parser.setting_has_identifier = false;
+    parser.value = 0;
+    parser.value_complete = false;
+    varint_reset(?parser.integer);
+    parser.state = STATE_PAYLOAD;
+    var event: Event = empty_event(EVENT_HEADER, consumed);
+    event.header = parser.header;
+    ret event;
+}
+
+pub fun parser_init(parser: *Parser, stream_kind: StreamKind,
+    settings: *Setting, settings_capacity: usize, limits: Limits) bool {
+    if (parser == nil || parser.initialized || !limits_valid(limits)
+     || (stream_kind != KIND_REQUEST && stream_kind != KIND_CONTROL
+        && stream_kind != KIND_PUSH)
+     || (stream_kind == KIND_CONTROL
+        && (settings == nil || settings_capacity < limits.max_settings))) { ret false; }
+    parser.limits = limits; parser.stream_kind = stream_kind; parser.state = STATE_TYPE;
+    varint_reset(?parser.integer);
+    parser.remaining = 0; parser.payload_length = 0; parser.settings = settings;
+    parser.settings_capacity = settings_capacity; parser.settings_count = 0;
+    parser.setting_has_identifier = false; parser.control_started = false;
+    parser.settings_received = false; parser.value = 0; parser.value_complete = false;
+    parser.held = false; parser.error = ERROR_NONE; parser.initialized = true;
+    ret true;
+}
+
+fun takes_single_varint(typ: u64) bool {
+    ret typ == FRAME_CANCEL_PUSH || typ == FRAME_GOAWAY || typ == FRAME_MAX_PUSH_ID;
+}
+
+fun payload_byte(parser: *Parser, byte: u8) Error {
+    if (parser.header.typ == FRAME_SETTINGS || takes_single_varint(parser.header.typ)
+     || (parser.header.typ == FRAME_PUSH_PROMISE && !parser.value_complete)) {
+        val error: Error = varint_feed(?parser.integer, byte);
+        if (error != ERROR_NONE) { ret error; }
+        if (parser.integer.complete) {
+            if (parser.header.typ == FRAME_SETTINGS) {
+                if (!parser.setting_has_identifier) {
+                    parser.setting_identifier = parser.integer.value;
+                    parser.setting_has_identifier = true;
+                } or {
+                    val setting_error: Error = add_setting(parser,
+                        parser.setting_identifier, parser.integer.value);
+                    if (setting_error != ERROR_NONE) { ret setting_error; }
+                    parser.setting_has_identifier = false;
+                }
+                varint_reset(?parser.integer);
+            } or {
+                parser.value = parser.integer.value;
+                parser.value_complete = true;
+            }
+        }
+    }
+    parser.payload_length = parser.payload_length + 1;
+    ret ERROR_NONE;
+}
+
+fun finish_frame(parser: *Parser, consumed: usize) Event {
+    if (parser.header.typ == FRAME_SETTINGS && (parser.setting_has_identifier
+        || parser.integer.length != 0)) { ret fail(parser, consumed, ERROR_FRAME); }
+    if (takes_single_varint(parser.header.typ)
+     && (!parser.value_complete || parser.integer.length != parser.header.length::usize)) {
+        ret fail(parser, consumed, ERROR_FRAME);
+    }
+    if (parser.header.typ == FRAME_PUSH_PROMISE && !parser.value_complete) {
+        ret fail(parser, consumed, ERROR_FRAME);
+    }
+    if (parser.header.typ == FRAME_SETTINGS) { parser.settings_received = true; }
+    var event: Event = empty_event(EVENT_FRAME_END, consumed);
+    event.header = parser.header; event.frame_final = true; event.value = parser.value;
+    parser.state = STATE_TYPE; varint_reset(?parser.integer);
+    ret event;
+}
+
+pub fun feed(parser: *Parser, input: *u8, length: usize, eof: bool) Event {
+    if (parser == nil || !parser.initialized || parser.held
+     || parser.state == STATE_FAILED || (input == nil && length != 0)) {
+        ret fail(parser, 0, ERROR_STATE);
+    }
+    var consumed: usize = 0;
+    for (parser.state == STATE_TYPE || parser.state == STATE_LENGTH) {
+        for (consumed < length && !parser.integer.complete) {
+            val error: Error = varint_feed(?parser.integer, input[consumed]);
+            consumed = consumed + 1;
+            if (error != ERROR_NONE) { ret fail(parser, consumed, error); }
+        }
+        if (!parser.integer.complete) {
+            if (eof) { ret fail(parser, consumed, ERROR_TRUNCATED); }
+            ret empty_event(EVENT_NEED_INPUT, consumed);
+        }
+        val completed: Event = header_complete(parser, consumed);
+        if (completed.kind != EVENT_NEED_INPUT) { ret completed; }
+    }
+    if (parser.remaining == 0) { ret finish_frame(parser, 0); }
+    var take: usize = length;
+    if (take > parser.remaining::usize) { take = parser.remaining::usize; }
+    if (take == 0) {
+        if (eof) { ret fail(parser, 0, ERROR_TRUNCATED); }
+        ret empty_event(EVENT_NEED_INPUT, 0);
+    }
+    var i: usize = 0;
+    for (i < take) {
+        val error: Error = payload_byte(parser, input[i]);
+        if (error != ERROR_NONE) { ret fail(parser, i + 1, error); }
+        i = i + 1;
+    }
+    parser.remaining = parser.remaining - take::u64;
+    var event: Event = empty_event(EVENT_PAYLOAD, take);
+    event.header = parser.header; event.data = input; event.data_length = take;
+    event.frame_final = parser.remaining == 0; event.value = parser.value;
+    parser.held = true;
+    ret event;
+}
+
+pub fun release(parser: *Parser) bool {
+    if (parser == nil || !parser.initialized || !parser.held) { ret false; }
+    parser.held = false;
+    ret true;
+}
+
+pub fun writer_init(writer: *Writer, stream_kind: StreamKind,
+    settings: *Setting, settings_capacity: usize, limits: Limits) bool {
+    if (writer == nil || writer.active || writer.parser.initialized) { ret false; }
+    ret parser_init(?writer.parser, stream_kind, settings, settings_capacity, limits);
+}
+
+pub fun begin(writer: *Writer, header: Header, output: *u8,
+    output_capacity: usize) Write {
+    if (writer == nil || !writer.parser.initialized || writer.active || output == nil) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_STATE};
+    }
+    var type_bytes: [8]u8; var length_bytes: [8]u8;
+    val type_length: usize = encode_varint(header.typ, ?type_bytes[0], 8);
+    val length_length: usize = encode_varint(header.length, ?length_bytes[0], 8);
+    if (type_length == 0 || length_length == 0
+     || header.length > writer.parser.limits.max_frame_payload) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_FRAME_SIZE};
+    }
+    if (output_capacity < type_length + length_length) {
+        ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_NONE};
+    }
+    writer.parser.header = header; writer.parser.integer.value = header.length;
+    writer.parser.integer.complete = true; writer.parser.state = STATE_LENGTH;
+    val validation: Event = header_complete(?writer.parser, 0);
+    if (validation.kind == EVENT_ERROR) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: validation.error};
+    }
+    memory.raw_copy(output, ?type_bytes[0], type_length);
+    memory.raw_copy(?output[type_length], ?length_bytes[0], length_length);
+    writer.active = true;
+    ret Write{status: WRITE_OUTPUT, consumed: 0,
+        written: type_length + length_length, error: ERROR_NONE};
+}
+
+pub fun write(writer: *Writer, output: *u8, output_capacity: usize,
+    payload: *u8, payload_length: usize) Write {
+    if (writer == nil || !writer.active || (payload == nil && payload_length != 0)
+     || (writer.parser.remaining != 0 && (output == nil || output_capacity == 0))) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_STATE};
+    }
+    var take: usize = payload_length;
+    if (take > output_capacity) { take = output_capacity; }
+    if (take > writer.parser.remaining::usize) { take = writer.parser.remaining::usize; }
+    if (take == 0 && writer.parser.remaining != 0) {
+        ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_NONE};
+    }
+    var i: usize = 0;
+    for (i < take) {
+        val error: Error = payload_byte(?writer.parser, payload[i]);
+        if (error != ERROR_NONE) {
+            writer.active = false;
+            ret Write{status: WRITE_ERROR, consumed: i + 1, written: i, error: error};
+        }
+        output[i] = payload[i]; i = i + 1;
+    }
+    writer.parser.remaining = writer.parser.remaining - take::u64;
+    if (writer.parser.remaining != 0) {
+        ret Write{status: WRITE_OUTPUT, consumed: take, written: take, error: ERROR_NONE};
+    }
+    val finished: Event = finish_frame(?writer.parser, 0);
+    writer.active = false;
+    if (finished.kind == EVENT_ERROR) {
+        ret Write{status: WRITE_ERROR, consumed: take, written: take, error: finished.error};
+    }
+    ret Write{status: WRITE_DONE, consumed: take, written: take, error: ERROR_NONE};
+}
+
+pub fun encode_setting(setting: Setting, output: *u8, capacity: usize) usize {
+    if (!setting_valid(setting.identifier, setting.value)) { ret 0; }
+    val first: usize = encode_varint(setting.identifier, output, capacity);
+    if (first == 0) { ret 0; }
+    val second: usize = encode_varint(setting.value, ?output[first], capacity - first);
+    if (second == 0) { ret 0; }
+    ret first + second;
+}
+
+pub fun critical_init(critical: *CriticalStreams) bool {
+    if (critical == nil || critical.initialized) { ret false; }
+    critical.control = false; critical.qpack_encoder = false;
+    critical.qpack_decoder = false; critical.initialized = true;
+    ret true;
+}
+
+fun claim(critical: *CriticalStreams, typ: u64) Error {
+    if (critical == nil || !critical.initialized) { ret ERROR_STATE; }
+    if (typ == STREAM_CONTROL) {
+        if (critical.control) { ret ERROR_STREAM_CREATION; }
+        critical.control = true;
+    } or (typ == STREAM_QPACK_ENCODER) {
+        if (critical.qpack_encoder) { ret ERROR_STREAM_CREATION; }
+        critical.qpack_encoder = true;
+    } or (typ == STREAM_QPACK_DECODER) {
+        if (critical.qpack_decoder) { ret ERROR_STREAM_CREATION; }
+        critical.qpack_decoder = true;
+    }
+    ret ERROR_NONE;
+}
+
+pub fun stream_parser_init(parser: *StreamParser, critical: *CriticalStreams,
+    peer_is_client: bool) bool {
+    if (parser == nil || parser.initialized || critical == nil || !critical.initialized) {
+        ret false;
+    }
+    varint_reset(?parser.integer); parser.critical = critical; parser.stream_type = 0;
+    parser.peer_is_client = peer_is_client; parser.has_type = false;
+    parser.complete = false; parser.error = ERROR_NONE; parser.initialized = true;
+    ret true;
+}
+
+fun stream_fail(parser: *StreamParser, consumed: usize, error: Error) StreamEvent {
+    var stream_type: u64 = 0;
+    if (parser != nil) { parser.error = error; stream_type = parser.stream_type; }
+    ret StreamEvent{kind: STREAM_EVENT_ERROR, consumed: consumed,
+        stream_type: stream_type, push_id: 0, error: error};
+}
+
+pub fun stream_feed(parser: *StreamParser, input: *u8, length: usize,
+    eof: bool) StreamEvent {
+    if (parser == nil || !parser.initialized || parser.complete
+     || parser.error != ERROR_NONE || (input == nil && length != 0)) {
+        ret stream_fail(parser, 0, ERROR_STATE);
+    }
+    var consumed: usize = 0;
+    for (consumed < length && !parser.integer.complete) {
+        val error: Error = varint_feed(?parser.integer, input[consumed]);
+        consumed = consumed + 1;
+        if (error != ERROR_NONE) { ret stream_fail(parser, consumed, error); }
+    }
+    if (!parser.integer.complete) {
+        if (eof) { ret stream_fail(parser, consumed, ERROR_TRUNCATED); }
+        ret StreamEvent{kind: STREAM_EVENT_NEED_INPUT, consumed: consumed,
+            stream_type: parser.stream_type, push_id: 0, error: ERROR_NONE};
+    }
+    if (!parser.has_type) {
+        parser.stream_type = parser.integer.value; parser.has_type = true;
+        if (parser.stream_type == STREAM_PUSH && parser.peer_is_client) {
+            ret stream_fail(parser, consumed, ERROR_STREAM_CREATION);
+        }
+        val error: Error = claim(parser.critical, parser.stream_type);
+        if (error != ERROR_NONE) { ret stream_fail(parser, consumed, error); }
+        if (parser.stream_type == STREAM_PUSH) { varint_reset(?parser.integer); }
+        or { parser.complete = true; }
+        ret StreamEvent{kind: STREAM_EVENT_TYPE, consumed: consumed,
+            stream_type: parser.stream_type, push_id: 0, error: ERROR_NONE};
+    }
+    parser.complete = true;
+    ret StreamEvent{kind: STREAM_EVENT_PUSH_ID, consumed: consumed,
+        stream_type: parser.stream_type, push_id: parser.integer.value, error: ERROR_NONE};
+}
+
+test "http.h3.frame: quic varints and frame headers split at every byte" {
+    var encoded: [16]u8;
+    val first: usize = encode_varint(FRAME_HEADERS, ?encoded[0], 16);
+    val second: usize = encode_varint(16384, ?encoded[first], 16 - first);
+    if (first != 1 || second != 4) { ret 1; }
+    var parser: Parser; var settings: [4]Setting;
+    var limits: Limits = limits_default(); limits.max_settings = 4;
+    if (!parser_init(?parser, KIND_REQUEST, ?settings[0], 4, limits)) { ret 2; }
+    var i: usize = 0;
+    for (i < first + second) {
+        val event: Event = feed(?parser, ?encoded[i], 1, false);
+        if (i + 1 < first + second && event.kind != EVENT_NEED_INPUT) { ret 3; }
+        if (i + 1 == first + second && (event.kind != EVENT_HEADER
+            || event.header.length != 16384)) { ret 4; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "http.h3.frame: settings are incremental unique and bounded" {
+    var payload: [16]u8;
+    val one: usize = encode_setting(Setting{identifier: SETTING_QPACK_MAX_TABLE_CAPACITY,
+        value: 4096}, ?payload[0], 16);
+    val two: usize = encode_setting(Setting{identifier: SETTING_QPACK_BLOCKED_STREAMS,
+        value: 8}, ?payload[one], 16 - one);
+    var settings: [2]Setting;
+    var limits: Limits = limits_default(); limits.max_settings = 2;
+    var parser: Parser; parser_init(?parser, KIND_CONTROL, ?settings[0], 2, limits);
+    var header: [2]u8; header[0] = FRAME_SETTINGS::u8; header[1] = (one + two)::u8;
+    if (feed(?parser, ?header[0], 2, false).kind != EVENT_HEADER) { ret 1; }
+    var i: usize = 0;
+    for (i < one + two) {
+        val event: Event = feed(?parser, ?payload[i], 1, false);
+        if (event.kind != EVENT_PAYLOAD || !release(?parser)) { ret 2; }
+        i = i + 1;
+    }
+    if (feed(?parser, nil, 0, false).kind != EVENT_FRAME_END
+     || parser.settings_count != 2 || settings[1].value != 8) { ret 3; }
+    var duplicate: Parser; parser_init(?duplicate, KIND_CONTROL, ?settings[0], 2, limits);
+    header[1] = (one * 2)::u8;
+    if (feed(?duplicate, ?header[0], 2, false).kind != EVENT_HEADER) { ret 4; }
+    memory.raw_copy(?payload[one], ?payload[0], one);
+    if (feed(?duplicate, ?payload[0], one * 2, false).error != ERROR_SETTINGS) { ret 5; }
+    ret 0;
+}
+
+test "http.h3.frame: placement missing settings and exact payloads fail closed" {
+    var settings: [4]Setting; var limits: Limits = limits_default(); limits.max_settings = 4;
+    var control: Parser; parser_init(?control, KIND_CONTROL, ?settings[0], 4, limits);
+    var data: [2]u8; data[0] = FRAME_GOAWAY::u8; data[1] = 0;
+    if (feed(?control, ?data[0], 2, false).error != ERROR_MISSING_SETTINGS) { ret 1; }
+    var request: Parser; parser_init(?request, KIND_REQUEST, ?settings[0], 4, limits);
+    data[0] = FRAME_SETTINGS::u8;
+    if (feed(?request, ?data[0], 2, false).error != ERROR_FRAME_UNEXPECTED) { ret 2; }
+    var reserved: Parser; parser_init(?reserved, KIND_REQUEST, ?settings[0], 4, limits);
+    data[0] = 0x2;
+    if (feed(?reserved, ?data[0], 2, false).error != ERROR_FRAME_UNEXPECTED) { ret 4; }
+    var malformed: Parser; parser_init(?malformed, KIND_CONTROL, ?settings[0], 4, limits);
+    var pair: [3]u8; pair[0] = FRAME_SETTINGS::u8; pair[1] = 1; pair[2] = 1;
+    if (feed(?malformed, ?pair[0], 2, false).kind != EVENT_HEADER
+     || feed(?malformed, ?pair[2], 1, false).kind != EVENT_PAYLOAD
+     || !release(?malformed) || feed(?malformed, nil, 0, false).error != ERROR_FRAME) {
+        ret 3;
+    }
+    ret 0;
+}
+
+test "http.h3.frame: critical stream types and push direction are enforced" {
+    val null_result: StreamEvent = stream_feed(nil, nil, 0, false);
+    if (null_result.kind != STREAM_EVENT_ERROR
+     || null_result.error != ERROR_STATE || null_result.consumed != 0) { ret 4; }
+    var critical: CriticalStreams; critical_init(?critical);
+    var first: StreamParser; stream_parser_init(?first, ?critical, false);
+    var control: [1]u8; control[0] = STREAM_CONTROL::u8;
+    if (stream_feed(?first, ?control[0], 1, false).kind != STREAM_EVENT_TYPE) { ret 1; }
+    var duplicate: StreamParser; stream_parser_init(?duplicate, ?critical, false);
+    if (stream_feed(?duplicate, ?control[0], 1, false).error
+        != ERROR_STREAM_CREATION) { ret 2; }
+    var client_push: StreamParser; stream_parser_init(?client_push, ?critical, true);
+    control[0] = STREAM_PUSH::u8;
+    if (stream_feed(?client_push, ?control[0], 1, false).error
+        != ERROR_STREAM_CREATION) { ret 3; }
+    ret 0;
+}
+
+test "http.h3.frame: writer preserves fragmented payload ownership" {
+    var settings: [4]Setting; var limits: Limits = limits_default(); limits.max_settings = 4;
+    var writer: Writer; writer_init(?writer, KIND_REQUEST, ?settings[0], 4, limits);
+    var output: [16]u8;
+    val started: Write = begin(?writer, Header{typ: FRAME_DATA, length: 3},
+        ?output[0], 16);
+    var payload: [3]u8; payload[0] = 1; payload[1] = 2; payload[2] = 3;
+    val one: Write = write(?writer, ?output[started.written], 1, ?payload[0], 3);
+    val two: Write = write(?writer, ?output[started.written + 1], 8, ?payload[1], 2);
+    if (started.written != 2 || one.status != WRITE_OUTPUT || one.consumed != 1
+     || two.status != WRITE_DONE || output[4] != 3) { ret 1; }
+    ret 0;
+}

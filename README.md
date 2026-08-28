@@ -10,9 +10,10 @@ with completion-driven plaintext and secured adapters. HTTP/1 wire parsing, fram
 serialization, and bounded client and server connection engines are implemented.
 Bounded route compilation and zero-allocation dispatch are implemented. WebSocket
 negotiation, framing, and completion-driven connections are implemented for HTTP/1
-upgrade and HTTP/2 or HTTP/3 extended CONNECT. The HTTP/2 and HTTP/3 wire layers
-remain under development. HTTP/2 frame, HPACK, connection, and stream engines are
-complete. HTTP/3 connection and stream state remains under development.
+upgrade and HTTP/2 or HTTP/3 extended CONNECT. The HTTP/2 frame, HPACK, connection,
+and stream engines are complete. HTTP/3 frame, SETTINGS, critical-stream, and QPACK
+codecs are complete. HTTP/3 connection and request-stream state remains under
+development.
 
 ## Design
 
@@ -76,6 +77,18 @@ complete. HTTP/3 connection and stream state remains under development.
   mismatches, and data on bodyless responses reset only the affected stream.
 - Header, request, idle, write, and total deadlines are absolute. Slow progress does
   not refresh them. Graceful close finishes admitted work before write half-close.
+- HTTP/3 frame headers, SETTINGS pairs, typed control payloads, and unidirectional
+  stream headers accept arbitrary fragmentation and retain borrowed payload input
+  only until explicit release.
+- QPACK encoder and decoder instructions are incremental and bounded independently
+  from encoded field sections. Dynamic entries own their bytes in caller storage.
+- QPACK field decoding retains a blocked section in its QUIC stream flow-control
+  window until its Required Insert Count arrives. Blocked streams, outstanding
+  sections, references, fields, decompressed bytes, strings, and wire bytes have
+  independent caller-selected limits.
+- QPACK encoders protect every referenced dynamic entry until Section Acknowledgment
+  or Stream Cancellation. Insert Count Increment advances only through inserts that
+  were actually sent.
 - TLS belongs below the transport contract and is not a dependency of this package.
 
 ## Routing
@@ -133,6 +146,20 @@ Each accepted request stream has one generation and must bind one
 keeps service cancellation, response construction, streaming bodies, and terminal
 completion version-neutral. See [doc/h2-connection.md](doc/h2-connection.md) for the
 state, memory, flow-control, and graceful-drain contracts.
+
+## HTTP/3 codecs
+
+`http.h3.frame.Parser` decodes QUIC variable-length frame headers and returns borrowed
+payload views. It enforces frame placement, SETTINGS-first control streams, duplicate
+and reserved settings, exact typed control payloads, reserved HTTP/2 frame types, and
+bounded unknown extensions. `StreamParser` claims the single control, QPACK encoder,
+and QPACK decoder streams and rejects client push streams.
+
+`http.h3.qpack` implements the complete RFC 9204 static table, dynamic insertion and
+eviction, both instruction streams, field-section prefixes, all indexed and literal
+representations, Huffman strings, blocked-section retry, reference protection, and
+decoder feedback. Tables and sections use caller-owned arrays and arenas. See
+[doc/h3-codecs.md](doc/h3-codecs.md) for memory, lifetime, and flow-control contracts.
 
 ## Layout
 
