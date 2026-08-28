@@ -309,9 +309,17 @@ pub fun commit_response(response: *Response, method_kind: method.Kind, configure
      || !field.validate(?response.trailers, configured.response_trailers, true)) { ret RESPONSE_LIMIT; }
     if (!status.permits_content(method_kind, response.status) && response.body_kind != BODY_NONE) { ret RESPONSE_BODY_FORBIDDEN; }
     if (response.body_kind == BODY_READER) {
-        if (!body.validate_reader(response.body_reader, configured.response_body, response.generation)) { ret RESPONSE_INVALID; }
+        if (response.body_reader.trailers != ?response.trailers
+            || !body.validate_reader(response.body_reader,
+                configured.response_body, response.generation)) {
+            ret RESPONSE_INVALID;
+        }
     } or (response.body_kind == BODY_WRITER) {
-        if (!body.validate_writer(response.body_writer, configured.response_body, response.generation)) { ret RESPONSE_INVALID; }
+        if (response.body_writer.trailers != ?response.trailers
+            || !body.validate_writer(response.body_writer,
+                configured.response_body, response.generation)) {
+            ret RESPONSE_INVALID;
+        }
     } or (response.body_kind != BODY_NONE) { ret RESPONSE_INVALID; }
     response.committed = true;
     response.committed_status = response.status;
@@ -334,10 +342,14 @@ pub fun validate_committed_response(response: *Response, method_kind: method.Kin
      || !field.validate(?response.trailers, configured.response_trailers, true)
      || (!status.permits_content(method_kind, response.status) && response.body_kind != BODY_NONE)) { ret false; }
     if (response.body_kind == BODY_READER) {
-        ret body.validate_reader(response.body_reader, configured.response_body, response.generation);
+        ret response.body_reader.trailers == ?response.trailers
+            && body.validate_reader(response.body_reader,
+                configured.response_body, response.generation);
     }
     if (response.body_kind == BODY_WRITER) {
-        ret body.validate_writer(response.body_writer, configured.response_body, response.generation);
+        ret response.body_writer.trailers == ?response.trailers
+            && body.validate_writer(response.body_writer,
+                configured.response_body, response.generation);
     }
     ret response.body_kind == BODY_NONE;
 }
