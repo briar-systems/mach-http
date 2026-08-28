@@ -1,7 +1,7 @@
 # bounded asynchronous client name cache
 
 use std.chrono.time;
-use std.memory;
+use std_memory: std.memory;
 use std.net.ip;
 use resolver: std.net.resolve;
 use cancellation: std.sync.cancel;
@@ -14,6 +14,7 @@ use std.types.result.is_err;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
+use http.client.memory;
 use http.client.policy;
 
 val ENTRY_EMPTY:   u8 = 0;
@@ -209,24 +210,22 @@ fun config_valid(configured: Config, entry_capacity: usize,
         * configured.max_endpoints_per_entry;
 }
 
-fun byte_ranges_overlap(first: ptr, first_size: usize,
-    second: ptr, second_size: usize) bool {
-    if (first == nil || second == nil || first_size == 0 || second_size == 0) {
-        ret false;
-    }
-    val first_start: usize = first::usize;
-    val second_start: usize = second::usize;
-    if (first_start > ~(0::usize) - first_size
-        || second_start > ~(0::usize) - second_size) { ret true; }
-    ret first_start < second_start + second_size
-        && second_start < first_start + first_size;
+fun cache_object(cache: *Cache) bool {
+    ret memory.range(cache::ptr, $size_of(Cache));
+}
+
+fun cache_ready(cache: *Cache) bool {
+    if (!cache_object(cache) || !cache.initialized) { ret false; }
+    ret memory.count(cache.entries::ptr, cache.capacity, $size_of(Entry))
+        && memory.count(cache.endpoints::ptr, cache.endpoint_capacity,
+            $size_of(ip.Endpoint));
 }
 
 fun overlaps_cache(cache: *Cache, value: ptr, size: usize) bool {
-    ret byte_ranges_overlap(value, size, cache::ptr, $size_of(Cache))
-        || byte_ranges_overlap(value, size, cache.entries::ptr,
+    ret memory.overlap(value, size, cache::ptr, $size_of(Cache))
+        || memory.overlap(value, size, cache.entries::ptr,
             cache.capacity * $size_of(Entry))
-        || byte_ranges_overlap(value, size, cache.endpoints::ptr,
+        || memory.overlap(value, size, cache.endpoints::ptr,
             cache.endpoint_capacity * $size_of(ip.Endpoint));
 }
 
@@ -289,15 +288,19 @@ fun clear_entry(cache: *Cache, index: usize) {
 pub fun init(cache: *Cache, entries: *Entry, entry_capacity: usize,
     endpoints: *ip.Endpoint, endpoint_capacity: usize,
     configured: Config) bool {
-    if (cache == nil || cache.initialized || entries == nil || endpoints == nil
+    if (!cache_object(cache)
+        || !memory.count(entries::ptr, entry_capacity, $size_of(Entry))
+        || !memory.count(endpoints::ptr, endpoint_capacity,
+            $size_of(ip.Endpoint))
+        || cache.initialized
         || !config_valid(configured, entry_capacity, endpoint_capacity)) {
         ret false;
     }
-    if (byte_ranges_overlap(cache::ptr, $size_of(Cache), entries::ptr,
+    if (memory.overlap(cache::ptr, $size_of(Cache), entries::ptr,
             entry_capacity * $size_of(Entry))
-        || byte_ranges_overlap(cache::ptr, $size_of(Cache), endpoints::ptr,
+        || memory.overlap(cache::ptr, $size_of(Cache), endpoints::ptr,
             endpoint_capacity * $size_of(ip.Endpoint))
-        || byte_ranges_overlap(entries::ptr,
+        || memory.overlap(entries::ptr,
             entry_capacity * $size_of(Entry), endpoints::ptr,
             endpoint_capacity * $size_of(ip.Endpoint))) { ret false; }
     cache.entries = entries;
@@ -480,19 +483,20 @@ fun copy_value_locked(cache: *Cache, index: usize, output: *ip.Endpoint,
     val entry: *Entry = ?cache.entries[index];
     if (output_capacity < entry.endpoint_len) { ret LOOKUP_TOO_SMALL; }
     if (entry.endpoint_len != 0 && output == nil) { ret LOOKUP_INVALID; }
-    if (output_capacity > ~(0::usize) / $size_of(ip.Endpoint)
+    if (!memory.count(output::ptr, output_capacity, $size_of(ip.Endpoint))
         || overlaps_cache(cache, output::ptr,
             output_capacity * $size_of(ip.Endpoint))) { ret LOOKUP_INVALID; }
     val base: usize = index * cache.configured.max_endpoints_per_entry;
-    memory.copy[ip.Endpoint](output, ?cache.endpoints[base],
+    std_memory.copy[ip.Endpoint](output, ?cache.endpoints[base],
         entry.endpoint_len);
     ret LOOKUP_HIT;
 }
 
 pub fun lookup(cache: *Cache, key: Key, now: time.Time,
     output: *ip.Endpoint, output_capacity: usize) Lookup {
-    if (cache == nil || !cache.initialized || !key_valid(key)
-        || !time_valid(now) || (output == nil && output_capacity != 0)) {
+    if (!cache_ready(cache) || !key_valid(key) || !time_valid(now)
+        || !memory.count(output::ptr, output_capacity,
+            $size_of(ip.Endpoint))) {
         ret lookup_value(LOOKUP_INVALID);
     }
     if (overlaps_cache(cache, key.host.data::ptr, key.host.len)) {
@@ -587,7 +591,7 @@ fun resolver_token_equal(first: resolver.Token, second: resolver.Token) bool {
 }
 
 pub fun bind(cache: *Cache, token: Token, resolver_token: resolver.Token) bool {
-    if (cache == nil || !cache.initialized || resolver_token.generation == 0) {
+    if (!cache_ready(cache) || resolver_token.generation == 0) {
         ret false;
     }
     mutex.lock(?cache.lock);
@@ -644,12 +648,15 @@ fun endpoint_equal(first: ip.Endpoint, second: ip.Endpoint) bool {
 
 fun success_valid(cache: *Cache, entry: *Entry,
     resolution: *resolver.Resolution) bool {
-    if (resolution == nil || resolution.len == 0
+    if (!memory.range(resolution::ptr, $size_of(resolver.Resolution))
+        || resolution.len == 0
         || resolution.len > resolution.endpoint_capacity
         || resolution.len > cache.configured.max_endpoints_per_entry
-        || resolution.endpoints == nil
-        || resolution.endpoint_capacity > ~(0::usize)
-            / $size_of(ip.Endpoint)
+        || !memory.count(resolution.endpoints::ptr,
+            resolution.endpoint_capacity, $size_of(ip.Endpoint))
+        || resolution.canonical_length > resolution.canonical_capacity
+        || !memory.count(resolution.canonical_name::ptr,
+            resolution.canonical_capacity, 1)
         || overlaps_cache(cache, resolution.endpoints::ptr,
             resolution.endpoint_capacity * $size_of(ip.Endpoint))) { ret false; }
     var i: usize = 0;
@@ -726,7 +733,8 @@ fun finish_locked(cache: *Cache, entry: *Entry) {
 
 pub fun complete(cache: *Cache, token: Token,
     completion: *resolver.Completion, now: time.Time) CompleteStatus {
-    if (cache == nil || !cache.initialized || completion == nil
+    if (!cache_ready(cache)
+        || !memory.range(completion::ptr, $size_of(resolver.Completion))
         || !time_valid(now)) { ret COMPLETE_INVALID; }
     mutex.lock(?cache.lock);
     val entry: *Entry = entry_for_locked(cache, token);
@@ -772,7 +780,8 @@ pub fun complete(cache: *Cache, token: Token,
 
 pub fun complete_bound(cache: *Cache, completion: *resolver.Completion,
     now: time.Time) CompleteStatus {
-    if (cache == nil || !cache.initialized || completion == nil
+    if (!cache_ready(cache)
+        || !memory.range(completion::ptr, $size_of(resolver.Completion))
         || completion.context >= cache.capacity) { ret COMPLETE_INVALID; }
     mutex.lock(?cache.lock);
     val entry: *Entry = ?cache.entries[completion.context];
@@ -788,7 +797,7 @@ pub fun complete_bound(cache: *Cache, completion: *resolver.Completion,
 
 pub fun abandon(cache: *Cache, token: Token, failure: resolver.Error,
     now: time.Time) CompleteStatus {
-    if (cache == nil || !cache.initialized || !time_valid(now)
+    if (!cache_ready(cache) || !time_valid(now)
         || failure.kind == resolver.NO_ERROR) { ret COMPLETE_INVALID; }
     mutex.lock(?cache.lock);
     val entry: *Entry = entry_for_locked(cache, token);
@@ -819,7 +828,7 @@ pub fun abandon(cache: *Cache, token: Token, failure: resolver.Error,
 }
 
 pub fun drain(cache: *Cache) bool {
-    if (cache == nil || !cache.initialized) { ret false; }
+    if (!cache_ready(cache)) { ret false; }
     mutex.lock(?cache.lock);
     if (!cache.accepting) {
         mutex.unlock(?cache.lock);
@@ -831,7 +840,7 @@ pub fun drain(cache: *Cache) bool {
 }
 
 pub fun take_cancel(cache: *Cache) Cancel {
-    if (cache == nil || !cache.initialized) { ret empty_cancel(); }
+    if (!cache_ready(cache)) { ret empty_cancel(); }
     mutex.lock(?cache.lock);
     if (cache.accepting) {
         mutex.unlock(?cache.lock);
@@ -857,7 +866,7 @@ pub fun take_cancel(cache: *Cache) Cancel {
 pub fun snapshot(cache: *Cache) Snapshot {
     var result: Snapshot = Snapshot{accepting: false, live_entries: 0,
         resolving: 0, ready: 0, failed: 0};
-    if (cache == nil || !cache.initialized) { ret result; }
+    if (!cache_ready(cache)) { ret result; }
     mutex.lock(?cache.lock);
     result.accepting = cache.accepting;
     result.live_entries = cache.live_entries;
@@ -878,7 +887,7 @@ pub fun snapshot(cache: *Cache) Snapshot {
 }
 
 pub fun destroy(cache: *Cache) bool {
-    if (cache == nil || !cache.initialized) { ret false; }
+    if (!cache_ready(cache)) { ret false; }
     mutex.lock(?cache.lock);
     if (cache.accepting || cache.resolving != 0) {
         mutex.unlock(?cache.lock);

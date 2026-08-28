@@ -1,0 +1,47 @@
+# representable borrowed memory ranges for client public boundaries
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+pub fun range(data: ptr, size: usize) bool {
+    if (size == 0) { ret true; }
+    if (data == nil) { ret false; }
+    ret data::usize <= ~(0::usize) - (size - 1);
+}
+
+pub fun count(data: ptr, length: usize, item_size: usize) bool {
+    if (length == 0) { ret true; }
+    if (data == nil || item_size == 0
+        || length > ~(0::usize) / item_size) { ret false; }
+    ret range(data, length * item_size);
+}
+
+pub fun borrowed(value: view.View) bool {
+    ret range(value.data::ptr, value.len);
+}
+
+pub fun overlap(first: ptr, first_size: usize,
+    second: ptr, second_size: usize) bool {
+    if (first_size == 0 || second_size == 0
+        || !range(first, first_size) || !range(second, second_size)) {
+        ret false;
+    }
+    val first_end: usize = first::usize + first_size - 1;
+    val second_end: usize = second::usize + second_size - 1;
+    ret first::usize <= second_end && second::usize <= first_end;
+}
+
+test "http.client.memory: borrowed ranges reject wrapping arithmetic" {
+    var bytes: [8]u8;
+    if (!range((?bytes[0])::ptr, 8)
+        || !range((~(0::usize))::ptr, 1)
+        || range((~(0::usize))::ptr, 2)
+        || count((?bytes[0])::ptr, ~(0::usize), 2)
+        || borrowed(view.view((~(0::usize))::*u8, 2))
+        || !overlap((?bytes[0])::ptr, 4, (?bytes[3])::ptr, 2)
+        || overlap((?bytes[0])::ptr, 4, (?bytes[4])::ptr, 2)) { ret 1; }
+    ret 0;
+}
