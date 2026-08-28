@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.1] - 2026-08-28
+
+### Fixed
+
+- Synchronized the exported library version with the package release version.
+
+### Added
+
+- Added a release check that rejects manifest and exported version drift.
+
 ## [0.2.0] - 2026-08-28
 
 ### Added
