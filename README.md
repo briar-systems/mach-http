@@ -8,8 +8,10 @@ construction, hierarchical cancellation, and streaming body lifecycles shared by
 HTTP/1, HTTP/2, and HTTP/3. The ordered-byte transport boundary is also implemented
 with completion-driven plaintext and secured adapters. HTTP/1 wire parsing, framing,
 serialization, and bounded client and server connection engines are implemented.
-Bounded route compilation and zero-allocation dispatch are implemented. The HTTP/2
-and HTTP/3 wire layers remain under development.
+Bounded route compilation and zero-allocation dispatch are implemented. WebSocket
+negotiation, framing, and completion-driven connections are implemented for HTTP/1
+upgrade and HTTP/2 or HTTP/3 extended CONNECT. The HTTP/2 and HTTP/3 wire layers
+remain under development.
 
 ## Design
 
@@ -43,6 +45,15 @@ and HTTP/3 wire layers remain under development.
   reads stop at configured saturation or while a body view is borrowed.
 - HTTP/1 request bodies have explicit deliver, bounded drain, reject, and close
   dispositions. Upgrade and CONNECT handoff preserve every unread tunnel byte.
+- WebSocket decoding is incremental across every byte boundary. Inbound data views
+  borrow the active input until explicit release. Control frames use caller-provided
+  bounded scratch storage.
+- WebSocket writes copy application payload into the caller-provided connection
+  buffer before returning ownership. Transport submissions retain only that stable
+  buffer through their exact completion token.
+- Frame, message, and fragmentation limits are independent. Mask direction,
+  minimally encoded lengths, streaming UTF-8, control interleaving, close codes,
+  and abnormal EOF outcomes are enforced before another frame is admitted.
 - Header, request, idle, write, and total deadlines are absolute. Slow progress does
   not refresh them. Graceful close finishes admitted work before write half-close.
 - TLS belongs below the transport contract and is not a dependency of this package.
@@ -61,6 +72,20 @@ name views for the router generation. Dispatch captures borrow the request path 
 the request generation. Recompilation advances the router generation and invalidates
 prior matches. `decode_capture` writes decoded values into caller storage.
 
+## WebSocket
+
+`http.websocket.negotiation.server` commits HTTP/1 upgrade or HTTP/2 and HTTP/3
+extended CONNECT through the common service exchange. The caller owns the accept-key
+scratch and any selected subprotocol view. Client response validation checks the
+exact accept value and case-sensitive subprotocol selection.
+
+`http.websocket.Decoder` and `Encoder` are allocation-free incremental codecs.
+`Connection` binds them to the common completion-driven transport and supports exact
+upgrade-buffer adoption, partial reads and writes, cancellation, timeout outcomes,
+and physical close. Clients must supply a fresh unpredictable four-byte mask key for
+every outbound frame. See [doc/websocket.md](doc/websocket.md) for lifecycle and
+ownership details.
+
 ## Layout
 
 ```text
@@ -72,7 +97,7 @@ src/
   server/     server configuration and lifecycle state
   client/     client configuration and lifecycle state
   router/     compiled routing, captures, dispatch, and handler invocation
-  websocket   upgrade and message framing contracts
+  websocket   negotiation, framing, and completion-driven connection state
 ```
 
 The remaining protocol and integration work is tracked in this repository.
