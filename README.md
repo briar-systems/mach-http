@@ -11,11 +11,10 @@ serialization, and bounded client and server connection engines are implemented.
 Bounded route compilation and zero-allocation dispatch are implemented. WebSocket
 negotiation, framing, and completion-driven connections are implemented for HTTP/1
 upgrade and HTTP/2 or HTTP/3 extended CONNECT. The HTTP/2 frame, HPACK, connection,
-and stream engines are complete. HTTP/3 frame, SETTINGS, critical-stream, and QPACK
-codecs are complete. HTTP/3 connection and request-stream state remains under
-development. The bounded client orchestrator, asynchronous DNS cache, origin-isolated
-connection pool, protocol selection, retries, redirects, cancellation, and graceful
-drain are implemented.
+and stream engines are complete. HTTP/3 frame, SETTINGS, critical-stream, QPACK,
+connection, and request-stream engines are complete. The bounded client
+orchestrator, asynchronous DNS cache, origin-isolated connection pool, protocol
+selection, retries, redirects, cancellation, and graceful drain are implemented.
 
 ## Design
 
@@ -119,6 +118,16 @@ drain are implemented.
   failure, and settle cancellation before redirect outcomes.
 - The pool route is the canonical authority. Host, CONNECT authority-form, and
   forward-proxy absolute-form inputs are checked against it before exchange.
+- HTTP/3 connections open and validate all three critical streams, enforce bounded
+  request and peer-stream admission, and keep QPACK-blocked field-section bytes out
+  of QUIC flow-control credit while unrelated requests continue.
+- HTTP/3 request DATA borrows one stream buffer until explicit consumption. Partial
+  writes remain in caller-owned output, and request FIN is published only after the
+  complete frame is accepted by QUIC.
+- HTTP/3 request, response, informational, trailer, target, body byte, DATA frame,
+  request admission, and peer-stream limits remain independent.
+- HTTP/3 GOAWAY boundaries are monotonic. Graceful close rejects only work beyond the
+  final boundary and waits for admitted exchanges and critical output to settle.
 - TLS belongs below the transport contract and is not a dependency of this package.
 
 ## Routing
@@ -190,6 +199,12 @@ eviction, both instruction streams, field-section prefixes, all indexed and lite
 representations, Huffman strings, blocked-section retry, reference protection, and
 decoder feedback. Tables and sections use caller-owned arrays and arenas. See
 [doc/h3-codecs.md](doc/h3-codecs.md) for memory, lifetime, and flow-control contracts.
+
+`http.h3.connection.Engine` binds those codecs to a bounded QUIC stream adapter.
+Reads separate delivery from flow-control credit, writes copy accepted bytes, and
+every server request must bind the common service exchange before its header event is
+released. See [doc/h3-connection.md](doc/h3-connection.md) for stream, memory, error,
+and graceful-close contracts.
 
 ## HTTP client
 
