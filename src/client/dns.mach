@@ -1,0 +1,1062 @@
+# bounded asynchronous client name cache
+
+use std.chrono.time;
+use std_memory: std.memory;
+use std.net.ip;
+use resolver: std.net.resolve;
+use cancellation: std.sync.cancel;
+use std.sync.mutex;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+use http.client.memory;
+use http.client.policy;
+
+val ENTRY_EMPTY:   u8 = 0;
+val ENTRY_PRESENT: u8 = 1;
+
+pub rec Token {
+    index:      u32;
+    generation: u32;
+}
+
+pub rec Key {
+    host:      view.View;
+    port:      u16;
+    transport: policy.TransportKind;
+}
+
+pub rec Config {
+    max_entries:             usize;
+    max_endpoints_per_entry: usize;
+    fresh_ns:                u64;
+    stale_ns:                u64;
+    failure_ns:              u64;
+    resolve_timeout_ns:      u64;
+}
+
+pub rec Entry {
+    state:            u8;
+    generation:       u32;
+    host:             [254]u8;
+    service:          [6]u8;
+    host_len:         usize;
+    port:             u16;
+    transport:        policy.TransportKind;
+    endpoint_len:     usize;
+    has_value:        bool;
+    fresh_until:      time.Time;
+    stale_until:      time.Time;
+    retry_after:      time.Time;
+    last_used:        time.Time;
+    failure_valid:    bool;
+    last_error:       resolver.Error;
+    resolving:        bool;
+    refreshing:       bool;
+    completing:       bool;
+    cancel_published: bool;
+    bound:            bool;
+    resolver_token:   resolver.Token;
+    scope:            cancellation.Scope;
+}
+
+pub rec Cache {
+    entries:           *Entry;
+    capacity:          usize;
+    endpoints:         *ip.Endpoint;
+    endpoint_capacity: usize;
+    configured:        Config;
+    next_entry:        usize;
+    live_entries:      usize;
+    resolving:         usize;
+    accepting:         bool;
+    lock:              mutex.Mutex;
+    initialized:       bool;
+}
+
+pub def LookupStatus: u8;
+pub val LOOKUP_HIT:         LookupStatus = 1;
+pub val LOOKUP_STALE:       LookupStatus = 2;
+pub val LOOKUP_STALE_QUERY: LookupStatus = 3;
+pub val LOOKUP_QUERY:       LookupStatus = 4;
+pub val LOOKUP_PENDING:     LookupStatus = 5;
+pub val LOOKUP_FAILED:      LookupStatus = 6;
+pub val LOOKUP_SATURATED:   LookupStatus = 7;
+pub val LOOKUP_TOO_SMALL:   LookupStatus = 8;
+pub val LOOKUP_DRAINING:    LookupStatus = 9;
+pub val LOOKUP_INVALID:     LookupStatus = 10;
+
+pub rec Query {
+    valid:   bool;
+    token:   Token;
+    query:   resolver.Query;
+    scope:   *cancellation.Scope;
+    context: usize;
+}
+
+pub rec Lookup {
+    status:  LookupStatus;
+    written: usize;
+    error:   resolver.Error;
+    ready_at: time.Time;
+    query:   Query;
+}
+
+pub rec Cancel {
+    found: bool;
+    token: Token;
+    scope: *cancellation.Scope;
+}
+
+pub def CompleteStatus: u8;
+pub val COMPLETE_OK:      CompleteStatus = 1;
+pub val COMPLETE_FAILURE: CompleteStatus = 2;
+pub val COMPLETE_BUSY:    CompleteStatus = 3;
+pub val COMPLETE_INVALID: CompleteStatus = 4;
+
+pub rec Snapshot {
+    accepting:   bool;
+    live_entries: usize;
+    resolving:   usize;
+    ready:       usize;
+    failed:      usize;
+}
+
+pub fun config_default() Config {
+    ret Config{max_entries: 256, max_endpoints_per_entry: 16,
+        fresh_ns: 60000000000, stale_ns: 300000000000,
+        failure_ns: 5000000000, resolve_timeout_ns: 10000000000};
+}
+
+fun no_error() resolver.Error {
+    ret resolver.Error{kind: resolver.NO_ERROR, native_code: 0};
+}
+
+fun malformed_error() resolver.Error {
+    ret resolver.Error{kind: resolver.MALFORMED, native_code: 0};
+}
+
+fun empty_token() Token {
+    ret Token{index: 0, generation: 0};
+}
+
+fun empty_resolver_token() resolver.Token {
+    ret resolver.Token{index: 0, generation: 0};
+}
+
+fun empty_query() Query {
+    ret Query{valid: false, token: empty_token(), query: resolver.Query{
+        host: nil, service: nil, family: resolver.ANY_FAMILY,
+        socket_kind: resolver.ANY_SOCKET, protocol: 0, flags: 0},
+        scope: nil, context: 0};
+}
+
+fun lookup_value(status: LookupStatus) Lookup {
+    ret Lookup{status: status, written: 0, error: no_error(),
+        ready_at: time.Time{sec: 0, nsec: 0},
+        query: empty_query()};
+}
+
+fun empty_cancel() Cancel {
+    ret Cancel{found: false, token: empty_token(), scope: nil};
+}
+
+fun time_valid(value: time.Time) bool {
+    ret value.sec >= 0 && value.nsec >= 0 && value.nsec < 1000000000;
+}
+
+fun time_before_or_equal(first: time.Time, second: time.Time) bool {
+    ret time.time_before(first, second) || time.time_equal(first, second);
+}
+
+fun time_add(now: time.Time, duration_ns: u64) time.Time {
+    val seconds: u64 = duration_ns / 1000000000;
+    val nanoseconds: u64 = duration_ns % 1000000000;
+    if (seconds > 0x7fffffffffffffff
+        || now.sec > 0x7fffffffffffffff - seconds::i64) {
+        ret time.Time{sec: 0x7fffffffffffffff, nsec: 999999999};
+    }
+    var result: time.Time = time.Time{sec: now.sec + seconds::i64,
+        nsec: now.nsec + nanoseconds::i64};
+    if (result.nsec >= 1000000000) {
+        if (result.sec == 0x7fffffffffffffff) {
+            result.nsec = 999999999;
+            ret result;
+        }
+        result.sec = result.sec + 1;
+        result.nsec = result.nsec - 1000000000;
+    }
+    ret result;
+}
+
+fun config_valid(configured: Config, entry_capacity: usize,
+    endpoint_capacity: usize) bool {
+    if (entry_capacity == 0 || entry_capacity > 0xffffffff
+        || entry_capacity > ~(0::usize) / $size_of(Entry)
+        || endpoint_capacity > ~(0::usize) / $size_of(ip.Endpoint)
+        || configured.max_entries == 0
+        || configured.max_entries > entry_capacity
+        || configured.max_endpoints_per_entry == 0
+        || configured.fresh_ns == 0 || configured.stale_ns < configured.fresh_ns
+        || configured.failure_ns == 0 || configured.resolve_timeout_ns == 0
+        || configured.max_entries > ~(0::usize)
+            / configured.max_endpoints_per_entry) { ret false; }
+    ret endpoint_capacity >= configured.max_entries
+        * configured.max_endpoints_per_entry;
+}
+
+fun cache_object(cache: *Cache) bool {
+    ret memory.range(cache::ptr, $size_of(Cache));
+}
+
+fun cache_ready(cache: *Cache) bool {
+    if (!cache_object(cache) || !cache.initialized) { ret false; }
+    ret memory.count(cache.entries::ptr, cache.capacity, $size_of(Entry))
+        && memory.count(cache.endpoints::ptr, cache.endpoint_capacity,
+            $size_of(ip.Endpoint));
+}
+
+fun overlaps_cache(cache: *Cache, value: ptr, size: usize) bool {
+    ret memory.overlap(value, size, cache::ptr, $size_of(Cache))
+        || memory.overlap(value, size, cache.entries::ptr,
+            cache.capacity * $size_of(Entry))
+        || memory.overlap(value, size, cache.endpoints::ptr,
+            cache.endpoint_capacity * $size_of(ip.Endpoint));
+}
+
+fun completion_descriptor_valid(cache: *Cache,
+    completion: *resolver.Completion) bool {
+    ret memory.range(completion::ptr, $size_of(resolver.Completion))
+        && !overlaps_cache(cache, completion::ptr,
+            $size_of(resolver.Completion));
+}
+
+fun empty_endpoint() ip.Endpoint {
+    var result: ip.Endpoint;
+    result.addr.is_v6 = 0;
+    var i: usize = 0;
+    for (i < 4) {
+        result.addr.v4.octets[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 16) {
+        result.addr.v6.octets[i] = 0;
+        i = i + 1;
+    }
+    result.port = 0;
+    result.scope = 0;
+    ret result;
+}
+
+fun clear_entry(cache: *Cache, index: usize) {
+    val entry: *Entry = ?cache.entries[index];
+    entry.state = ENTRY_EMPTY;
+    entry.host_len = 0;
+    entry.port = 0;
+    entry.transport = 0;
+    entry.endpoint_len = 0;
+    entry.has_value = false;
+    entry.fresh_until = time.Time{sec: 0, nsec: 0};
+    entry.stale_until = time.Time{sec: 0, nsec: 0};
+    entry.retry_after = time.Time{sec: 0, nsec: 0};
+    entry.last_used = time.Time{sec: 0, nsec: 0};
+    entry.failure_valid = false;
+    entry.last_error = no_error();
+    entry.resolving = false;
+    entry.refreshing = false;
+    entry.completing = false;
+    entry.cancel_published = false;
+    entry.bound = false;
+    entry.resolver_token = empty_resolver_token();
+    var i: usize = 0;
+    for (i < 254) {
+        entry.host[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 6) {
+        entry.service[i] = 0;
+        i = i + 1;
+    }
+    val base: usize = index * cache.configured.max_endpoints_per_entry;
+    i = 0;
+    for (i < cache.configured.max_endpoints_per_entry) {
+        cache.endpoints[base + i] = empty_endpoint();
+        i = i + 1;
+    }
+}
+
+pub fun init(cache: *Cache, entries: *Entry, entry_capacity: usize,
+    endpoints: *ip.Endpoint, endpoint_capacity: usize,
+    configured: Config) bool {
+    if (!cache_object(cache)
+        || !memory.count(entries::ptr, entry_capacity, $size_of(Entry))
+        || !memory.count(endpoints::ptr, endpoint_capacity,
+            $size_of(ip.Endpoint))
+        || cache.initialized
+        || !config_valid(configured, entry_capacity, endpoint_capacity)) {
+        ret false;
+    }
+    if (memory.overlap(cache::ptr, $size_of(Cache), entries::ptr,
+            entry_capacity * $size_of(Entry))
+        || memory.overlap(cache::ptr, $size_of(Cache), endpoints::ptr,
+            endpoint_capacity * $size_of(ip.Endpoint))
+        || memory.overlap(entries::ptr,
+            entry_capacity * $size_of(Entry), endpoints::ptr,
+            endpoint_capacity * $size_of(ip.Endpoint))) { ret false; }
+    cache.entries = entries;
+    cache.capacity = configured.max_entries;
+    cache.endpoints = endpoints;
+    cache.endpoint_capacity = endpoint_capacity;
+    cache.configured = configured;
+    cache.next_entry = 0;
+    cache.live_entries = 0;
+    cache.resolving = 0;
+    cache.accepting = true;
+    cache.lock = mutex.make();
+    var i: usize = 0;
+    for (i < cache.capacity) {
+        entries[i].generation = 0;
+        clear_entry(cache, i);
+        i = i + 1;
+    }
+    cache.initialized = true;
+    ret true;
+}
+
+fun folded(value: u8) u8 {
+    if (value >= 'A' && value <= 'Z') { ret value + 32; }
+    ret value;
+}
+
+fun key_valid(key: Key) bool {
+    ret key.port != 0 && policy.host_valid(key.host, 253)
+        && (key.transport == policy.TRANSPORT_TCP
+            || key.transport == policy.TRANSPORT_QUIC);
+}
+
+fun entry_matches(entry: *Entry, key: Key) bool {
+    if (entry.state != ENTRY_PRESENT || entry.host_len != key.host.len
+        || entry.port != key.port || entry.transport != key.transport) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < key.host.len) {
+        if (entry.host[i] != folded(key.host.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun find_locked(cache: *Cache, key: Key) usize {
+    var i: usize = 0;
+    for (i < cache.capacity) {
+        if (entry_matches(?cache.entries[i], key)) { ret i; }
+        i = i + 1;
+    }
+    ret cache.capacity;
+}
+
+fun token_for(index: usize, entry: *Entry) Token {
+    ret Token{index: index::u32, generation: entry.generation};
+}
+
+fun entry_for_locked(cache: *Cache, token: Token) *Entry {
+    if (token.generation == 0 || token.index::usize >= cache.capacity) {
+        ret nil;
+    }
+    val entry: *Entry = ?cache.entries[token.index::usize];
+    if (entry.state != ENTRY_PRESENT
+        || entry.generation != token.generation) { ret nil; }
+    ret entry;
+}
+
+fun claim_locked(cache: *Cache, now: time.Time) usize {
+    var checked: usize = 0;
+    for (checked < cache.capacity) {
+        val index: usize = cache.next_entry;
+        cache.next_entry = (cache.next_entry + 1) % cache.capacity;
+        val entry: *Entry = ?cache.entries[index];
+        if (entry.state == ENTRY_EMPTY && entry.generation != 0xffffffff) {
+            entry.generation = entry.generation + 1;
+            entry.state = ENTRY_PRESENT;
+            cache.live_entries = cache.live_entries + 1;
+            ret index;
+        }
+        checked = checked + 1;
+    }
+    var selected: usize = cache.capacity;
+    var i: usize = 0;
+    for (i < cache.capacity) {
+        val entry: *Entry = ?cache.entries[i];
+        if (entry.state == ENTRY_PRESENT && !entry.resolving
+            && !entry.completing
+            && (selected == cache.capacity
+                || time.time_before(entry.last_used,
+                    cache.entries[selected].last_used))) {
+            selected = i;
+        }
+        i = i + 1;
+    }
+    if (selected == cache.capacity
+        || cache.entries[selected].generation == 0xffffffff) {
+        ret cache.capacity;
+    }
+    val next_generation: u32 = cache.entries[selected].generation + 1;
+    clear_entry(cache, selected);
+    cache.entries[selected].generation = next_generation;
+    cache.entries[selected].state = ENTRY_PRESENT;
+    cache.entries[selected].last_used = now;
+    ret selected;
+}
+
+fun store_key(entry: *Entry, key: Key) {
+    entry.host_len = key.host.len;
+    var i: usize = 0;
+    for (i < key.host.len) {
+        entry.host[i] = folded(key.host.data[i]);
+        i = i + 1;
+    }
+    entry.host[key.host.len] = 0;
+    entry.port = key.port;
+    entry.transport = key.transport;
+}
+
+fun write_service(entry: *Entry) {
+    var value: u16 = entry.port;
+    var digits: [5]u8;
+    var count: usize = 0;
+    for (true) {
+        digits[count] = (value % 10)::u8 + '0';
+        count = count + 1;
+        value = value / 10;
+        if (value == 0) { brk; }
+    }
+    var i: usize = 0;
+    for (i < count) {
+        entry.service[i] = digits[count - i - 1];
+        i = i + 1;
+    }
+    entry.service[count] = 0;
+}
+
+fun numeric_host(entry: *Entry) bool {
+    val parsed: Result[ip.Addr, str] = ip.addr_parse(?entry.host[0]);
+    ret !is_err[ip.Addr, str](parsed);
+}
+
+fun query_for(index: usize, entry: *Entry) Query {
+    write_service(entry);
+    var flags: u32 = resolver.NUMERIC_SERVICE;
+    if (numeric_host(entry)) { flags = flags | resolver.NUMERIC_HOST; }
+    var socket_kind: resolver.SocketKind = resolver.STREAM_SOCKET;
+    if (entry.transport == policy.TRANSPORT_QUIC) {
+        socket_kind = resolver.DATAGRAM_SOCKET;
+    }
+    ret Query{valid: true, token: token_for(index, entry),
+        query: resolver.Query{host: ?entry.host[0], service: ?entry.service[0],
+            family: resolver.ANY_FAMILY, socket_kind: socket_kind,
+            protocol: 0, flags: flags}, scope: ?entry.scope, context: index};
+}
+
+fun begin_locked(cache: *Cache, index: usize, now: time.Time) Query {
+    val entry: *Entry = ?cache.entries[index];
+    if (entry.resolving || entry.completing
+        || !cancellation.make_root(?entry.scope, true,
+            time_add(now, cache.configured.resolve_timeout_ns))) {
+        ret empty_query();
+    }
+    entry.resolving = true;
+    entry.refreshing = entry.has_value;
+    entry.completing = false;
+    entry.cancel_published = false;
+    entry.bound = false;
+    entry.resolver_token = empty_resolver_token();
+    entry.failure_valid = false;
+    entry.last_error = no_error();
+    entry.last_used = now;
+    cache.resolving = cache.resolving + 1;
+    ret query_for(index, entry);
+}
+
+fun copy_value_locked(cache: *Cache, index: usize, output: *ip.Endpoint,
+    output_capacity: usize) LookupStatus {
+    val entry: *Entry = ?cache.entries[index];
+    if (output_capacity < entry.endpoint_len) { ret LOOKUP_TOO_SMALL; }
+    if (entry.endpoint_len != 0 && output == nil) { ret LOOKUP_INVALID; }
+    if (!memory.count(output::ptr, output_capacity, $size_of(ip.Endpoint))
+        || overlaps_cache(cache, output::ptr,
+            output_capacity * $size_of(ip.Endpoint))) { ret LOOKUP_INVALID; }
+    val base: usize = index * cache.configured.max_endpoints_per_entry;
+    std_memory.copy[ip.Endpoint](output, ?cache.endpoints[base],
+        entry.endpoint_len);
+    ret LOOKUP_HIT;
+}
+
+pub fun lookup(cache: *Cache, key: Key, now: time.Time,
+    output: *ip.Endpoint, output_capacity: usize) Lookup {
+    if (!cache_ready(cache) || !key_valid(key) || !time_valid(now)
+        || !memory.count(output::ptr, output_capacity,
+            $size_of(ip.Endpoint))) {
+        ret lookup_value(LOOKUP_INVALID);
+    }
+    if (overlaps_cache(cache, key.host.data::ptr, key.host.len)) {
+        ret lookup_value(LOOKUP_INVALID);
+    }
+    mutex.lock(?cache.lock);
+    if (!cache.accepting) {
+        mutex.unlock(?cache.lock);
+        ret lookup_value(LOOKUP_DRAINING);
+    }
+    var index: usize = find_locked(cache, key);
+    if (index == cache.capacity) {
+        index = claim_locked(cache, now);
+        if (index == cache.capacity) {
+            mutex.unlock(?cache.lock);
+            ret lookup_value(LOOKUP_SATURATED);
+        }
+        store_key(?cache.entries[index], key);
+        val action: Query = begin_locked(cache, index, now);
+        if (!action.valid) {
+            clear_entry(cache, index);
+            cache.live_entries = cache.live_entries - 1;
+            mutex.unlock(?cache.lock);
+            ret lookup_value(LOOKUP_INVALID);
+        }
+        var result: Lookup = lookup_value(LOOKUP_QUERY);
+        result.query = action;
+        mutex.unlock(?cache.lock);
+        ret result;
+    }
+    val entry: *Entry = ?cache.entries[index];
+    entry.last_used = now;
+    if (entry.has_value && time_before_or_equal(now, entry.fresh_until)) {
+        val copied: LookupStatus = copy_value_locked(cache, index, output,
+            output_capacity);
+        var result: Lookup = lookup_value(copied);
+        if (copied == LOOKUP_HIT || copied == LOOKUP_TOO_SMALL) {
+            result.written = entry.endpoint_len;
+        }
+        mutex.unlock(?cache.lock);
+        ret result;
+    }
+    if (entry.has_value && time_before_or_equal(now, entry.stale_until)) {
+        val copied: LookupStatus = copy_value_locked(cache, index, output,
+            output_capacity);
+        if (copied != LOOKUP_HIT) {
+            var failure: Lookup = lookup_value(copied);
+            if (copied == LOOKUP_TOO_SMALL) {
+                failure.written = entry.endpoint_len;
+            }
+            mutex.unlock(?cache.lock);
+            ret failure;
+        }
+        var result: Lookup = lookup_value(LOOKUP_STALE);
+        result.written = entry.endpoint_len;
+        if (!entry.resolving && !entry.completing
+            && (!entry.failure_valid
+                || time_before_or_equal(entry.retry_after, now))) {
+            val action: Query = begin_locked(cache, index, now);
+            if (action.valid) {
+                result.status = LOOKUP_STALE_QUERY;
+                result.query = action;
+            }
+        }
+        mutex.unlock(?cache.lock);
+        ret result;
+    }
+    if (entry.resolving || entry.completing) {
+        mutex.unlock(?cache.lock);
+        ret lookup_value(LOOKUP_PENDING);
+    }
+    if (entry.failure_valid && time.time_before(now, entry.retry_after)) {
+        var result: Lookup = lookup_value(LOOKUP_FAILED);
+        result.error = entry.last_error;
+        result.ready_at = entry.retry_after;
+        mutex.unlock(?cache.lock);
+        ret result;
+    }
+    val action: Query = begin_locked(cache, index, now);
+    if (!action.valid) {
+        mutex.unlock(?cache.lock);
+        ret lookup_value(LOOKUP_INVALID);
+    }
+    var result: Lookup = lookup_value(LOOKUP_QUERY);
+    result.query = action;
+    mutex.unlock(?cache.lock);
+    ret result;
+}
+
+fun resolver_token_equal(first: resolver.Token, second: resolver.Token) bool {
+    ret first.index == second.index && first.generation == second.generation;
+}
+
+pub fun bind(cache: *Cache, token: Token, resolver_token: resolver.Token) bool {
+    if (!cache_ready(cache) || resolver_token.generation == 0) {
+        ret false;
+    }
+    mutex.lock(?cache.lock);
+    val entry: *Entry = entry_for_locked(cache, token);
+    if (entry == nil || !entry.resolving || entry.completing || entry.bound) {
+        mutex.unlock(?cache.lock);
+        ret false;
+    }
+    entry.resolver_token = resolver_token;
+    entry.bound = true;
+    mutex.unlock(?cache.lock);
+    ret true;
+}
+
+fun endpoint_valid(endpoint: ip.Endpoint, port: u16) bool {
+    if (endpoint.port != port
+        || (endpoint.addr.is_v6 != 0 && endpoint.addr.is_v6 != 1)
+        || (endpoint.addr.is_v6 == 0 && endpoint.scope != 0)) { ret false; }
+    var nonzero: bool = false;
+    var i: usize = 0;
+    if (endpoint.addr.is_v6 == 0) {
+        for (i < 4) {
+            if (endpoint.addr.v4.octets[i] != 0) { nonzero = true; }
+            i = i + 1;
+        }
+        ret nonzero;
+    }
+    for (i < 16) {
+        if (endpoint.addr.v6.octets[i] != 0) { nonzero = true; }
+        i = i + 1;
+    }
+    ret nonzero;
+}
+
+fun endpoint_equal(first: ip.Endpoint, second: ip.Endpoint) bool {
+    if (first.port != second.port || first.scope != second.scope
+        || first.addr.is_v6 != second.addr.is_v6) { ret false; }
+    var i: usize = 0;
+    if (first.addr.is_v6 == 0) {
+        for (i < 4) {
+            if (first.addr.v4.octets[i] != second.addr.v4.octets[i]) {
+                ret false;
+            }
+            i = i + 1;
+        }
+        ret true;
+    }
+    for (i < 16) {
+        if (first.addr.v6.octets[i] != second.addr.v6.octets[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun success_valid(cache: *Cache, entry: *Entry,
+    resolution: *resolver.Resolution) bool {
+    if (!memory.range(resolution::ptr, $size_of(resolver.Resolution))
+        || resolution.len == 0
+        || resolution.len > resolution.endpoint_capacity
+        || resolution.len > cache.configured.max_endpoints_per_entry
+        || !memory.count(resolution.endpoints::ptr,
+            resolution.endpoint_capacity, $size_of(ip.Endpoint))
+        || resolution.canonical_length > resolution.canonical_capacity
+        || !memory.count(resolution.canonical_name::ptr,
+            resolution.canonical_capacity, 1)
+        || overlaps_cache(cache, resolution.endpoints::ptr,
+            resolution.endpoint_capacity * $size_of(ip.Endpoint))) { ret false; }
+    var i: usize = 0;
+    for (i < resolution.len) {
+        if (!endpoint_valid(resolution.endpoints[i], entry.port)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun publish_success_locked(cache: *Cache, index: usize,
+    resolution: *resolver.Resolution, now: time.Time) {
+    val entry: *Entry = ?cache.entries[index];
+    val base: usize = index * cache.configured.max_endpoints_per_entry;
+    var written: usize = 0;
+    var i: usize = 0;
+    for (i < resolution.len) {
+        var duplicate: bool = false;
+        var j: usize = 0;
+        for (j < written) {
+            if (endpoint_equal(cache.endpoints[base + j],
+                resolution.endpoints[i])) { duplicate = true; }
+            j = j + 1;
+        }
+        if (!duplicate) {
+            cache.endpoints[base + written] = resolution.endpoints[i];
+            written = written + 1;
+        }
+        i = i + 1;
+    }
+    i = written;
+    for (i < cache.configured.max_endpoints_per_entry) {
+        cache.endpoints[base + i] = empty_endpoint();
+        i = i + 1;
+    }
+    entry.endpoint_len = written;
+    entry.has_value = true;
+    entry.fresh_until = time_add(now, cache.configured.fresh_ns);
+    entry.stale_until = time_add(now, cache.configured.stale_ns);
+    entry.retry_after = time.Time{sec: 0, nsec: 0};
+    entry.failure_valid = false;
+    entry.last_error = no_error();
+}
+
+pub fun error_temporary(failure: resolver.Error) bool {
+    ret failure.kind == resolver.TEMPORARY
+        || failure.kind == resolver.OVERLOADED
+        || failure.kind == resolver.OUT_OF_MEMORY
+        || failure.kind == resolver.SYSTEM_FAILURE
+        || failure.kind == resolver.TIMED_OUT;
+}
+
+fun publish_failure_locked(cache: *Cache, index: usize,
+    failure: resolver.Error, now: time.Time) {
+    val entry: *Entry = ?cache.entries[index];
+    if (!error_temporary(failure)) {
+        entry.has_value = false;
+        entry.endpoint_len = 0;
+    }
+    entry.failure_valid = true;
+    entry.last_error = failure;
+    entry.retry_after = time_add(now, cache.configured.failure_ns);
+}
+
+fun finish_locked(cache: *Cache, entry: *Entry) {
+    entry.resolving = false;
+    entry.refreshing = false;
+    entry.completing = false;
+    entry.cancel_published = false;
+    entry.bound = false;
+    entry.resolver_token = empty_resolver_token();
+    cache.resolving = cache.resolving - 1;
+}
+
+pub fun complete(cache: *Cache, token: Token,
+    completion: *resolver.Completion, now: time.Time) CompleteStatus {
+    if (!cache_ready(cache)
+        || !completion_descriptor_valid(cache, completion)
+        || !time_valid(now)) { ret COMPLETE_INVALID; }
+    mutex.lock(?cache.lock);
+    val entry: *Entry = entry_for_locked(cache, token);
+    if (entry == nil || !entry.resolving || entry.completing || !entry.bound
+        || completion.context != token.index::usize
+        || !resolver_token_equal(entry.resolver_token, completion.token)) {
+        mutex.unlock(?cache.lock);
+        ret COMPLETE_INVALID;
+    }
+    entry.completing = true;
+    mutex.unlock(?cache.lock);
+    if (!cancellation.destroy(?entry.scope)) {
+        mutex.lock(?cache.lock);
+        val current: *Entry = entry_for_locked(cache, token);
+        if (current != nil && current.completing) { current.completing = false; }
+        mutex.unlock(?cache.lock);
+        ret COMPLETE_BUSY;
+    }
+    mutex.lock(?cache.lock);
+    val current: *Entry = entry_for_locked(cache, token);
+    if (current == nil || !current.resolving || !current.completing) {
+        mutex.unlock(?cache.lock);
+        ret COMPLETE_INVALID;
+    }
+    var result: CompleteStatus = COMPLETE_FAILURE;
+    if (!completion.has_error && completion.error.kind == resolver.NO_ERROR
+        && success_valid(cache, current, ?completion.resolution)) {
+        publish_success_locked(cache, token.index::usize,
+            ?completion.resolution, now);
+        result = COMPLETE_OK;
+    } or {
+        var failure: resolver.Error = completion.error;
+        if (!completion.has_error || failure.kind == resolver.NO_ERROR) {
+            failure = malformed_error();
+        }
+        publish_failure_locked(cache, token.index::usize, failure, now);
+    }
+    current.last_used = now;
+    finish_locked(cache, current);
+    mutex.unlock(?cache.lock);
+    ret result;
+}
+
+pub fun complete_bound(cache: *Cache, completion: *resolver.Completion,
+    now: time.Time) CompleteStatus {
+    if (!cache_ready(cache)
+        || !completion_descriptor_valid(cache, completion)
+        || completion.context >= cache.capacity) { ret COMPLETE_INVALID; }
+    mutex.lock(?cache.lock);
+    val entry: *Entry = ?cache.entries[completion.context];
+    if (entry.state != ENTRY_PRESENT || !entry.resolving || !entry.bound
+        || !resolver_token_equal(entry.resolver_token, completion.token)) {
+        mutex.unlock(?cache.lock);
+        ret COMPLETE_INVALID;
+    }
+    val token: Token = token_for(completion.context, entry);
+    mutex.unlock(?cache.lock);
+    ret complete(cache, token, completion, now);
+}
+
+pub fun abandon(cache: *Cache, token: Token, failure: resolver.Error,
+    now: time.Time) CompleteStatus {
+    if (!cache_ready(cache) || !time_valid(now)
+        || failure.kind == resolver.NO_ERROR) { ret COMPLETE_INVALID; }
+    mutex.lock(?cache.lock);
+    val entry: *Entry = entry_for_locked(cache, token);
+    if (entry == nil || !entry.resolving || entry.completing || entry.bound) {
+        mutex.unlock(?cache.lock);
+        ret COMPLETE_INVALID;
+    }
+    entry.completing = true;
+    mutex.unlock(?cache.lock);
+    if (!cancellation.destroy(?entry.scope)) {
+        mutex.lock(?cache.lock);
+        val current: *Entry = entry_for_locked(cache, token);
+        if (current != nil && current.completing) { current.completing = false; }
+        mutex.unlock(?cache.lock);
+        ret COMPLETE_BUSY;
+    }
+    mutex.lock(?cache.lock);
+    val current: *Entry = entry_for_locked(cache, token);
+    if (current == nil || !current.resolving || !current.completing) {
+        mutex.unlock(?cache.lock);
+        ret COMPLETE_INVALID;
+    }
+    publish_failure_locked(cache, token.index::usize, failure, now);
+    current.last_used = now;
+    finish_locked(cache, current);
+    mutex.unlock(?cache.lock);
+    ret COMPLETE_FAILURE;
+}
+
+pub fun drain(cache: *Cache) bool {
+    if (!cache_ready(cache)) { ret false; }
+    mutex.lock(?cache.lock);
+    if (!cache.accepting) {
+        mutex.unlock(?cache.lock);
+        ret false;
+    }
+    cache.accepting = false;
+    mutex.unlock(?cache.lock);
+    ret true;
+}
+
+pub fun take_cancel(cache: *Cache) Cancel {
+    if (!cache_ready(cache)) { ret empty_cancel(); }
+    mutex.lock(?cache.lock);
+    if (cache.accepting) {
+        mutex.unlock(?cache.lock);
+        ret empty_cancel();
+    }
+    var i: usize = 0;
+    for (i < cache.capacity) {
+        val entry: *Entry = ?cache.entries[i];
+        if (entry.resolving && !entry.completing
+            && !entry.cancel_published) {
+            entry.cancel_published = true;
+            val result: Cancel = Cancel{found: true,
+                token: token_for(i, entry), scope: ?entry.scope};
+            mutex.unlock(?cache.lock);
+            ret result;
+        }
+        i = i + 1;
+    }
+    mutex.unlock(?cache.lock);
+    ret empty_cancel();
+}
+
+pub fun snapshot(cache: *Cache) Snapshot {
+    var result: Snapshot = Snapshot{accepting: false, live_entries: 0,
+        resolving: 0, ready: 0, failed: 0};
+    if (!cache_ready(cache)) { ret result; }
+    mutex.lock(?cache.lock);
+    result.accepting = cache.accepting;
+    result.live_entries = cache.live_entries;
+    result.resolving = cache.resolving;
+    var i: usize = 0;
+    for (i < cache.capacity) {
+        val entry: *Entry = ?cache.entries[i];
+        if (entry.state == ENTRY_PRESENT && entry.has_value) {
+            result.ready = result.ready + 1;
+        }
+        if (entry.state == ENTRY_PRESENT && entry.failure_valid) {
+            result.failed = result.failed + 1;
+        }
+        i = i + 1;
+    }
+    mutex.unlock(?cache.lock);
+    ret result;
+}
+
+pub fun destroy(cache: *Cache) bool {
+    if (!cache_ready(cache)) { ret false; }
+    mutex.lock(?cache.lock);
+    if (cache.accepting || cache.resolving != 0) {
+        mutex.unlock(?cache.lock);
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < cache.capacity) {
+        clear_entry(cache, i);
+        i = i + 1;
+    }
+    cache.entries = nil;
+    cache.capacity = 0;
+    cache.endpoints = nil;
+    cache.endpoint_capacity = 0;
+    cache.configured = Config{max_entries: 0, max_endpoints_per_entry: 0,
+        fresh_ns: 0, stale_ns: 0, failure_ns: 0, resolve_timeout_ns: 0};
+    cache.next_entry = 0;
+    cache.live_entries = 0;
+    cache.initialized = false;
+    mutex.unlock(?cache.lock);
+    ret true;
+}
+
+fun test_key(host: *u8, len: usize, port: u16) Key {
+    ret Key{host: view.view(host, len), port: port,
+        transport: policy.TRANSPORT_TCP};
+}
+
+fun test_completion(query: Query, endpoints: *ip.Endpoint,
+    len: usize) resolver.Completion {
+    ret resolver.Completion{token: resolver.Token{index: 7, generation: 3},
+        context: query.context, resolution: resolver.Resolution{
+            endpoints: endpoints, len: len, endpoint_capacity: len,
+            canonical_name: nil, canonical_length: 0, canonical_capacity: 0,
+            allocator: nil}, has_error: false, error: no_error()};
+}
+
+test "http.client.dns: refresh copies ordered results and retains temporary stale data" {
+    var entries: [1]Entry;
+    var storage: [4]ip.Endpoint;
+    var cache: Cache;
+    var configured: Config = config_default();
+    configured.max_entries = 1;
+    configured.max_endpoints_per_entry = 4;
+    configured.fresh_ns = 10;
+    configured.stale_ns = 100;
+    configured.failure_ns = 5;
+    configured.resolve_timeout_ns = 20;
+    if (!init(?cache, ?entries[0], 1, ?storage[0], 4,
+        configured)) { ret 1; }
+    val key: Key = test_key("Example.COM", 11, 443);
+    val now: time.Time = time.Time{sec: 1, nsec: 0};
+    val initial: Lookup = lookup(?cache, key, now, nil, 0);
+    if (initial.status != LOOKUP_QUERY || !initial.query.valid
+        || initial.query.query.host[0] != 'e'
+        || initial.query.query.service[0] != '4'
+        || !bind(?cache, initial.query.token,
+            resolver.Token{index: 7, generation: 3})) { ret 2; }
+    var resolved: [3]ip.Endpoint;
+    resolved[0] = ip.endpoint(192, 0, 2, 1, 443);
+    resolved[1] = ip.endpoint(192, 0, 2, 2, 443);
+    resolved[2] = resolved[0];
+    var completion: resolver.Completion = test_completion(initial.query,
+        ?resolved[0], 3);
+    if (complete(?cache, initial.query.token, ?completion, now) != COMPLETE_OK) {
+        ret 3;
+    }
+    var output: [4]ip.Endpoint;
+    val hit: Lookup = lookup(?cache, key,
+        time.Time{sec: 1, nsec: 5}, ?output[0], 4);
+    if (hit.status != LOOKUP_HIT || hit.written != 2
+        || output[0].addr.v4.octets[3] != 1
+        || output[1].addr.v4.octets[3] != 2) { ret 4; }
+    val stale: Lookup = lookup(?cache, key,
+        time.Time{sec: 1, nsec: 11}, ?output[0], 4);
+    if (stale.status != LOOKUP_STALE_QUERY
+        || !bind(?cache, stale.query.token,
+            resolver.Token{index: 8, generation: 4})) { ret 5; }
+    completion = resolver.Completion{token: resolver.Token{index: 8,
+        generation: 4}, context: stale.query.context,
+        resolution: resolver.Resolution{endpoints: nil, len: 0,
+            endpoint_capacity: 0, canonical_name: nil, canonical_length: 0,
+            canonical_capacity: 0, allocator: nil}, has_error: true,
+        error: resolver.Error{kind: resolver.TEMPORARY, native_code: 9}};
+    if (complete(?cache, stale.query.token, ?completion,
+            time.Time{sec: 1, nsec: 12}) != COMPLETE_FAILURE
+        || lookup(?cache, key, time.Time{sec: 1, nsec: 13},
+            ?output[0], 4).status != LOOKUP_STALE) { ret 6; }
+    if (!drain(?cache) || !destroy(?cache)) { ret 7; }
+    ret 0;
+}
+
+test "http.client.dns: capacity output and cancellation stay bounded" {
+    var entries: [1]Entry;
+    var storage: [2]ip.Endpoint;
+    var cache: Cache;
+    var configured: Config = config_default();
+    configured.max_entries = 1;
+    configured.max_endpoints_per_entry = 2;
+    if (!init(?cache, ?entries[0], 1, ?storage[0], 2,
+        configured)) { ret 1; }
+    val now: time.Time = time.Time{sec: 2, nsec: 0};
+    val first: Lookup = lookup(?cache, test_key("one.example", 11, 80),
+        now, nil, 0);
+    if (first.status != LOOKUP_QUERY
+        || lookup(?cache, test_key("two.example", 11, 80), now,
+            nil, 0).status != LOOKUP_SATURATED
+        || !bind(?cache, first.query.token,
+            resolver.Token{index: 2, generation: 1}) || !drain(?cache)) {
+        ret 2;
+    }
+    val cancelled: Cancel = take_cancel(?cache);
+    if (!cancelled.found || take_cancel(?cache).found
+        || !cancellation.cancel(cancelled.scope)) { ret 3; }
+    var completion: resolver.Completion = resolver.Completion{
+        token: resolver.Token{index: 2, generation: 1},
+        context: first.query.context,
+        resolution: resolver.Resolution{endpoints: nil, len: 0,
+            endpoint_capacity: 0, canonical_name: nil, canonical_length: 0,
+            canonical_capacity: 0, allocator: nil}, has_error: true,
+        error: resolver.Error{kind: resolver.CANCELLED, native_code: 0}};
+    if (complete(?cache, first.query.token, ?completion, now)
+        != COMPLETE_FAILURE || !destroy(?cache)) { ret 4; }
+    ret 0;
+}
+
+test "http.client.dns: completion descriptors cannot alias cache storage" {
+    var entries: [1]Entry;
+    var aliased: resolver.Completion;
+    var cache: Cache;
+    var configured: Config = config_default();
+    configured.max_entries = 1;
+    configured.max_endpoints_per_entry = 1;
+    if (!init(?cache, ?entries[0], 1,
+        (?aliased)::ptr::*ip.Endpoint, 1, configured)) { ret 1; }
+    val now: time.Time = time.Time{sec: 3, nsec: 0};
+    val query: Lookup = lookup(?cache,
+        test_key("alias.example", 13, 443), now, nil, 0);
+    val resolver_token: resolver.Token = resolver.Token{
+        index: 7, generation: 3};
+    if (query.status != LOOKUP_QUERY
+        || !bind(?cache, query.query.token, resolver_token)) { ret 2; }
+    var resolved: [1]ip.Endpoint;
+    resolved[0] = ip.endpoint(192, 0, 2, 3, 443);
+    aliased = test_completion(query.query, ?resolved[0], 1);
+    if (complete(?cache, query.query.token, ?aliased, now)
+            != COMPLETE_INVALID
+        || complete_bound(?cache, ?aliased, now) != COMPLETE_INVALID
+        || complete(?cache, query.query.token,
+            (?cache)::ptr::*resolver.Completion, now) != COMPLETE_INVALID
+        || complete_bound(?cache,
+            (?entries[0])::ptr::*resolver.Completion, now)
+            != COMPLETE_INVALID) { ret 3; }
+    var completion: resolver.Completion = test_completion(query.query,
+        ?resolved[0], 1);
+    if (complete(?cache, query.query.token, ?completion, now) != COMPLETE_OK) {
+        ret 4;
+    }
+    var output: [1]ip.Endpoint;
+    if (lookup(?cache, test_key("alias.example", 13, 443), now,
+            ?output[0], 1).status != LOOKUP_HIT
+        || output[0].addr.v4.octets[3] != 3
+        || !drain(?cache) || !destroy(?cache)) { ret 5; }
+    ret 0;
+}

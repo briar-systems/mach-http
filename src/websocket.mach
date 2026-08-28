@@ -1,24 +1,1117 @@
-# websocket framing and upgrade contracts
+# allocation-free websocket framing and connection state
 
+use std.chrono.time;
+use std.sync.cancel;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.ok;
+use std.types.result.unwrap_ok;
 use std.types.size.usize;
+use std.memory;
+use io_error: std.io.error;
+use io_runtime: std.io.runtime;
+use http.core.transport;
 
 pub val OPCODE_CONTINUATION: u8 = 0x0;
-pub val OPCODE_TEXT:         u8 = 0x1;
-pub val OPCODE_BINARY:       u8 = 0x2;
-pub val OPCODE_CLOSE:        u8 = 0x8;
-pub val OPCODE_PING:         u8 = 0x9;
-pub val OPCODE_PONG:         u8 = 0xA;
+pub val OPCODE_TEXT: u8 = 0x1;
+pub val OPCODE_BINARY: u8 = 0x2;
+pub val OPCODE_CLOSE: u8 = 0x8;
+pub val OPCODE_PING: u8 = 0x9;
+pub val OPCODE_PONG: u8 = 0xa;
+
+pub def Role: u8;
+pub val SERVER: Role = 1;
+pub val CLIENT: Role = 2;
+
+pub def State: u8;
+pub val OPEN: State = 1;
+pub val CLOSE_SENT: State = 2;
+pub val CLOSE_RECEIVED: State = 3;
+pub val CLOSED: State = 4;
+pub val ERROR_PENDING: State = 5;
+pub val FAILED: State = 6;
+
+pub def Error: u8;
+pub val ERROR_NONE: Error = 0;
+pub val ERROR_STATE: Error = 1;
+pub val ERROR_PROTOCOL: Error = 2;
+pub val ERROR_UTF8: Error = 3;
+pub val ERROR_LIMIT: Error = 4;
+pub val ERROR_TRUNCATED: Error = 5;
+pub val ERROR_TRANSPORT: Error = 6;
+pub val ERROR_CANCELLED: Error = 7;
+pub val ERROR_TIMED_OUT: Error = 8;
+pub val ERROR_NO_PROGRESS: Error = 9;
+
+pub def EventKind: u8;
+pub val EVENT_NONE: EventKind = 0;
+pub val EVENT_NEED_INPUT: EventKind = 1;
+pub val EVENT_DATA: EventKind = 2;
+pub val EVENT_PING: EventKind = 3;
+pub val EVENT_PONG: EventKind = 4;
+pub val EVENT_CLOSE: EventKind = 5;
+pub val EVENT_ERROR: EventKind = 6;
+pub val EVENT_CLOSED: EventKind = 7;
 
 pub rec Limits {
-    max_frame_bytes:   u64;
+    max_frame_bytes: u64;
     max_message_bytes: u64;
-    max_fragments:     usize;
+    max_fragments: usize;
 }
 
 pub rec Frame {
-    fin:        bool;
-    opcode:     u8;
-    masked:     bool;
+    fin: bool;
+    opcode: u8;
+    masked: bool;
     payload_len: u64;
+}
+
+pub rec Utf8 { needed: u8; minimum: u8; maximum: u8; }
+
+pub rec Event {
+    kind: EventKind;
+    consumed: usize;
+    data: *u8;
+    data_length: usize;
+    opcode: u8;
+    message_final: bool;
+    close_code: u16;
+    reply_close: bool;
+    error: Error;
+}
+
+pub rec Decoder {
+    role: Role;
+    limits: Limits;
+    state: State;
+    error: Error;
+    close_code: u16;
+    header: [14]u8;
+    header_length: usize;
+    header_needed: usize;
+    frame: Frame;
+    frame_remaining: u64;
+    mask: [4]u8;
+    mask_offset: u64;
+    frame_ready: bool;
+    fragmented: bool;
+    message_opcode: u8;
+    message_length: u64;
+    fragments: usize;
+    utf8: Utf8;
+    control: *u8;
+    control_capacity: usize;
+    control_length: usize;
+    held: bool;
+    initialized: bool;
+}
+
+pub def WriteStatus: u8;
+pub val WRITE_OUTPUT: WriteStatus = 1;
+pub val WRITE_DONE: WriteStatus = 2;
+pub val WRITE_BLOCKED: WriteStatus = 3;
+pub val WRITE_ERROR: WriteStatus = 4;
+
+pub rec Write { status: WriteStatus; consumed: usize; written: usize; error: Error; }
+
+pub rec Encoder {
+    role: Role;
+    limits: Limits;
+    state: State;
+    error: Error;
+    active: bool;
+    frame: Frame;
+    remaining: u64;
+    mask: [4]u8;
+    mask_offset: u64;
+    fragmented: bool;
+    message_opcode: u8;
+    message_length: u64;
+    fragments: usize;
+    utf8: Utf8;
+    control: [125]u8;
+    control_length: usize;
+    initialized: bool;
+}
+
+pub fun limits_default() Limits {
+    ret Limits{max_frame_bytes: 16777216, max_message_bytes: 67108864,
+        max_fragments: 1024};
+}
+
+fun limits_valid(limits: Limits) bool {
+    ret limits.max_frame_bytes != 0 && limits.max_message_bytes != 0
+        && limits.max_frame_bytes <= limits.max_message_bytes && limits.max_fragments != 0;
+}
+
+fun role_valid(role: Role) bool { ret role == SERVER || role == CLIENT; }
+
+fun opcode_valid(opcode: u8) bool {
+    ret opcode == OPCODE_CONTINUATION || opcode == OPCODE_TEXT
+        || opcode == OPCODE_BINARY || opcode == OPCODE_CLOSE
+        || opcode == OPCODE_PING || opcode == OPCODE_PONG;
+}
+
+fun control_opcode(opcode: u8) bool { ret (opcode & 0x8) != 0; }
+
+fun utf8_reset(state: *Utf8) {
+    state.needed = 0;
+    state.minimum = 0x80;
+    state.maximum = 0xbf;
+}
+
+fun utf8_feed(state: *Utf8, data: *u8, length: usize) bool {
+    var i: usize = 0;
+    for (i < length) {
+        val byte: u8 = data[i];
+        if (state.needed != 0) {
+            if (byte < state.minimum || byte > state.maximum) { ret false; }
+            state.needed = state.needed - 1;
+            state.minimum = 0x80;
+            state.maximum = 0xbf;
+        } or (byte <= 0x7f) {
+        } or (byte >= 0xc2 && byte <= 0xdf) {
+            state.needed = 1;
+        } or (byte == 0xe0) {
+            state.needed = 2; state.minimum = 0xa0;
+        } or (byte >= 0xe1 && byte <= 0xec) {
+            state.needed = 2;
+        } or (byte == 0xed) {
+            state.needed = 2; state.maximum = 0x9f;
+        } or (byte >= 0xee && byte <= 0xef) {
+            state.needed = 2;
+        } or (byte == 0xf0) {
+            state.needed = 3; state.minimum = 0x90;
+        } or (byte >= 0xf1 && byte <= 0xf3) {
+            state.needed = 3;
+        } or (byte == 0xf4) {
+            state.needed = 3; state.maximum = 0x8f;
+        } or { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun close_code_valid(code: u16) bool {
+    if (code < 1000 || code >= 5000 || code == 1004 || code == 1005
+     || code == 1006 || code == 1015) { ret false; }
+    if (code >= 1016 && code < 3000) { ret false; }
+    ret true;
+}
+
+fun empty_event(kind: EventKind, consumed: usize) Event {
+    ret Event{kind: kind, consumed: consumed, data: nil, data_length: 0,
+        opcode: 0, message_final: false, close_code: 0,
+        reply_close: false, error: ERROR_NONE};
+}
+
+fun fail_decoder(decoder: *Decoder, consumed: usize, error: Error,
+    code: u16, can_reply: bool) Event {
+    var event: Event = empty_event(EVENT_ERROR, consumed);
+    event.error = error; event.close_code = code; event.reply_close = can_reply;
+    if (decoder == nil) { ret event; }
+    decoder.error = error; decoder.close_code = code;
+    if (can_reply) { decoder.state = ERROR_PENDING; } or { decoder.state = FAILED; }
+    ret event;
+}
+
+pub fun decoder_init(decoder: *Decoder, role: Role, limits: Limits,
+    control: *u8, control_capacity: usize) bool {
+    if (decoder == nil || decoder.initialized || !role_valid(role)
+     || !limits_valid(limits) || control == nil || control_capacity < 125) { ret false; }
+    decoder.role = role; decoder.limits = limits; decoder.state = OPEN;
+    decoder.error = ERROR_NONE; decoder.close_code = 0;
+    decoder.header_length = 0; decoder.header_needed = 2; decoder.frame_ready = false;
+    decoder.fragmented = false; decoder.message_opcode = 0;
+    decoder.message_length = 0; decoder.fragments = 0;
+    utf8_reset(?decoder.utf8);
+    decoder.control = control; decoder.control_capacity = control_capacity;
+    decoder.control_length = 0; decoder.held = false; decoder.initialized = true;
+    ret true;
+}
+
+fun begin_message(decoder: *Decoder, opcode: u8, length: u64, fin: bool) Error {
+    if (opcode == OPCODE_CONTINUATION) {
+        if (!decoder.fragmented) { ret ERROR_PROTOCOL; }
+        if (decoder.fragments >= decoder.limits.max_fragments) { ret ERROR_LIMIT; }
+        decoder.fragments = decoder.fragments + 1;
+    } or {
+        if (decoder.fragmented) { ret ERROR_PROTOCOL; }
+        decoder.message_opcode = opcode; decoder.message_length = 0; decoder.fragments = 1;
+        if (opcode == OPCODE_TEXT) { utf8_reset(?decoder.utf8); }
+    }
+    if (length > decoder.limits.max_message_bytes - decoder.message_length) { ret ERROR_LIMIT; }
+    decoder.message_length = decoder.message_length + length;
+    if (!fin) { decoder.fragmented = true; }
+    ret ERROR_NONE;
+}
+
+fun parse_header(decoder: *Decoder) Error {
+    val first: u8 = decoder.header[0];
+    val second: u8 = decoder.header[1];
+    decoder.frame.fin = (first & 0x80) != 0;
+    decoder.frame.opcode = first & 0x0f;
+    decoder.frame.masked = (second & 0x80) != 0;
+    if ((first & 0x70) != 0 || !opcode_valid(decoder.frame.opcode)) { ret ERROR_PROTOCOL; }
+    if ((decoder.role == SERVER && !decoder.frame.masked)
+     || (decoder.role == CLIENT && decoder.frame.masked)) { ret ERROR_PROTOCOL; }
+    val short: u8 = second & 0x7f;
+    var cursor: usize = 2;
+    var length: u64 = short::u64;
+    if (short == 126) {
+        length = (decoder.header[cursor]::u64 << 8) | decoder.header[cursor + 1]::u64;
+        cursor = cursor + 2;
+        if (length < 126) { ret ERROR_PROTOCOL; }
+    } or (short == 127) {
+        if ((decoder.header[cursor] & 0x80) != 0) { ret ERROR_PROTOCOL; }
+        length = 0;
+        var i: usize = 0;
+        for (i < 8) { length = (length << 8) | decoder.header[cursor + i]::u64; i = i + 1; }
+        cursor = cursor + 8;
+        if (length <= 65535) { ret ERROR_PROTOCOL; }
+    }
+    if (decoder.frame.masked) {
+        var i: usize = 0;
+        for (i < 4) { decoder.mask[i] = decoder.header[cursor + i]; i = i + 1; }
+    }
+    decoder.frame.payload_len = length; decoder.frame_remaining = length;
+    decoder.mask_offset = 0; decoder.control_length = 0;
+    if (length > decoder.limits.max_frame_bytes) { ret ERROR_LIMIT; }
+    if (control_opcode(decoder.frame.opcode)) {
+        if (!decoder.frame.fin || length > 125) { ret ERROR_PROTOCOL; }
+    } or {
+        val message_error: Error = begin_message(decoder, decoder.frame.opcode,
+            length, decoder.frame.fin);
+        if (message_error != ERROR_NONE) { ret message_error; }
+    }
+    decoder.frame_ready = true;
+    ret ERROR_NONE;
+}
+
+fun finish_data(decoder: *Decoder) Error {
+    if (!decoder.frame.fin) { ret ERROR_NONE; }
+    if (decoder.message_opcode == OPCODE_TEXT && decoder.utf8.needed != 0) { ret ERROR_UTF8; }
+    decoder.fragmented = false; decoder.message_opcode = 0;
+    decoder.message_length = 0; decoder.fragments = 0;
+    ret ERROR_NONE;
+}
+
+fun reset_frame(decoder: *Decoder) {
+    decoder.header_length = 0; decoder.header_needed = 2;
+    decoder.frame_ready = false; decoder.control_length = 0;
+}
+
+fun control_event(decoder: *Decoder, consumed: usize) Event {
+    val opcode: u8 = decoder.frame.opcode;
+    if (opcode == OPCODE_CLOSE) {
+        if (decoder.control_length == 1) {
+            ret fail_decoder(decoder, consumed, ERROR_PROTOCOL, 1002, true);
+        }
+        var code: u16 = 1005;
+        if (decoder.control_length >= 2) {
+            code = (decoder.control[0]::u16 << 8) | decoder.control[1]::u16;
+            if (!close_code_valid(code)) {
+                ret fail_decoder(decoder, consumed, ERROR_PROTOCOL, 1002, true);
+            }
+            var close_utf8: Utf8;
+            utf8_reset(?close_utf8);
+            if (!utf8_feed(?close_utf8, ?decoder.control[2], decoder.control_length - 2)
+             || close_utf8.needed != 0) {
+                ret fail_decoder(decoder, consumed, ERROR_UTF8, 1007, true);
+            }
+        }
+        var event: Event = empty_event(EVENT_CLOSE, consumed);
+        event.data = decoder.control; event.data_length = decoder.control_length;
+        event.opcode = opcode; event.close_code = code;
+        event.reply_close = decoder.state == OPEN;
+        if (decoder.state == CLOSE_SENT) { decoder.state = CLOSED; }
+        or { decoder.state = CLOSE_RECEIVED; }
+        decoder.held = true; reset_frame(decoder);
+        ret event;
+    }
+    var kind: EventKind = EVENT_PONG;
+    if (opcode == OPCODE_PING) { kind = EVENT_PING; }
+    var event: Event = empty_event(kind, consumed);
+    event.data = decoder.control; event.data_length = decoder.control_length;
+    event.opcode = opcode; decoder.held = true; reset_frame(decoder);
+    ret event;
+}
+
+pub fun feed(decoder: *Decoder, input: *u8, length: usize, eof: bool) Event {
+    if (decoder == nil || !decoder.initialized || decoder.held
+     || (input == nil && length != 0) || (decoder.state != OPEN
+        && decoder.state != CLOSE_SENT)) {
+        ret fail_decoder(decoder, 0, ERROR_STATE, 1002, false);
+    }
+    var consumed: usize = 0;
+    for {
+        if (!decoder.frame_ready) {
+            for (decoder.header_length < decoder.header_needed && consumed < length) {
+                decoder.header[decoder.header_length] = input[consumed];
+                decoder.header_length = decoder.header_length + 1; consumed = consumed + 1;
+                if (decoder.header_length == 2) {
+                    val short: u8 = decoder.header[1] & 0x7f;
+                    decoder.header_needed = 2;
+                    if (short == 126) { decoder.header_needed = decoder.header_needed + 2; }
+                    or (short == 127) { decoder.header_needed = decoder.header_needed + 8; }
+                    if ((decoder.header[1] & 0x80) != 0) {
+                        decoder.header_needed = decoder.header_needed + 4;
+                    }
+                }
+            }
+            if (decoder.header_length < decoder.header_needed) {
+                if (eof) { ret fail_decoder(decoder, consumed, ERROR_TRUNCATED, 1006, false); }
+                ret empty_event(EVENT_NEED_INPUT, consumed);
+            }
+            val header_error: Error = parse_header(decoder);
+            if (header_error != ERROR_NONE) {
+                var code: u16 = 1002;
+                if (header_error == ERROR_LIMIT) { code = 1009; }
+                ret fail_decoder(decoder, consumed, header_error, code, true);
+            }
+        }
+        if (control_opcode(decoder.frame.opcode)) {
+            val available: usize = length - consumed;
+            var take: usize = decoder.frame_remaining::usize;
+            if (take > available) { take = available; }
+            var i: usize = 0;
+            for (i < take) {
+                var byte: u8 = input[consumed + i];
+                if (decoder.frame.masked) {
+                    byte = byte ^ decoder.mask[(decoder.mask_offset + i::u64)::usize % 4];
+                }
+                decoder.control[decoder.control_length + i] = byte; i = i + 1;
+            }
+            decoder.control_length = decoder.control_length + take;
+            decoder.mask_offset = decoder.mask_offset + take::u64;
+            decoder.frame_remaining = decoder.frame_remaining - take::u64;
+            consumed = consumed + take;
+            if (decoder.frame_remaining == 0) { ret control_event(decoder, consumed); }
+            if (eof) { ret fail_decoder(decoder, consumed, ERROR_TRUNCATED, 1006, false); }
+            ret empty_event(EVENT_NEED_INPUT, consumed);
+        }
+        val available: usize = length - consumed;
+        var take: usize = decoder.frame_remaining::usize;
+        if (take > available) { take = available; }
+        if (take == 0 && decoder.frame_remaining != 0) {
+            if (eof) { ret fail_decoder(decoder, consumed, ERROR_TRUNCATED, 1006, false); }
+            ret empty_event(EVENT_NEED_INPUT, consumed);
+        }
+        var i: usize = 0;
+        for (i < take) {
+            if (decoder.frame.masked) {
+                input[consumed + i] = input[consumed + i]
+                    ^ decoder.mask[(decoder.mask_offset + i::u64)::usize % 4];
+            }
+            i = i + 1;
+        }
+        val message_opcode: u8 = decoder.message_opcode;
+        if (message_opcode == OPCODE_TEXT && !utf8_feed(?decoder.utf8, ?input[consumed], take)) {
+            ret fail_decoder(decoder, consumed + take, ERROR_UTF8, 1007, true);
+        }
+        decoder.mask_offset = decoder.mask_offset + take::u64;
+        decoder.frame_remaining = decoder.frame_remaining - take::u64;
+        consumed = consumed + take;
+        val final: bool = decoder.frame_remaining == 0 && decoder.frame.fin;
+    if (decoder.frame_remaining == 0) {
+            val final_error: Error = finish_data(decoder);
+            reset_frame(decoder);
+            if (final_error != ERROR_NONE) {
+                ret fail_decoder(decoder, consumed, final_error, 1007, true);
+            }
+        }
+        var event: Event = empty_event(EVENT_DATA, consumed);
+        if (take != 0) { event.data = ?input[consumed - take]; }
+        event.data_length = take;
+        event.opcode = message_opcode; event.message_final = final;
+        decoder.held = true;
+        ret event;
+    }
+}
+
+pub fun release(decoder: *Decoder) bool {
+    if (decoder == nil || !decoder.initialized || !decoder.held) { ret false; }
+    decoder.held = false;
+    ret true;
+}
+
+pub fun decoder_close_sent(decoder: *Decoder) bool {
+    if (decoder == nil || !decoder.initialized) { ret false; }
+    if (decoder.state == OPEN || decoder.state == ERROR_PENDING) {
+        decoder.state = CLOSE_SENT; ret true;
+    }
+    if (decoder.state == CLOSE_RECEIVED) { decoder.state = CLOSED; ret true; }
+    ret false;
+}
+
+pub fun encoder_init(encoder: *Encoder, role: Role, limits: Limits) bool {
+    if (encoder == nil || encoder.initialized || !role_valid(role) || !limits_valid(limits)) {
+        ret false;
+    }
+    encoder.role = role; encoder.limits = limits; encoder.state = OPEN;
+    encoder.error = ERROR_NONE; encoder.active = false; encoder.fragmented = false;
+    encoder.message_opcode = 0; encoder.message_length = 0; encoder.fragments = 0;
+    encoder.control_length = 0;
+    utf8_reset(?encoder.utf8); encoder.initialized = true;
+    ret true;
+}
+
+fun write_header(frame: Frame, key: *u8, output: *u8, capacity: usize) usize {
+    var needed: usize = 2;
+    if (frame.payload_len >= 126 && frame.payload_len <= 65535) { needed = needed + 2; }
+    or (frame.payload_len > 65535) { needed = needed + 8; }
+    if (frame.masked) { needed = needed + 4; }
+    if (output == nil || capacity < needed) { ret 0; }
+    output[0] = frame.opcode;
+    if (frame.fin) { output[0] = output[0] | 0x80; }
+    var cursor: usize = 2;
+    if (frame.payload_len < 126) { output[1] = frame.payload_len::u8; }
+    or (frame.payload_len <= 65535) {
+        output[1] = 126; output[2] = (frame.payload_len >> 8)::u8;
+        output[3] = frame.payload_len::u8; cursor = 4;
+    } or {
+        output[1] = 127;
+        var i: usize = 0;
+        for (i < 8) {
+            output[2 + i] = (frame.payload_len >> ((7 - i) * 8)::u8)::u8; i = i + 1;
+        }
+        cursor = 10;
+    }
+    if (frame.masked) {
+        output[1] = output[1] | 0x80;
+        var i: usize = 0;
+        for (i < 4) { output[cursor + i] = key[i]; i = i + 1; }
+    }
+    ret needed;
+}
+
+fun header_size(payload_length: u64, masked: bool) usize {
+    var needed: usize = 2;
+    if (payload_length >= 126 && payload_length <= 65535) { needed = needed + 2; }
+    or (payload_length > 65535) { needed = needed + 8; }
+    if (masked) { needed = needed + 4; }
+    ret needed;
+}
+
+pub fun begin(encoder: *Encoder, fin: bool, opcode: u8, payload_length: u64,
+    mask_key: *u8, output: *u8, output_capacity: usize) Write {
+    if (encoder == nil || !encoder.initialized || encoder.active
+     || encoder.state == CLOSED || encoder.state == CLOSE_SENT
+     || encoder.state == FAILED || (encoder.state == CLOSE_RECEIVED
+        && opcode != OPCODE_CLOSE) || (encoder.role == CLIENT && mask_key == nil)) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_STATE};
+    }
+    if (!opcode_valid(opcode)) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_PROTOCOL};
+    }
+    if (payload_length > encoder.limits.max_frame_bytes) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_LIMIT};
+    }
+    if (output == nil || output_capacity < header_size(payload_length, encoder.role == CLIENT)) {
+        ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_NONE};
+    }
+    if (control_opcode(opcode)) {
+        if (!fin || payload_length > 125 || (opcode == OPCODE_CLOSE && payload_length == 1)) {
+            ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_PROTOCOL};
+        }
+    } or {
+        if ((opcode == OPCODE_CONTINUATION && !encoder.fragmented)
+         || (opcode != OPCODE_CONTINUATION && encoder.fragmented)) {
+            ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_PROTOCOL};
+        }
+        if (opcode == OPCODE_CONTINUATION) {
+            if (encoder.fragments >= encoder.limits.max_fragments) {
+                ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_LIMIT};
+            }
+            if (payload_length > encoder.limits.max_message_bytes - encoder.message_length) {
+                ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_LIMIT};
+            }
+            encoder.fragments = encoder.fragments + 1;
+        } or {
+            if (payload_length > encoder.limits.max_message_bytes) {
+                ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_LIMIT};
+            }
+            encoder.message_opcode = opcode; encoder.message_length = 0; encoder.fragments = 1;
+            if (opcode == OPCODE_TEXT) { utf8_reset(?encoder.utf8); }
+        }
+        encoder.message_length = encoder.message_length + payload_length;
+        if (!fin) { encoder.fragmented = true; }
+    }
+    encoder.frame = Frame{fin: fin, opcode: opcode, masked: encoder.role == CLIENT,
+        payload_len: payload_length};
+    encoder.remaining = payload_length; encoder.mask_offset = 0; encoder.control_length = 0;
+    if (encoder.role == CLIENT) {
+        var i: usize = 0;
+        for (i < 4) { encoder.mask[i] = mask_key[i]; i = i + 1; }
+    }
+    val written: usize = write_header(encoder.frame, mask_key, output, output_capacity);
+    if (written == 0) {
+        ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_NONE};
+    }
+    encoder.active = true;
+    ret Write{status: WRITE_OUTPUT, consumed: 0, written: written, error: ERROR_NONE};
+}
+
+fun encoder_finish(encoder: *Encoder) Error {
+    encoder.active = false;
+    if (control_opcode(encoder.frame.opcode)) {
+        if (encoder.frame.opcode == OPCODE_CLOSE) {
+            if (encoder.control_length >= 2) {
+                val code: u16 = (encoder.control[0]::u16 << 8) | encoder.control[1]::u16;
+                var reason: Utf8;
+                utf8_reset(?reason);
+                if (!close_code_valid(code)) {
+                    encoder.state = FAILED; encoder.error = ERROR_PROTOCOL;
+                    ret ERROR_PROTOCOL;
+                }
+                if (!utf8_feed(?reason, ?encoder.control[2], encoder.control_length - 2)
+                 || reason.needed != 0) {
+                    encoder.state = FAILED; encoder.error = ERROR_UTF8;
+                    ret ERROR_UTF8;
+                }
+            }
+            if (encoder.state == CLOSE_RECEIVED) { encoder.state = CLOSED; }
+            or { encoder.state = CLOSE_SENT; }
+        }
+        ret ERROR_NONE;
+    }
+    if (encoder.frame.fin) {
+        if (encoder.message_opcode == OPCODE_TEXT && encoder.utf8.needed != 0) {
+            encoder.state = FAILED; encoder.error = ERROR_UTF8; ret ERROR_UTF8;
+        }
+        encoder.fragmented = false; encoder.message_opcode = 0;
+        encoder.message_length = 0; encoder.fragments = 0;
+    }
+    ret ERROR_NONE;
+}
+
+pub fun write(encoder: *Encoder, output: *u8, output_capacity: usize,
+    payload: *u8, payload_length: usize) Write {
+    if (encoder == nil || !encoder.initialized || !encoder.active
+     || output == nil || output_capacity == 0 || (payload == nil && payload_length != 0)) {
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_STATE};
+    }
+    var take: usize = payload_length;
+    if (take > output_capacity) { take = output_capacity; }
+    if (take::u64 > encoder.remaining) { take = encoder.remaining::usize; }
+    if (take == 0 && encoder.remaining != 0) {
+        ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_NONE};
+    }
+    if (encoder.message_opcode == OPCODE_TEXT && !control_opcode(encoder.frame.opcode)
+     && !utf8_feed(?encoder.utf8, payload, take)) {
+        encoder.state = FAILED; encoder.error = ERROR_UTF8; encoder.active = false;
+        ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_UTF8};
+    }
+    if (control_opcode(encoder.frame.opcode) && take != 0) {
+        memory.raw_copy(?encoder.control[encoder.control_length], payload, take);
+        encoder.control_length = encoder.control_length + take;
+    }
+    var i: usize = 0;
+    for (i < take) {
+        var byte: u8 = payload[i];
+        if (encoder.frame.masked) {
+            byte = byte ^ encoder.mask[(encoder.mask_offset + i::u64)::usize % 4];
+        }
+        output[i] = byte; i = i + 1;
+    }
+    encoder.remaining = encoder.remaining - take::u64;
+    encoder.mask_offset = encoder.mask_offset + take::u64;
+    if (encoder.remaining == 0) {
+        val error: Error = encoder_finish(encoder);
+        if (error != ERROR_NONE) {
+            ret Write{status: WRITE_ERROR, consumed: take, written: take, error: error};
+        }
+        ret Write{status: WRITE_DONE, consumed: take, written: take, error: ERROR_NONE};
+    }
+    ret Write{status: WRITE_OUTPUT, consumed: take, written: take, error: ERROR_NONE};
+}
+
+pub fun close_payload(code: u16, reason: *u8, reason_length: usize,
+    output: *u8, capacity: usize) usize {
+    if (!close_code_valid(code) || reason_length > 123 || capacity < reason_length + 2
+     || output == nil || (reason == nil && reason_length != 0)) { ret 0; }
+    var state: Utf8;
+    utf8_reset(?state);
+    if (!utf8_feed(?state, reason, reason_length) || state.needed != 0) { ret 0; }
+    output[0] = (code >> 8)::u8; output[1] = code::u8;
+    memory.raw_copy(?output[2], reason, reason_length);
+    ret reason_length + 2;
+}
+
+pub rec Connection {
+    decoder: Decoder;
+    encoder: Encoder;
+    transport: *transport.Transport;
+    scope: *cancel.Scope;
+    read_buffer: *u8;
+    read_capacity: usize;
+    input: *u8;
+    input_length: usize;
+    input_offset: usize;
+    input_borrowed: bool;
+    input_eof: bool;
+    read_pending: bool;
+    read_token: transport.Token;
+    write_buffer: *u8;
+    write_capacity: usize;
+    write_length: usize;
+    write_offset: usize;
+    write_pending: bool;
+    write_token: transport.Token;
+    close_pending: bool;
+    close_token: transport.Token;
+    initialized: bool;
+}
+
+pub fun connection_init(connection: *Connection, role: Role, limits: Limits,
+    transport_value: *transport.Transport, scope: *cancel.Scope,
+    read_buffer: *u8, read_capacity: usize, write_buffer: *u8,
+    write_capacity: usize, control: *u8, control_capacity: usize) bool {
+    if (connection == nil || connection.initialized || transport_value == nil
+     || !transport_value.initialized || scope == nil || read_buffer == nil
+     || read_capacity == 0 || write_buffer == nil || write_capacity < 14
+     || !decoder_init(?connection.decoder, role, limits, control, control_capacity)
+     || !encoder_init(?connection.encoder, role, limits)) { ret false; }
+    connection.transport = transport_value; connection.scope = scope;
+    connection.read_buffer = read_buffer; connection.read_capacity = read_capacity;
+    connection.input = nil; connection.input_length = 0; connection.input_offset = 0;
+    connection.input_borrowed = false; connection.input_eof = false;
+    connection.read_pending = false; connection.write_buffer = write_buffer;
+    connection.write_capacity = write_capacity; connection.write_length = 0;
+    connection.write_offset = 0; connection.write_pending = false;
+    connection.close_pending = false;
+    connection.initialized = true;
+    ret true;
+}
+
+# the caller retains an upgrade buffer until borrowed_input_released becomes true
+pub fun adopt_input(connection: *Connection, input: *u8, length: usize, eof: bool) bool {
+    if (connection == nil || !connection.initialized || connection.input != nil
+     || connection.read_pending || input == nil || length == 0) { ret false; }
+    connection.input = input; connection.input_length = length; connection.input_offset = 0;
+    connection.input_borrowed = true; connection.input_eof = eof;
+    ret true;
+}
+
+pub fun borrowed_input_released(connection: *Connection) bool {
+    ret connection != nil && connection.initialized && !connection.input_borrowed;
+}
+
+pub fun poll(connection: *Connection) Event {
+    if (connection == nil || !connection.initialized) { ret empty_event(EVENT_ERROR, 0); }
+    if (connection.decoder.held) {
+        ret fail_decoder(?connection.decoder, 0, ERROR_STATE, 1002, false);
+    }
+    if (connection.input == nil) {
+        if (connection.input_eof) { ret feed(?connection.decoder, nil, 0, true); }
+        ret empty_event(EVENT_NEED_INPUT, 0);
+    }
+    val event: Event = feed(?connection.decoder, ?connection.input[connection.input_offset],
+        connection.input_length - connection.input_offset, connection.input_eof);
+    connection.input_offset = connection.input_offset + event.consumed;
+    if (event.kind == EVENT_ERROR || event.kind == EVENT_CLOSE) {
+        connection.input_offset = connection.input_length;
+    }
+    if (connection.input_offset == connection.input_length && !connection.decoder.held) {
+        connection.input = nil; connection.input_length = 0; connection.input_offset = 0;
+        connection.input_borrowed = false;
+    }
+    ret event;
+}
+
+pub fun release_event(connection: *Connection) bool {
+    if (connection == nil || !connection.initialized || !release(?connection.decoder)) { ret false; }
+    if (connection.input_offset == connection.input_length) {
+        connection.input = nil; connection.input_length = 0; connection.input_offset = 0;
+        connection.input_borrowed = false;
+    }
+    ret true;
+}
+
+pub fun submit_read(connection: *Connection) bool {
+    if (connection == nil || !connection.initialized || connection.read_pending
+     || connection.close_pending || connection.input != nil
+     || connection.input_eof || connection.decoder.held) { ret false; }
+    val submitted: Result[transport.Token, io_error.Error] = transport.read(
+        connection.transport, connection.scope, connection.read_buffer,
+        connection.read_capacity, 0);
+    if (is_err[transport.Token, io_error.Error](submitted)) { ret false; }
+    connection.read_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    connection.read_pending = true;
+    ret true;
+}
+
+pub fun begin_frame(connection: *Connection, fin: bool, opcode: u8,
+    payload_length: u64, mask_key: *u8) Write {
+    if (connection == nil || !connection.initialized || connection.write_pending
+     || connection.close_pending || connection.write_length != 0) {
+        ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_STATE};
+    }
+    if (opcode == OPCODE_CLOSE && connection.decoder.state == CLOSE_RECEIVED) {
+        connection.encoder.state = CLOSE_RECEIVED;
+    }
+    val result: Write = begin(?connection.encoder, fin, opcode, payload_length,
+        mask_key, connection.write_buffer, connection.write_capacity);
+    connection.write_length = result.written; connection.write_offset = 0;
+    ret result;
+}
+
+# payload ownership returns when this function returns because bytes are copied
+pub fun offer(connection: *Connection, payload: *u8, payload_length: usize) Write {
+    if (connection == nil || !connection.initialized || connection.write_pending
+     || connection.write_length >= connection.write_capacity) {
+        ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_STATE};
+    }
+    val result: Write = write(?connection.encoder,
+        ?connection.write_buffer[connection.write_length],
+        connection.write_capacity - connection.write_length, payload, payload_length);
+    connection.write_length = connection.write_length + result.written;
+    if (result.status == WRITE_ERROR) {
+        connection.write_length = 0;
+        connection.write_offset = 0;
+    }
+    if (result.status == WRITE_DONE && connection.encoder.frame.opcode == OPCODE_CLOSE) {
+        decoder_close_sent(?connection.decoder);
+    }
+    ret result;
+}
+
+pub fun submit_write(connection: *Connection) bool {
+    if (connection == nil || !connection.initialized || connection.write_pending
+     || connection.close_pending || connection.write_length == 0
+     || connection.write_offset >= connection.write_length
+     || (connection.encoder.active && control_opcode(connection.encoder.frame.opcode))) {
+        ret false;
+    }
+    val submitted: Result[transport.Token, io_error.Error] = transport.write(
+        connection.transport, connection.scope, ?connection.write_buffer[connection.write_offset],
+        connection.write_length - connection.write_offset, 0);
+    if (is_err[transport.Token, io_error.Error](submitted)) { ret false; }
+    connection.write_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    connection.write_pending = true;
+    ret true;
+}
+
+pub fun submit_close(connection: *Connection) bool {
+    if (connection == nil || !connection.initialized || connection.close_pending
+     || connection.write_pending || connection.write_length != 0) { ret false; }
+    val submitted: Result[transport.Token, io_error.Error] = transport.close(
+        connection.transport, 0);
+    if (is_err[transport.Token, io_error.Error](submitted)) { ret false; }
+    connection.close_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    connection.close_pending = true;
+    ret true;
+}
+
+pub fun complete_io(connection: *Connection, completion: *transport.Completion) Event {
+    if (connection == nil || !connection.initialized || completion == nil
+     || (completion.kind == transport.READ && (!connection.read_pending
+        || !transport.token_equal(completion.token, connection.read_token)))
+     || (completion.kind == transport.WRITE && (!connection.write_pending
+        || !transport.token_equal(completion.token, connection.write_token)))
+     || (completion.kind == transport.CLOSE && (!connection.close_pending
+        || !transport.token_equal(completion.token, connection.close_token)))
+     || (completion.kind != transport.READ && completion.kind != transport.WRITE
+        && completion.kind != transport.CLOSE)) {
+        var invalid: Event = empty_event(EVENT_ERROR, 0); invalid.error = ERROR_STATE; ret invalid;
+    }
+    if (!transport.complete(connection.transport, completion)) {
+        var invalid: Event = empty_event(EVENT_ERROR, 0); invalid.error = ERROR_TRANSPORT; ret invalid;
+    }
+    if (completion.kind == transport.CLOSE) {
+        connection.close_pending = false;
+        connection.decoder.state = CLOSED;
+        connection.encoder.state = CLOSED;
+        if (completion.status == transport.IO_COMPLETE
+         || completion.status == transport.IO_CLOSED) {
+            ret empty_event(EVENT_CLOSED, 0);
+        }
+    } or (completion.kind == transport.READ) {
+        connection.read_pending = false;
+        if (completion.status == transport.IO_COMPLETE || completion.status == transport.IO_END) {
+            if (completion.status == transport.IO_COMPLETE && completion.count == 0) {
+                var no_progress: Event = empty_event(EVENT_ERROR, 0);
+                no_progress.error = ERROR_NO_PROGRESS; ret no_progress;
+            }
+            connection.input = connection.read_buffer; connection.input_length = completion.count;
+            connection.input_offset = 0; connection.input_borrowed = false;
+            connection.input_eof = completion.status == transport.IO_END;
+            ret poll(connection);
+        }
+    } or {
+        connection.write_pending = false;
+        if (completion.status == transport.IO_COMPLETE && completion.count != 0) {
+            connection.write_offset = connection.write_offset + completion.count;
+            if (connection.write_offset == connection.write_length) {
+                connection.write_length = 0; connection.write_offset = 0;
+            }
+            ret empty_event(EVENT_NONE, 0);
+        }
+        if (completion.status == transport.IO_COMPLETE) {
+            var no_progress: Event = empty_event(EVENT_ERROR, 0);
+            no_progress.error = ERROR_NO_PROGRESS; ret no_progress;
+        }
+    }
+    var event: Event = empty_event(EVENT_ERROR, 0);
+    if (completion.status == transport.IO_CANCELLED) { event.error = ERROR_CANCELLED; }
+    or (completion.status == transport.IO_TIMED_OUT) { event.error = ERROR_TIMED_OUT; }
+    or { event.error = ERROR_TRANSPORT; }
+    ret event;
+}
+
+test "http.websocket: fragmented masked text and interleaved ping" {
+    var control: [125]u8;
+    var decoder: Decoder;
+    if (!decoder_init(?decoder, SERVER, limits_default(), ?control[0], 125)) { ret 1; }
+    var first: [9]u8;
+    first[0] = 0x01; first[1] = 0x83; first[2] = 1; first[3] = 2;
+    first[4] = 3; first[5] = 4; first[6] = 'h' ^ 1;
+    first[7] = 'e' ^ 2; first[8] = 'l' ^ 3;
+    val one: Event = feed(?decoder, ?first[0], 9, false);
+    if (one.kind != EVENT_DATA || one.opcode != OPCODE_TEXT || one.message_final
+     || one.data_length != 3 || one.data[0] != 'h' || !release(?decoder)) { ret 2; }
+    var ping: [7]u8;
+    ping[0] = 0x89; ping[1] = 0x81; ping[2] = 5; ping[3] = 6;
+    ping[4] = 7; ping[5] = 8; ping[6] = 'x' ^ 5;
+    val control_event_value: Event = feed(?decoder, ?ping[0], 7, false);
+    if (control_event_value.kind != EVENT_PING || control_event_value.data_length != 1
+     || control_event_value.data[0] != 'x' || !release(?decoder)) { ret 3; }
+    var final: [8]u8;
+    final[0] = 0x80; final[1] = 0x82; final[2] = 9; final[3] = 10;
+    final[4] = 11; final[5] = 12; final[6] = 'l' ^ 9; final[7] = 'o' ^ 10;
+    val last: Event = feed(?decoder, ?final[0], 8, false);
+    if (last.kind != EVENT_DATA || !last.message_final || last.data_length != 2
+     || last.data[0] != 'l' || last.data[1] != 'o') { ret 4; }
+    ret 0;
+}
+
+test "http.websocket: every-byte header fragmentation preserves ownership" {
+    var control: [125]u8;
+    var decoder: Decoder;
+    if (!decoder_init(?decoder, CLIENT, limits_default(), ?control[0], 125)) { ret 1; }
+    var frame: [5]u8;
+    frame[0] = 0x82; frame[1] = 3; frame[2] = 1; frame[3] = 2; frame[4] = 3;
+    var i: usize = 0;
+    for (i < 2) {
+        val event: Event = feed(?decoder, ?frame[i], 1, false);
+        if (event.kind != EVENT_NEED_INPUT || event.consumed != 1) { ret 2; }
+        i = i + 1;
+    }
+    val body: Event = feed(?decoder, ?frame[2], 3, false);
+    if (body.kind != EVENT_DATA || !body.message_final || body.consumed != 3
+     || body.data != ?frame[2] || !decoder.held) { ret 3; }
+    if (feed(?decoder, nil, 0, false).error != ERROR_STATE || decoder.state != FAILED) { ret 4; }
+    ret 0;
+}
+
+test "http.websocket: hostile framing maps exact close outcomes" {
+    var control: [125]u8;
+    var decoder: Decoder;
+    var unmasked: [2]u8;
+    unmasked[0] = 0x81; unmasked[1] = 0;
+    decoder_init(?decoder, SERVER, limits_default(), ?control[0], 125);
+    val mask_error: Event = feed(?decoder, ?unmasked[0], 2, false);
+    if (mask_error.kind != EVENT_ERROR || mask_error.close_code != 1002
+     || !mask_error.reply_close) { ret 1; }
+    var decoder_two: Decoder;
+    decoder_init(?decoder_two, CLIENT, limits_default(), ?control[0], 125);
+    var invalid_utf8: [4]u8;
+    invalid_utf8[0] = 0x81; invalid_utf8[1] = 2;
+    invalid_utf8[2] = 0xc0; invalid_utf8[3] = 0x80;
+    val utf8_error: Event = feed(?decoder_two, ?invalid_utf8[0], 4, false);
+    if (utf8_error.error != ERROR_UTF8 || utf8_error.close_code != 1007) { ret 2; }
+    var decoder_three: Decoder;
+    var small: Limits = Limits{max_frame_bytes: 2, max_message_bytes: 2, max_fragments: 2};
+    decoder_init(?decoder_three, CLIENT, small, ?control[0], 125);
+    var large: [4]u8;
+    large[0] = 0x82; large[1] = 126; large[2] = 0; large[3] = 126;
+    val limit_error: Event = feed(?decoder_three, ?large[0], 4, false);
+    if (limit_error.error != ERROR_LIMIT || limit_error.close_code != 1009) { ret 3; }
+    var decoder_four: Decoder;
+    decoder_init(?decoder_four, CLIENT, limits_default(), ?control[0], 125);
+    var truncated: [3]u8;
+    truncated[0] = 0x82; truncated[1] = 2; truncated[2] = 1;
+    val partial: Event = feed(?decoder_four, ?truncated[0], 3, true);
+    if (partial.kind != EVENT_DATA || partial.data_length != 1 || !release(?decoder_four)) {
+        ret 4;
+    }
+    val truncated_error: Event = feed(?decoder_four, nil, 0, true);
+    if (truncated_error.error != ERROR_TRUNCATED || truncated_error.close_code != 1006
+     || truncated_error.reply_close) { ret 5; }
+    ret 0;
+}
+
+test "http.websocket: client encoder masks and enforces utf8" {
+    var encoder: Encoder;
+    if (!encoder_init(?encoder, CLIENT, limits_default())) { ret 1; }
+    var key: [4]u8;
+    key[0] = 0x37; key[1] = 0xfa; key[2] = 0x21; key[3] = 0x3d;
+    var output: [32]u8;
+    val header: Write = begin(?encoder, true, OPCODE_TEXT, 5, ?key[0], ?output[0], 32);
+    if (header.written != 6 || output[0] != 0x81 || output[1] != 0x85) { ret 2; }
+    val body: Write = write(?encoder, ?output[6], 26, "Hello", 5);
+    if (body.status != WRITE_DONE || body.written != 5 || output[6] != ('H' ^ 0x37)
+     || output[10] != ('o' ^ 0x37)) { ret 3; }
+    var invalid: Encoder;
+    encoder_init(?invalid, SERVER, limits_default());
+    begin(?invalid, true, OPCODE_TEXT, 2, nil, ?output[0], 32);
+    var bytes: [2]u8;
+    bytes[0] = 0xc0; bytes[1] = 0x80;
+    if (write(?invalid, ?output[0], 32, ?bytes[0], 2).error != ERROR_UTF8) { ret 4; }
+    ret 0;
+}
+
+rec TestAdapter {
+    token: transport.Token;
+    buffer: *u8;
+    length: usize;
+    kind: transport.Kind;
+}
+
+fun test_submit_buffer(context: ptr, token: transport.Token, scope: *cancel.Scope,
+    buffer: *u8, length: usize, kind: transport.Kind) Result[bool, io_error.Error] {
+    val state: *TestAdapter = context::*TestAdapter;
+    state.token = token; state.buffer = buffer; state.length = length; state.kind = kind;
+    ret ok[bool, io_error.Error](true);
+}
+
+fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
+    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    ret test_submit_buffer(context, token, scope, buffer, length, transport.READ);
+}
+
+fun test_write(context: ptr, token: transport.Token, scope: *cancel.Scope,
+    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    ret test_submit_buffer(context, token, scope, buffer, length, transport.WRITE);
+}
+
+fun test_control(context: ptr, token: transport.Token,
+    scope: *cancel.Scope) Result[bool, io_error.Error] {
+    val state: *TestAdapter = context::*TestAdapter;
+    state.token = token; state.buffer = nil; state.length = 0; state.kind = transport.CLOSE;
+    ret ok[bool, io_error.Error](true);
+}
+
+test "http.websocket: transport backpressure retains only connection buffers" {
+    var operation_scope: cancel.Scope;
+    var control_scope: cancel.Scope;
+    val none: time.Time = time.Time{sec: 0, nsec: 0};
+    if (!cancel.make_root(?operation_scope, false, none)
+     || !cancel.make_root(?control_scope, false, none)) { ret 1; }
+    var adapter_state: TestAdapter;
+    var adapter: transport.Adapter = transport.Adapter{
+        runtime: 1::*io_runtime.Runtime,
+        context: (?adapter_state)::ptr,
+        security: transport.PLAINTEXT,
+        submit_read: test_read,
+        submit_write: test_write,
+        submit_shutdown_write: test_control,
+        submit_close: test_control,
+    };
+    var slots: [3]transport.Slot;
+    var transport_value: transport.Transport;
+    if (!transport.init(?transport_value, adapter, ?operation_scope, ?control_scope,
+        ?slots[0], 3)) { ret 2; }
+    var read_buffer: [16]u8;
+    var write_buffer: [16]u8;
+    var control: [125]u8;
+    var connection: Connection;
+    if (!connection_init(?connection, CLIENT, limits_default(), ?transport_value,
+        ?operation_scope, ?read_buffer[0], 16, ?write_buffer[0], 16,
+        ?control[0], 125)) { ret 3; }
+    var mask_key: [4]u8;
+    mask_key[0] = 1; mask_key[1] = 2; mask_key[2] = 3; mask_key[3] = 4;
+    var header: Write = begin_frame(?connection, true, OPCODE_BINARY, 4, ?mask_key[0]);
+    var payload: [4]u8;
+    payload[0] = 1; payload[1] = 2; payload[2] = 3; payload[3] = 4;
+    val output: Write = offer(?connection, ?payload[0], 4);
+    if (header.written != 6 || output.status != WRITE_DONE || !submit_write(?connection)
+     || adapter_state.buffer != ?write_buffer[0] || adapter_state.length != 10
+     || offer(?connection, ?payload[0], 1).status != WRITE_BLOCKED) { ret 4; }
+    var completion: transport.Completion = transport.completed(
+        adapter_state.token, transport.WRITE, 5);
+    if (complete_io(?connection, ?completion).kind != EVENT_NONE
+     || connection.write_offset != 5 || !submit_write(?connection)
+     || adapter_state.buffer != ?write_buffer[5] || adapter_state.length != 5) { ret 5; }
+    completion = transport.completed(adapter_state.token, transport.WRITE, 5);
+    if (complete_io(?connection, ?completion).kind != EVENT_NONE
+     || connection.write_length != 0 || connection.write_offset != 0) { ret 6; }
+    if (!submit_read(?connection) || adapter_state.buffer != ?read_buffer[0]) { ret 7; }
+    read_buffer[0] = 0x82; read_buffer[1] = 2; read_buffer[2] = 9; read_buffer[3] = 8;
+    completion = transport.completed(adapter_state.token, transport.READ, 4);
+    val event: Event = complete_io(?connection, ?completion);
+    if (event.kind != EVENT_DATA || event.data != ?read_buffer[2]
+     || event.data_length != 2 || submit_read(?connection)
+     || !release_event(?connection) || connection.input != nil) { ret 8; }
+    if (!submit_close(?connection) || adapter_state.kind != transport.CLOSE) { ret 9; }
+    completion = transport.completed(adapter_state.token, transport.CLOSE, 0);
+    if (complete_io(?connection, ?completion).kind != EVENT_CLOSED
+     || connection.decoder.state != CLOSED || connection.encoder.state != CLOSED) { ret 10; }
+    if (!cancel.destroy(?operation_scope) || !cancel.destroy(?control_scope)) { ret 11; }
+    ret 0;
+}
+
+test "http.websocket: fourteen-byte header survives every-byte fragmentation" {
+    var control: [125]u8;
+    var decoder: Decoder;
+    var limits: Limits = Limits{max_frame_bytes: 65536,
+        max_message_bytes: 65536, max_fragments: 2};
+    if (!decoder_init(?decoder, SERVER, limits, ?control[0], 125)) { ret 1; }
+    var header: [14]u8;
+    header[0] = 0x82; header[1] = 0xff; header[7] = 1;
+    header[10] = 1; header[11] = 2; header[12] = 3; header[13] = 4;
+    var i: usize = 0;
+    for (i < 14) {
+        val event: Event = feed(?decoder, ?header[i], 1, false);
+        if (event.kind != EVENT_NEED_INPUT || event.consumed != 1) { ret 2; }
+        i = i + 1;
+    }
+    val ended: Event = feed(?decoder, nil, 0, true);
+    if (ended.error != ERROR_TRUNCATED || ended.close_code != 1006
+     || ended.reply_close) { ret 3; }
+    ret 0;
+}
+
+test "http.websocket: close validation and handshake are protocol exact" {
+    var payload: [125]u8;
+    if (close_payload(1000, "bye", 3, ?payload[0], 125) != 5
+     || payload[0] != 3 || payload[1] != 0xe8
+     || close_payload(1006, nil, 0, ?payload[0], 125) != 0) { ret 1; }
+    var control: [125]u8;
+    var decoder: Decoder;
+    decoder_init(?decoder, SERVER, limits_default(), ?control[0], 125);
+    var frame: [11]u8;
+    frame[0] = 0x88; frame[1] = 0x85;
+    frame[2] = 1; frame[3] = 2; frame[4] = 3; frame[5] = 4;
+    var i: usize = 0;
+    for (i < 5) { frame[6 + i] = payload[i] ^ frame[2 + (i % 4)]; i = i + 1; }
+    val received: Event = feed(?decoder, ?frame[0], 11, false);
+    if (received.kind != EVENT_CLOSE || received.close_code != 1000
+     || !received.reply_close || received.data_length != 5 || !release(?decoder)
+     || !decoder_close_sent(?decoder) || decoder.state != CLOSED) { ret 2; }
+    var invalid: Decoder;
+    decoder_init(?invalid, CLIENT, limits_default(), ?control[0], 125);
+    var nonminimal: [4]u8;
+    nonminimal[0] = 0x82; nonminimal[1] = 126; nonminimal[2] = 0; nonminimal[3] = 125;
+    val rejected: Event = feed(?invalid, ?nonminimal[0], 4, false);
+    if (rejected.error != ERROR_PROTOCOL || rejected.close_code != 1002) { ret 3; }
+    ret 0;
+}
+
+test "http.websocket: utf8 state crosses message fragments" {
+    var control: [125]u8;
+    var decoder: Decoder;
+    decoder_init(?decoder, CLIENT, limits_default(), ?control[0], 125);
+    var first: [4]u8;
+    first[0] = 0x01; first[1] = 2; first[2] = 0xe2; first[3] = 0x82;
+    val one: Event = feed(?decoder, ?first[0], 4, false);
+    if (one.kind != EVENT_DATA || one.message_final || !release(?decoder)) { ret 1; }
+    var second: [3]u8;
+    second[0] = 0x80; second[1] = 1; second[2] = 0xac;
+    val two: Event = feed(?decoder, ?second[0], 3, false);
+    if (two.kind != EVENT_DATA || !two.message_final || two.opcode != OPCODE_TEXT) { ret 2; }
+    ret 0;
 }

@@ -1,0 +1,631 @@
+# client origin, protocol, redirect, and retry policy
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.string.str;
+use std.types.view;
+use std.net.ip;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.client.memory;
+
+pub def Scheme: u8;
+pub val HTTP:  Scheme = 1;
+pub val HTTPS: Scheme = 2;
+
+pub def ProxyKind: u8;
+pub val PROXY_NONE:         ProxyKind = 0;
+pub val PROXY_HTTP_FORWARD: ProxyKind = 1;
+pub val PROXY_HTTP_TUNNEL:  ProxyKind = 2;
+pub val PROXY_SOCKS5:       ProxyKind = 3;
+pub val PROXY_CONNECT_UDP:   ProxyKind = 4;
+
+pub def TransportKind: u8;
+pub val TRANSPORT_TCP:  TransportKind = 1;
+pub val TRANSPORT_QUIC: TransportKind = 2;
+
+pub val PROXY_TCP:      u8 = 1;
+pub val PROXY_DATAGRAM: u8 = 2;
+
+pub val ALLOW_H1: u8 = 1;
+pub val ALLOW_H2: u8 = 2;
+pub val ALLOW_H3: u8 = 4;
+
+pub rec Origin {
+    scheme: Scheme;
+    host:   view.View;
+    port:   u16;
+}
+
+# identity isolates connections using different proxy credentials or policy
+pub rec Proxy {
+    kind:     ProxyKind;
+    host:     view.View;
+    port:     u16;
+    secure:   bool;
+    identity: u64;
+    transports: u8;
+}
+
+pub rec Route {
+    origin: Origin;
+    proxy:  Proxy;
+}
+
+pub rec ProtocolPolicy {
+    allowed:         u8;
+    prior_knowledge: message.Wire;
+    require_alpn:    bool;
+}
+
+pub def SelectStatus: u8;
+pub val SELECT_OK:          SelectStatus = 1;
+pub val SELECT_INVALID:     SelectStatus = 2;
+pub val SELECT_MISSING:     SelectStatus = 3;
+pub val SELECT_UNSUPPORTED: SelectStatus = 4;
+
+pub rec Selection {
+    status: SelectStatus;
+    wire:   message.Wire;
+}
+
+pub def BodyReplay: u8;
+pub val BODY_EMPTY:      BodyReplay = 1;
+pub val BODY_REWINDABLE: BodyReplay = 2;
+pub val BODY_STREAMING:  BodyReplay = 3;
+
+# explicit is application authorization, not a guess from the method
+pub rec Replay {
+    explicit: bool;
+    body:     BodyReplay;
+}
+
+pub rec RedirectPolicy {
+    max_redirects:       usize;
+    allow_http_downgrade: bool;
+    legacy_post_to_get:  bool;
+}
+
+pub def RedirectStatus: u8;
+pub val REDIRECT_FOLLOW:      RedirectStatus = 1;
+pub val REDIRECT_NOT_REDIRECT: RedirectStatus = 2;
+pub val REDIRECT_LIMIT:       RedirectStatus = 3;
+pub val REDIRECT_UNSAFE:      RedirectStatus = 4;
+pub val REDIRECT_DOWNGRADE:   RedirectStatus = 5;
+pub val REDIRECT_INVALID:     RedirectStatus = 6;
+pub val REDIRECT_CANCELLED:   RedirectStatus = 7;
+
+pub rec Redirect {
+    status:                 RedirectStatus;
+    next_method:            method.Method;
+    drop_body:              bool;
+    strip_origin_sensitive: bool;
+    strip_proxy_sensitive:  bool;
+}
+
+pub def RetryReason: u8;
+pub val RETRY_DNS_TEMPORARY:   RetryReason = 1;
+pub val RETRY_CONNECT:         RetryReason = 2;
+pub val RETRY_TRANSPORT:       RetryReason = 3;
+pub val RETRY_REFUSED_STREAM:  RetryReason = 4;
+pub val RETRY_GOAWAY:          RetryReason = 5;
+pub val RETRY_REQUEST_TIMEOUT: RetryReason = 6;
+pub val RETRY_TOO_EARLY:       RetryReason = 7;
+pub val RETRY_RATE_LIMIT:      RetryReason = 8;
+pub val RETRY_SERVER:          RetryReason = 9;
+
+pub rec RetryPolicy {
+    max_attempts:          usize;
+    retry_request_timeout: bool;
+    retry_too_early:       bool;
+    retry_rate_limit:      bool;
+    retry_server:          bool;
+}
+
+pub rec Failure {
+    reason:                 RetryReason;
+    definitely_unprocessed: bool;
+    response_started:       bool;
+    response_complete:      bool;
+    retry_after_ns:         u64;
+}
+
+pub def RetryStatus: u8;
+pub val RETRY_ALLOWED: RetryStatus = 1;
+pub val RETRY_DENIED:  RetryStatus = 2;
+pub val RETRY_LIMITED: RetryStatus = 3;
+pub val RETRY_INVALID: RetryStatus = 4;
+
+pub rec RetryDecision {
+    status:         RetryStatus;
+    delay_ns:       u64;
+    consume_budget: bool;
+}
+
+fun ascii_host_byte(byte: u8) bool {
+    ret (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z')
+        || (byte >= '0' && byte <= '9') || byte == '-' || byte == '.'
+        || byte == ':' || byte == '_';
+}
+
+pub fun host_valid(host: view.View, maximum: usize) bool {
+    if (!memory.borrowed(host) || host.len == 0 || host.len > maximum
+        || host.len > 253 || host.data[0] == '.' || host.data[host.len - 1] == '.') {
+        ret false;
+    }
+    var i: usize = 0;
+    var colon: bool = false;
+    for (i < host.len) {
+        val byte: u8 = host.data[i];
+        if (!ascii_host_byte(byte)) { ret false; }
+        if (byte == ':') { colon = true; }
+        i = i + 1;
+    }
+    if (colon && !ipv6_valid(host)) { ret false; }
+    ret true;
+}
+
+pub fun ipv6_valid(host: view.View) bool {
+    if (!memory.borrowed(host) || host.len == 0 || host.len > 253) { ret false; }
+    var text: [254]u8;
+    var i: usize = 0;
+    var colon: bool = false;
+    for (i < host.len) {
+        val byte: u8 = host.data[i];
+        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f')
+            || (byte >= 'A' && byte <= 'F') || byte == ':' || byte == '.')) {
+            ret false;
+        }
+        if (byte == ':') { colon = true; }
+        text[i] = byte;
+        i = i + 1;
+    }
+    if (!colon) { ret false; }
+    text[host.len] = 0;
+    val parsed: Result[ip.IPv6, str] = ip.ipv6_parse(?text[0]);
+    ret !is_err[ip.IPv6, str](parsed);
+}
+
+pub fun origin_valid(origin: Origin, max_host_bytes: usize) bool {
+    ret (origin.scheme == HTTP || origin.scheme == HTTPS) && origin.port != 0
+        && host_valid(origin.host, max_host_bytes);
+}
+
+pub fun proxy_valid(proxy: Proxy, max_host_bytes: usize) bool {
+    if (proxy.kind == PROXY_NONE) {
+        ret proxy.host.data == nil && proxy.host.len == 0 && proxy.port == 0
+            && !proxy.secure && proxy.identity == 0 && proxy.transports == 0;
+    }
+    if (proxy.port == 0 || proxy.identity == 0
+        || (proxy.transports & ~(PROXY_TCP | PROXY_DATAGRAM)) != 0
+        || proxy.transports == 0 || !host_valid(proxy.host, max_host_bytes)) {
+        ret false;
+    }
+    if (proxy.kind == PROXY_HTTP_FORWARD
+        || proxy.kind == PROXY_HTTP_TUNNEL) {
+        ret proxy.transports == PROXY_TCP;
+    }
+    if (proxy.kind == PROXY_CONNECT_UDP) {
+        ret proxy.transports == PROXY_DATAGRAM;
+    }
+    ret proxy.kind == PROXY_SOCKS5;
+}
+
+pub fun route_valid(route: Route, max_host_bytes: usize) bool {
+    if (!origin_valid(route.origin, max_host_bytes)
+        || !proxy_valid(route.proxy, max_host_bytes)) { ret false; }
+    if (route.proxy.kind == PROXY_HTTP_FORWARD && route.origin.scheme == HTTPS) {
+        ret false;
+    }
+    ret true;
+}
+
+fun fold(byte: u8) u8 {
+    if (byte >= 'A' && byte <= 'Z') { ret byte + 32; }
+    ret byte;
+}
+
+pub fun text_equal(first: view.View, second: view.View) bool {
+    if (first.len != second.len || !memory.borrowed(first)
+        || !memory.borrowed(second)) { ret false; }
+    var i: usize = 0;
+    for (i < first.len) {
+        if (fold(first.data[i]) != fold(second.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun origin_equal(first: Origin, second: Origin) bool {
+    ret first.scheme == second.scheme && first.port == second.port
+        && text_equal(first.host, second.host);
+}
+
+pub fun proxy_equal(first: Proxy, second: Proxy) bool {
+    if (first.kind != second.kind || first.port != second.port
+        || first.secure != second.secure || first.identity != second.identity
+        || first.transports != second.transports) {
+        ret false;
+    }
+    if (first.kind == PROXY_NONE) { ret true; }
+    ret text_equal(first.host, second.host);
+}
+
+pub fun route_equal(first: Route, second: Route) bool {
+    ret origin_equal(first.origin, second.origin)
+        && proxy_equal(first.proxy, second.proxy);
+}
+
+pub fun no_proxy() Proxy {
+    ret Proxy{kind: PROXY_NONE, host: view.view(nil, 0), port: 0,
+        secure: false, identity: 0, transports: 0};
+}
+
+pub fun proxy_supports(proxy: Proxy, transport: TransportKind) bool {
+    if (proxy.kind == PROXY_NONE) {
+        ret transport == TRANSPORT_TCP || transport == TRANSPORT_QUIC;
+    }
+    if (transport == TRANSPORT_TCP) {
+        ret (proxy.transports & PROXY_TCP) != 0;
+    }
+    if (transport == TRANSPORT_QUIC) {
+        ret (proxy.transports & PROXY_DATAGRAM) != 0;
+    }
+    ret false;
+}
+
+pub fun protocols_default() ProtocolPolicy {
+    ret ProtocolPolicy{allowed: ALLOW_H1 | ALLOW_H2 | ALLOW_H3,
+        prior_knowledge: 0, require_alpn: false};
+}
+
+pub fun protocol_valid(configured: ProtocolPolicy) bool {
+    if (configured.allowed == 0 || (configured.allowed & 0xf8) != 0) { ret false; }
+    if (configured.prior_knowledge == 0) { ret true; }
+    if (configured.prior_knowledge == message.WIRE_H1) {
+        ret (configured.allowed & ALLOW_H1) != 0;
+    }
+    if (configured.prior_knowledge == message.WIRE_H2) {
+        ret (configured.allowed & ALLOW_H2) != 0;
+    }
+    if (configured.prior_knowledge == message.WIRE_H3) {
+        ret (configured.allowed & ALLOW_H3) != 0;
+    }
+    ret false;
+}
+
+pub fun wire_allowed(configured: ProtocolPolicy, wire: message.Wire) bool {
+    if (wire == message.WIRE_H1) { ret (configured.allowed & ALLOW_H1) != 0; }
+    if (wire == message.WIRE_H2) { ret (configured.allowed & ALLOW_H2) != 0; }
+    if (wire == message.WIRE_H3) { ret (configured.allowed & ALLOW_H3) != 0; }
+    ret false;
+}
+
+fun exact(value: view.View, text: *u8, len: usize) bool {
+    if (value.len != len || !memory.borrowed(value)
+        || !memory.range(text::ptr, len)) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (value.data[i] != text[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun wire_for_alpn(value: view.View) message.Wire {
+    if (exact(value, "http/1.1", 8)) { ret message.WIRE_H1; }
+    if (exact(value, "h2", 2)) { ret message.WIRE_H2; }
+    if (exact(value, "h3", 2)) { ret message.WIRE_H3; }
+    ret 0;
+}
+
+pub fun alpn_for_wire(wire: message.Wire) view.View {
+    if (wire == message.WIRE_H1) { ret view.view("http/1.1", 8); }
+    if (wire == message.WIRE_H2) { ret view.view("h2", 2); }
+    if (wire == message.WIRE_H3) { ret view.view("h3", 2); }
+    ret view.view(nil, 0);
+}
+
+pub fun offer_count(configured: ProtocolPolicy,
+    transport: TransportKind) usize {
+    if (!protocol_valid(configured)) { ret 0; }
+    if (configured.prior_knowledge != 0) {
+        if (configured.prior_knowledge == message.WIRE_H3) {
+            if (transport == TRANSPORT_QUIC) { ret 1; }
+            ret 0;
+        }
+        if (transport == TRANSPORT_TCP) { ret 1; }
+        ret 0;
+    }
+    if (transport == TRANSPORT_QUIC) {
+        if ((configured.allowed & ALLOW_H3) != 0) { ret 1; }
+        ret 0;
+    }
+    if (transport != TRANSPORT_TCP) { ret 0; }
+    var count: usize = 0;
+    if ((configured.allowed & ALLOW_H2) != 0) { count = count + 1; }
+    if ((configured.allowed & ALLOW_H1) != 0) { count = count + 1; }
+    ret count;
+}
+
+pub fun offers(configured: ProtocolPolicy, transport: TransportKind,
+    output: *view.View, capacity: usize) usize {
+    val required: usize = offer_count(configured, transport);
+    if (required == 0 || capacity < required
+        || !memory.count(output::ptr, capacity, $size_of(view.View))) { ret 0; }
+    if (configured.prior_knowledge != 0) {
+        output[0] = alpn_for_wire(configured.prior_knowledge);
+        ret 1;
+    }
+    if (transport == TRANSPORT_QUIC) {
+        output[0] = alpn_for_wire(message.WIRE_H3);
+        ret 1;
+    }
+    var written: usize = 0;
+    if ((configured.allowed & ALLOW_H2) != 0) {
+        output[written] = alpn_for_wire(message.WIRE_H2);
+        written = written + 1;
+    }
+    if ((configured.allowed & ALLOW_H1) != 0) {
+        output[written] = alpn_for_wire(message.WIRE_H1);
+        written = written + 1;
+    }
+    ret written;
+}
+
+pub fun select(configured: ProtocolPolicy, secure: bool,
+    transport: TransportKind, negotiated: view.View) Selection {
+    if (!protocol_valid(configured)
+        || (transport != TRANSPORT_TCP && transport != TRANSPORT_QUIC)
+        || (transport == TRANSPORT_QUIC && !secure)
+        || !memory.borrowed(negotiated)) {
+        ret Selection{status: SELECT_INVALID, wire: 0};
+    }
+    if (!secure) {
+        if (negotiated.len != 0 || transport != TRANSPORT_TCP) {
+            ret Selection{status: SELECT_INVALID, wire: 0};
+        }
+        if (configured.prior_knowledge != 0) {
+            if (configured.prior_knowledge == message.WIRE_H3) {
+                ret Selection{status: SELECT_INVALID, wire: 0};
+            }
+            ret Selection{status: SELECT_OK,
+                wire: configured.prior_knowledge};
+        }
+        if ((configured.allowed & ALLOW_H1) != 0) {
+            ret Selection{status: SELECT_OK, wire: message.WIRE_H1};
+        }
+        ret Selection{status: SELECT_MISSING, wire: 0};
+    }
+    if (negotiated.len == 0) {
+        if (transport == TRANSPORT_TCP && !configured.require_alpn
+            && (configured.prior_knowledge == 0
+                || configured.prior_knowledge == message.WIRE_H1)
+            && (configured.allowed & ALLOW_H1) != 0) {
+            ret Selection{status: SELECT_OK, wire: message.WIRE_H1};
+        }
+        ret Selection{status: SELECT_MISSING, wire: 0};
+    }
+    val selected: message.Wire = wire_for_alpn(negotiated);
+    if (selected == 0 || !wire_allowed(configured, selected)
+        || (transport == TRANSPORT_QUIC && selected != message.WIRE_H3)
+        || (transport == TRANSPORT_TCP && selected == message.WIRE_H3)
+        || (configured.prior_knowledge != 0
+            && selected != configured.prior_knowledge)) {
+        ret Selection{status: SELECT_UNSUPPORTED, wire: 0};
+    }
+    ret Selection{status: SELECT_OK, wire: selected};
+}
+
+pub fun replay_valid(replay: Replay) bool {
+    ret replay.body == BODY_EMPTY || replay.body == BODY_REWINDABLE
+        || replay.body == BODY_STREAMING;
+}
+
+pub fun replayable(replay: Replay) bool {
+    ret replay_valid(replay) && replay.explicit
+        && (replay.body == BODY_EMPTY || replay.body == BODY_REWINDABLE);
+}
+
+pub fun redirect_policy_default() RedirectPolicy {
+    ret RedirectPolicy{max_redirects: 10, allow_http_downgrade: false,
+        legacy_post_to_get: false};
+}
+
+fun redirect_code(code: status.Status) bool {
+    ret code == status.MOVED_PERMANENTLY || code == status.FOUND
+        || code == status.SEE_OTHER || code == status.TEMPORARY_REDIRECT
+        || code == status.PERMANENT_REDIRECT;
+}
+
+pub fun redirect(configured: RedirectPolicy, code: status.Status,
+    current_method: method.Method, replay: Replay, source: Route, target: Route,
+    followed: usize) Redirect {
+    var result: Redirect = Redirect{status: REDIRECT_INVALID,
+        next_method: current_method, drop_body: false,
+        strip_origin_sensitive: true, strip_proxy_sensitive: true};
+    if (!redirect_code(code)) { result.status = REDIRECT_NOT_REDIRECT; ret result; }
+    if (!memory.borrowed(current_method.token)
+        || !method.valid(current_method, 32) || !replay_valid(replay)
+        || !route_valid(source, 253)
+        || !route_valid(target, 253)) { ret result; }
+    if (followed >= configured.max_redirects) {
+        result.status = REDIRECT_LIMIT;
+        ret result;
+    }
+    if (source.origin.scheme == HTTPS && target.origin.scheme == HTTP
+        && !configured.allow_http_downgrade) {
+        result.status = REDIRECT_DOWNGRADE;
+        ret result;
+    }
+    result.strip_origin_sensitive = !origin_equal(source.origin, target.origin);
+    result.strip_proxy_sensitive = !proxy_equal(source.proxy, target.proxy);
+    if (code == status.SEE_OTHER && current_method.kind != method.HEAD) {
+        result.next_method = method.from_kind(method.GET);
+        result.drop_body = true;
+        result.status = REDIRECT_FOLLOW;
+        ret result;
+    }
+    if ((code == status.MOVED_PERMANENTLY || code == status.FOUND)
+        && configured.legacy_post_to_get && current_method.kind == method.POST) {
+        result.next_method = method.from_kind(method.GET);
+        result.drop_body = true;
+        result.status = REDIRECT_FOLLOW;
+        ret result;
+    }
+    if (replay.body != BODY_EMPTY && !replayable(replay)) {
+        result.status = REDIRECT_UNSAFE;
+        ret result;
+    }
+    result.status = REDIRECT_FOLLOW;
+    ret result;
+}
+
+pub fun retry_policy_default() RetryPolicy {
+    ret RetryPolicy{max_attempts: 3, retry_request_timeout: false,
+        retry_too_early: true, retry_rate_limit: false,
+        retry_server: false};
+}
+
+pub fun retry_reason_valid(reason: RetryReason) bool {
+    ret reason >= RETRY_DNS_TEMPORARY && reason <= RETRY_SERVER;
+}
+
+pub fun response_retry_reason(reason: RetryReason) bool {
+    ret reason == RETRY_REQUEST_TIMEOUT || reason == RETRY_TOO_EARLY
+        || reason == RETRY_RATE_LIMIT || reason == RETRY_SERVER;
+}
+
+pub fun failure_valid(failure: Failure) bool {
+    if (!retry_reason_valid(failure.reason)) { ret false; }
+    val response_reason: bool = response_retry_reason(failure.reason);
+    if (response_reason) {
+        ret failure.response_started && failure.response_complete
+            && !failure.definitely_unprocessed;
+    }
+    ret !failure.response_complete
+        && (!failure.definitely_unprocessed || !failure.response_started);
+}
+
+fun policy_allows(configured: RetryPolicy, reason: RetryReason) bool {
+    if (reason == RETRY_REQUEST_TIMEOUT) { ret configured.retry_request_timeout; }
+    if (reason == RETRY_TOO_EARLY) { ret configured.retry_too_early; }
+    if (reason == RETRY_RATE_LIMIT) { ret configured.retry_rate_limit; }
+    if (reason == RETRY_SERVER) { ret configured.retry_server; }
+    ret true;
+}
+
+pub fun retry(configured: RetryPolicy, replay: Replay, failure: Failure,
+    attempts: usize) RetryDecision {
+    if (configured.max_attempts == 0 || !replay_valid(replay)
+        || !failure_valid(failure)) {
+        ret RetryDecision{status: RETRY_INVALID, delay_ns: 0,
+            consume_budget: false};
+    }
+    if (attempts >= configured.max_attempts) {
+        ret RetryDecision{status: RETRY_LIMITED, delay_ns: 0,
+            consume_budget: false};
+    }
+    if ((!response_retry_reason(failure.reason)
+            && !failure.definitely_unprocessed)
+        || !policy_allows(configured, failure.reason)
+        || !replayable(replay)) {
+        ret RetryDecision{status: RETRY_DENIED, delay_ns: 0,
+            consume_budget: false};
+    }
+    ret RetryDecision{status: RETRY_ALLOWED,
+        delay_ns: failure.retry_after_ns, consume_budget: true};
+}
+
+test "http.client.policy: alpn and prior knowledge select only allowed wires" {
+    val configured: ProtocolPolicy = protocols_default();
+    var offered: [3]view.View;
+    if (offers(configured, TRANSPORT_TCP, ?offered[0], 3) != 2
+        || !exact(offered[0], "h2", 2) || !exact(offered[1], "http/1.1", 8)
+        || offers(configured, TRANSPORT_QUIC, ?offered[0], 3) != 1
+        || !exact(offered[0], "h3", 2)) { ret 1; }
+    if (select(configured, true, TRANSPORT_TCP,
+            view.view("h2", 2)).wire != message.WIRE_H2
+        || select(configured, true, TRANSPORT_QUIC,
+            view.view("h3", 2)).wire != message.WIRE_H3
+        || select(configured, true, TRANSPORT_TCP,
+            view.view("h3", 2)).status != SELECT_UNSUPPORTED
+        || select(configured, false, TRANSPORT_TCP,
+            view.view(nil, 0)).wire != message.WIRE_H1) { ret 2; }
+    val h2c: ProtocolPolicy = ProtocolPolicy{allowed: ALLOW_H2,
+        prior_knowledge: message.WIRE_H2, require_alpn: false};
+    if (select(h2c, false, TRANSPORT_TCP,
+            view.view(nil, 0)).wire != message.WIRE_H2
+        || select(h2c, true, TRANSPORT_TCP,
+            view.view("http/1.1", 8)).status != SELECT_UNSUPPORTED) { ret 3; }
+    ret 0;
+}
+
+test "http.client.policy: redirects preserve replay and origin security" {
+    val secure: Route = Route{origin: Origin{scheme: HTTPS,
+        host: view.view("example.com", 11), port: 443}, proxy: no_proxy()};
+    val other: Route = Route{origin: Origin{scheme: HTTPS,
+        host: view.view("other.example", 13), port: 443}, proxy: no_proxy()};
+    val clear: Route = Route{origin: Origin{scheme: HTTP,
+        host: view.view("example.com", 11), port: 80}, proxy: no_proxy()};
+    val streaming: Replay = Replay{explicit: true, body: BODY_STREAMING};
+    val buffered: Replay = Replay{explicit: true, body: BODY_REWINDABLE};
+    val configured: RedirectPolicy = redirect_policy_default();
+    if (redirect(configured, status.TEMPORARY_REDIRECT,
+            method.from_kind(method.POST), streaming, secure, secure, 0).status
+            != REDIRECT_UNSAFE
+        || redirect(configured, status.SEE_OTHER, method.from_kind(method.POST),
+            streaming, secure, other, 0).next_method.kind != method.GET
+        || !redirect(configured, status.SEE_OTHER, method.from_kind(method.POST),
+            streaming, secure, other, 0).strip_origin_sensitive
+        || redirect(configured, status.PERMANENT_REDIRECT,
+            method.from_kind(method.PUT), buffered, secure, secure, 0).status
+            != REDIRECT_FOLLOW
+        || redirect(configured, status.FOUND, method.from_kind(method.GET),
+            Replay{explicit: true, body: BODY_EMPTY}, secure, clear, 0).status
+            != REDIRECT_DOWNGRADE
+        || redirect(RedirectPolicy{max_redirects: 0,
+            allow_http_downgrade: false, legacy_post_to_get: false},
+            status.FOUND, method.from_kind(method.GET),
+            Replay{explicit: true, body: BODY_EMPTY}, secure, secure, 0).status
+            != REDIRECT_LIMIT) { ret 1; }
+    ret 0;
+}
+
+test "http.client.policy: retries require explicit and unambiguous replay safety" {
+    val configured: RetryPolicy = retry_policy_default();
+    val safe: Replay = Replay{explicit: true, body: BODY_REWINDABLE};
+    val streaming: Replay = Replay{explicit: true, body: BODY_STREAMING};
+    val refused: Failure = Failure{reason: RETRY_REFUSED_STREAM,
+        definitely_unprocessed: true, response_started: false,
+        response_complete: false, retry_after_ns: 0};
+    val ambiguous: Failure = Failure{reason: RETRY_TRANSPORT,
+        definitely_unprocessed: false, response_started: false,
+        response_complete: false, retry_after_ns: 0};
+    var response_policy: RetryPolicy = configured;
+    response_policy.retry_server = true;
+    val server: Failure = Failure{reason: RETRY_SERVER,
+        definitely_unprocessed: false, response_started: true,
+        response_complete: true, retry_after_ns: 5};
+    if (retry(configured, safe, refused, 1).status != RETRY_ALLOWED
+        || retry(configured, streaming, refused, 1).status != RETRY_DENIED
+        || retry(configured, Replay{explicit: false, body: BODY_EMPTY},
+            refused, 1).status != RETRY_DENIED
+        || retry(configured, safe, ambiguous, 1).status != RETRY_DENIED
+        || retry(configured, safe, Failure{reason: RETRY_GOAWAY,
+            definitely_unprocessed: false, response_started: false,
+            response_complete: false, retry_after_ns: 0}, 1).status
+            != RETRY_DENIED
+        || retry(configured, safe, refused, 3).status != RETRY_LIMITED
+        || retry(response_policy, safe, server, 1).status != RETRY_ALLOWED
+        || retry(response_policy, safe, Failure{reason: RETRY_SERVER,
+            definitely_unprocessed: false, response_started: true,
+            response_complete: false, retry_after_ns: 0}, 1).status
+            != RETRY_INVALID) { ret 1; }
+    ret 0;
+}
