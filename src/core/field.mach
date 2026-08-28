@@ -1,0 +1,270 @@
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+pub def AddStatus: u8;
+
+pub val ADD_OK: AddStatus = 1;
+pub val ADD_INVALID: AddStatus = 2;
+pub val ADD_COUNT_LIMIT: AddStatus = 3;
+pub val ADD_STORAGE_LIMIT: AddStatus = 4;
+pub val ADD_NAME_LIMIT: AddStatus = 5;
+pub val ADD_VALUE_LIMIT: AddStatus = 6;
+pub val ADD_BYTE_LIMIT: AddStatus = 7;
+pub val ADD_FORBIDDEN_TRAILER: AddStatus = 8;
+
+pub val ACCEPT: str = "accept";
+pub val ACCEPT_ENCODING: str = "accept-encoding";
+pub val AUTHORIZATION: str = "authorization";
+pub val CACHE_CONTROL: str = "cache-control";
+pub val CONNECTION: str = "connection";
+pub val CONTENT_ENCODING: str = "content-encoding";
+pub val CONTENT_LENGTH: str = "content-length";
+pub val CONTENT_TYPE: str = "content-type";
+pub val COOKIE: str = "cookie";
+pub val DATE: str = "date";
+pub val ETAG: str = "etag";
+pub val EXPECT: str = "expect";
+pub val FORWARDED: str = "forwarded";
+pub val HOST: str = "host";
+pub val IF_MATCH: str = "if-match";
+pub val IF_MODIFIED_SINCE: str = "if-modified-since";
+pub val IF_NONE_MATCH: str = "if-none-match";
+pub val LAST_MODIFIED: str = "last-modified";
+pub val LINK: str = "link";
+pub val LOCATION: str = "location";
+pub val ORIGIN: str = "origin";
+pub val PROXY_AUTHORIZATION: str = "proxy-authorization";
+pub val RANGE: str = "range";
+pub val REFERER: str = "referer";
+pub val RETRY_AFTER: str = "retry-after";
+pub val SERVER: str = "server";
+pub val SET_COOKIE: str = "set-cookie";
+pub val TE: str = "te";
+pub val TRAILER: str = "trailer";
+pub val TRANSFER_ENCODING: str = "transfer-encoding";
+pub val UPGRADE: str = "upgrade";
+pub val USER_AGENT: str = "user-agent";
+pub val VARY: str = "vary";
+pub val VIA: str = "via";
+pub val WWW_AUTHENTICATE: str = "www-authenticate";
+
+pub rec Limits {
+    max_count:       usize;
+    max_bytes:       usize;
+    max_name_bytes:  usize;
+    max_value_bytes: usize;
+}
+
+pub rec Field {
+    name:      view.View;
+    value:     view.View;
+    sensitive: bool;
+}
+
+pub rec Fields {
+    items:    *Field;
+    len:      usize;
+    capacity: usize;
+    bytes:    usize;
+    limits:   Limits;
+    valid:    bool;
+}
+
+fun token_char(c: u8) bool {
+    ret (c >= '0' && c <= '9')
+        || (c >= 'A' && c <= 'Z')
+        || (c >= 'a' && c <= 'z')
+        || c == '!' || c == '#' || c == '$' || c == '%' || c == '&'
+        || c == 39 || c == '*' || c == '+' || c == '-' || c == '.'
+        || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+}
+
+pub fun valid_name(name: view.View) bool {
+    if (name.data == nil || name.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < name.len) {
+        if (!token_char(name.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun valid_value(value: view.View) bool {
+    if (value.data == nil && value.len != 0) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val c: u8 = value.data[i];
+        if (c == 0 || c == '\r' || c == '\n' || (c < ' ' && c != '\t') || c == 127) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun limits(max_count: usize, max_bytes: usize, max_name_bytes: usize, max_value_bytes: usize) Limits {
+    ret Limits{
+        max_count: max_count,
+        max_bytes: max_bytes,
+        max_name_bytes: max_name_bytes,
+        max_value_bytes: max_value_bytes,
+    };
+}
+
+pub fun init(items: *Field, capacity: usize, configured: Limits) Fields {
+    var fields: Fields;
+    fields.items = items;
+    fields.len = 0;
+    fields.capacity = capacity;
+    fields.bytes = 0;
+    fields.limits = configured;
+    fields.valid = capacity == 0 || items != nil;
+    ret fields;
+}
+
+fun equal_char(a: u8, b: u8) bool {
+    var left: u8 = a;
+    var right: u8 = b;
+    if (left >= 'A' && left <= 'Z') { left = left + 32; }
+    if (right >= 'A' && right <= 'Z') { right = right + 32; }
+    ret left == right;
+}
+
+pub fun name_equal(a: view.View, b: view.View) bool {
+    if (a.len != b.len || (a.len != 0 && (a.data == nil || b.data == nil))) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (!equal_char(a.data[i], b.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun name_is(name: view.View, value: str, len: usize) bool {
+    ret name_equal(name, view.view(value, len));
+}
+
+pub fun allowed_trailer_name(name: view.View) bool {
+    if (name_is(name, "connection", 10) || name_is(name, "content-encoding", 16)
+     || name_is(name, "content-length", 14) || name_is(name, "content-range", 13)
+     || name_is(name, "content-type", 12) || name_is(name, "host", 4)
+     || name_is(name, "te", 2) || name_is(name, "trailer", 7)
+     || name_is(name, "transfer-encoding", 17) || name_is(name, "upgrade", 7)
+     || name_is(name, "authorization", 13) || name_is(name, "proxy-authorization", 19)) { ret false; }
+    ret true;
+}
+
+pub fun append(fields: *Fields, item: Field) AddStatus {
+    if (fields == nil || !fields.valid || !valid_name(item.name) || !valid_value(item.value)) { ret ADD_INVALID; }
+    if (fields.len >= fields.limits.max_count) { ret ADD_COUNT_LIMIT; }
+    if (fields.len >= fields.capacity) { ret ADD_STORAGE_LIMIT; }
+    if (item.name.len > fields.limits.max_name_bytes) { ret ADD_NAME_LIMIT; }
+    if (item.value.len > fields.limits.max_value_bytes) { ret ADD_VALUE_LIMIT; }
+    if (item.name.len > fields.limits.max_bytes
+     || item.value.len > fields.limits.max_bytes - item.name.len) { ret ADD_BYTE_LIMIT; }
+    val added: usize = item.name.len + item.value.len;
+    if (fields.bytes > fields.limits.max_bytes - added) { ret ADD_BYTE_LIMIT; }
+    fields.items[fields.len] = item;
+    fields.len = fields.len + 1;
+    fields.bytes = fields.bytes + added;
+    ret ADD_OK;
+}
+
+pub fun append_trailer(fields: *Fields, item: Field) AddStatus {
+    if (!allowed_trailer_name(item.name)) { ret ADD_FORBIDDEN_TRAILER; }
+    ret append(fields, item);
+}
+
+pub fun within_limits(actual: Limits, maximum: Limits) bool {
+    ret actual.max_count <= maximum.max_count && actual.max_bytes <= maximum.max_bytes
+        && actual.max_name_bytes <= maximum.max_name_bytes
+        && actual.max_value_bytes <= maximum.max_value_bytes;
+}
+
+pub fun validate(fields: *Fields, maximum: Limits, trailers: bool) bool {
+    if (fields == nil || !fields.valid || !within_limits(fields.limits, maximum)
+     || fields.len > fields.capacity || fields.len > fields.limits.max_count) { ret false; }
+    var bytes: usize = 0;
+    var i: usize = 0;
+    for (i < fields.len) {
+        val item: *Field = ?fields.items[i];
+        if (!valid_name(item.name) || !valid_value(item.value)
+         || item.name.len > fields.limits.max_name_bytes || item.value.len > fields.limits.max_value_bytes
+         || (trailers && !allowed_trailer_name(item.name))) { ret false; }
+        if (item.name.len > fields.limits.max_bytes
+         || item.value.len > fields.limits.max_bytes - item.name.len) { ret false; }
+        val added: usize = item.name.len + item.value.len;
+        if (bytes > fields.limits.max_bytes - added) { ret false; }
+        bytes = bytes + added;
+        i = i + 1;
+    }
+    ret bytes == fields.bytes;
+}
+
+pub fun find_first(fields: *Fields, name: view.View) *Field {
+    if (fields == nil || !fields.valid) { ret nil; }
+    var i: usize = 0;
+    for (i < fields.len) {
+        if (name_equal(fields.items[i].name, name)) { ret ?fields.items[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+pub fun reset(fields: *Fields) bool {
+    if (fields == nil || !fields.valid) { ret false; }
+    fields.len = 0;
+    fields.bytes = 0;
+    ret true;
+}
+
+test "http.core.field: collections enforce every limit independently" {
+    var items: [3]Field;
+    var fields: Fields = init(?items[0], 3, limits(2, 12, 5, 7));
+    if (append(?fields, Field{name: view.view("alpha", 5), value: view.view("1234567", 7), sensitive: false}) != ADD_OK) { ret 1; }
+    if (append(?fields, Field{name: view.view("b", 1), value: view.view("", 0), sensitive: false}) != ADD_BYTE_LIMIT) { ret 2; }
+    reset(?fields);
+    if (append(?fields, Field{name: view.view("longer", 6), value: view.view("x", 1), sensitive: false}) != ADD_NAME_LIMIT) { ret 3; }
+    if (append(?fields, Field{name: view.view("a", 1), value: view.view("12345678", 8), sensitive: false}) != ADD_VALUE_LIMIT) { ret 4; }
+    if (append(?fields, Field{name: view.view("a", 1), value: view.view("1", 1), sensitive: false}) != ADD_OK
+     || append(?fields, Field{name: view.view("b", 1), value: view.view("2", 1), sensitive: false}) != ADD_OK
+     || append(?fields, Field{name: view.view("c", 1), value: view.view("3", 1), sensitive: false}) != ADD_COUNT_LIMIT) { ret 5; }
+    ret 0;
+}
+
+test "http.core.field: syntax and trailer policy reject unsafe fields" {
+    var items: [2]Field;
+    var fields: Fields = init(?items[0], 2, limits(2, 64, 32, 32));
+    if (append(?fields, Field{name: view.view("bad name", 8), value: view.view("x", 1), sensitive: false}) != ADD_INVALID) { ret 1; }
+    if (append(?fields, Field{name: view.view("x-test", 6), value: view.view("bad\r\n", 5), sensitive: false}) != ADD_INVALID) { ret 2; }
+    if (append_trailer(?fields, Field{name: view.view("Content-Length", 14), value: view.view("1", 1), sensitive: false}) != ADD_FORBIDDEN_TRAILER) { ret 3; }
+    if (append_trailer(?fields, Field{name: view.view("digest", 6), value: view.view("ok", 2), sensitive: true}) != ADD_OK) { ret 4; }
+    if (find_first(?fields, view.view("DIGEST", 6)) == nil) { ret 5; }
+    if (!name_equal(view.view(CONTENT_TYPE, 12), view.view("Content-Type", 12))) { ret 6; }
+    ret 0;
+}
+
+test "http.core.field: physical storage and policy capacity are distinct" {
+    var item: Field;
+    var invalid: Fields = init(nil, 1, limits(1, 8, 4, 4));
+    if (append(?invalid, item) != ADD_INVALID) { ret 1; }
+    var one: [1]Field;
+    var fields: Fields = init(?one[0], 1, limits(2, 8, 4, 4));
+    if (append(?fields, Field{name: view.view("name", 4), value: view.view("data", 4), sensitive: false}) != ADD_OK) { ret 2; }
+    if (append(?fields, Field{name: view.view("x", 1), value: view.view("y", 1), sensitive: false}) != ADD_STORAGE_LIMIT) { ret 3; }
+    ret 0;
+}
+
+test "http.core.field: validation detects direct mutation and weaker limits" {
+    var items: [1]Field;
+    var fields: Fields = init(?items[0], 1, limits(1, 8, 4, 4));
+    if (append(?fields, Field{name: view.view("name", 4), value: view.view("data", 4), sensitive: false}) != ADD_OK) { ret 1; }
+    if (!validate(?fields, limits(2, 16, 8, 8), false)) { ret 2; }
+    fields.bytes = 7;
+    if (validate(?fields, limits(2, 16, 8, 8), false)) { ret 3; }
+    fields.bytes = 8;
+    if (validate(?fields, limits(0, 16, 8, 8), false)) { ret 4; }
+    ret 0;
+}

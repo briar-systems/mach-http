@@ -1,0 +1,90 @@
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+pub def Kind: u8;
+
+pub val GET:     Kind = 1;
+pub val HEAD:    Kind = 2;
+pub val POST:    Kind = 3;
+pub val PUT:     Kind = 4;
+pub val DELETE:  Kind = 5;
+pub val CONNECT: Kind = 6;
+pub val OPTIONS: Kind = 7;
+pub val TRACE:   Kind = 8;
+pub val PATCH:   Kind = 9;
+pub val EXTENSION: Kind = 10;
+
+pub rec Method {
+    kind:  Kind;
+    token: view.View;
+}
+
+fun token_char(c: u8) bool {
+    ret (c >= '0' && c <= '9')
+        || (c >= 'A' && c <= 'Z')
+        || (c >= 'a' && c <= 'z')
+        || c == '!' || c == '#' || c == '$' || c == '%' || c == '&'
+        || c == 39 || c == '*' || c == '+' || c == '-' || c == '.'
+        || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+}
+
+pub fun valid_token(token: view.View, max_bytes: usize) bool {
+    if (token.data == nil || token.len == 0 || token.len > max_bytes) { ret false; }
+    var i: usize = 0;
+    for (i < token.len) {
+        if (!token_char(token.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun from_kind(kind: Kind) Method {
+    if (kind == GET)     { ret Method{kind: GET, token: view.view("GET", 3)}; }
+    if (kind == HEAD)    { ret Method{kind: HEAD, token: view.view("HEAD", 4)}; }
+    if (kind == POST)    { ret Method{kind: POST, token: view.view("POST", 4)}; }
+    if (kind == PUT)     { ret Method{kind: PUT, token: view.view("PUT", 3)}; }
+    if (kind == DELETE)  { ret Method{kind: DELETE, token: view.view("DELETE", 6)}; }
+    if (kind == CONNECT) { ret Method{kind: CONNECT, token: view.view("CONNECT", 7)}; }
+    if (kind == OPTIONS) { ret Method{kind: OPTIONS, token: view.view("OPTIONS", 7)}; }
+    if (kind == TRACE)   { ret Method{kind: TRACE, token: view.view("TRACE", 5)}; }
+    if (kind == PATCH)   { ret Method{kind: PATCH, token: view.view("PATCH", 5)}; }
+    ret Method{kind: 0, token: view.view(nil, 0)};
+}
+
+pub fun extension(token: view.View) Method {
+    ret Method{kind: EXTENSION, token: token};
+}
+
+pub fun valid(m: Method, max_bytes: usize) bool {
+    if (!valid_token(m.token, max_bytes)) { ret false; }
+    if (m.kind == EXTENSION) { ret true; }
+    val known: Method = from_kind(m.kind);
+    if (known.kind == 0) { ret false; }
+    ret view.view_eq_str(m.token, known.token.data);
+}
+
+pub fun is_safe(kind: Kind) bool {
+    ret kind == GET || kind == HEAD || kind == OPTIONS || kind == TRACE;
+}
+
+pub fun is_idempotent(kind: Kind) bool {
+    ret is_safe(kind) || kind == PUT || kind == DELETE;
+}
+
+test "http.core.method: common methods retain canonical tokens" {
+    if (!valid(from_kind(GET), 8) || !valid(from_kind(CONNECT), 8) || !valid(from_kind(PATCH), 8)) { ret 1; }
+    if (valid(Method{kind: GET, token: view.view("get", 3)}, 8)) { ret 2; }
+    if (!is_safe(TRACE) || is_safe(POST) || !is_idempotent(DELETE) || is_idempotent(PATCH)) { ret 3; }
+    ret 0;
+}
+
+test "http.core.method: extension methods are bounded tokens" {
+    if (!valid(extension(view.view("PURGE", 5)), 5)) { ret 1; }
+    if (valid(extension(view.view("PURGE", 5)), 4)) { ret 2; }
+    if (valid(extension(view.view("BAD METHOD", 10)), 16)) { ret 3; }
+    if (valid(extension(view.view("", 0)), 16)) { ret 4; }
+    ret 0;
+}
