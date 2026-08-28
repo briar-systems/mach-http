@@ -185,7 +185,8 @@ pub fun within_limits(actual: Limits, maximum: Limits) bool {
 
 pub fun validate(fields: *Fields, maximum: Limits, trailers: bool) bool {
     if (fields == nil || !fields.valid || !within_limits(fields.limits, maximum)
-     || fields.len > fields.capacity || fields.len > fields.limits.max_count) { ret false; }
+     || (fields.capacity != 0 && fields.items == nil) || fields.len > fields.capacity
+     || fields.len > fields.limits.max_count) { ret false; }
     var bytes: usize = 0;
     var i: usize = 0;
     for (i < fields.len) {

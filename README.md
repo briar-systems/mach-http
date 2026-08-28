@@ -6,8 +6,9 @@ The version-neutral service exchange is implemented. It provides bounded methods
 statuses, fields, targets, metadata, informational responses, trailers, response
 construction, hierarchical cancellation, and streaming body lifecycles shared by
 HTTP/1, HTTP/2, and HTTP/3. The ordered-byte transport boundary is also implemented
-with completion-driven plaintext and secured adapters. Protocol parsing,
-serialization, routing, and connection engines remain under development.
+with completion-driven plaintext and secured adapters. HTTP/1
+wire parsing, framing, and serialization are implemented. HTTP/1 connection
+orchestration, routing, and the HTTP/2 and HTTP/3 wire layers remain under development.
 
 ## Design
 
@@ -26,6 +27,9 @@ serialization, routing, and connection engines remain under development.
   control scope, so close and cancellation races settle exactly once.
 - Routing storage is caller-owned. The router does not require a global allocator.
 - HTTP/1.1, HTTP/2, HTTP/3, and WebSocket state are isolated from the version-neutral application contract.
+- HTTP/1 parser-owned message views live until reset. Body views borrow only the
+  current input. Serializers retain no body pointer across calls and borrow trailer
+  fields until terminal chunk serialization.
 - TLS belongs below the transport contract and is not a dependency of this package.
 
 ## Layout
@@ -33,7 +37,7 @@ serialization, routing, and connection engines remain under development.
 ```text
 src/
   core/       request, response, body, and transport contracts
-  h1/         HTTP/1 parser, framing, and serializer state
+  h1/         strict incremental HTTP/1 framing, parsing, and serialization
   h2/         HTTP/2 frames, HPACK, flow control, and connection state
   h3/         HTTP/3 frames, QPACK, control streams, and connection state
   server/     server configuration and lifecycle state
