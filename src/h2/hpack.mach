@@ -862,6 +862,9 @@ fun decode_block(decoder: *Decoder) Error {
             decoder.saw_field = true;
         }
     }
+    if (decoder.update_required && !decoder.update_satisfied) {
+        ret ERROR_TABLE_UPDATE;
+    }
     if (!shadow_commit(?decoder.shadow)) { ret ERROR_TABLE_LIMIT; }
     if (decoder.update_required && decoder.update_satisfied) {
         decoder.table.requires_update = false;
@@ -1337,6 +1340,25 @@ test "http.h2.hpack: reduced table limit requires ordered update" {
     indexed[0] = 0x82;
     if (decoder_feed(?missing, ?indexed[0], 1, true).error != ERROR_TABLE_UPDATE
      || !missing_table.requires_update) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.hpack: required table update rejects empty block" {
+    val limits: Limits = limits_default();
+    var entries: [100]Entry;
+    var table_storage: [4096]u8;
+    var table: DynamicTable;
+    table_init(?table, ?entries[0], 100, ?table_storage[0], 4096, 4096, 4096);
+    table_set_allowed_max(?table, 128);
+    var encoded: [8]u8;
+    var fields: [100]field.Field;
+    var storage: [64]u8;
+    var pending: [100]Entry;
+    var decoder: Decoder;
+    decoder_init(?decoder, ?table, ?encoded[0], 8, ?fields[0], 100,
+        ?storage[0], 64, ?pending[0], 100, limits);
+    val decoded: Decode = decoder_feed(?decoder, nil, 0, true);
+    if (decoded.error != ERROR_TABLE_UPDATE || !table.requires_update) { ret 1; }
     ret 0;
 }
 
