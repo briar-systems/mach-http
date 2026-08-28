@@ -252,10 +252,17 @@ pub fun init_response(response: *Response, fields: *field.Field, field_capacity:
 }
 
 pub fun set_status(response: *Response, code: status.Status) ResponseStatus {
-    if (response == nil || !status.is_final(code)) { ret RESPONSE_INVALID; }
+    if (response == nil || (!status.is_final(code) && code != status.SWITCHING_PROTOCOLS)) {
+        ret RESPONSE_INVALID;
+    }
     if (response.committed) { ret RESPONSE_COMMITTED; }
     response.status = code;
     ret RESPONSE_OK;
+}
+
+fun response_status_allowed(method_kind: method.Kind, code: status.Status) bool {
+    ret status.is_final(code)
+        || (code == status.SWITCHING_PROTOCOLS && method_kind == method.GET);
 }
 
 pub fun add_field(response: *Response, item: field.Field) field.AddStatus {
@@ -295,7 +302,8 @@ pub fun set_body_writer(response: *Response, writer: *body.Writer, configured: L
 }
 
 pub fun commit_response(response: *Response, method_kind: method.Kind, configured: Limits) ResponseStatus {
-    if (response == nil || response.generation == 0 || !status.is_final(response.status)) { ret RESPONSE_INVALID; }
+    if (response == nil || response.generation == 0
+     || !response_status_allowed(method_kind, response.status)) { ret RESPONSE_INVALID; }
     if (response.committed) { ret RESPONSE_COMMITTED; }
     if (!field.validate(?response.fields, configured.response_fields, false)
      || !field.validate(?response.trailers, configured.response_trailers, true)) { ret RESPONSE_LIMIT; }
@@ -321,7 +329,7 @@ pub fun validate_committed_response(response: *Response, method_kind: method.Kin
      || response.body_kind != response.committed_body_kind
      || response.body_reader != response.committed_body_reader
      || response.body_writer != response.committed_body_writer
-     || !status.is_final(response.status)
+     || !response_status_allowed(method_kind, response.status)
      || !field.validate(?response.fields, configured.response_fields, false)
      || !field.validate(?response.trailers, configured.response_trailers, true)
      || (!status.permits_content(method_kind, response.status) && response.body_kind != BODY_NONE)) { ret false; }

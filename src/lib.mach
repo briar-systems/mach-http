@@ -22,6 +22,7 @@ fwd h3_frame: http.h3.frame;
 fwd http.h3.qpack;
 fwd h3_connection: http.h3.connection;
 fwd http.websocket;
+fwd http.websocket.negotiation;
 fwd http.server.server;
 fwd http.client.client;
 fwd http.router.router;
