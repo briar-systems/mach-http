@@ -12,8 +12,11 @@ endpoints. The DNS cache and connection pool have their own caller-provided arra
 `client.init` rejects overlap among all nine objects and backing regions before it
 writes any storage. Submission also rejects request views, body readers, body
 provider contexts, and body cancellation scopes that overlap client-owned storage.
-Response completion rejects the response object, fields, trailers, bodies, provider
-contexts, and scopes on the same basis before ownership changes.
+For every field collection, ownership covers the complete physical backing capacity,
+not only the populated length. It also covers the trailer collection referenced by a
+body reader or writer, including that collection's descriptor, complete backing
+capacity, and populated name and value views. Response callbacks reject the response
+object and all of these nested regions on the same basis before ownership changes.
 
 Every public borrowed pointer, view, array count, and capacity is checked for
 address-space representability before the first dereference. Zero-length ranges may
@@ -21,11 +24,14 @@ use a null pointer. Non-empty ranges must not be null or wrap the address space.
 The supplied parent cancellation scope is range-checked and rejected if it overlaps
 client-owned storage before the client queries its cancellation reason.
 
-The client owns the cache and pool lifecycle after initialization. Drain and destroy
-them through the client, then destroy the empty dependencies. A `Request` and all of
-its borrowed method, target, field, trailer, and body storage remain fixed until the
+The client owns the cache and pool lifecycle after initialization. Both dependencies
+must still accept work when `client.init` adopts them. Initialization rejects a
+drained or already-draining cache or pool. Drain and destroy adopted dependencies
+through the client, then destroy the empty dependencies. A `Request` and all of its
+borrowed method, target, field, trailer, and body storage remain fixed until the
 matching request token is released or a replay or redirect explicitly replaces that
-generation. Routes are copied into the request slot and no longer borrow the
+generation, except for the one body-scope rebind performed when the initial request
+is accepted. Routes are copied into the request slot and no longer borrow the
 submission views.
 
 The client is single-owner by design. DNS and pool internals synchronize their own
@@ -58,15 +64,20 @@ Call `submit`, then call `next` until it publishes an external action or complet
   for HTTP/2 and HTTP/3. A complete retryable HTTP response enters through
   `exchange_response_retry`, which either schedules replay or preserves that exact
   response as the final successful HTTP outcome when policy denies or exhausts the
-  retry. Response completion and retry require the owned response body to be in a
-  terminal state whose reuse decision exactly matches the callback. The completion
-  supplies that body reuse decision to control pool retention.
+  retry. Every callback that consumes the exchange requires the transferred request
+  body and any response body to have reached terminal states. Its outcome and reuse
+  evidence must exactly match the common `http.core.exchange.Exchange` combination
+  of both body results. Cancellation, timeout, limit, and body error results therefore
+  cannot be published as a successful client outcome. Either body forbidding reuse
+  forbids connection reuse. HTTP 101 always forbids reuse. Successful HTTP/1 CONNECT
+  also forbids reuse because the lease becomes the upgraded or tunneled transport.
 - `ACTION_WAIT_DNS`, `ACTION_WAIT_POOL`, and `ACTION_WAIT_TIMER` retain no new caller
   buffer. Drive `next` again after the corresponding state changes or absolute time
   arrives.
 - `ACTION_REPLAY` requires the caller to produce a fresh request generation. The
   client never rewinds, copies, or buffers a request body. `replay_ready` verifies the
-  method, target, deadline, memory ownership, and new generation before retrying.
+  method, target, deadline, memory ownership, and new generation before retrying. An
+  open replacement body must already use the request's existing client child scope.
 - `ACTION_COMPLETE` remains stable until `release_request` destroys its cancellation
   child and returns the slot to the client.
 
@@ -116,11 +127,12 @@ cancellation actions remain gated to dependency drain.
 Retry permission is application data. `Replay.explicit` must be true and the body
 must be empty or externally rewindable. Streaming bodies are never retried. Transport
 and protocol retries additionally require exact proof that the request was not
-processed. Contradictory response or processing flags are invalid rather than a
-retry denial. Response retries require a complete response and an enabled status
-class. The response status must match the supplied response retry reason. A detached
-or contradictory reason is rejected without consuming the exchange. Retry-After
-delays and DNS negative-cache delays are absolute wait actions.
+processed. A valid transport or protocol failure without that proof is terminalized
+with forbidden connection reuse and is never replayed. Contradictory response or
+processing flags remain invalid. Response retries require a complete response and an
+enabled status class. The response status must match the supplied response retry
+reason. A detached or contradictory reason is rejected without consuming the
+exchange. Retry-After delays and DNS negative-cache delays are absolute wait actions.
 
 Redirect evaluation distinguishes method rewriting, body removal, downgrade policy,
 origin credentials, and proxy credentials. `follow_redirect` accepts only a fresh,
@@ -136,8 +148,12 @@ cancellation wins over both following and publishing a redirect error.
 
 ## Cancellation and shutdown
 
-Every request owns a child of the supplied cancellation scope. The effective
-deadline must exactly match the request metadata. Call `cancel_request` or
+Every request owns a child of the supplied cancellation scope. An open request body
+must initially reference that supplied parent. After the child is created, the client
+rebinds the body to it so the selected engine can initialize the common
+`http.core.exchange.Exchange` without mutating otherwise fixed request storage. A
+replay or redirect replacement must already reference the current child. The
+effective deadline must exactly match the request metadata. Call `cancel_request` or
 `expire_request`, or drive the same child scope directly. Cancellation wins a late
 connect or exchange callback. A late untransferred connect driver returns to the
 connector for closure. A driver already owned by another connection does not. Late

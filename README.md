@@ -93,7 +93,8 @@ drain are implemented.
   were actually sent.
 - Client requests use caller-owned fixed slots and stable generation tokens. Routes
   are copied, while request fields, targets, and bodies remain borrowed for one exact
-  request generation.
+  request generation. Field ownership includes complete backing capacities and body
+  trailer collections, not only populated entries.
 - Public client pointers, views, counts, and capacities are address-space checked
   before dereference. Raw URLs reject embedded NUL bytes, and bracketed authorities
   require a valid IPv6 literal.
@@ -108,11 +109,14 @@ drain are implemented.
   updates. Driver ownership transfers exactly once, so stale or duplicate connect
   callbacks cannot close a live connection.
 - Retries require explicit replay authorization. Streaming bodies are never buffered
-  or retried. Retry callbacks return the exact published exchange lease and complete
-  response retries prove terminal body ownership and reuse. Cross-origin and
-  cross-proxy redirects require sensitive fields and trailers to be removed from a
-  fresh request generation. Redirects retain the original protocol policy, preserve
-  a live lease on release failure, and settle cancellation before redirect outcomes.
+  or retried. Exchange callbacks return the exact published lease and require both
+  transferred bodies to be terminal. Client outcome and connection reuse combine
+  both body results through the common exchange contract. Ambiguous failures settle
+  without replay or reuse. HTTP 101 and successful HTTP/1 CONNECT never return their
+  upgraded transport to the pool. Cross-origin and cross-proxy redirects require
+  sensitive fields and trailers to be removed from a fresh request generation.
+  Redirects retain the original protocol policy, preserve a live lease on release
+  failure, and settle cancellation before redirect outcomes.
 - The pool route is the canonical authority. Host, CONNECT authority-form, and
   forward-proxy absolute-form inputs are checked against it before exchange.
 - TLS belongs below the transport contract and is not a dependency of this package.
