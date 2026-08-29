@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `destroy` on the HTTP/1, HTTP/2, and HTTP/3 connection engines. Each returns its engine to the state `init` accepts, so one set of caller-owned storage can carry a succession of connections, and each refuses while the transport, the application, or a live stream still references that storage.
+
+### Fixed
+
+- A connection engine was usable exactly once. `init` and the guards on the HPACK and QPACK tables, the frame parser and writer, the QPACK section sets, and the critical-stream record all refuse to run twice, so pooled storage could not be re-initialised and consumers cleared those flags from outside. Both dynamic tables now come back empty, because a surviving table would decode the next connection against entries its peer never inserted.
+- `src/lib.mach` reported version `0.4.0` while the manifest had moved to `0.5.0`, so `tools/check-version.sh` failed on `main` and `dev`.
+
 ## [0.5.0] - 2026-08-28
 
 ### Changed

@@ -22,6 +22,17 @@ the connection HPACK context synchronized under saturation. If even the reserve 
 unavailable because closed generations were not released, the connection fails with
 `ENHANCE_YOUR_CALM` instead of continuing with a corrupt compression context.
 
+`destroy` returns the engine to the state `init` accepts, so one set of caller-owned
+storage can carry a succession of connections. It refuses while the transport still
+owns a read, write, or close operation, while the application still borrows an
+event, and while any stream is live, because each of those is a reference into
+storage the caller is about to reuse. It clears every initialization guard the
+engine holds by value, including both HPACK dynamic tables, the frame parser, and
+the frame writer, so no consumer has to reach in and clear one. Both dynamic tables
+come back empty: a surviving table would decode the next connection against entries
+its peer never inserted. The connection itself is not pooled, only the storage, so
+the next `init` takes a fresh transport.
+
 HPACK storage must cover the protocol's 4096-byte initial table size even when the
 advertised table size is lower. A lower local size takes effect only after its
 SETTINGS bytes complete on the transport. The next peer field block must then carry
