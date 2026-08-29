@@ -89,6 +89,13 @@ pub fun make_session(session: *Session, driver: *qt.Driver, clock: *u64,
                      role: h3.Role, configured: h3.Config) bool {
     if (!cancel.make_root(?session.scope, false,
         time.Time{sec: 0, nsec: 0})) { ret false; }
+    ret start_session(session, driver, clock, role, configured);
+}
+
+# every argument but the driver is the session's own storage, so calling this a
+# second time is exactly what a pool does with a recycled engine
+pub fun start_session(session: *Session, driver: *qt.Driver, clock: *u64,
+                      role: h3.Role, configured: h3.Config) bool {
     var i: usize = 0;
     for (i < STREAM_SLOTS) {
         session.memories[i] = h3.StreamMemory{
@@ -156,6 +163,8 @@ pub fun tick(session: *Session) h3.Event {
 pub rec Fabric {
     client_wire: loopback.Endpoint;
     server_wire: loopback.Endpoint;
+    pooled_client_wire: loopback.Endpoint;
+    pooled_server_wire: loopback.Endpoint;
     link: loopback.Link;
     client: Session;
     server: Session;
@@ -179,6 +188,34 @@ pub fun make_fabric_with(fabric: *Fabric, client_config: h3.Config,
 
 pub fun make_fabric(fabric: *Fabric, configured: h3.Config, window: u64) usize {
     ret make_fabric_with(fabric, configured, configured, window);
+}
+
+# a fresh driver pair carrying the same engine storage, which is what a pool
+# hands to the next connection
+pub fun recycle(fabric: *Fabric, configured: h3.Config, window: u64) usize {
+    if (!h3.destroy(?fabric.client.engine)) { ret 30; }
+    if (!h3.destroy(?fabric.server.engine)) { ret 31; }
+    val client_ready: usize = loopback.init_endpoint(?fabric.pooled_client_wire,
+        401, true, window);
+    if (client_ready != 0) { ret 40 + client_ready; }
+    val server_ready: usize = loopback.init_endpoint(?fabric.pooled_server_wire,
+        402, false, window);
+    if (server_ready != 0) { ret 50 + server_ready; }
+    loopback.init_link(?fabric.link, ?fabric.pooled_client_wire,
+        ?fabric.pooled_server_wire);
+    var i: usize = 0;
+    for (i < EVENT_KINDS) {
+        fabric.client.counts[i] = 0;
+        fabric.server.counts[i] = 0;
+        i = i + 1;
+    }
+    fabric.client.rejected = 0;
+    fabric.server.rejected = 0;
+    if (!start_session(?fabric.client, ?fabric.pooled_client_wire.driver,
+        ?fabric.link.now_ns, h3.CLIENT, configured)) { ret 60; }
+    if (!start_session(?fabric.server, ?fabric.pooled_server_wire.driver,
+        ?fabric.link.now_ns, h3.SERVER, configured)) { ret 61; }
+    ret 0;
 }
 
 # one turn: drain both engines' event queues, then move datagrams both ways

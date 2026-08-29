@@ -538,6 +538,19 @@ fun fail(engine: *Engine, error: Error) Event {
     ret empty_event(engine, EVENT_ERROR);
 }
 
+# returns the engine to the state `init` accepts so caller-owned storage can
+# carry a second connection. zeroing is deliberate: it also drops the transport
+# tokens and held-body pointer `init` does not otherwise rewrite, and a field
+# added later must not silently survive a reuse.
+pub fun destroy(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized) { ret false; }
+    if (engine.read_pending || engine.write_pending || engine.shutdown_pending
+     || engine.close_pending || engine.held_body != nil
+     || engine.count != 0) { ret false; }
+    memory.raw_zero(engine::ptr, $size_of(Engine));
+    ret true;
+}
+
 pub fun tick(engine: *Engine, now: time.Time) Event {
     if (engine == nil || !engine.initialized || !valid_now(now)) {
         var invalid: Event;
@@ -1171,6 +1184,10 @@ rec Fixture {
     adapter: transport.Adapter;
     transport_slots: [3]transport.Slot;
     transport: transport.Transport;
+    pooled_operation_root: cancel.Scope;
+    pooled_control_root: cancel.Scope;
+    pooled_slots: [3]transport.Slot;
+    pooled_transport: transport.Transport;
     slots: [3]Slot;
     memories: [3]SlotMemory;
     lines: [3][256]u8;
@@ -1217,7 +1234,6 @@ fun make_fixture(fixture: *Fixture, role: Role, pipeline: usize) bool {
     fixture.adapter.submit_close = test_close;
     if (!transport.init(?fixture.transport, fixture.adapter, ?fixture.operation_root,
         ?fixture.control_root, ?fixture.transport_slots[0], 3)) { ret false; }
-    val configured: Config = test_config(pipeline);
     var i: usize = 0;
     for (i < pipeline) {
         fixture.memories[i] = SlotMemory{
@@ -1229,10 +1245,18 @@ fun make_fixture(fixture: *Fixture, role: Role, pipeline: usize) bool {
         };
         i = i + 1;
     }
-    ret init(?fixture.engine, role, ?fixture.transport, ?fixture.operation_root,
+    ret start_engine(fixture, ?fixture.transport, ?fixture.operation_root, role,
+        pipeline);
+}
+
+# every argument but the connection is the fixture's own storage, so calling
+# this a second time is exactly what a pool does with a recycled engine
+fun start_engine(fixture: *Fixture, connection: *transport.Transport,
+    scope: *cancel.Scope, role: Role, pipeline: usize) bool {
+    ret init(?fixture.engine, role, connection, scope,
         ?fixture.slots[0], ?fixture.memories[0], pipeline,
         ?fixture.read_buffer[0], 512, ?fixture.write_buffer[0], 128,
-        configured, test_now(100));
+        test_config(pipeline), test_now(100));
 }
 
 fun complete_read(fixture: *Fixture, wire: str, eof: bool, now: time.Time) Event {
@@ -1281,6 +1305,61 @@ fun flush_offer(fixture: *Fixture, index: usize, body: *u8,
         }
     }
     ret offset == length;
+}
+
+# one complete server exchange, returning the sequence the engine assigned it
+fun pooled_exchange(fixture: *Fixture, now: time.Time) u64 {
+    val headers: Event = complete_read(fixture,
+        "GET /1 HTTP/1.1\r\nHost: x\r\n\r\n", false, now);
+    if (headers.kind != EVENT_REQUEST_HEADERS || headers.slot != 0
+     || process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE) { ret 0; }
+    # a slot still carrying a request refuses teardown
+    if (fixture.engine.count == 0 || destroy(?fixture.engine)) { ret 0; }
+    var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    if (!prepare_response(?fixture.engine, headers.slot, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, now)
+     || !flush_offer(fixture, headers.slot, nil, 0, true, now, false)
+     || !release(?fixture.engine, headers.slot, now)
+     || fixture.engine.count != 0) { ret 0; }
+    ret headers.sequence;
+}
+
+test "http.h1.connection: destroy returns pooled storage for a second connection" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    val first_sequence: u64 = pooled_exchange(?fixture, now);
+    if (first_sequence == 0) { ret 2; }
+    if (!begin_graceful(?fixture.engine)
+     || !progress_close(?fixture.engine)
+     || fixture.io.shutdown_calls != 1) { ret 4; }
+    if (destroy(?fixture.engine)) { ret 5; }
+    var shutdown: transport.Completion = transport.completed(
+        fixture.io.shutdown_token, transport.SHUTDOWN_WRITE, 0);
+    if (complete_io(?fixture.engine, ?shutdown, now).kind == EVENT_ERROR
+     || !progress_close(?fixture.engine) || fixture.io.close_calls != 1) { ret 6; }
+    if (destroy(?fixture.engine)) { ret 7; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed, now).kind != EVENT_CLOSED) { ret 8; }
+    if (!destroy(?fixture.engine)) { ret 9; }
+    if (fixture.engine.initialized || fixture.engine.next_sequence != 0
+     || fixture.engine.count != 0 || fixture.engine.slots != nil) { ret 10; }
+    if (destroy(?fixture.engine)) { ret 11; }
+    val none: time.Time = test_now(0);
+    if (!cancel.make_root(?fixture.pooled_operation_root, false, none)
+     || !cancel.make_root(?fixture.pooled_control_root, false, none)
+     || !transport.init(?fixture.pooled_transport, fixture.adapter,
+        ?fixture.pooled_operation_root, ?fixture.pooled_control_root,
+        ?fixture.pooled_slots[0], 3)) { ret 12; }
+    if (!start_engine(?fixture, ?fixture.pooled_transport,
+        ?fixture.pooled_operation_root, SERVER, 1)) { ret 13; }
+    if (fixture.engine.state != OPEN || fixture.engine.count != 0
+     || fixture.engine.next_sequence != 1) { ret 14; }
+    val second_sequence: u64 = pooled_exchange(?fixture, now);
+    if (second_sequence == 0 || second_sequence != first_sequence) { ret 15; }
+    if (!destroy(?fixture.engine)) { ret 16; }
+    ret 0;
 }
 
 test "http.h1.connection: server pipeline is bounded and responses stay ordered" {

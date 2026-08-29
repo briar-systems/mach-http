@@ -186,6 +186,13 @@ keeps service cancellation, response construction, streaming bodies, and termina
 completion version-neutral. See [doc/h2-connection.md](doc/h2-connection.md) for the
 state, memory, flow-control, and graceful-drain contracts.
 
+The HTTP/1, HTTP/2, and HTTP/3 connection engines each expose `destroy`, which
+returns the engine to the state `init` accepts so one set of caller-owned storage
+can carry a succession of connections. It refuses while anything still references
+that storage, and it clears every initialization guard the engine holds, so a pool
+never has to reach into these records to reset one. Only the storage is pooled: the
+next `init` takes a fresh transport.
+
 ## HTTP/3 codecs
 
 `http.h3.frame.Parser` decodes QUIC variable-length frame headers and returns borrowed
