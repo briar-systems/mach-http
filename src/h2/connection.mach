@@ -765,6 +765,19 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     ret true;
 }
 
+# returns the engine to the state `init` accepts so caller-owned storage can
+# carry a second connection. zeroing is deliberate: the initialization guards on
+# the two HPACK tables, the parser, and the writer all live inside this record,
+# as do the transport tokens `init` does not otherwise rewrite, and a field
+# added later must not silently survive a reuse.
+pub fun destroy(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized) { ret false; }
+    if (engine.read_pending || engine.write_pending || engine.close_pending
+     || engine.held || engine.active_streams != 0) { ret false; }
+    memory.raw_zero(engine::ptr, $size_of(Engine));
+    ret true;
+}
+
 pub fun send_settings(engine: *Engine, settings: Settings) bool {
     if (engine == nil || !engine.initialized || engine.local_settings_pending
      || !settings_valid(settings)
@@ -2516,6 +2529,10 @@ rec Fixture {
     adapter: transport.Adapter;
     transport_slots: [3]transport.Slot;
     wire: transport.Transport;
+    pooled_operation_root: cancel.Scope;
+    pooled_control_root: cancel.Scope;
+    pooled_slots: [3]transport.Slot;
+    pooled_wire: transport.Transport;
     streams: [5]Stream;
     memories: [5]StreamMemory;
     encoded: [5][512]u8;
@@ -2575,7 +2592,15 @@ fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
         };
         i = i + 1;
     }
-    ret init(?fixture.engine, role, ?fixture.wire, ?fixture.operation_root,
+    ret start_engine(fixture, ?fixture.wire, ?fixture.operation_root, role,
+        configured);
+}
+
+# every argument but the connection is the fixture's own storage, so calling
+# this a second time is exactly what a pool does with a recycled engine
+fun start_engine(fixture: *Fixture, connection: *transport.Transport,
+    scope: *cancel.Scope, role: Role, configured: Config) bool {
+    ret init(?fixture.engine, role, connection, scope,
         ?fixture.streams[0], ?fixture.memories[0], 5,
         ?fixture.read_buffer[0], 2048, ?fixture.write_buffer[0], 1024,
         ?fixture.frame_payload[0], 16384, ?fixture.header_output[0], 512,
@@ -2706,6 +2731,80 @@ fun test_service(context: ptr, served: *exchange.Exchange) exchange.ServiceStatu
         ret exchange.SERVICE_FAILED;
     }
     ret exchange.SERVICE_COMPLETE;
+}
+
+# one complete server-side exchange whose request block inserts a field into the
+# inbound dynamic table, so a surviving table would decode the second connection
+# against state the peer does not share
+fun pooled_exchange(fixture: *Fixture, storage: *ExchangeMemory) bool {
+    var block: [6]u8;
+    block[0] = 0x82; block[1] = 0x86; block[2] = 0x84;
+    block[3] = 0x41; block[4] = 0x01; block[5] = 'x';
+    val request: Event = receive_frame(fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 1, ?block[0], 6);
+    if (request.kind != EVENT_REQUEST_HEADERS || request.stream_id != 1
+     || request.headers.count != 4 || request.headers.regular_offset != 4
+     || !request.end_stream || fixture.engine.inbound_table.count != 1) {
+        ret false;
+    }
+    if (!make_exchange(storage, request.generation, 1)
+     || !bind_exchange(?fixture.engine, 1, ?storage.exchange)) { ret false; }
+    val service: exchange.Service = exchange.Service{ctx: nil, serve: test_service};
+    if (dispatch(?fixture.engine, 1, ?service) != exchange.SERVICE_COMPLETE
+     || !release_event(?fixture.engine, 1, request.generation)) { ret false; }
+    var response: [1]field.Field;
+    response[0] = field.Field{name: view.view(":status", 7),
+        value: view.view("204", 3), sensitive: false};
+    if (send_headers(?fixture.engine, 1, ?response[0], 1, true,
+        true).status != OFFER_OUTPUT || !drain_output(fixture)
+     || stream_for(?fixture.engine, 1).state != STREAM_CLOSED) { ret false; }
+    ret release_stream(?fixture.engine, 1, request.generation);
+}
+
+test "http.h2.connection: destroy returns pooled storage for a second connection" {
+    var fixture: Fixture;
+    var first: ExchangeMemory;
+    var second: ExchangeMemory;
+    if (!make_fixture(?fixture, SERVER, test_config())
+     || server_handshake(?fixture).kind != EVENT_SETTINGS
+     || !drain_output(?fixture)) { ret 1; }
+    if (!pooled_exchange(?fixture, ?first)) { ret 2; }
+    val inbound_bytes: usize = fixture.engine.inbound_table.bytes;
+    if (inbound_bytes == 0 || fixture.engine.active_streams != 0) { ret 3; }
+    if (!begin_graceful(?fixture.engine) || !finish_graceful(?fixture.engine)
+     || !drain_output(?fixture) || !progress_close(?fixture.engine)) { ret 4; }
+    if (destroy(?fixture.engine)) { ret 5; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed).kind != EVENT_CLOSED
+     || fixture.engine.state != CLOSED) { ret 6; }
+    if (!destroy(?fixture.engine)) { ret 7; }
+    if (fixture.engine.initialized || fixture.engine.inbound_table.valid
+     || fixture.engine.outbound_table.valid || fixture.engine.parser.initialized
+     || fixture.engine.writer.initialized
+     || fixture.engine.inbound_table.count != 0
+     || fixture.engine.inbound_table.bytes != 0
+     || fixture.engine.outbound_table.count != 0) { ret 8; }
+    if (destroy(?fixture.engine)) { ret 9; }
+    val none: time.Time = time.Time{sec: 0, nsec: 0};
+    if (!cancel.make_root(?fixture.pooled_operation_root, false, none)
+     || !cancel.make_root(?fixture.pooled_control_root, false, none)
+     || !transport.init(?fixture.pooled_wire, fixture.adapter,
+        ?fixture.pooled_operation_root, ?fixture.pooled_control_root,
+        ?fixture.pooled_slots[0], 3)) { ret 10; }
+    if (!start_engine(?fixture, ?fixture.pooled_wire,
+        ?fixture.pooled_operation_root, SERVER, test_config())) { ret 11; }
+    if (fixture.engine.state != PREFACE || fixture.engine.active_streams != 0
+     || fixture.engine.inbound_table.count != 0
+     || fixture.engine.outbound_table.count != 0
+     || fixture.engine.peer_settings_received) { ret 12; }
+    if (server_handshake(?fixture).kind != EVENT_SETTINGS
+     || fixture.engine.state != OPEN || !drain_output(?fixture)) { ret 13; }
+    if (!pooled_exchange(?fixture, ?second)) { ret 14; }
+    if (fixture.engine.inbound_table.count != 1
+     || fixture.engine.inbound_table.bytes != inbound_bytes
+     || fixture.engine.active_streams != 0) { ret 15; }
+    ret 0;
 }
 
 test "http.h2.connection: preface settings and ping interoperate incrementally" {

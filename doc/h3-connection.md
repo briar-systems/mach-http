@@ -60,6 +60,16 @@ field references. Connection storage separately owns both QPACK tables, table
 arenas, table scratch, outstanding section and reference arrays, the pending-release
 array, and the three local critical-stream queues.
 
+`destroy` returns the engine to the state `init` accepts, so one set of caller-owned
+storage can carry a succession of connections. It refuses while a request is live or
+while the transport still owes a release, because both are references into storage
+the caller is about to reuse; the peer's control and QPACK streams stay live for the
+whole connection and are reclaimed by the transport close, so they do not block
+teardown. It clears every initialization guard the engine holds by value, including
+both QPACK tables, the inbound and outbound section sets, and the critical-stream
+record, and both tables come back empty. The stream slots are reset by the next
+`init`. The QUIC connection is not pooled, only the storage.
+
 The caller zero-initializes `Engine`, `Stream`, and codec records before their first
 initialization. `init` validates every configured table, section, queue, stream, and
 memory capacity before the engine becomes live. Closed stream slots retain their

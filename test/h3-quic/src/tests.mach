@@ -646,3 +646,42 @@ test "h3quic: a drained unknown unidirectional stream releases over the driver" 
     if (fabric.server.io.blocked_releases != 0) { ret 11; }
     ret 0;
 }
+
+test "h3quic: a destroyed engine pair carries a second connection over new drivers" {
+    var fabric: session.Fabric;
+    var app: App;
+    val ready: usize = session.make_fabric(?fabric, session.session_config(), 512);
+    if (ready != 0) { ret (100 + ready)::i32; }
+    init_app(?app, ?fabric);
+    attach(?app, ?fabric);
+    app.respond_with_body = true;
+    if (!session.handshake(?fabric, 64)) { ret 2; }
+    if (start_request(?app, true) != 0) { ret 3; }
+    cycle(?app, 96);
+    if (app.request_bytes != REQUEST_BYTES
+     || app.response_bytes != RESPONSE_BYTES
+     || app.responses != 1 || app.client_ends != 1) { ret 4; }
+    if (!quiet(?app)) { ret 5; }
+    if (!app.client_slots[0].released || !app.server_slots[0].released) { ret 6; }
+    val recycled: usize = session.recycle(?fabric, session.session_config(), 512);
+    if (recycled != 0) { ret (120 + recycled)::i32; }
+    if (fabric.client.engine.state != h3.STARTING
+     || fabric.server.engine.state != h3.STARTING
+     || fabric.client.engine.peer_settings_received
+     || fabric.server.engine.peer_settings_received
+     || fabric.server.engine.inbound_table.insert_count != 0) { ret 7; }
+    var second: App;
+    init_app(?second, ?fabric);
+    attach(?second, ?fabric);
+    second.respond_with_body = true;
+    if (!session.handshake(?fabric, 64)) { ret 8; }
+    if (start_request(?second, true) != 0) { ret 9; }
+    cycle(?second, 96);
+    if (second.request_bytes != REQUEST_BYTES
+     || second.response_bytes != RESPONSE_BYTES
+     || second.responses != 1 || second.client_ends != 1) { ret 10; }
+    if (!quiet(?second)) { ret 11; }
+    if (!second.client_slots[0].released
+     || !second.server_slots[0].released) { ret 12; }
+    ret 0;
+}

@@ -2426,6 +2426,30 @@ pub fun release_stream(engine: *Engine, id: u64, generation: u64) bool {
     ret true;
 }
 
+# returns the engine to the state `init` accepts so caller-owned storage can
+# carry a second connection. zeroing is deliberate: the guards on both QPACK
+# tables, the inbound and outbound section sets, and the critical-stream record
+# all live inside this record, as does the pending-release count, and a field
+# added later must not silently survive a reuse. the caller's stream slots are
+# reset by `init` itself.
+#
+# the peer's control and QPACK streams stay live for the whole connection and
+# are reclaimed by the transport close, so they do not block teardown; an
+# application borrow or a release the transport still owes does.
+pub fun destroy(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized) { ret false; }
+    if (engine.active_requests != 0 || engine.pending_release_count != 0) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < engine.stream_capacity) {
+        if (engine.streams[i].live && engine.streams[i].held) { ret false; }
+        i = i + 1;
+    }
+    memory.raw_zero(engine::ptr, $size_of(Engine));
+    ret true;
+}
+
 pub fun detach_exchange(engine: *Engine, id: u64,
     generation: u64) *exchange.Exchange {
     val stream: *Stream = stream_for(engine, id);
@@ -2612,6 +2636,10 @@ rec TestTransport {
     close_code: u64;
 }
 
+fun no_handle() StreamHandle {
+    ret StreamHandle{source: 0, index: 0, generation: 0, id: 0};
+}
+
 fun test_wire(io: *TestTransport, value: StreamHandle) *TestWire {
     if (io == nil || value.source != io.source || value.index >= io.capacity) { ret nil; }
     val wire: *TestWire = ?io.wires[value.index];
@@ -2648,7 +2676,7 @@ fun test_open(context: ptr, direction: u8) TransportOpen {
     if (direction == UNIDIRECTIONAL) { id = io.next_uni; }
     val wire: *TestWire = test_claim(io, id);
     if (wire == nil) {
-        ret TransportOpen{status: TRANSPORT_BLOCKED,
+        ret TransportOpen{status: TRANSPORT_BLOCKED, stream: no_handle(),
             stream_limit_blocked: false, storage_blocked: true, error: 0};
     }
     if (direction == UNIDIRECTIONAL) { io.next_uni = io.next_uni + 4; }
@@ -2670,7 +2698,7 @@ fun test_accept(context: ptr) TransportOpen {
         }
         i = i + 1;
     }
-    ret TransportOpen{status: TRANSPORT_EMPTY,
+    ret TransportOpen{status: TRANSPORT_EMPTY, stream: no_handle(),
         stream_limit_blocked: false, storage_blocked: false, error: 0};
 }
 
@@ -2848,9 +2876,8 @@ fun test_config() Config {
     ret configured;
 }
 
-fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
-    val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!cancel.make_root(?fixture.scope, false, none)) { ret false; }
+# a fresh transport, as a pooled engine gets for its next connection
+fun reset_io(fixture: *Fixture, role: Role) {
     fixture.io.wires = ?fixture.wires[0]; fixture.io.capacity = 12;
     fixture.io.role = role; fixture.io.source = 77;
     if (role == CLIENT) {
@@ -2866,7 +2893,19 @@ fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
         fixture.wires[i].output = ?fixture.wire_output[i][0];
         fixture.wires[i].output_capacity = 1024; i = i + 1;
     }
-    i = 0;
+}
+
+fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
+    val none: time.Time = time.Time{sec: 0, nsec: 0};
+    if (!cancel.make_root(?fixture.scope, false, none)) { ret false; }
+    reset_io(fixture, role);
+    ret start_engine(fixture, role, configured);
+}
+
+# every argument is the fixture's own storage, so calling this a second time is
+# exactly what a pool does with a recycled engine
+fun start_engine(fixture: *Fixture, role: Role, configured: Config) bool {
+    var i: usize = 0;
     for (i < 6) {
         fixture.memories[i] = StreamMemory{
             read: ?fixture.reads[i][0], read_capacity: 128,
@@ -3033,6 +3072,92 @@ fun test_service(context: ptr, served: *exchange.Exchange) exchange.ServiceStatu
         ret exchange.SERVICE_FAILED;
     }
     ret exchange.SERVICE_COMPLETE;
+}
+
+# one complete server exchange over a request stream that the caller releases
+fun pooled_exchange(fixture: *Fixture, storage: *ExchangeMemory) bool {
+    var request_bytes: [16]u8;
+    val request_length: usize = static_request(?request_bytes[0], 16);
+    val wire: *TestWire = peer_stream(fixture, 0, ?request_bytes[0],
+        request_length, true);
+    if (wire == nil) { ret false; }
+    val request: Event = drive(fixture, EVENT_REQUEST_HEADERS, 128);
+    if (request.kind != EVENT_REQUEST_HEADERS || request.stream_id != 0) {
+        ret false;
+    }
+    # a live request refuses teardown
+    if (destroy(?fixture.engine)) { ret false; }
+    val service: exchange.Service = exchange.Service{ctx: nil, serve: test_service};
+    if (!make_exchange(storage, request.generation, 0)
+     || !bind_exchange(?fixture.engine, 0, ?storage.exchange)
+     || !release_event(?fixture.engine, 0, request.generation)
+     || dispatch(?fixture.engine, 0, ?service) != exchange.SERVICE_COMPLETE
+     || drive(fixture, EVENT_STREAM_END, 64).stream_id != 0) { ret false; }
+    var response: [1]field.Field;
+    response[0] = field.Field{name: view.view(":status", 7),
+        value: view.view("204", 3), sensitive: false};
+    if (send_headers(?fixture.engine, 0, ?response[0], 1, true,
+        false).status != OFFER_OUTPUT) { ret false; }
+    var i: usize = 0;
+    for (i < 128 && !wire.finished) { process(?fixture.engine); i = i + 1; }
+    if (!wire.finished) { ret false; }
+    ret release_stream(?fixture.engine, 0, request.generation);
+}
+
+fun insert_peer_entry(fixture: *Fixture, id: u64) bool {
+    var instructions: [6]u8;
+    instructions[0] = frame.STREAM_QPACK_ENCODER::u8;
+    instructions[1] = 0x3f; instructions[2] = 0x61;
+    instructions[3] = 0xc0; instructions[4] = 1; instructions[5] = 'x';
+    if (peer_stream(fixture, id, ?instructions[0], 6, false) == nil) { ret false; }
+    var i: usize = 0;
+    for (i < 64 && fixture.engine.inbound_table.insert_count == 0) {
+        process(?fixture.engine); i = i + 1;
+    }
+    ret fixture.engine.inbound_table.insert_count == 1;
+}
+
+test "http.h3.connection: destroy returns pooled storage for a second connection" {
+    var fixture: Fixture;
+    var first: ExchangeMemory;
+    var second: ExchangeMemory;
+    if (!make_fixture(?fixture, SERVER, test_config())
+     || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    if (!insert_peer_entry(?fixture, 6)) { ret 2; }
+    if (!pooled_exchange(?fixture, ?first)) { ret 3; }
+    if (fixture.engine.active_requests != 0) { ret 4; }
+    if (!begin_graceful(?fixture.engine)
+     || !finish_graceful(?fixture.engine)) { ret 5; }
+    var guard: usize = 0;
+    for (guard < 128 && fixture.engine.state != CLOSED) {
+        process(?fixture.engine);
+        progress_close(?fixture.engine);
+        guard = guard + 1;
+    }
+    if (fixture.engine.state != CLOSED || fixture.io.close_calls != 1) { ret 6; }
+    if (!destroy(?fixture.engine)) { ret 7; }
+    if (fixture.engine.initialized || fixture.engine.inbound_table.valid
+     || fixture.engine.outbound_table.valid
+     || fixture.engine.inbound_sections.valid
+     || fixture.engine.outbound_sections.valid
+     || fixture.engine.critical.initialized
+     || fixture.engine.inbound_table.insert_count != 0
+     || fixture.engine.pending_release_count != 0) { ret 8; }
+    if (destroy(?fixture.engine)) { ret 9; }
+    reset_io(?fixture, SERVER);
+    if (!start_engine(?fixture, SERVER, test_config())) { ret 10; }
+    if (fixture.engine.state != STARTING
+     || fixture.engine.inbound_table.insert_count != 0
+     || fixture.engine.active_peer_unidirectional != 0
+     || fixture.engine.peer_settings_received) { ret 11; }
+    if (server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 12; }
+    if (!insert_peer_entry(?fixture, 6)) { ret 13; }
+    if (!pooled_exchange(?fixture, ?second)) { ret 14; }
+    if (fixture.engine.active_requests != 0 || fixture.io.close_calls != 0) {
+        ret 15;
+    }
+    if (!destroy(?fixture.engine)) { ret 16; }
+    ret 0;
 }
 
 test "http.h3.connection: settings and critical streams survive every-byte fragmentation" {
