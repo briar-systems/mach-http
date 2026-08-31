@@ -207,7 +207,10 @@ representations, Huffman strings, blocked-section retry, reference protection, a
 decoder feedback. Tables and sections use caller-owned arrays and arenas. See
 [doc/h3-codecs.md](doc/h3-codecs.md) for memory, lifetime, and flow-control contracts.
 
-`http.h3.connection.Engine` binds those codecs to a bounded QUIC stream adapter.
+`http.h3.connection.Engine[T]` binds those codecs to a bounded
+`http.h3.connection.Transport[T]` QUIC stream adapter. The adapter context and
+callbacks retain their concrete type, including when that type reaches
+secret-welded QUIC connection state.
 Reads separate delivery from flow-control credit, writes copy accepted bytes, and
 every server request must bind the common service exchange before its header event is
 released. See [doc/h3-connection.md](doc/h3-connection.md) for stream, memory, error,

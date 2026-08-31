@@ -96,7 +96,7 @@ fun claim_slot(slots: *Slot, id: u64, generation: u64) *Slot {
 
 # borrowed DATA must still be holding its quic credit, and consuming it must
 # return exactly those bytes
-fun absorb(app: *App, slot: *Slot, event: h3.Event, engine: *h3.Engine,
+fun absorb(app: *App, slot: *Slot, event: h3.Event, engine: *h3.Engine[adapter.Adapter],
            io: *adapter.Adapter) bool {
     var i: usize = 0;
     for (i < event.data_length) {
@@ -106,11 +106,11 @@ fun absorb(app: *App, slot: *Slot, event: h3.Event, engine: *h3.Engine,
         i = i + 1;
     }
     slot.received = slot.received + event.data_length;
-    val stream: *h3.Stream = h3.stream_for(engine, event.stream_id);
+    val stream: *h3.Stream = h3.stream_for[adapter.Adapter](engine, event.stream_id);
     if (stream == nil) { app.failures = app.failures + 1; ret false; }
     val before: qt.StreamSnapshot = adapter.stream_snapshot(io,
         stream.transport_stream);
-    if (!h3.consume_data(engine, event.stream_id, event.data_length)) {
+    if (!h3.consume_data[adapter.Adapter](engine, event.stream_id, event.data_length)) {
         ret false;
     }
     val after: qt.StreamSnapshot = adapter.stream_snapshot(io,
@@ -138,14 +138,14 @@ fun respond(context: ptr, served: *exchange.Exchange) exchange.ServiceStatus {
 
 fun serve(context: ptr, event: h3.Event) bool {
     val app: *App = context::*App;
-    val engine: *h3.Engine = ?app.fabric.server.engine;
+    val engine: *h3.Engine[adapter.Adapter] = ?app.fabric.server.engine;
     if (event.kind == h3.EVENT_REQUEST_HEADERS) {
         if (app.used >= EXCHANGES) { app.failures = app.failures + 1; ret false; }
         val memory: *session.ExchangeMemory = ?app.exchanges[app.used];
         app.used = app.used + 1;
         if (!session.make_exchange(memory, event.generation, event.stream_id)
-         || !h3.bind_exchange(engine, event.stream_id, ?memory.exchange)
-         || !h3.release_event(engine, event.stream_id, event.generation)
+         || !h3.bind_exchange[adapter.Adapter](engine, event.stream_id, ?memory.exchange)
+         || !h3.release_event[adapter.Adapter](engine, event.stream_id, event.generation)
          || claim_slot(?app.server_slots[0], event.stream_id,
             event.generation) == nil) {
             app.failures = app.failures + 1;
@@ -153,7 +153,7 @@ fun serve(context: ptr, event: h3.Event) bool {
         }
         if (app.skip_dispatch) { ret true; }
         val service: exchange.Service = exchange.Service{ctx: nil, serve: respond};
-        if (h3.dispatch(engine, event.stream_id, ?service)
+        if (h3.dispatch[adapter.Adapter](engine, event.stream_id, ?service)
             != exchange.SERVICE_COMPLETE) {
             app.failures = app.failures + 1;
             ret false;
@@ -173,7 +173,7 @@ fun serve(context: ptr, event: h3.Event) bool {
         if (app.withhold_response) { ret true; }
         var items: [1]field.Field;
         session.response_fields(?items[0], view.view("200", 3));
-        val offered: h3.Offer = h3.send_headers(engine, event.stream_id,
+        val offered: h3.Offer = h3.send_headers[adapter.Adapter](engine, event.stream_id,
             ?items[0], 1, !app.respond_with_body, false);
         if (offered.status != h3.OFFER_OUTPUT) {
             app.failures = app.failures + 1;
@@ -195,9 +195,9 @@ fun serve(context: ptr, event: h3.Event) bool {
 
 fun consume(context: ptr, event: h3.Event) bool {
     val app: *App = context::*App;
-    val engine: *h3.Engine = ?app.fabric.client.engine;
+    val engine: *h3.Engine[adapter.Adapter] = ?app.fabric.client.engine;
     if (event.kind == h3.EVENT_RESPONSE_HEADERS) {
-        ret h3.release_event(engine, event.stream_id, event.generation);
+        ret h3.release_event[adapter.Adapter](engine, event.stream_id, event.generation);
     }
     if (event.kind == h3.EVENT_DATA) {
         val slot: *Slot = find_slot(?app.client_slots[0], event.stream_id);
@@ -222,10 +222,10 @@ fun consume(context: ptr, event: h3.Event) bool {
 }
 
 fun start_request(app: *App, with_body: bool) u64 {
-    val engine: *h3.Engine = ?app.fabric.client.engine;
-    val id: u64 = h3.open_request(engine, nil);
+    val engine: *h3.Engine[adapter.Adapter] = ?app.fabric.client.engine;
+    val id: u64 = h3.open_request[adapter.Adapter](engine, nil);
     if (id == h3.NO_STREAM) { ret h3.NO_STREAM; }
-    val stream: *h3.Stream = h3.stream_for(engine, id);
+    val stream: *h3.Stream = h3.stream_for[adapter.Adapter](engine, id);
     if (stream == nil) { ret h3.NO_STREAM; }
     var items: [5]field.Field;
     var count: usize = session.request_fields(?items[0], view.view("/", 1));
@@ -234,7 +234,7 @@ fun start_request(app: *App, with_body: bool) u64 {
             value: view.view("hold", 4), sensitive: false};
         count = count + 1;
     }
-    if (h3.send_headers(engine, id, ?items[0], count, !with_body,
+    if (h3.send_headers[adapter.Adapter](engine, id, ?items[0], count, !with_body,
         false).status != h3.OFFER_OUTPUT) {
         app.failures = app.failures + 1;
         ret h3.NO_STREAM;
@@ -247,15 +247,15 @@ fun start_request(app: *App, with_body: bool) u64 {
     ret id;
 }
 
-fun push_bodies(app: *App, slots: *Slot, engine: *h3.Engine, length: usize) {
+fun push_bodies(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter], length: usize) {
     if (app.hold_body) { ret; }
     var i: usize = 0;
     for (i < SLOTS) {
         val slot: *Slot = ?slots[i];
         if (slot.active && slot.body_pending) {
-            val stream: *h3.Stream = h3.stream_for(engine, slot.id);
+            val stream: *h3.Stream = h3.stream_for[adapter.Adapter](engine, slot.id);
             if (stream != nil && stream.output_length == 0) {
-                if (h3.offer_data(engine, slot.id, ?app.payload[0], length,
+                if (h3.offer_data[adapter.Adapter](engine, slot.id, ?app.payload[0], length,
                     true).status == h3.OFFER_DONE) { slot.body_pending = false; }
             }
         }
@@ -263,12 +263,12 @@ fun push_bodies(app: *App, slots: *Slot, engine: *h3.Engine, length: usize) {
     }
 }
 
-fun reap(app: *App, slots: *Slot, engine: *h3.Engine) {
+fun reap(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter]) {
     var i: usize = 0;
     for (i < SLOTS) {
         val slot: *Slot = ?slots[i];
         if (slot.active && !slot.body_pending
-         && h3.release_stream(engine, slot.id, slot.generation)) {
+         && h3.release_stream[adapter.Adapter](engine, slot.id, slot.generation)) {
             slot.active = false;
             slot.released = true;
         }
@@ -405,8 +405,8 @@ test "h3quic: a qpack-blocked section holds quic credit while other requests run
     app.release_streams = false;
     if (!session.handshake(?fabric, 64)) { ret 2; }
     var scratch: [128]u8;
-    if (!h3.set_qpack_capacity(?fabric.client.engine, 128)
-     || !h3.insert_qpack(?fabric.client.engine, view.view("x-tag", 5),
+    if (!h3.set_qpack_capacity[adapter.Adapter](?fabric.client.engine, 128)
+     || !h3.insert_qpack[adapter.Adapter](?fabric.client.engine, view.view("x-tag", 5),
         view.view("hold", 4), false, ?scratch[0], 128)) { ret 3; }
     fabric.link.hold_id = fabric.client.engine.local_encoder.stream.id;
     app.extra_field = true;
@@ -416,7 +416,7 @@ test "h3quic: a qpack-blocked section holds quic credit while other requests run
     if (fabric.link.reordered == 0) { ret 5; }
     if (fabric.server.engine.inbound_sections.blocked_count != 1) { ret 6; }
     if (session.count_of(?fabric.server, h3.EVENT_REQUEST_HEADERS) != 0) { ret 7; }
-    val blocked: *h3.Stream = h3.stream_for(?fabric.server.engine, blocked_id);
+    val blocked: *h3.Stream = h3.stream_for[adapter.Adapter](?fabric.server.engine, blocked_id);
     if (blocked == nil) { ret 8; }
     val held: qt.StreamSnapshot = adapter.stream_snapshot(?fabric.server.io,
         blocked.transport_stream);
@@ -458,7 +458,7 @@ test "h3quic: stream reset and application cancellation settle exactly once" {
     if (id != 0) { ret 3; }
     cycle(?app, 16);
     if (session.count_of(?fabric.server, h3.EVENT_REQUEST_HEADERS) != 1) { ret 4; }
-    if (!h3.cancel_stream(?fabric.client.engine, id, h3.H3_REQUEST_CANCELLED)) {
+    if (!h3.cancel_stream[adapter.Adapter](?fabric.client.engine, id, h3.H3_REQUEST_CANCELLED)) {
         ret 5;
     }
     cycle(?app, 48);
@@ -512,20 +512,20 @@ test "h3quic: goaway and two-stage graceful close settle over the driver pair" {
     if (start_request(?app, true) != 0) { ret 3; }
     cycle(?app, 96);
     if (app.responses != 1 || app.client_ends != 1) { ret 4; }
-    if (!h3.begin_graceful(?fabric.server.engine)) { ret 5; }
+    if (!h3.begin_graceful[adapter.Adapter](?fabric.server.engine)) { ret 5; }
     cycle(?app, 32);
     if (session.count_of(?fabric.client, h3.EVENT_GOAWAY) != 1) { ret 6; }
     if (app.last_goaway == 0) { ret 7; }
-    if (h3.open_request(?fabric.client.engine, nil) != h3.NO_STREAM) { ret 8; }
+    if (h3.open_request[adapter.Adapter](?fabric.client.engine, nil) != h3.NO_STREAM) { ret 8; }
     val first_boundary: u64 = app.last_goaway;
-    if (!h3.finish_graceful(?fabric.server.engine)) { ret 9; }
+    if (!h3.finish_graceful[adapter.Adapter](?fabric.server.engine)) { ret 9; }
     cycle(?app, 64);
     if (session.count_of(?fabric.client, h3.EVENT_GOAWAY) != 2) { ret 10; }
     if (app.last_goaway >= first_boundary) { ret 11; }
     var guard: usize = 0;
     for (guard < 64 && fabric.server.engine.state != h3.CLOSED) {
         cycle(?app, 2);
-        h3.progress_close(?fabric.server.engine);
+        h3.progress_close[adapter.Adapter](?fabric.server.engine);
         guard = guard + 1;
     }
     if (fabric.server.engine.active_requests != 0

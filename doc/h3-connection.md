@@ -1,15 +1,22 @@
 # HTTP/3 connection ownership
 
-`http.h3.connection.Engine` binds the HTTP/3 frame and QPACK codecs to a bounded
-QUIC stream adapter. It allocates nothing and owns no packet, recovery, TLS, socket,
-or QUIC connection state.
+`http.h3.connection.Engine[T]` binds the HTTP/3 frame and QPACK codecs to a
+bounded QUIC stream adapter. It allocates nothing and owns no packet, recovery,
+TLS, socket, or QUIC connection state.
 
 ## QUIC boundary
 
-The adapter exposes local stream creation, peer stream acceptance, receive, explicit
-receive credit, copied writes, FIN, RESET_STREAM, STOP_SENDING, release, and
-application close. Stream handles carry source, slot, generation, and QUIC stream ID
-identity. A stale or structurally invalid result fails the connection.
+`Transport[T]` carries `context: *T`, and every adapter callback accepts that same
+typed pointer. The type is part of `Engine[T]` and every engine operation. This
+lets a production adapter retain a QUIC driver that reaches secret-welded packet
+keys, which cannot be erased to an untyped `ptr`. The engine only passes the
+context to callbacks. It never inspects its bytes or claims its ownership, so the
+transport contract needs no context range.
+
+The adapter exposes local stream creation, peer stream acceptance, receive,
+explicit receive credit, copied writes, FIN, RESET_STREAM, STOP_SENDING, release,
+and application close. Stream handles carry source, slot, generation, and QUIC
+stream ID identity. A stale or structurally invalid result fails the connection.
 
 Receive is deliberately two phase. `Transport.read` advances delivery into the
 engine-owned stream buffer without returning connection or stream flow-control

@@ -54,7 +54,7 @@ pub rec Session {
     control_queue: [256]u8;
     encoder_queue: [256]u8;
     decoder_queue: [256]u8;
-    engine: h3.Engine;
+    engine: h3.Engine[adapter.Adapter];
     handler: HandlerFun;
     context: ptr;
     counts: [16]usize;
@@ -128,8 +128,9 @@ pub fun start_session(session: *Session, driver: *qt.Driver, clock: *u64,
         control_queue: ?session.control_queue[0], control_queue_capacity: 256,
         encoder_queue: ?session.encoder_queue[0], encoder_queue_capacity: 256,
         decoder_queue: ?session.decoder_queue[0], decoder_queue_capacity: 256};
-    val transport: h3.Transport = adapter.bind(?session.io, driver, clock);
-    ret h3.init(?session.engine, role, transport, ?session.scope, storage,
+    val transport: h3.Transport[adapter.Adapter] = adapter.bind(
+        ?session.io, driver, clock);
+    ret h3.init[adapter.Adapter](?session.engine, role, transport, ?session.scope, storage,
         configured);
 }
 
@@ -149,13 +150,13 @@ fun record(session: *Session, event: h3.Event) {
 }
 
 pub fun poll(session: *Session) h3.Event {
-    val event: h3.Event = h3.process(?session.engine);
+    val event: h3.Event = h3.process[adapter.Adapter](?session.engine);
     record(session, event);
     ret event;
 }
 
 pub fun tick(session: *Session) h3.Event {
-    val event: h3.Event = h3.tick(?session.engine);
+    val event: h3.Event = h3.tick[adapter.Adapter](?session.engine);
     record(session, event);
     ret event;
 }
@@ -193,8 +194,8 @@ pub fun make_fabric(fabric: *Fabric, configured: h3.Config, window: u64) usize {
 # a fresh driver pair carrying the same engine storage, which is what a pool
 # hands to the next connection
 pub fun recycle(fabric: *Fabric, configured: h3.Config, window: u64) usize {
-    if (!h3.destroy(?fabric.client.engine)) { ret 30; }
-    if (!h3.destroy(?fabric.server.engine)) { ret 31; }
+    if (!h3.destroy[adapter.Adapter](?fabric.client.engine)) { ret 30; }
+    if (!h3.destroy[adapter.Adapter](?fabric.server.engine)) { ret 31; }
     val client_ready: usize = loopback.init_endpoint(?fabric.pooled_client_wire,
         401, true, window);
     if (client_ready != 0) { ret 40 + client_ready; }
