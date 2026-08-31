@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking.** `http.h3.connection.Transport[T]` now carries a typed `*T`
+  context, and every callback, `Engine[T]`, and engine operation carries the same
+  type argument. Real QUIC adapters can retain secret-welded connection state
+  without erasing it to `ptr`.
+
 ## [0.6.0] - 2026-08-28
 
 ### Added
