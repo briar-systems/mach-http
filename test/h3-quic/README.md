@@ -6,7 +6,8 @@ and the QUIC dependency lives here so no consumer of the library has to build it
 
 ## Shape
 
-- `src/adapter.mach` binds `http.h3.connection.Transport` to `quic.transport`.
+- `src/adapter.mach` binds `http.h3.connection.Transport[Adapter]` to
+  `quic.transport`.
   Handles carry across unchanged; statuses are mapped explicitly. Two need real
   translation: a partially accepted write, and a release the driver refuses because
   the stream is not yet settled on the wire.
