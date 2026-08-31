@@ -44,8 +44,7 @@ fun operation(value: qt.OperationResult) h3.TransportOperation {
         error: value.error::u64};
 }
 
-fun adapter_open(context: ptr, direction: u8) h3.TransportOpen {
-    val self: *Adapter = context::*Adapter;
+fun adapter_open(self: *Adapter, direction: u8) h3.TransportOpen {
     var wanted: qt.Direction = qt.BIDIRECTIONAL;
     if (direction == h3.UNIDIRECTIONAL) { wanted = qt.UNIDIRECTIONAL; }
     val opened: qt.OpenResult = qt.open_stream(self.driver, wanted);
@@ -55,8 +54,7 @@ fun adapter_open(context: ptr, direction: u8) h3.TransportOpen {
         storage_blocked: opened.storage_blocked, error: opened.error::u64};
 }
 
-fun adapter_accept(context: ptr) h3.TransportOpen {
-    val self: *Adapter = context::*Adapter;
+fun adapter_accept(self: *Adapter) h3.TransportOpen {
     val opened: qt.OpenResult = qt.accept_stream(self.driver);
     ret h3.TransportOpen{status: status(opened.status),
         stream: to_h3(opened.stream),
@@ -65,9 +63,8 @@ fun adapter_accept(context: ptr) h3.TransportOpen {
 }
 
 # delivery only; the driver accumulates the uncredited total for credit to release
-fun adapter_read(context: ptr, value: h3.StreamHandle, output: *u8,
+fun adapter_read(self: *Adapter, value: h3.StreamHandle, output: *u8,
     capacity: usize) h3.TransportRead {
-    val self: *Adapter = context::*Adapter;
     val read: qt.ReadResult = qt.read_stream(self.driver, to_quic(value),
         output, capacity);
     if (read.count != 0 && read.count < capacity) {
@@ -78,18 +75,16 @@ fun adapter_read(context: ptr, value: h3.StreamHandle, output: *u8,
         fin: read.fin, error: read.error::u64};
 }
 
-fun adapter_credit(context: ptr, value: h3.StreamHandle,
+fun adapter_credit(self: *Adapter, value: h3.StreamHandle,
     count: usize) h3.TransportOperation {
-    val self: *Adapter = context::*Adapter;
     ret operation(qt.credit_stream(self.driver, to_quic(value), count::u64));
 }
 
 # quic's status answers whether the whole write was accepted, http/3's answers
 # whether the call made progress. a positive count is therefore always OK, and
 # BLOCKED is reserved for the write that accepted nothing.
-fun adapter_write(context: ptr, value: h3.StreamHandle, input: *u8,
+fun adapter_write(self: *Adapter, value: h3.StreamHandle, input: *u8,
     length: usize) h3.TransportWrite {
-    val self: *Adapter = context::*Adapter;
     val written: qt.WriteResult = qt.write_stream(self.driver, to_quic(value),
         input, length);
     var mapped: h3.TransportStatus = status(written.status);
@@ -105,27 +100,23 @@ fun adapter_write(context: ptr, value: h3.StreamHandle, input: *u8,
         storage_blocked: written.storage_blocked, error: written.error::u64};
 }
 
-fun adapter_finish(context: ptr, value: h3.StreamHandle) h3.TransportOperation {
-    val self: *Adapter = context::*Adapter;
+fun adapter_finish(self: *Adapter, value: h3.StreamHandle) h3.TransportOperation {
     ret operation(qt.finish_stream(self.driver, to_quic(value)));
 }
 
-fun adapter_cancel_send(context: ptr, value: h3.StreamHandle,
+fun adapter_cancel_send(self: *Adapter, value: h3.StreamHandle,
     code: u64) h3.TransportOperation {
-    val self: *Adapter = context::*Adapter;
     ret operation(qt.cancel_stream_send(self.driver, to_quic(value), code));
 }
 
-fun adapter_cancel_receive(context: ptr, value: h3.StreamHandle,
+fun adapter_cancel_receive(self: *Adapter, value: h3.StreamHandle,
     code: u64) h3.TransportOperation {
-    val self: *Adapter = context::*Adapter;
     ret operation(qt.cancel_stream_receive(self.driver, to_quic(value), code));
 }
 
 # quic reports "not settled on the wire yet" as a stream state error; http/3
 # has a word for exactly that condition and retries it, so it is named here
-fun adapter_release(context: ptr, value: h3.StreamHandle) h3.TransportOperation {
-    val self: *Adapter = context::*Adapter;
+fun adapter_release(self: *Adapter, value: h3.StreamHandle) h3.TransportOperation {
     val released: qt.OperationResult = qt.release_stream(self.driver,
         to_quic(value));
     if (released.status == qt.STATUS_ERROR && released.error == qt.ERROR_STREAM
@@ -136,8 +127,7 @@ fun adapter_release(context: ptr, value: h3.StreamHandle) h3.TransportOperation 
     ret operation(released);
 }
 
-fun adapter_close(context: ptr, code: u64) h3.TransportOperation {
-    val self: *Adapter = context::*Adapter;
+fun adapter_close(self: *Adapter, code: u64) h3.TransportOperation {
     self.close_calls = self.close_calls + 1;
     self.close_error = code;
     self.clock[0] = self.clock[0] + 1;
@@ -148,7 +138,8 @@ pub fun stream_snapshot(self: *Adapter, value: h3.StreamHandle) qt.StreamSnapsho
     ret qt.stream_snapshot(self.driver, to_quic(value));
 }
 
-pub fun bind(self: *Adapter, driver: *qt.Driver, clock: *u64) h3.Transport {
+pub fun bind(self: *Adapter, driver: *qt.Driver,
+    clock: *u64) h3.Transport[Adapter] {
     self.driver = driver;
     self.clock = clock;
     self.close_error = 0;
@@ -157,7 +148,7 @@ pub fun bind(self: *Adapter, driver: *qt.Driver, clock: *u64) h3.Transport {
     self.blocked_writes = 0;
     self.short_reads = 0;
     self.blocked_releases = 0;
-    ret h3.Transport{context: self::ptr, open: adapter_open,
+    ret h3.Transport[Adapter]{context: self, open: adapter_open,
         accept: adapter_accept, read: adapter_read, credit: adapter_credit,
         write: adapter_write, finish: adapter_finish,
         cancel_send: adapter_cancel_send, cancel_receive: adapter_cancel_receive,
