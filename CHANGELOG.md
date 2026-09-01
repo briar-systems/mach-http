@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `http.h1.connection.abandon` retires an exact nonterminal slot identity after
+  connection failure or close while application body completions remain owned by
+  the caller.
+
 ## [0.7.0] - 2026-08-31
 
 ### Changed
