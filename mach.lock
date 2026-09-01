@@ -2,5 +2,5 @@
 
 [dep.mach-std]
 url = "https://github.com/briar-systems/mach-std"
-ref = "tag/v0.33.0"
-commit = "d2f08352acaac3169e823335ab4ef1e8ce632abb"
+ref = "tag/v0.34.0"
+commit = "2f0a0f9cc73edc5f4e31d6c90ab445dfaf79ddb4"

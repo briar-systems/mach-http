@@ -2,3 +2,4 @@ out/
 dep
 *.swp
 *.swo
+.wt/
