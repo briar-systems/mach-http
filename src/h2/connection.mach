@@ -871,6 +871,23 @@ pub fun detach_exchange(engine: *Engine, id: u32,
     ret detached;
 }
 
+pub fun abandon_exchange(engine: *Engine, id: u32,
+    generation: u64) *exchange.Exchange {
+    val stream: *Stream = stream_for(engine, id);
+    if (stream == nil || stream.generation != generation
+     || stream.state != STREAM_CLOSED || stream.exchange == nil) { ret nil; }
+    val abandoned: *exchange.Exchange = stream.exchange;
+    if (abandoned.state != exchange.COMPLETE_STATE
+     && abandoned.state != exchange.CANCELLED_STATE
+     && abandoned.state != exchange.TIMED_OUT_STATE
+     && abandoned.state != exchange.FAILED_STATE
+     && cancel.reason(abandoned.scope) == cancel.ACTIVE) {
+        exchange.cancel_exchange(abandoned);
+    }
+    stream.exchange = nil;
+    ret abandoned;
+}
+
 fun close_cause(error: Error) lifecycle.Cause {
     if (error == ERROR_CANCELLED) { ret lifecycle.CANCELLATION; }
     ret lifecycle.FAILURE;
@@ -2697,6 +2714,42 @@ rec ExchangeMemory {
     exchange: exchange.Exchange;
 }
 
+rec PendingCancellation {
+    finish_calls: usize;
+    complete_calls: usize;
+    release_calls: usize;
+}
+
+fun pending_body_read(context: ptr, output: *u8, capacity: usize,
+    trailers: *field.Fields) body.Progress {
+    ret body.complete(body.REUSE_FORBIDDEN);
+}
+
+fun pending_body_finish(context: ptr, mode: body.Mode,
+    trailers: *field.Fields) body.Progress {
+    val pending: *PendingCancellation = context::*PendingCancellation;
+    pending.finish_calls = pending.finish_calls + 1;
+    if (mode != body.CANCEL) {
+        ret body.failed("unexpected body finish mode", body.REUSE_FORBIDDEN);
+    }
+    ret body.pending(701);
+}
+
+fun pending_body_complete(context: ptr, token: u64,
+    trailers: *field.Fields) body.Progress {
+    val pending: *PendingCancellation = context::*PendingCancellation;
+    pending.complete_calls = pending.complete_calls + 1;
+    if (token != 701) {
+        ret body.failed("unexpected body completion token", body.REUSE_FORBIDDEN);
+    }
+    ret body.cancelled(body.REUSE_FORBIDDEN);
+}
+
+fun pending_body_release(context: ptr) {
+    val pending: *PendingCancellation = context::*PendingCancellation;
+    pending.release_calls = pending.release_calls + 1;
+}
+
 fun make_exchange(storage: *ExchangeMemory, generation: u64,
     stream_id: u32) bool {
     val configured: message.Limits = message.limits_default();
@@ -2721,6 +2774,17 @@ fun make_exchange(storage: *ExchangeMemory, generation: u64,
         ret false;
     }
     ret true;
+}
+
+fun make_pending_exchange(storage: *ExchangeMemory,
+    pending: *PendingCancellation, generation: u64, stream_id: u32) bool {
+    if (!make_exchange(storage, generation, stream_id)) { ret false; }
+    val configured: message.Limits = message.limits_default();
+    storage.reader = body.init_reader(pending, pending_body_read,
+        pending_body_finish, pending_body_complete, pending_body_release,
+        body.OWNER_ENGINE, generation, false, 0, configured.request_body,
+        ?storage.request.trailers, ?storage.scope);
+    ret storage.reader.valid;
 }
 
 fun test_service(context: ptr, served: *exchange.Exchange) exchange.ServiceStatus {
@@ -2882,6 +2946,96 @@ test "http.h2.connection: request stream binds and dispatches one common exchang
     if (offered.status != OFFER_OUTPUT || !finish_write(?fixture, true)
      || stream_for(?fixture.engine, 1).state != STREAM_CLOSED
      || !release_stream(?fixture.engine, 1, request.generation)) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: teardown abandonment initiates cancellation" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+     || server_handshake(?fixture).kind != EVENT_SETTINGS
+     || !drain_output(?fixture)) { ret 1; }
+    var block: [6]u8;
+    block[0] = 0x82; block[1] = 0x86; block[2] = 0x84;
+    block[3] = 0x01; block[4] = 0x01; block[5] = 'x';
+    val request: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 1, ?block[0], 6);
+    var storage: ExchangeMemory;
+    if (request.kind != EVENT_REQUEST_HEADERS
+     || !make_exchange(?storage, request.generation, 1)
+     || !bind_exchange(?fixture.engine, 1, ?storage.exchange)
+     || !release_event(?fixture.engine, 1, request.generation)) { ret 2; }
+    var response: [1]field.Field;
+    response[0] = field.Field{name: view.view(":status", 7),
+        value: view.view("204", 3), sensitive: false};
+    if (send_headers(?fixture.engine, 1, ?response[0], 1,
+        true, true).status != OFFER_OUTPUT || !drain_output(?fixture)
+     || stream_for(?fixture.engine, 1).state != STREAM_CLOSED
+     || cancel.reason(?storage.scope) != cancel.ACTIVE) { ret 3; }
+    if (abandon_exchange(?fixture.engine, 1,
+        request.generation) != ?storage.exchange
+     || cancel.reason(?storage.scope) != cancel.CANCELLED
+     || storage.exchange.state != exchange.CANCELLED_STATE
+     || exchange_for(?fixture.engine, 1) != nil
+     || !release_stream(?fixture.engine, 1, request.generation)) { ret 4; }
+    if (!cancel.destroy(?storage.scope)) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: teardown detaches pending exchange generation safely" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+     || server_handshake(?fixture).kind != EVENT_SETTINGS
+     || !drain_output(?fixture)) { ret 1; }
+    var block: [6]u8;
+    block[0] = 0x82; block[1] = 0x86; block[2] = 0x84;
+    block[3] = 0x01; block[4] = 0x01; block[5] = 'x';
+    val first_request: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS, 1, ?block[0], 6);
+    var first: ExchangeMemory;
+    var pending: PendingCancellation;
+    if (first_request.kind != EVENT_REQUEST_HEADERS
+     || !make_pending_exchange(?first, ?pending, first_request.generation, 1)
+     || !bind_exchange(?fixture.engine, 1, ?first.exchange)
+     || !release_event(?fixture.engine, 1, first_request.generation)) { ret 2; }
+    val first_slot: *Stream = stream_for(?fixture.engine, 1);
+    if (first_slot == nil
+     || !cancel_stream(?fixture.engine, 1, H2_CANCEL)
+     || first_slot.state != STREAM_CLOSED
+     || first.exchange.state == exchange.CANCELLED_STATE
+     || first.reader.pending_kind != body.OP_FINISH
+     || first.reader.pending_token != 701 || pending.finish_calls != 1
+     || release_stream(?fixture.engine, 1, first_request.generation)) { ret 3; }
+    if (abandon_exchange(?fixture.engine, 1,
+        first_request.generation + 1) != nil
+     || exchange_for(?fixture.engine, 1) != ?first.exchange) { ret 4; }
+    val detached: *exchange.Exchange = abandon_exchange(?fixture.engine, 1,
+        first_request.generation);
+    if (detached != ?first.exchange || exchange_for(?fixture.engine, 1) != nil
+     || pending.finish_calls != 1
+     || !release_stream(?fixture.engine, 1, first_request.generation)) { ret 5; }
+
+    val second_request: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS, 3, ?block[0], 6);
+    var second: ExchangeMemory;
+    if (second_request.kind != EVENT_REQUEST_HEADERS
+     || !make_exchange(?second, second_request.generation, 3)
+     || !bind_exchange(?fixture.engine, 3, ?second.exchange)
+     || !release_event(?fixture.engine, 3, second_request.generation)
+     || stream_for(?fixture.engine, 3) != first_slot
+     || second_request.generation == first_request.generation
+     || !cancel_stream(?fixture.engine, 3, H2_CANCEL)) { ret 6; }
+    if (abandon_exchange(?fixture.engine, 3, first_request.generation) != nil
+     || exchange_for(?fixture.engine, 3) != ?second.exchange) { ret 7; }
+
+    if (body.complete_reader(first.request.body, 701).status != body.CANCELLED
+     || exchange.settle_cancellation(?first.exchange) != exchange.FINISH_OK
+     || first.exchange.state != exchange.CANCELLED_STATE
+     || pending.complete_calls != 1 || pending.release_calls != 1
+     || exchange_for(?fixture.engine, 3) != ?second.exchange) { ret 8; }
+    if (abandon_exchange(?fixture.engine, 3,
+        second_request.generation) != ?second.exchange
+     || !release_stream(?fixture.engine, 3, second_request.generation)) { ret 9; }
+    if (!cancel.destroy(?first.scope) || !cancel.destroy(?second.scope)) { ret 10; }
     ret 0;
 }
 
