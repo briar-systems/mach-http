@@ -72,8 +72,11 @@ The protocol engine never owns application request or response objects.
 If GOAWAY rejects an unprocessed local stream, `EVENT_STREAM_RETRY` preserves its
 generation. `detach_exchange` transfers the bound exchange back to the caller before
 the closed stream slot is released. Other reset and connection-failure paths cancel
-the bound exchange. A stream with asynchronous cancellation still pending cannot be
-released until the exchange reaches a terminal state.
+the bound exchange. During owner teardown, `abandon_exchange` transfers a bound
+exchange from an exact closed stream generation after initiating cancellation when
+needed. The caller then owns any pending body completion. The engine cannot address
+the detached exchange, and the stream slot can be released without waiting for that
+completion.
 
 ## Headers and bodies
 
