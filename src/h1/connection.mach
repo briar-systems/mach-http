@@ -15,6 +15,7 @@ use std.memory;
 use std.io.lifecycle;
 use io_error: std.io.error;
 use io_runtime: std.io.runtime;
+use http.core.body;
 use http.core.field;
 use http.core.message;
 use http.core.method;
@@ -1052,13 +1053,17 @@ fun slot_done(engine: *Engine, slot: *Slot) bool {
     ret slot.inbound_complete && slot.outbound_complete && slot.released;
 }
 
-fun sweep(engine: *Engine, now: time.Time) {
+fun sweep_done(engine: *Engine) {
     for (engine.count != 0 && slot_done(engine, ?engine.slots[engine.head])) {
         val memory: SlotMemory = engine.slots[engine.head].memory;
         reset_slot(?engine.slots[engine.head], memory);
         engine.head = (engine.head + 1) % engine.capacity;
         engine.count = engine.count - 1;
     }
+}
+
+fun sweep(engine: *Engine, now: time.Time) {
+    sweep_done(engine);
     if (engine.count == 0 && engine.state == OPEN) {
         engine.idle_deadline = deadline(now, engine.configured.idle_timeout_ns);
     }
@@ -1071,6 +1076,30 @@ pub fun release(engine: *Engine, index: usize, now: time.Time) bool {
     }
     engine.slots[index].released = true;
     sweep(engine, now);
+    ret true;
+}
+
+pub fun abandon(engine: *Engine, index: usize, sequence: u64) bool {
+    if (!slot_live(engine, index) || sequence == 0
+     || engine.slots[index].sequence != sequence || engine.slots[index].released
+     || (engine.state != FAILED && engine.state != CLOSED)) { ret false; }
+    val slot: *Slot = ?engine.slots[index];
+    if (engine.receiving == index) { engine.receiving = NO_SLOT; }
+    if (engine.held_slot == index) {
+        engine.held_body = nil;
+        engine.held_length = 0;
+        engine.held_final = false;
+        engine.held_slot = NO_SLOT;
+    }
+    slot.inbound_complete = true;
+    slot.inbound_abandoned = true;
+    slot.outbound_complete = true;
+    slot.serializer_active = false;
+    slot.released = true;
+    slot.header_deadline.active = false;
+    slot.request_deadline.active = false;
+    slot.write_deadline.active = false;
+    sweep_done(engine);
     ret true;
 }
 
@@ -1198,6 +1227,59 @@ rec Fixture {
     read_buffer: [512]u8;
     write_buffer: [128]u8;
     engine: Engine;
+}
+
+rec PendingBody {
+    scope: cancel.Scope;
+    trailers: field.Fields;
+    reader: body.Reader;
+    token: u64;
+    finish_calls: usize;
+    complete_calls: usize;
+    release_calls: usize;
+}
+
+fun application_body_read(context: ptr, output: *u8, capacity: usize,
+    trailers: *field.Fields) body.Progress {
+    ret body.complete(body.REUSE_FORBIDDEN);
+}
+
+fun application_body_finish(context: ptr, mode: body.Mode,
+    trailers: *field.Fields) body.Progress {
+    val pending: *PendingBody = context::*PendingBody;
+    pending.finish_calls = pending.finish_calls + 1;
+    if (mode != body.CANCEL) {
+        ret body.failed("unexpected body finish mode", body.REUSE_FORBIDDEN);
+    }
+    ret body.pending(pending.token);
+}
+
+fun application_body_complete(context: ptr, token: u64,
+    trailers: *field.Fields) body.Progress {
+    val pending: *PendingBody = context::*PendingBody;
+    pending.complete_calls = pending.complete_calls + 1;
+    if (token != pending.token) {
+        ret body.failed("unexpected body completion token", body.REUSE_FORBIDDEN);
+    }
+    ret body.cancelled(body.REUSE_FORBIDDEN);
+}
+
+fun application_body_release(context: ptr) {
+    val pending: *PendingBody = context::*PendingBody;
+    pending.release_calls = pending.release_calls + 1;
+}
+
+fun make_pending_body(pending: *PendingBody, generation: u64,
+    token: u64) bool {
+    val none: time.Time = test_now(0);
+    if (!cancel.make_root(?pending.scope, false, none)) { ret false; }
+    pending.trailers = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    pending.token = token;
+    pending.reader = body.init_reader(pending, application_body_read,
+        application_body_finish, application_body_complete,
+        application_body_release, body.OWNER_APPLICATION, generation, false, 0,
+        message.limits_default().request_body, ?pending.trailers, ?pending.scope);
+    ret pending.reader.valid;
 }
 
 fun test_config(pipeline: usize) Config {
@@ -1359,6 +1441,76 @@ test "http.h1.connection: destroy returns pooled storage for a second connection
     val second_sequence: u64 = pooled_exchange(?fixture, now);
     if (second_sequence == 0 || second_sequence != first_sequence) { ret 15; }
     if (!destroy(?fixture.engine)) { ret 16; }
+    ret 0;
+}
+
+test "http.h1.connection: teardown abandons an incomplete held request exactly once" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    val headers: Event = complete_read(?fixture,
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello", false, now);
+    val held: Event = process(?fixture.engine, now);
+    if (headers.kind != EVENT_REQUEST_HEADERS || held.kind != EVENT_REQUEST_BODY
+     || held.slot != headers.slot || held.sequence != headers.sequence
+     || fixture.engine.held_slot != headers.slot || fixture.engine.held_length != 5
+     || abandon(?fixture.engine, headers.slot, headers.sequence)) { ret 2; }
+    if (!cancel_connection(?fixture.engine) || fixture.engine.state != FAILED
+     || !fixture.engine.close_pending || fixture.io.close_calls != 1) { ret 3; }
+    if (abandon(?fixture.engine, headers.slot, headers.sequence + 1)
+     || !abandon(?fixture.engine, headers.slot, headers.sequence)
+     || fixture.engine.count != 0 || fixture.engine.held_body != nil
+     || fixture.engine.held_length != 0 || fixture.engine.held_slot != NO_SLOT
+     || abandon(?fixture.engine, headers.slot, headers.sequence)
+     || destroy(?fixture.engine)) { ret 4; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed, now).kind != EVENT_CLOSED
+     || !destroy(?fixture.engine)) { ret 5; }
+    ret 0;
+}
+
+test "http.h1.connection: late body completion is isolated from a reused slot" {
+    var fixture: Fixture;
+    val now: time.Time = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    val first: Event = complete_read(?fixture,
+        "GET /first HTTP/1.1\r\nHost: x\r\n\r\n", false, now);
+    if (first.kind != EVENT_REQUEST_HEADERS
+     || process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE) { ret 2; }
+    var old_body: PendingBody;
+    if (!make_pending_body(?old_body, first.sequence, 701)
+     || body.cancel_reader(?old_body.reader).status != body.PENDING
+     || old_body.reader.pending_kind != body.OP_FINISH
+     || old_body.reader.pending_token != 701 || old_body.finish_calls != 1) { ret 3; }
+    var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    if (!prepare_response(?fixture.engine, first.slot, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, now)
+     || !flush_offer(?fixture, first.slot, nil, 0, true, now, false)
+     || !release(?fixture.engine, first.slot, now)) { ret 4; }
+    val second: Event = complete_read(?fixture,
+        "POST /second HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello", false, now);
+    val held: Event = process(?fixture.engine, now);
+    if (second.kind != EVENT_REQUEST_HEADERS || second.slot != first.slot
+     || second.sequence == first.sequence || held.kind != EVENT_REQUEST_BODY
+     || body.complete_reader(?old_body.reader, 701).status != body.CANCELLED
+     || old_body.complete_calls != 1 || old_body.release_calls != 1
+     || fixture.slots[second.slot].sequence != second.sequence
+     || fixture.slots[second.slot].state != SLOT_LIVE
+     || fixture.engine.held_slot != second.slot) { ret 5; }
+    var active_body: PendingBody;
+    if (!make_pending_body(?active_body, second.sequence, 702)
+     || body.cancel_reader(?active_body.reader).status != body.PENDING
+     || !cancel_connection(?fixture.engine)
+     || abandon(?fixture.engine, second.slot, first.sequence)
+     || !abandon(?fixture.engine, second.slot, second.sequence)) { ret 6; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed, now).kind != EVENT_CLOSED
+     || !destroy(?fixture.engine)
+     || body.complete_reader(?active_body.reader, 702).status != body.CANCELLED
+     || active_body.complete_calls != 1 || active_body.release_calls != 1) { ret 7; }
+    if (!cancel.destroy(?old_body.scope) || !cancel.destroy(?active_body.scope)) { ret 8; }
     ret 0;
 }
 

@@ -1,15 +1,15 @@
 # binds the http/3 stream adapter to the real quic connection driver
 
+use h3quic.loopback;
 use h3: http.h3.connection;
 use qt: quic.transport;
-use sm: quic.stream.stream;
 use std.types.bool.bool;
 use std.types.size.usize;
 
 # the engine's close hook carries no clock, so the adapter shares the link's
 # monotonic instant and advances it on every close attempt
 pub rec Adapter {
-    driver: *qt.Driver;
+    driver: *qt.Driver[loopback.Core];
     clock: *u64;
     close_error: u64;
     close_calls: usize;
@@ -47,7 +47,7 @@ fun operation(value: qt.OperationResult) h3.TransportOperation {
 fun adapter_open(self: *Adapter, direction: u8) h3.TransportOpen {
     var wanted: qt.Direction = qt.BIDIRECTIONAL;
     if (direction == h3.UNIDIRECTIONAL) { wanted = qt.UNIDIRECTIONAL; }
-    val opened: qt.OpenResult = qt.open_stream(self.driver, wanted);
+    val opened: qt.OpenResult = qt.open_stream[loopback.Core](self.driver, wanted);
     ret h3.TransportOpen{status: status(opened.status),
         stream: to_h3(opened.stream),
         stream_limit_blocked: opened.stream_limit_blocked,
@@ -55,7 +55,7 @@ fun adapter_open(self: *Adapter, direction: u8) h3.TransportOpen {
 }
 
 fun adapter_accept(self: *Adapter) h3.TransportOpen {
-    val opened: qt.OpenResult = qt.accept_stream(self.driver);
+    val opened: qt.OpenResult = qt.accept_stream[loopback.Core](self.driver);
     ret h3.TransportOpen{status: status(opened.status),
         stream: to_h3(opened.stream),
         stream_limit_blocked: opened.stream_limit_blocked,
@@ -65,7 +65,7 @@ fun adapter_accept(self: *Adapter) h3.TransportOpen {
 # delivery only; the driver accumulates the uncredited total for credit to release
 fun adapter_read(self: *Adapter, value: h3.StreamHandle, output: *u8,
     capacity: usize) h3.TransportRead {
-    val read: qt.ReadResult = qt.read_stream(self.driver, to_quic(value),
+    val read: qt.ReadResult = qt.read_stream[loopback.Core](self.driver, to_quic(value),
         output, capacity);
     if (read.count != 0 && read.count < capacity) {
         self.short_reads = self.short_reads + 1;
@@ -77,7 +77,8 @@ fun adapter_read(self: *Adapter, value: h3.StreamHandle, output: *u8,
 
 fun adapter_credit(self: *Adapter, value: h3.StreamHandle,
     count: usize) h3.TransportOperation {
-    ret operation(qt.credit_stream(self.driver, to_quic(value), count::u64));
+    ret operation(qt.credit_stream[loopback.Core](self.driver,
+        to_quic(value), count::u64));
 }
 
 # quic's status answers whether the whole write was accepted, http/3's answers
@@ -85,8 +86,8 @@ fun adapter_credit(self: *Adapter, value: h3.StreamHandle,
 # BLOCKED is reserved for the write that accepted nothing.
 fun adapter_write(self: *Adapter, value: h3.StreamHandle, input: *u8,
     length: usize) h3.TransportWrite {
-    val written: qt.WriteResult = qt.write_stream(self.driver, to_quic(value),
-        input, length);
+    val written: qt.WriteResult = qt.write_stream[loopback.Core](self.driver,
+        to_quic(value), input, length);
     var mapped: h3.TransportStatus = status(written.status);
     if (written.status == qt.STATUS_BLOCKED) {
         if (written.count != 0) {
@@ -101,28 +102,27 @@ fun adapter_write(self: *Adapter, value: h3.StreamHandle, input: *u8,
 }
 
 fun adapter_finish(self: *Adapter, value: h3.StreamHandle) h3.TransportOperation {
-    ret operation(qt.finish_stream(self.driver, to_quic(value)));
+    ret operation(qt.finish_stream[loopback.Core](self.driver, to_quic(value)));
 }
 
 fun adapter_cancel_send(self: *Adapter, value: h3.StreamHandle,
     code: u64) h3.TransportOperation {
-    ret operation(qt.cancel_stream_send(self.driver, to_quic(value), code));
+    ret operation(qt.cancel_stream_send[loopback.Core](self.driver,
+        to_quic(value), code));
 }
 
 fun adapter_cancel_receive(self: *Adapter, value: h3.StreamHandle,
     code: u64) h3.TransportOperation {
-    ret operation(qt.cancel_stream_receive(self.driver, to_quic(value), code));
+    ret operation(qt.cancel_stream_receive[loopback.Core](self.driver,
+        to_quic(value), code));
 }
 
-# quic reports "not settled on the wire yet" as a stream state error; http/3
-# has a word for exactly that condition and retries it, so it is named here
+# quic publishes an unsettled wire release as blocked, which http/3 retries
 fun adapter_release(self: *Adapter, value: h3.StreamHandle) h3.TransportOperation {
-    val released: qt.OperationResult = qt.release_stream(self.driver,
-        to_quic(value));
-    if (released.status == qt.STATUS_ERROR && released.error == qt.ERROR_STREAM
-     && released.protocol_error == sm.ERROR_STATE::u64) {
+    val released: qt.OperationResult = qt.release_stream[loopback.Core](
+        self.driver, to_quic(value));
+    if (released.status == qt.STATUS_BLOCKED) {
         self.blocked_releases = self.blocked_releases + 1;
-        ret h3.TransportOperation{status: h3.TRANSPORT_BLOCKED, error: 0};
     }
     ret operation(released);
 }
@@ -131,14 +131,15 @@ fun adapter_close(self: *Adapter, code: u64) h3.TransportOperation {
     self.close_calls = self.close_calls + 1;
     self.close_error = code;
     self.clock[0] = self.clock[0] + 1;
-    ret operation(qt.begin_close(self.driver, code, nil, 0, self.clock[0]));
+    ret operation(qt.begin_close[loopback.Core](self.driver, code, nil, 0,
+        self.clock[0]));
 }
 
 pub fun stream_snapshot(self: *Adapter, value: h3.StreamHandle) qt.StreamSnapshot {
-    ret qt.stream_snapshot(self.driver, to_quic(value));
+    ret qt.stream_snapshot[loopback.Core](self.driver, to_quic(value));
 }
 
-pub fun bind(self: *Adapter, driver: *qt.Driver,
+pub fun bind(self: *Adapter, driver: *qt.Driver[loopback.Core],
     clock: *u64) h3.Transport[Adapter] {
     self.driver = driver;
     self.clock = clock;

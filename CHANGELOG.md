@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.7.2] - 2026-09-01
+
+### Added
+
+- `http.h1.connection.abandon` retires an exact nonterminal slot identity after
+  connection failure or close while application body completions remain owned by
+  the caller.
+
+## [0.7.1] - 2026-08-31
+
+### Added
+
+- `http.h2.connection.abandon_exchange` detaches an exact closed stream
+  generation during teardown while caller-owned body completions remain live.
+
+### Fixed
+
+- The manifest and exported library version now agree after the v0.7.1 release.
+
 ## [0.7.0] - 2026-08-31
 
 ### Changed

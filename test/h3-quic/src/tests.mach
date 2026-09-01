@@ -534,7 +534,8 @@ test "h3quic: goaway and two-stage graceful close settle over the driver pair" {
     if (fabric.server.engine.state != h3.CLOSED) { ret 13; }
     if (fabric.server.io.close_calls == 0
      || fabric.server.io.close_error != h3.H3_NO_ERROR) { ret 14; }
-    if (qt.snapshot(?fabric.server_wire.driver).state != qt.DRAINING) { ret 15; }
+    if (qt.snapshot[loopback.Core](?fabric.server_wire.driver).state
+        != qt.DRAINING) { ret 15; }
     if (app.failures != 0 || app.mismatches != 0) { ret 16; }
     if (session.count_of(?fabric.client, h3.EVENT_ERROR) != 0
      || session.count_of(?fabric.server, h3.EVENT_ERROR) != 0) { ret 17; }
@@ -628,13 +629,13 @@ test "h3quic: a drained unknown unidirectional stream releases over the driver" 
     attach(?app, ?fabric);
     if (!session.handshake(?fabric, 64)) { ret 2; }
     if (fabric.server.engine.active_peer_unidirectional != 3) { ret 3; }
-    val opened: qt.OpenResult = qt.open_stream(?fabric.client_wire.driver,
-        qt.UNIDIRECTIONAL);
+    val opened: qt.OpenResult = qt.open_stream[loopback.Core](
+        ?fabric.client_wire.driver, qt.UNIDIRECTIONAL);
     if (opened.status != qt.STATUS_OK) { ret 4; }
     var bytes: [2]u8; bytes[0] = 0x21; bytes[1] = 'x';
-    if (qt.write_stream(?fabric.client_wire.driver, opened.stream,
-        ?bytes[0], 2).count != 2) { ret 5; }
-    if (qt.finish_stream(?fabric.client_wire.driver,
+    if (qt.write_stream[loopback.Core](?fabric.client_wire.driver,
+        opened.stream, ?bytes[0], 2).count != 2) { ret 5; }
+    if (qt.finish_stream[loopback.Core](?fabric.client_wire.driver,
         opened.stream).status != qt.STATUS_OK) { ret 6; }
     cycle(?app, 64);
     if (fabric.server.engine.state != h3.OPEN) { ret 7; }
