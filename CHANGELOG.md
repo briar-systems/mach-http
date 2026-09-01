@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Pinned `mach-std` to `v0.34.0` so HTTP composes with the typed secret-storage
+  dependency graph used by QUIC and Hedge.
+
 ## [0.7.2] - 2026-09-01
 
 ### Added
