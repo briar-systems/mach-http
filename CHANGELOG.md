@@ -1,12 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.3] - 2026-09-01
 
 ### Changed
 
 - Pinned `mach-std` to `v0.34.0` so HTTP composes with the typed secret-storage
   dependency graph used by QUIC and Hedge.
-- The HTTP/3 transport qualification project pins `mach-quic` `v0.5.0`, whose
+- The HTTP/3 transport qualification project pins `mach-quic` `v0.5.1`, whose
   split connection storage and released `mach-crypto` `v0.8.1` and `mach-tls`
   `v0.2.2` graph form one coherent dependency stack.
 
