@@ -57,4 +57,4 @@ path = "../.."
 
 [dep.mach-quic]
 git = "https://github.com/briar-systems/mach-quic"
-ref = "commit/6599ccd91b9cdcd62e57d3f79fbc08ff3b541b47"
+ref = "tag/v0.4.4"

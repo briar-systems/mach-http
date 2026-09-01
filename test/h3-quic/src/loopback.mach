@@ -6,6 +6,7 @@
 # lets the harness deliver, drop, or reorder each datagram between two drivers.
 
 use qt: quic.transport;
+use quic.connection.ownership;
 use sm: quic.stream.stream;
 use dq: quic.stream.datagram;
 use quic.wire.varint;
@@ -164,9 +165,12 @@ fun prepare_stream(core: *Core, budget: usize) sm.Prepared {
     ret empty;
 }
 
-fun core_generate(context: ptr, output: *u8, capacity: usize,
+fun core_range(core: *Core) ownership.Range {
+    ret ownership.bytes(core::*u8, $size_of(Core), ownership.ZERO_FORBIDDEN);
+}
+
+fun core_generate(core: *Core, output: *u8, capacity: usize,
                   now_ns: u64) qt.CoreDatagram {
-    val core: *Core = context::*Core;
     var result_value: qt.CoreDatagram;
     result_value.state = state_of(core);
     if (core.closed || core.closing || output == nil
@@ -216,8 +220,7 @@ fun core_generate(context: ptr, output: *u8, capacity: usize,
     ret result_value;
 }
 
-fun core_receive(context: ptr, input: *qt.Datagram) qt.CoreResult {
-    val core: *Core = context::*Core;
+fun core_receive(core: *Core, input: *qt.Datagram) qt.CoreResult {
     if (input == nil || input.data == nil || input.length == 0) {
         ret core_result(core, qt.STATUS_ERROR, 1);
     }
@@ -310,14 +313,12 @@ fun core_receive(context: ptr, input: *qt.Datagram) qt.CoreResult {
     ret core_result(core, qt.STATUS_ERROR, 12);
 }
 
-fun core_timeout(context: ptr, generation: u64, now_ns: u64) qt.CoreResult {
-    val core: *Core = context::*Core;
+fun core_timeout(core: *Core, generation: u64, now_ns: u64) qt.CoreResult {
     ret core_result(core, qt.STATUS_ERROR, 13);
 }
 
-fun core_complete(context: ptr, owner: u64, status: qt.SendStatus, count: usize,
+fun core_complete(core: *Core, owner: u64, status: qt.SendStatus, count: usize,
                   now_ns: u64) qt.CoreResult {
-    val core: *Core = context::*Core;
     val slot: usize = (owner % OWNER_SLOTS::u64)::usize;
     if (!core.owner_used[slot]) { ret core_result(core, qt.STATUS_ERROR, 14); }
     var terminal: u8 = sm.TERMINAL_LOST;
@@ -333,10 +334,9 @@ fun core_complete(context: ptr, owner: u64, status: qt.SendStatus, count: usize,
     ret core_result(core, qt.STATUS_OK, 0);
 }
 
-fun core_begin_close(context: ptr, abortive: bool, application_error: u64,
+fun core_begin_close(core: *Core, abortive: bool, application_error: u64,
                      reason: *u8, reason_length: usize,
                      now_ns: u64) qt.CoreResult {
-    val core: *Core = context::*Core;
     if (reason_length > 0 && reason == nil) {
         ret core_result(core, qt.STATUS_ERROR, 16);
     }
@@ -344,19 +344,17 @@ fun core_begin_close(context: ptr, abortive: bool, application_error: u64,
     ret core_result(core, qt.STATUS_OK, 0);
 }
 
-fun core_ready(context: ptr) bool {
-    val core: *Core = context::*Core;
+fun core_ready(core: *Core) bool {
     ret core.closing && core.outstanding == 0;
 }
 
-fun core_finish(context: ptr) bool {
-    val core: *Core = context::*Core;
-    if (!core_ready(context)) { ret false; }
+fun core_finish(core: *Core) bool {
+    if (!core_ready(core)) { ret false; }
     core.closed = true;
     ret true;
 }
 
-fun core_timer(context: ptr) qt.CoreTimer {
+fun core_timer(core: *Core) qt.CoreTimer {
     var value: qt.CoreTimer;
     ret value;
 }
@@ -375,7 +373,7 @@ pub rec Endpoint {
     sends: [4]qt.SendSlot;
     core: Core;
     scope: cancel.Scope;
-    driver: qt.Driver;
+    driver: qt.Driver[Core];
 }
 
 fun stream_config(source: u64, role: u8, window: u64) sm.Config {
@@ -426,8 +424,8 @@ pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
     endpoint.core.next_owner = 1;
     if (!cancel.make_root(?endpoint.scope, false,
         time.Time{sec: 0, nsec: 0})) { ret 3; }
-    val protocol: qt.Protocol = qt.Protocol{context: (?endpoint.core)::ptr,
-        context_size: $size_of(Core), receive: core_receive,
+    val protocol: qt.Protocol[Core] = qt.Protocol[Core]{context: ?endpoint.core,
+        context_range: core_range, receive: core_receive,
         timeout: core_timeout, generate: core_generate,
         complete_send: core_complete, begin_close: core_begin_close,
         close_ready: core_ready, finish_close: core_finish, timer: core_timer};
@@ -436,13 +434,13 @@ pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
     val storage: qt.Storage = qt.Storage{sends: ?endpoint.sends[0],
         send_capacity: SEND_SLOTS};
     if (client) {
-        if (!qt.init_client(?endpoint.driver, config, protocol,
+        if (!qt.init_client[Core](?endpoint.driver, config, protocol,
             ?endpoint.manager, ?endpoint.datagrams, ?endpoint.scope, storage)) {
             ret 4;
         }
         ret 0;
     }
-    if (!qt.init_server(?endpoint.driver, config, protocol, ?endpoint.manager,
+    if (!qt.init_server[Core](?endpoint.driver, config, protocol, ?endpoint.manager,
         ?endpoint.datagrams, ?endpoint.scope, storage)) { ret 5; }
     ret 0;
 }
@@ -496,7 +494,7 @@ fun deliver(link: *Link, to: *Endpoint, data: *u8, length: usize) bool {
     datagram.data = data;
     datagram.length = length;
     datagram.received_at_ns = link.now_ns;
-    if (qt.receive_datagram(?to.driver, ?datagram).status != qt.STATUS_OK) {
+    if (qt.receive_datagram[Core](?to.driver, ?datagram).status != qt.STATUS_OK) {
         ret false;
     }
     link.transfers = link.transfers + 1;
@@ -522,7 +520,7 @@ pub fun release_held(link: *Link, to: *Endpoint) bool {
 # harness has asked for loss so the sender must retransmit
 fun carry(link: *Link, from: *Endpoint, to: *Endpoint) bool {
     link.now_ns = link.now_ns + 1;
-    val generated: qt.Generated = qt.generate(?from.driver, ?from.scope,
+    val generated: qt.Generated = qt.generate[Core](?from.driver, ?from.scope,
         ?link.buffer[0], DATAGRAM_BYTES, link.now_ns, 0);
     if (generated.status != qt.STATUS_OK) { ret false; }
     var lost: bool = false;
@@ -549,14 +547,14 @@ fun carry(link: *Link, from: *Endpoint, to: *Endpoint) bool {
     if (!lost && !parked
      && !deliver(link, to, generated.buffer, generated.count)) {
         link.errors = link.errors + 1;
-        qt.complete_send(?from.driver, generated.token, qt.SEND_FAILED, 0,
+        qt.complete_send[Core](?from.driver, generated.token, qt.SEND_FAILED, 0,
             link.now_ns);
         ret false;
     }
     var status: qt.SendStatus = qt.SEND_SENT;
     var count: usize = generated.count;
     if (lost) { status = qt.SEND_FAILED; count = 0; }
-    if (qt.complete_send(?from.driver, generated.token, status, count,
+    if (qt.complete_send[Core](?from.driver, generated.token, status, count,
         link.now_ns).status != qt.STATUS_OK) {
         link.errors = link.errors + 1;
         ret false;
@@ -580,10 +578,11 @@ pub fun flush(link: *Link, budget: usize) usize {
 }
 
 pub fun close_endpoint(endpoint: *Endpoint, now_ns: u64) bool {
-    if (qt.snapshot(?endpoint.driver).state != qt.DRAINING
-     && qt.begin_close(?endpoint.driver, 0, nil, 0, now_ns).status != qt.STATUS_OK) {
+    if (qt.snapshot[Core](?endpoint.driver).state != qt.DRAINING
+     && qt.begin_close[Core](?endpoint.driver, 0, nil, 0,
+        now_ns).status != qt.STATUS_OK) {
         ret false;
     }
-    if (qt.finish_close(?endpoint.driver).status != qt.STATUS_OK) { ret false; }
+    if (qt.finish_close[Core](?endpoint.driver).status != qt.STATUS_OK) { ret false; }
     ret cancel.destroy(?endpoint.scope);
 }

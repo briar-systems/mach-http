@@ -85,7 +85,8 @@ pub fun session_config() h3.Config {
     ret configured;
 }
 
-pub fun make_session(session: *Session, driver: *qt.Driver, clock: *u64,
+pub fun make_session(session: *Session,
+                     driver: *qt.Driver[loopback.Core], clock: *u64,
                      role: h3.Role, configured: h3.Config) bool {
     if (!cancel.make_root(?session.scope, false,
         time.Time{sec: 0, nsec: 0})) { ret false; }
@@ -94,7 +95,8 @@ pub fun make_session(session: *Session, driver: *qt.Driver, clock: *u64,
 
 # every argument but the driver is the session's own storage, so calling this a
 # second time is exactly what a pool does with a recycled engine
-pub fun start_session(session: *Session, driver: *qt.Driver, clock: *u64,
+pub fun start_session(session: *Session,
+                      driver: *qt.Driver[loopback.Core], clock: *u64,
                       role: h3.Role, configured: h3.Config) bool {
     var i: usize = 0;
     for (i < STREAM_SLOTS) {
