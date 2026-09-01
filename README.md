@@ -48,6 +48,10 @@ selection, retries, redirects, cancellation, and graceful drain are implemented.
   reads stop at configured saturation or while a body view is borrowed.
 - HTTP/1 request bodies have explicit deliver, bounded drain, reject, and close
   dispositions. Upgrade and CONNECT handoff preserve every unread tunnel byte.
+- Failed HTTP/1 connections can abandon an exact slot sequence during teardown
+  without taking ownership of pending application body completions. Stale sequences
+  cannot retire a reused physical slot. See
+  [doc/h1-connection.md](doc/h1-connection.md) for release and teardown ordering.
 - WebSocket decoding is incremental across every byte boundary. Inbound data views
   borrow the active input until explicit release. Control frames use caller-provided
   bounded scratch storage.
