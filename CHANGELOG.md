@@ -15,6 +15,11 @@
   settles with a request still live on both ends. `close_endpoint`, which
   nothing called, is replaced by the driven close path.
 
+### Removed
+
+- `tools/check-version.sh`. The manifest-against-constant comparison it did now
+  runs inline in CI, which is the only place it was ever run.
+
 ### Fixed
 
 - A drained request body no longer fails the declared-length check. The
