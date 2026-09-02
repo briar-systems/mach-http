@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.5] - 2026-09-02
+
+### Fixed
+
+- HTTP/3 DATA frames are no longer bounded by their declared length: the
+  frame parser exempts them from `max_frame_payload` and the request stream no
+  longer fails a frame longer than `max_chunk_bytes`, since the payload streams
+  through reads the body reader bounds itself. The frame count policy and the
+  cap on frames buffered whole are unchanged.
+
 ## [0.7.4] - 2026-09-02
 
 ### Fixed
