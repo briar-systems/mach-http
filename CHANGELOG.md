@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- The HTTP/3 transport qualification project drives the QUIC driver close
+  contract. Its protocol core releases the stream manager and the datagram
+  queue as its half of `finish_close`, which the driver requires and the core
+  never did, and it records the close mode and application error the driver
+  hands it. Every test now ends its connection through `begin_close` and
+  `finish_close` on both drivers instead of abandoning them, and two tests
+  assert the post-conditions directly: a graceful close ends the six critical
+  streams the connection carries for its whole life, and an abortive close
+  settles with a request still live on both ends. `close_endpoint`, which
+  nothing called, is replaced by the driven close path.
+
 ### Fixed
 
 - A drained request body no longer fails the declared-length check. The
