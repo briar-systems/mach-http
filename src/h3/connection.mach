@@ -1145,7 +1145,8 @@ fun fail_connection[T](engine: *Engine[T], error: Error, code: u64) Event {
         if (!engine.close_started) {
             val closed: TransportOperation = engine.transport.close(
                 engine.transport.context, code);
-            engine.close_started = closed.status == TRANSPORT_OK;
+            engine.close_started = closed.status == TRANSPORT_OK
+                || closed.status == TRANSPORT_CLOSED;
         }
     }
     var result: Event = base_event[T](engine, EVENT_ERROR); result.code = code;
@@ -2628,6 +2629,7 @@ rec TestTransport {
     accepts: usize;
     close_calls: usize;
     close_code: u64;
+    close_override: bool;
     close_status: TransportStatus;
 }
 
@@ -2815,7 +2817,7 @@ fun test_release(context: *TestTransport, value: StreamHandle) TransportOperatio
 fun test_close(context: *TestTransport, code: u64) TransportOperation {
     val io: *TestTransport = context;
     io.close_calls = io.close_calls + 1; io.close_code = code;
-    if (io.close_status != 0) { ret TransportOperation{status: io.close_status, error: 0}; }
+    if (io.close_override) { ret TransportOperation{status: io.close_status, error: 0}; }
     ret TransportOperation{status: TRANSPORT_OK, error: 0};
 }
 
@@ -3756,14 +3758,15 @@ test "http.h3.connection: blocked reset and application cancellation settle once
 test "http.h3.connection: a transport the peer already closed satisfies the close" {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())) { ret 1; }
-    if (!cancel_connection[TestTransport](?fixture.engine) || fixture.engine.state != FAILED) { ret 2; }
-    fixture.io.close_status = TRANSPORT_CLOSED;
+    fixture.io.close_override = true; fixture.io.close_status = TRANSPORT_CLOSED;
+    if (!cancel_connection[TestTransport](?fixture.engine) || fixture.engine.state != FAILED
+     || !fixture.engine.close_started || fixture.io.close_calls != 1) { ret 2; }
     if (!progress_close[TestTransport](?fixture.engine) || fixture.engine.state != CLOSED
-     || !fixture.engine.close_started || fixture.io.close_calls != 1) { ret 3; }
+     || fixture.io.close_calls != 1) { ret 3; }
     var failing: Fixture;
     if (!make_fixture(?failing, SERVER, test_config())) { ret 4; }
-    if (!cancel_connection[TestTransport](?failing.engine)) { ret 5; }
-    failing.io.close_status = TRANSPORT_ERROR;
+    failing.io.close_override = true; failing.io.close_status = TRANSPORT_ERROR;
+    if (!cancel_connection[TestTransport](?failing.engine) || failing.engine.close_started) { ret 5; }
     if (progress_close[TestTransport](?failing.engine) || failing.engine.state != FAILED
      || failing.engine.close_started) { ret 6; }
     ret 0;
