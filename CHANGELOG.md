@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.4] - 2026-09-02
+
+### Fixed
+
+- `h3.progress_close` treats a transport that reports CLOSED as having
+  satisfied the close, so an engine cancelled by the peer's connection close
+  reaches CLOSED instead of failing on every call and leaving its session
+  pending forever.
+
 ## [0.7.3] - 2026-09-01
 
 ### Changed
