@@ -259,7 +259,10 @@ fun header_complete(parser: *Parser, consumed: usize) Event {
         ret empty_event(EVENT_NEED_INPUT, consumed);
     }
     parser.header.length = parser.integer.value;
-    if (parser.header.length > parser.limits.max_frame_payload) {
+    # DATA payloads stream through the consumer, so their declared length
+    # never sizes memory and is not bounded here (RFC 9114 section 7.1)
+    if (parser.header.typ != FRAME_DATA &&
+        parser.header.length > parser.limits.max_frame_payload) {
         ret fail(parser, consumed, ERROR_FRAME_SIZE);
     }
     if (!frame_allowed(parser.stream_kind, parser.header.typ)) {
@@ -644,5 +647,23 @@ test "http.h3.frame: writer preserves fragmented payload ownership" {
     val two: Write = write(?writer, ?output[started.written + 1], 8, ?payload[1], 2);
     if (started.written != 2 || one.status != WRITE_OUTPUT || one.consumed != 1
      || two.status != WRITE_DONE || output[4] != 3) { ret 1; }
+    ret 0;
+}
+
+test "http.h3.frame: a data frame is not bounded by the payload cap but a headers frame is" {
+    var parser: Parser; var settings: [4]Setting;
+    var limits: Limits = limits_default(); limits.max_settings = 4; limits.max_frame_payload = 8;
+    if (!parser_init(?parser, KIND_REQUEST, ?settings[0], 4, limits)) { ret 1; }
+    var encoded: [16]u8;
+    var first: usize = encode_varint(FRAME_DATA, ?encoded[0], 16);
+    var second: usize = encode_varint(100, ?encoded[first], 16 - first);
+    val data: Event = feed(?parser, ?encoded[0], first + second, false);
+    if (data.kind != EVENT_HEADER || data.header.typ != FRAME_DATA || data.header.length != 100) { ret 2; }
+    var refusing: Parser;
+    if (!parser_init(?refusing, KIND_REQUEST, ?settings[0], 4, limits)) { ret 3; }
+    first = encode_varint(FRAME_HEADERS, ?encoded[0], 16);
+    second = encode_varint(100, ?encoded[first], 16 - first);
+    val headers: Event = feed(?refusing, ?encoded[0], first + second, false);
+    if (headers.kind != EVENT_ERROR || headers.error != ERROR_FRAME_SIZE) { ret 4; }
     ret 0;
 }

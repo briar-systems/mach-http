@@ -1883,8 +1883,9 @@ fun process_request_frame[T](engine: *Engine[T], stream: *Stream) Event {
         }
         if (parsed.header.typ == frame.FRAME_DATA) {
             val limits: body.Limits = inbound_body_limits[T](engine);
-            if (parsed.header.length > limits.max_chunk_bytes::u64
-             || stream.inbound_body_chunks >= limits.max_chunks) {
+            # the declared length streams through reads the body reader bounds
+            # itself, so only the frame count is policed here
+            if (stream.inbound_body_chunks >= limits.max_chunks) {
                 ret stream_failure[T](engine, stream, H3_EXCESSIVE_LOAD);
             }
             stream.inbound_body_chunks = stream.inbound_body_chunks + 1;
@@ -3446,25 +3447,32 @@ test "http.h3.connection: informational response counts are bounded in both dire
 test "http.h3.connection: body byte chunk and frame budgets are transactional" {
     var inbound_config: Config = test_config();
     inbound_config.messages.request_body.max_chunk_bytes = 2;
+    inbound_config.messages.request_body.max_chunks = 1;
     var inbound: Fixture;
     if (!make_fixture(?inbound, SERVER, inbound_config)
      || server_handshake(?inbound).kind != EVENT_SETTINGS) { ret 1; }
-    var input: [24]u8;
-    val header_length: usize = static_request(?input[0], 24);
+    var input: [32]u8;
+    val header_length: usize = static_request(?input[0], 32);
     var payload: [3]u8; payload[0] = 'a'; payload[1] = 'b'; payload[2] = 'c';
     val data_length: usize = append_frame(?input[header_length],
-        24 - header_length, frame.FRAME_DATA, ?payload[0], 3);
+        32 - header_length, frame.FRAME_DATA, ?payload[0], 3);
+    val second_length: usize = append_frame(?input[header_length + data_length],
+        32 - header_length - data_length, frame.FRAME_DATA, ?payload[0], 1);
     if (peer_stream(?inbound, 0, ?input[0],
-        header_length + data_length, false) == nil) { ret 2; }
+        header_length + data_length + second_length, false) == nil) { ret 2; }
     val request: Event = drive(?inbound, EVENT_REQUEST_HEADERS, 32);
     var inbound_storage: ExchangeMemory;
     if (!make_exchange(?inbound_storage, request.generation, 0)
      || !bind_exchange[TestTransport](?inbound.engine, 0, ?inbound_storage.exchange)
      || !release_event[TestTransport](?inbound.engine, 0, request.generation)) { ret 3; }
+    # a data frame longer than the read chunk streams instead of failing
+    val inbound_data: Event = drive(?inbound, EVENT_DATA, 32);
+    if (inbound_data.data_length != 3
+     || stream_for[TestTransport](?inbound.engine, 0).inbound_body_chunks != 1
+     || !consume_data[TestTransport](?inbound.engine, 0, 3)) { ret 4; }
+    # the frame count is still policed
     val inbound_excess: Event = drive(?inbound, EVENT_STREAM_ERROR, 32);
-    if (inbound_excess.code != H3_EXCESSIVE_LOAD
-     || inbound.io.close_calls != 0
-     || stream_for[TestTransport](?inbound.engine, 0).inbound_body_chunks != 0) { ret 4; }
+    if (inbound_excess.code != H3_EXCESSIVE_LOAD || inbound.io.close_calls != 0) { ret 8; }
 
     var outbound_config: Config = test_config();
     outbound_config.messages.response_body.max_chunk_bytes = 2;
