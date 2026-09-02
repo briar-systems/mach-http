@@ -15,6 +15,15 @@
   settles with a request still live on both ends. `close_endpoint`, which
   nothing called, is replaced by the driven close path.
 
+### Fixed
+
+- A drained request body no longer fails the declared-length check. The
+  adapter consumes the remainder without delivering it through `read`, so
+  `transferred` was compared against the declared length and every drained
+  body with a Content-Length or HTTP/2 or HTTP/3 declared length ended with
+  `body ended at a different declared length`. The check still applies to a
+  body whose bytes all passed through the reader.
+
 ## [0.7.5] - 2026-09-02
 
 ### Fixed
