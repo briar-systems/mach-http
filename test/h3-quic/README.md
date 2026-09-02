@@ -15,7 +15,9 @@ and the QUIC dependency lives here so no consumer of the library has to build it
   driver's prepared stream and flow-control work, frames it with RFC 9000
   variable-length integers, and moves datagrams between two real drivers. The
   harness can drop a datagram (the sender retransmits) or park one stream's
-  datagrams for later delivery (the peer reorders).
+  datagrams for later delivery (the peer reorders). It also closes a connection:
+  the core releases the stream manager and the datagram queue as its half of
+  `finish_close`, and `close_link` retries both ends until each reports closed.
 - `src/session.mach` holds one HTTP/3 engine plus its adapter, and the two-endpoint
   fabric that drives both engines and the link.
 - `src/tests.mach` drives a small application over the pair.
@@ -33,6 +35,15 @@ requests complete, stream reset and application cancellation settling exactly on
 GOAWAY with two-stage graceful close, datagram loss with retransmission, partial
 writes with short reads under a small flow-control window, a request rejected past
 the server's budget, and a drained unknown unidirectional stream.
+
+Every test ends its connection by closing both drivers, so `finish_close` is
+reached from each of those states rather than only from a quiet one. Two tests
+assert what the close leaves behind. A graceful close ends the six critical
+streams each endpoint carries for the whole connection, three of its own and
+three the peer opened, which nothing above the transport releases. An abortive
+close settles with a request still live on both ends: the driver publishes no
+abortive entry of its own, so cancelling its operation scope escalates a
+graceful close, and the error the close began with survives the escalation.
 
 ## What it does not cover
 
