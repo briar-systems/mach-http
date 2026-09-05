@@ -13,6 +13,7 @@ use http.core.message;
 use http.core.status;
 use qt: quic.transport;
 
+use std.io.lifecycle;
 use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -307,6 +308,15 @@ fun quiet(app: *App) bool {
         && app.fabric.client.rejected == 0 && app.fabric.server.rejected == 0;
 }
 
+# every connection ends the same way a pool ends one: the engines give up what
+# they hold, then both drivers settle their close. a test that leaves the
+# engines mid-exchange still closes the drivers, which is what the transport
+# guarantees regardless of the http/3 state above it.
+fun teardown(fabric: *session.Fabric) bool {
+    ret session.close_fabric(fabric, false, h3.H3_NO_ERROR)
+        && session.fabric_closed(fabric);
+}
+
 fun attach(app: *App, fabric: *session.Fabric) {
     fabric.client.handler = consume;
     fabric.client.context = app::ptr;
@@ -324,6 +334,7 @@ test "h3quic: settings and critical streams cross two real quic drivers" {
     if (session.count_of(?fabric.client, h3.EVENT_ERROR) != 0
      || session.count_of(?fabric.server, h3.EVENT_ERROR) != 0) { ret 4; }
     if (fabric.link.transfers == 0) { ret 5; }
+    if (!teardown(?fabric)) { ret 6; }
     ret 0;
 }
 
@@ -346,6 +357,7 @@ test "h3quic: a request and response body cross the driver pair intact" {
     if (app.credit_checks < 2) { ret 8; }
     if (!app.client_slots[0].released) { ret 9; }
     if (!app.server_slots[0].released) { ret 10; }
+    if (!teardown(?fabric)) { ret 11; }
     ret 0;
 }
 
@@ -392,6 +404,7 @@ test "h3quic: sustained multiplexing reuses quic stream slots and generations" {
     }
     if (reused == 0) { ret 10; }
     if (fabric.client_wire.manager.active_streams > 6) { ret 11; }
+    if (!teardown(?fabric)) { ret 12; }
     ret 0;
 }
 
@@ -440,6 +453,7 @@ test "h3quic: a qpack-blocked section holds quic credit while other requests run
     if (released.status != qt.STATUS_OK || released.receive_uncredited != 0) { ret 18; }
     if (app.responses != 2 || app.client_ends != 2) { ret 19; }
     if (!quiet(?app)) { ret 20; }
+    if (!teardown(?fabric)) { ret 21; }
     ret 0;
 }
 
@@ -497,6 +511,8 @@ test "h3quic: stream reset and application cancellation settle exactly once" {
      || session.count_of(?second.client, h3.EVENT_STREAM_RESET) != 1) { ret 19; }
     if (second.client.engine.state != h3.OPEN
      || second.server.engine.state != h3.OPEN) { ret 20; }
+    if (!teardown(?fabric)) { ret 21; }
+    if (!teardown(?second)) { ret 22; }
     ret 0;
 }
 
@@ -539,6 +555,7 @@ test "h3quic: goaway and two-stage graceful close settle over the driver pair" {
     if (app.failures != 0 || app.mismatches != 0) { ret 16; }
     if (session.count_of(?fabric.client, h3.EVENT_ERROR) != 0
      || session.count_of(?fabric.server, h3.EVENT_ERROR) != 0) { ret 17; }
+    if (!teardown(?fabric)) { ret 18; }
     ret 0;
 }
 
@@ -561,6 +578,7 @@ test "h3quic: partial writes and short reads keep retained output intact" {
     if (fabric.server.io.partial_writes == 0) { ret 9; }
     if (fabric.client.io.short_reads == 0
      || fabric.server.io.short_reads == 0) { ret 10; }
+    if (!teardown(?fabric)) { ret 11; }
     ret 0;
 }
 
@@ -584,6 +602,7 @@ test "h3quic: lost datagrams are retransmitted without disturbing the exchange" 
     if (app.response_bytes != RESPONSE_BYTES) { ret 7; }
     if (app.responses != 1 || app.client_ends != 1) { ret 8; }
     if (!quiet(?app)) { ret 9; }
+    if (!teardown(?fabric)) { ret 11; }
     ret 0;
 }
 
@@ -614,6 +633,7 @@ test "h3quic: a request past the server budget is rejected without closing the c
     if (fabric.server.io.blocked_releases == 0) { ret 10; }
     if (fabric.server.engine.pending_release_count != 0) { ret 11; }
     if (fabric.server.io.close_calls != 0) { ret 12; }
+    if (!teardown(?fabric)) { ret 13; }
     ret 0;
 }
 
@@ -645,6 +665,7 @@ test "h3quic: a drained unknown unidirectional stream releases over the driver" 
     # a peer unidirectional stream has no send side and its receive side is
     # already closed at fin, so this release never has to be retried
     if (fabric.server.io.blocked_releases != 0) { ret 11; }
+    if (!teardown(?fabric)) { ret 12; }
     ret 0;
 }
 
@@ -684,5 +705,109 @@ test "h3quic: a destroyed engine pair carries a second connection over new drive
     if (!quiet(?second)) { ret 11; }
     if (!second.client_slots[0].released
      || !second.server_slots[0].released) { ret 12; }
+    if (!teardown(?fabric)) { ret 13; }
+    ret 0;
+}
+
+test "h3quic: a graceful close ends the six critical streams on both drivers" {
+    var fabric: session.Fabric;
+    var app: App;
+    val ready: usize = session.make_fabric(?fabric, session.session_config(), 512);
+    if (ready != 0) { ret (100 + ready)::i32; }
+    init_app(?app, ?fabric);
+    attach(?app, ?fabric);
+    app.respond_with_body = true;
+    if (!session.handshake(?fabric, 64)) { ret 2; }
+    if (start_request(?app, true) != 0) { ret 3; }
+    cycle(?app, 96);
+    if (app.responses != 1 || app.client_ends != 1) { ret 4; }
+    if (!quiet(?app)) { ret 5; }
+    if (!app.client_slots[0].released || !app.server_slots[0].released) { ret 6; }
+    # the request stream is gone, but each endpoint still holds three critical
+    # streams of its own and three the peer opened, and only the transport
+    # close ends them
+    if (fabric.client_wire.manager.active_streams != 6
+     || fabric.server_wire.manager.active_streams != 6) { ret 7; }
+    if (!h3.begin_graceful[adapter.Adapter](?fabric.server.engine)
+     || !h3.finish_graceful[adapter.Adapter](?fabric.server.engine)) { ret 8; }
+    var guard: usize = 0;
+    for (guard < 64 && fabric.server.engine.state != h3.CLOSED) {
+        cycle(?app, 2);
+        h3.progress_close[adapter.Adapter](?fabric.server.engine);
+        guard = guard + 1;
+    }
+    if (fabric.server.engine.state != h3.CLOSED) { ret 9; }
+    # the engine's own close reached the transport, so the server driver is
+    # already draining when the harness closes it
+    if (qt.snapshot[loopback.Core](?fabric.server_wire.driver).state
+        != qt.DRAINING) { ret 10; }
+    if (fabric.client_wire.manager.active_streams != 6
+     || fabric.server_wire.manager.active_streams != 6) { ret 11; }
+    if (!h3.destroy[adapter.Adapter](?fabric.client.engine)
+     || !h3.destroy[adapter.Adapter](?fabric.server.engine)) { ret 12; }
+    if (!session.close_fabric(?fabric, false, h3.H3_NO_ERROR)) { ret 13; }
+    if (!session.fabric_closed(?fabric)) { ret 14; }
+    # nothing was left owing, so both ends settle on the first attempt and the
+    # connection never enters a drain the harness has to wait out
+    if (fabric.link.close_rounds != 1) { ret 15; }
+    if (fabric.client_wire.core.abortive
+     || fabric.server_wire.core.abortive) { ret 16; }
+    if (fabric.client_wire.core.close_error != h3.H3_NO_ERROR
+     || fabric.server_wire.core.close_error != h3.H3_NO_ERROR) { ret 17; }
+    val settled: qt.Snapshot = qt.snapshot[loopback.Core](
+        ?fabric.server_wire.driver);
+    if (settled.close_mode != lifecycle.GRACEFUL
+     || settled.close_cause != lifecycle.EXPLICIT
+     || settled.pending_sends != 0
+     || settled.queued_datagrams != 0) { ret 18; }
+    if (fabric.link.errors != 0) { ret 19; }
+    ret 0;
+}
+
+test "h3quic: an abortive close settles with a request still live on both ends" {
+    var fabric: session.Fabric;
+    var app: App;
+    val ready: usize = session.make_fabric(?fabric, session.session_config(), 512);
+    if (ready != 0) { ret (100 + ready)::i32; }
+    init_app(?app, ?fabric);
+    attach(?app, ?fabric);
+    app.release_streams = false;
+    app.withhold_response = true;
+    app.hold_body = true;
+    if (!session.handshake(?fabric, 64)) { ret 2; }
+    if (start_request(?app, true) != 0) { ret 3; }
+    cycle(?app, 16);
+    if (session.count_of(?fabric.server, h3.EVENT_REQUEST_HEADERS) != 1) { ret 4; }
+    # six critical streams plus the request neither side has finished, which the
+    # engines still hold: an abortive close does not wait for them
+    if (fabric.client_wire.manager.active_streams != 7
+     || fabric.server_wire.manager.active_streams != 7) { ret 5; }
+    if (fabric.client.engine.active_requests != 1
+     || fabric.server.engine.active_requests != 1) { ret 6; }
+    if (!session.close_fabric(?fabric, true, h3.H3_REQUEST_CANCELLED)) { ret 7; }
+    if (!session.fabric_closed(?fabric)) { ret 8; }
+    if (fabric.link.close_rounds != 1) { ret 9; }
+    if (!fabric.client_wire.core.abortive
+     || !fabric.server_wire.core.abortive) { ret 10; }
+    # the driver publishes no abortive entry, so the harness escalates a
+    # graceful close by cancelling the operation scope. the error the close
+    # began with survives the escalation; the cancellation carries none.
+    if (fabric.client_wire.core.close_error != h3.H3_REQUEST_CANCELLED
+     || fabric.server_wire.core.close_error != h3.H3_REQUEST_CANCELLED) {
+        ret 11;
+    }
+    val settled: qt.Snapshot = qt.snapshot[loopback.Core](
+        ?fabric.client_wire.driver);
+    if (settled.close_mode != lifecycle.ABORTIVE
+     || settled.close_cause != lifecycle.EXPLICIT
+     || settled.terminal_cause != lifecycle.CANCELLATION
+     || settled.cancellation_reason != cancel.CANCELLED
+     || settled.application_error != h3.H3_REQUEST_CANCELLED) { ret 12; }
+    # the engines were never told, and the closed drivers own no stream storage
+    # for them to reach
+    if (fabric.client.engine.state != h3.OPEN
+     || fabric.server.engine.state != h3.OPEN) { ret 13; }
+    if (fabric.client_wire.manager.valid
+     || fabric.server_wire.manager.valid) { ret 14; }
     ret 0;
 }

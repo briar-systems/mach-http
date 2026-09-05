@@ -390,7 +390,8 @@ fun writer_release(writer: *Writer) {
 fun reader_terminal(reader: *Reader, progress: Progress) Progress {
     var settled: Progress = progress;
     if (!terminal_reuse(settled)) { settled = failed("terminal body result omitted reuse policy", REUSE_FORBIDDEN); }
-    if (settled.status == COMPLETE && reader.has_length && reader.transferred != reader.declared_length) {
+    if (settled.status == COMPLETE && reader.has_length && reader.state != DRAINING
+     && reader.transferred != reader.declared_length) {
         settled = failed("body ended at a different declared length", REUSE_FORBIDDEN);
     }
     if (settled.status == COMPLETE) { reader.state = COMPLETE_STATE; }
@@ -873,6 +874,27 @@ test "http.core.body: drain and reject are retry-safe exclusive dispositions" {
     if (rejected_reader.reuse != REUSE_FORBIDDEN) { ret 5; }
     if (reject_adapter.release_calls != 1) { ret 6; }
     if (!cancel.destroy(?scope)) { ret 7; }
+    ret 0;
+}
+
+test "http.core.body: drained readers complete without a declared-length check" {
+    var scope: cancel.Scope;
+    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, true);
+    var reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 8, true, 100, limits(256, 4, 4), ?fields, ?scope);
+    if (drain(?reader).status != PENDING || reader.state != DRAINING) { ret 1; }
+    val drained: Progress = complete_reader(?reader, 41);
+    if (drained.status != COMPLETE || reader.transferred != 0 || reader.state != COMPLETE_STATE) { ret 2; }
+    var short_adapter: TestAdapter = test_adapter(REUSE_ALLOWED, true);
+    var short_reader: Reader = init_reader(?short_adapter, test_read, test_finish, test_complete, test_release,
+        OWNER_ENGINE, 9, true, 100, limits(256, 4, 4), ?fields, ?scope);
+    var bytes: [8]u8;
+    if (read(?short_reader, ?bytes[0], 8).status != DATA || short_reader.transferred != 2) { ret 3; }
+    val ended: Progress = read(?short_reader, ?bytes[0], 8);
+    if (ended.status != ERROR || short_reader.reuse != REUSE_FORBIDDEN) { ret 4; }
+    if (!cancel.destroy(?scope)) { ret 5; }
     ret 0;
 }
 

@@ -43,6 +43,7 @@ val FRAME_OVERHEAD: usize = 32;
 
 pub rec Core {
     manager: *sm.Manager;
+    datagrams: *dq.Queue;
     owner_tokens: [8]sm.AttemptToken;
     owner_used: [8]bool;
     next_owner: u64;
@@ -51,7 +52,9 @@ pub rec Core {
     delivered: usize;
     lost: usize;
     closing: bool;
+    abortive: bool;
     closed: bool;
+    close_error: u64;
 }
 
 fun state_of(core: *Core) qt.ConnectionState {
@@ -340,7 +343,12 @@ fun core_begin_close(core: *Core, abortive: bool, application_error: u64,
     if (reason_length > 0 && reason == nil) {
         ret core_result(core, qt.STATUS_ERROR, 16);
     }
+    # the driver escalates a graceful close by calling this again, so the mode
+    # is recorded rather than assumed. that second call carries no error of its
+    # own, and the driver keeps the one the close began with.
+    if (!core.closing) { core.close_error = application_error; }
     core.closing = true;
+    if (abortive) { core.abortive = true; }
     ret core_result(core, qt.STATUS_OK, 0);
 }
 
@@ -348,8 +356,15 @@ fun core_ready(core: *Core) bool {
     ret core.closing && core.outstanding == 0;
 }
 
+# the core owns the stream manager and the datagram queue, so releasing them is
+# its half of the close: the driver checks both are invalid on return and fails
+# the close if either still is. finishing twice is what a retry loop does after
+# one endpoint settles ahead of the other, so a settled core reports done.
 fun core_finish(core: *Core) bool {
+    if (core.closed) { ret true; }
     if (!core_ready(core)) { ret false; }
+    if (sm.finish_close(core.manager).status != sm.STATUS_OK
+     || dq.finish_close(core.datagrams).status != dq.STATUS_OK) { ret false; }
     core.closed = true;
     ret true;
 }
@@ -374,6 +389,7 @@ pub rec Endpoint {
     core: Core;
     scope: cancel.Scope;
     driver: qt.Driver[Core];
+    close_failed: bool;
 }
 
 fun stream_config(source: u64, role: u8, window: u64) sm.Config {
@@ -421,7 +437,9 @@ pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
         peer_max_frame_size: 0, local_max_frame_size: 0, enabled: false},
         datagram_storage)) { ret 2; }
     endpoint.core.manager = ?endpoint.manager;
+    endpoint.core.datagrams = ?endpoint.datagrams;
     endpoint.core.next_owner = 1;
+    endpoint.close_failed = false;
     if (!cancel.make_root(?endpoint.scope, false,
         time.Time{sec: 0, nsec: 0})) { ret 3; }
     val protocol: qt.Protocol[Core] = qt.Protocol[Core]{context: ?endpoint.core,
@@ -462,6 +480,7 @@ pub rec Link {
     transfers: usize;
     reordered: usize;
     errors: usize;
+    close_rounds: usize;
 }
 
 pub fun init_link(link: *Link, client: *Endpoint, server: *Endpoint) {
@@ -473,6 +492,7 @@ pub fun init_link(link: *Link, client: *Endpoint, server: *Endpoint) {
     link.transfers = 0;
     link.reordered = 0;
     link.errors = 0;
+    link.close_rounds = 0;
     link.held_count = 0;
     link.hold_id = NO_HOLD;
 }
@@ -577,12 +597,75 @@ pub fun flush(link: *Link, budget: usize) usize {
     ret moved;
 }
 
-pub fun close_endpoint(endpoint: *Endpoint, now_ns: u64) bool {
-    if (qt.snapshot[Core](?endpoint.driver).state != qt.DRAINING
-     && qt.begin_close[Core](?endpoint.driver, 0, nil, 0,
-        now_ns).status != qt.STATUS_OK) {
+# a graceful close is the driver's explicit begin_close; an abortive one is
+# scope cancellation, which is the only abortive entry the driver publishes. the
+# driver applies a cancelled scope on the owner's next call, so both arrive at
+# the core through the same begin_close callback.
+pub fun begin_close_endpoint(endpoint: *Endpoint, abortive: bool, code: u64,
+                             now_ns: u64) bool {
+    val begun: qt.Status = qt.begin_close[Core](?endpoint.driver, code, nil, 0,
+        now_ns).status;
+    if (begun != qt.STATUS_OK && begun != qt.STATUS_CLOSED) { ret false; }
+    # beginning the graceful close first carries the application error to the
+    # core, then the cancellation escalates the mode the driver recorded
+    if (abortive) { ret qt.cancel_connection[Core](?endpoint.driver); }
+    ret true;
+}
+
+# the driver settles the close only once it owes nothing: no send in flight, no
+# cancellation call on the stack, every stream attempt drained, and both
+# datagram counts at zero. anything short of that is BLOCKED and has to be
+# retried after the link moves, so the caller distinguishes it from a failure.
+pub fun finish_close_endpoint(endpoint: *Endpoint) bool {
+    val finished: qt.Status = qt.finish_close[Core](?endpoint.driver).status;
+    if (finished == qt.STATUS_OK) { ret true; }
+    if (finished == qt.STATUS_BLOCKED) { ret false; }
+    endpoint.close_failed = true;
+    ret false;
+}
+
+# closes both drivers of a live connection and releases their operation scopes.
+# the two ends settle independently, so each is retried until it reports closed
+# and the link is pumped between rounds to settle whatever a driver still owes.
+pub fun close_link(link: *Link, abortive: bool, code: u64, budget: usize) bool {
+    link.now_ns = link.now_ns + 1;
+    if (!begin_close_endpoint(link.client, abortive, code, link.now_ns)
+     || !begin_close_endpoint(link.server, abortive, code, link.now_ns)) {
         ret false;
     }
-    if (qt.finish_close[Core](?endpoint.driver).status != qt.STATUS_OK) { ret false; }
-    ret cancel.destroy(?endpoint.scope);
+    var client_closed: bool = false;
+    var server_closed: bool = false;
+    var i: usize = 0;
+    for (i < budget) {
+        link.close_rounds = i + 1;
+        if (!client_closed) {
+            client_closed = finish_close_endpoint(link.client);
+        }
+        if (!server_closed) {
+            server_closed = finish_close_endpoint(link.server);
+        }
+        if (client_closed && server_closed) { brk; }
+        if (link.client.close_failed || link.server.close_failed) { ret false; }
+        flush(link, 16);
+        i = i + 1;
+    }
+    if (!client_closed || !server_closed) { ret false; }
+    ret cancel.destroy(?link.client.scope) && cancel.destroy(?link.server.scope);
+}
+
+# the driver deactivates every stream record and invalidates the manager and the
+# queue as it settles, so a closed endpoint owns no stream storage at all
+pub fun endpoint_closed(endpoint: *Endpoint) bool {
+    if (qt.snapshot[Core](?endpoint.driver).state != qt.CLOSED
+     || !endpoint.core.closed || endpoint.core.outstanding != 0
+     || endpoint.manager.valid || endpoint.manager.active_streams != 0
+     || endpoint.manager.active_attempts != 0 || endpoint.datagrams.valid) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < STREAM_CAPACITY) {
+        if (endpoint.stream_records[i].active) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }

@@ -3,3 +3,4 @@ dep
 *.swp
 *.swo
 .wt/
+.mach-seed/
