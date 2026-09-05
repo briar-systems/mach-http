@@ -1,9 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.6] - 2026-09-05
 
 ### Added
 
+- GitHub Actions CI: every pull request builds the library, runs the suite in both profiles and the HTTP/3 reference against the real QUIC driver, checks the release version constant, and verifies IR across all six targets.
 - The HTTP/3 transport qualification project drives the QUIC driver close
   contract. Its protocol core releases the stream manager and the datagram
   queue as its half of `finish_close`, which the driver requires and the core
@@ -28,6 +29,10 @@
   body with a Content-Length or HTTP/2 or HTTP/3 declared length ended with
   `body ended at a different declared length`. The check still applies to a
   body whose bytes all passed through the reader.
+
+### Changed
+
+- Dependencies: mach-quic v0.5.8.
 
 ## [0.7.5] - 2026-09-02
 
