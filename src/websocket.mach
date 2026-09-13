@@ -5,16 +5,17 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.ok;
-use std.types.result.unwrap_ok;
+use std.types.result.res;
 use std.types.size.usize;
 use std.memory;
 use io_error: std.io.error;
 use io_runtime: std.io.runtime;
 use http.core.transport;
 
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
 pub val OPCODE_CONTINUATION: u8 = 0x0;
 pub val OPCODE_TEXT: u8 = 0x1;
 pub val OPCODE_BINARY: u8 = 0x2;
@@ -735,11 +736,11 @@ pub fun submit_read(connection: *Connection) bool {
     if (connection == nil || !connection.initialized || connection.read_pending
      || connection.close_pending || connection.input != nil
      || connection.input_eof || connection.decoder.held) { ret false; }
-    val submitted: Result[transport.Token, io_error.Error] = transport.read(
+    val submitted: res[transport.Token, io_error.Error] = transport.read(
         connection.transport, connection.scope, connection.read_buffer,
         connection.read_capacity, 0);
-    if (is_err[transport.Token, io_error.Error](submitted)) { ret false; }
-    connection.read_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    if ((sel submitted.err)) { ret false; }
+    connection.read_token = submitted.ok;
     connection.read_pending = true;
     ret true;
 }
@@ -786,11 +787,11 @@ pub fun submit_write(connection: *Connection) bool {
      || (connection.encoder.active && control_opcode(connection.encoder.frame.opcode))) {
         ret false;
     }
-    val submitted: Result[transport.Token, io_error.Error] = transport.write(
+    val submitted: res[transport.Token, io_error.Error] = transport.write(
         connection.transport, connection.scope, ?connection.write_buffer[connection.write_offset],
         connection.write_length - connection.write_offset, 0);
-    if (is_err[transport.Token, io_error.Error](submitted)) { ret false; }
-    connection.write_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    if ((sel submitted.err)) { ret false; }
+    connection.write_token = submitted.ok;
     connection.write_pending = true;
     ret true;
 }
@@ -798,10 +799,10 @@ pub fun submit_write(connection: *Connection) bool {
 pub fun submit_close(connection: *Connection) bool {
     if (connection == nil || !connection.initialized || connection.close_pending
      || connection.write_pending || connection.write_length != 0) { ret false; }
-    val submitted: Result[transport.Token, io_error.Error] = transport.close(
+    val submitted: res[transport.Token, io_error.Error] = transport.close(
         connection.transport, 0);
-    if (is_err[transport.Token, io_error.Error](submitted)) { ret false; }
-    connection.close_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    if ((sel submitted.err)) { ret false; }
+    connection.close_token = submitted.ok;
     connection.close_pending = true;
     ret true;
 }
@@ -972,35 +973,35 @@ rec TestAdapter {
 }
 
 fun test_submit_buffer(context: ptr, token: transport.Token, scope: *cancel.Scope,
-    buffer: *u8, length: usize, kind: transport.Kind) Result[bool, io_error.Error] {
+    buffer: *u8, length: usize, kind: transport.Kind) res[bool, io_error.Error] {
     val state: *TestAdapter = context::*TestAdapter;
     state.token = token; state.buffer = buffer; state.length = length; state.kind = kind;
-    ret ok[bool, io_error.Error](true);
+    ret res[bool, io_error.Error].ok{true};
 }
 
 fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
-    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    buffer: *u8, length: usize) res[bool, io_error.Error] {
     ret test_submit_buffer(context, token, scope, buffer, length, transport.READ);
 }
 
 fun test_write(context: ptr, token: transport.Token, scope: *cancel.Scope,
-    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    buffer: *u8, length: usize) res[bool, io_error.Error] {
     ret test_submit_buffer(context, token, scope, buffer, length, transport.WRITE);
 }
 
 fun test_control(context: ptr, token: transport.Token,
-    scope: *cancel.Scope) Result[bool, io_error.Error] {
+    scope: *cancel.Scope) res[bool, io_error.Error] {
     val state: *TestAdapter = context::*TestAdapter;
     state.token = token; state.buffer = nil; state.length = 0; state.kind = transport.CLOSE;
-    ret ok[bool, io_error.Error](true);
+    ret res[bool, io_error.Error].ok{true};
 }
 
 test "http.websocket: transport backpressure retains only connection buffers" {
     var operation_scope: cancel.Scope;
     var control_scope: cancel.Scope;
     val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!cancel.make_root(?operation_scope, false, none)
-     || !cancel.make_root(?control_scope, false, none)) { ret 1; }
+    if (!operation_ok(cancel.make_root(?operation_scope, false, none))
+     || !operation_ok(cancel.make_root(?control_scope, false, none))) { ret 1; }
     var adapter_state: TestAdapter;
     var adapter: transport.Adapter = transport.Adapter{
         runtime: 1::*io_runtime.Runtime,
@@ -1050,7 +1051,7 @@ test "http.websocket: transport backpressure retains only connection buffers" {
     completion = transport.completed(adapter_state.token, transport.CLOSE, 0);
     if (complete_io(?connection, ?completion).kind != EVENT_CLOSED
      || connection.decoder.state != CLOSED || connection.encoder.state != CLOSED) { ret 10; }
-    if (!cancel.destroy(?operation_scope) || !cancel.destroy(?control_scope)) { ret 11; }
+    if (!operation_ok(cancel.destroy(?operation_scope)) || !operation_ok(cancel.destroy(?control_scope))) { ret 11; }
     ret 0;
 }
 

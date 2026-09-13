@@ -8,6 +8,10 @@ use std.types.string.str;
 use std.types.view;
 use http.core.field;
 
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
 pub def Status: u8;
 pub def State: u8;
 pub def Mode: u8;
@@ -569,15 +573,15 @@ fun writer_finish(writer: *Writer, mode: Mode, expected_state: State) Progress {
 
 fun reader_scope(reader: *Reader) Progress {
     val reason: cancel.Reason = cancel.reason(reader.scope);
-    if (reason == cancel.ACTIVE) { ret data(0); }
-    if (reason == cancel.TIMED_OUT) { ret reader_finish(reader, TIMEOUT, CANCELLING); }
+    if ((sel reason.active)) { ret data(0); }
+    if ((sel reason.timed_out)) { ret reader_finish(reader, TIMEOUT, CANCELLING); }
     ret reader_finish(reader, CANCEL, CANCELLING);
 }
 
 fun writer_scope(writer: *Writer) Progress {
     val reason: cancel.Reason = cancel.reason(writer.scope);
-    if (reason == cancel.ACTIVE) { ret data(0); }
-    if (reason == cancel.TIMED_OUT) { ret writer_finish(writer, TIMEOUT, CANCELLING); }
+    if ((sel reason.active)) { ret data(0); }
+    if ((sel reason.timed_out)) { ret writer_finish(writer, TIMEOUT, CANCELLING); }
     ret writer_finish(writer, CANCEL, CANCELLING);
 }
 
@@ -801,7 +805,7 @@ fun test_release(context: ptr) {
 
 test "http.core.body: readers stream exact declared lengths and release once" {
     var scope: cancel.Scope;
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
     var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var adapter: TestAdapter = test_adapter(REUSE_ALLOWED, false);
     var reader: Reader = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
@@ -811,7 +815,7 @@ test "http.core.body: readers stream exact declared lengths and release once" {
     if (read(?reader, ?output[0], 4).status != COMPLETE || reader.state != COMPLETE_STATE
      || reader.reuse != REUSE_ALLOWED || adapter.release_calls != 1) { ret 3; }
     if (read(?reader, ?output[0], 4).status != COMPLETE || adapter.release_calls != 1) { ret 4; }
-    if (!cancel.destroy(?scope)) { ret 5; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 5; }
     ret 0;
 }
 
@@ -827,7 +831,7 @@ test "http.core.body: reader completion publishes bounded trailers" {
     var output: [4]u8;
     if (read(?reader, ?output[0], 4).status != DATA || read(?reader, ?output[0], 4).status != COMPLETE) { ret 1; }
     if (fields.len != 1 || field.find_first(?fields, view.view("Digest", 6)) == nil) { ret 2; }
-    if (!cancel.destroy(?scope)) { ret 3; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 3; }
     ret 0;
 }
 
@@ -852,7 +856,7 @@ test "http.core.body: pending reads and writes require matching completion token
     if (finish(?writer).status != INVALID || complete_writer(?writer, 42).status != INVALID) { ret 5; }
     if (complete_writer(?writer, 43).status != DATA || writer.transferred != 2
      || finish(?writer).status != COMPLETE || adapter.release_calls != 1) { ret 6; }
-    if (!cancel.destroy(?scope)) { ret 7; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 7; }
     ret 0;
 }
 
@@ -873,7 +877,7 @@ test "http.core.body: drain and reject are retry-safe exclusive dispositions" {
     if (rejected_result.status != REJECTED) { ret 4; }
     if (rejected_reader.reuse != REUSE_FORBIDDEN) { ret 5; }
     if (reject_adapter.release_calls != 1) { ret 6; }
-    if (!cancel.destroy(?scope)) { ret 7; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 7; }
     ret 0;
 }
 
@@ -894,7 +898,7 @@ test "http.core.body: drained readers complete without a declared-length check" 
     if (read(?short_reader, ?bytes[0], 8).status != DATA || short_reader.transferred != 2) { ret 3; }
     val ended: Progress = read(?short_reader, ?bytes[0], 8);
     if (ended.status != ERROR || short_reader.reuse != REUSE_FORBIDDEN) { ret 4; }
-    if (!cancel.destroy(?scope)) { ret 5; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 5; }
     ret 0;
 }
 
@@ -908,14 +912,14 @@ test "http.core.body: cancellation scopes preserve cancelled and timed out outco
     cancel.cancel(?scope);
     var output: [4]u8;
     if (read(?reader, ?output[0], 4).status != CANCELLED || adapter.finish_mode != CANCEL) { ret 1; }
-    if (!cancel.destroy(?scope)) { ret 2; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 2; }
     cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
     var timeout_adapter: TestAdapter = test_adapter(REUSE_FORBIDDEN, false);
     var timeout_body: Reader = init_reader(?timeout_adapter, test_read, test_finish, test_complete, test_release,
         OWNER_ENGINE, 11, false, 0, limits(8, 4, 4), ?fields, ?scope);
     cancel.timeout(?scope);
     if (read(?timeout_body, ?output[0], 4).status != TIMED_OUT || timeout_adapter.finish_mode != TIMEOUT) { ret 3; }
-    if (!cancel.destroy(?scope)) { ret 4; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 4; }
     ret 0;
 }
 
@@ -929,7 +933,7 @@ test "http.core.body: cancellation preempts pending drain and finish operations"
     if (drain(?reader).status != PENDING) { ret 1; }
     cancel.cancel(?scope);
     if (drain(?reader).status != CANCELLED || adapter.finish_mode != CANCEL || adapter.release_calls != 1) { ret 2; }
-    if (!cancel.destroy(?scope)) { ret 3; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 3; }
     cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
     adapter = test_adapter(REUSE_FORBIDDEN, true);
     var writer: Writer = init_writer(?adapter, test_write, test_finish, test_complete, test_release,
@@ -937,7 +941,7 @@ test "http.core.body: cancellation preempts pending drain and finish operations"
     if (finish(?writer).status != PENDING) { ret 4; }
     cancel.timeout(?scope);
     if (finish(?writer).status != TIMED_OUT || adapter.finish_mode != TIMEOUT || adapter.release_calls != 1) { ret 5; }
-    if (!cancel.destroy(?scope)) { ret 6; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 6; }
     ret 0;
 }
 
@@ -951,7 +955,7 @@ test "http.core.body: readers enforce chunk counts bytes and producer counts" {
     var output: [8]u8;
     if (read(?reader, ?output[0], 8).status != DATA || reader.transferred != 2 || reader.chunks != 1) { ret 1; }
     if (read(?reader, ?output[0], 8).status != COMPLETE) { ret 2; }
-    if (!cancel.destroy(?scope)) { ret 3; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 3; }
     ret 0;
 }
 
@@ -982,7 +986,7 @@ test "http.core.body: limit exhaustion and adapter violations settle ownership" 
         OWNER_ENGINE, 22, false, 0, limits(2, 2, 1), ?fields, ?scope);
     if (write(?writer, ?bytes[0], 2).status != DATA || write(?writer, ?bytes[0], 1).status != LIMIT_REACHED
      || adapter.release_calls != 1) { ret 5; }
-    if (!cancel.destroy(?scope)) { ret 6; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 6; }
     ret 0;
 }
 
@@ -1002,7 +1006,7 @@ test "http.core.body: writers bound chunks and require exact completion" {
         OWNER_APPLICATION, 14, true, 4, limits(8, 4, 2), ?fields, ?scope);
     if (write(?writer, ?input[0], 2).status != DATA || finish(?writer).status != ERROR
      || writer.reuse != REUSE_FORBIDDEN || adapter.release_calls != 1) { ret 4; }
-    if (!cancel.destroy(?scope)) { ret 5; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 5; }
     ret 0;
 }
 
@@ -1020,6 +1024,6 @@ test "http.core.body: body endpoint ownership requires one release authority" {
      || !validate_reader(?empty, limits(8, 4, 2), 15)) { ret 2; }
     empty.declared_length = 1;
     if (validate_reader(?empty, limits(8, 4, 2), 15)) { ret 3; }
-    if (!cancel.destroy(?scope)) { ret 4; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 4; }
     ret 0;
 }

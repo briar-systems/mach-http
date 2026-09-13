@@ -18,6 +18,19 @@ use http.core.target;
 use http.h3.frame;
 use http.h3.qpack;
 
+
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
+
+fun transition_ok(outcome: cancel.Transition) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
+fun scope_active(scope: *cancel.Scope) bool {
+    val reason: cancel.Reason = cancel.reason(scope);
+    ret sel reason.active;
+}
 pub def Role: u8;
 pub val SERVER: Role = 1;
 pub val CLIENT: Role = 2;
@@ -751,7 +764,7 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
     scope: *cancel.Scope, storage: Storage, configured: Config) bool {
     if (engine == nil || engine.initialized || (role != SERVER && role != CLIENT)
      || !transport_valid[T](?transport) || scope == nil
-     || cancel.reason(scope) != cancel.ACTIVE || !config_valid(configured, ?storage)
+     || !scope_active(scope) || !config_valid(configured, ?storage)
      || storage.streams == nil || storage.memories == nil
      || storage.control_queue == nil || storage.encoder_queue == nil
      || storage.decoder_queue == nil
@@ -831,7 +844,7 @@ pub fun bind_exchange[T](engine: *Engine[T], id: u64,
      || !bound.valid || stream.exchange != nil || bound.generation != stream.generation
      || bound.request.metadata.version.wire != message.WIRE_H3
      || bound.request.metadata.request_index != id
-     || bound.scope == nil || cancel.reason(bound.scope) != cancel.ACTIVE) { ret false; }
+     || bound.scope == nil || !scope_active(bound.scope)) { ret false; }
     stream.exchange = bound; ret true;
 }
 
@@ -2333,7 +2346,7 @@ pub fun process[T](engine: *Engine[T]) Event {
     }
     if (engine.state == CLOSED) { ret base_event[T](engine, EVENT_CLOSED); }
     if (engine.state == FAILED) { ret base_event[T](engine, EVENT_ERROR); }
-    if (cancel.reason(engine.scope) != cancel.ACTIVE) {
+    if (!scope_active(engine.scope)) {
         ret fail_connection[T](engine, ERROR_CANCELLED, H3_REQUEST_CANCELLED);
     }
     queue_increment[T](engine);
@@ -2467,7 +2480,7 @@ pub fun tick[T](engine: *Engine[T]) Event {
     if (engine == nil || !engine.initialized) {
         ret invalid_event();
     }
-    if (cancel.reason(engine.scope) != cancel.ACTIVE) {
+    if (!scope_active(engine.scope)) {
         ret fail_connection[T](engine, ERROR_CANCELLED, H3_REQUEST_CANCELLED);
     }
     var i: usize = 0;
@@ -2475,7 +2488,7 @@ pub fun tick[T](engine: *Engine[T]) Event {
         val stream: *Stream = ?engine.streams[i];
         if (stream.live && stream.kind == STREAM_REQUEST && !stream_terminal(stream)
          && stream.exchange != nil
-         && cancel.reason(stream.exchange.scope) != cancel.ACTIVE) {
+         && !scope_active(stream.exchange.scope)) {
             exchange.settle_cancellation(stream.exchange);
             val result: Event = stream_failure[T](engine, stream, H3_REQUEST_CANCELLED);
             var reset: Event = result; reset.kind = EVENT_STREAM_RESET;
@@ -2832,7 +2845,7 @@ test "http.h3.connection: typed transport accepts a secret-welded context" {
         release: test_release, close: test_close};
     val closed: TransportOperation = transport.close(transport.context, 42);
     if (closed.status != TRANSPORT_OK || io.close_calls != 1
-     || io.close_code != 42 || io.secret:^ != 7) { ret 1; }
+     || io.close_code != 42 || io.secret:>u64 != 7) { ret 1; }
     ret 0;
 }
 
@@ -2910,7 +2923,7 @@ fun reset_io(fixture: *Fixture, role: Role) {
 
 fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
     val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!cancel.make_root(?fixture.scope, false, none)) { ret false; }
+    if (!operation_ok(cancel.make_root(?fixture.scope, false, none))) { ret false; }
     reset_io(fixture, role);
     ret start_engine(fixture, role, configured);
 }
@@ -3056,7 +3069,7 @@ rec ExchangeMemory {
 fun make_exchange(storage: *ExchangeMemory, generation: u64, id: u64) bool {
     val configured: message.Limits = message.limits_default();
     val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!cancel.make_root(?storage.scope, false, none)) { ret false; }
+    if (!operation_ok(cancel.make_root(?storage.scope, false, none))) { ret false; }
     var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     storage.reader = body.empty_reader(generation);
@@ -3755,7 +3768,7 @@ test "http.h3.connection: blocked reset and application cancellation settle once
     if (wire == nil || !make_exchange(?exchange_memory, headers.generation, 0)
      || !bind_exchange[TestTransport](?cancelled.engine, 0, ?exchange_memory.exchange)
      || !release_event[TestTransport](?cancelled.engine, 0, headers.generation)
-     || !cancel.cancel(?exchange_memory.scope)) { ret 5; }
+     || !transition_ok(cancel.cancel(?exchange_memory.scope))) { ret 5; }
     val event: Event = tick[TestTransport](?cancelled.engine);
     if (event.kind != EVENT_STREAM_RESET || event.code != H3_REQUEST_CANCELLED
      || !wire.send_cancelled || !wire.receive_cancelled

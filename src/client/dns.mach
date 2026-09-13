@@ -9,14 +9,21 @@ use std.sync.mutex;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.result.Result;
-use std.types.result.is_err;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
 use http.client.memory;
 use http.client.policy;
 
+
+fun operation_ok(outcome: cancellation.Operation) bool {
+    ret sel outcome.ok;
+}
+
+fun transition_ok(outcome: cancellation.Transition) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
 val ENTRY_EMPTY:   u8 = 0;
 val ENTRY_PRESENT: u8 = 1;
 
@@ -447,8 +454,8 @@ fun write_service(entry: *Entry) {
 }
 
 fun numeric_host(entry: *Entry) bool {
-    val parsed: Result[ip.Addr, str] = ip.addr_parse(?entry.host[0]);
-    ret !is_err[ip.Addr, str](parsed);
+    val parsed: res[ip.Addr, ip.ParseError] = ip.addr_parse(?entry.host[0]);
+    ret (sel parsed.ok);
 }
 
 fun query_for(index: usize, entry: *Entry) Query {
@@ -468,8 +475,8 @@ fun query_for(index: usize, entry: *Entry) Query {
 fun begin_locked(cache: *Cache, index: usize, now: time.Time) Query {
     val entry: *Entry = ?cache.entries[index];
     if (entry.resolving || entry.completing
-        || !cancellation.make_root(?entry.scope, true,
-            time_add(now, cache.configured.resolve_timeout_ns))) {
+        || !operation_ok(cancellation.make_root(?entry.scope, true,
+            time_add(now, cache.configured.resolve_timeout_ns)))) {
         ret empty_query();
     }
     entry.resolving = true;
@@ -753,7 +760,7 @@ pub fun complete(cache: *Cache, token: Token,
     }
     entry.completing = true;
     mutex.unlock(?cache.lock);
-    if (!cancellation.destroy(?entry.scope)) {
+    if (!operation_ok(cancellation.destroy(?entry.scope))) {
         mutex.lock(?cache.lock);
         val current: *Entry = entry_for_locked(cache, token);
         if (current != nil && current.completing) { current.completing = false; }
@@ -814,7 +821,7 @@ pub fun abandon(cache: *Cache, token: Token, failure: resolver.Error,
     }
     entry.completing = true;
     mutex.unlock(?cache.lock);
-    if (!cancellation.destroy(?entry.scope)) {
+    if (!operation_ok(cancellation.destroy(?entry.scope))) {
         mutex.lock(?cache.lock);
         val current: *Entry = entry_for_locked(cache, token);
         if (current != nil && current.completing) { current.completing = false; }
@@ -1008,7 +1015,7 @@ test "http.client.dns: capacity output and cancellation stay bounded" {
     }
     val cancelled: Cancel = take_cancel(?cache);
     if (!cancelled.found || take_cancel(?cache).found
-        || !cancellation.cancel(cancelled.scope)) { ret 3; }
+        || !transition_ok(cancellation.cancel(cancelled.scope))) { ret 3; }
     var completion: resolver.Completion = resolver.Completion{
         token: resolver.Token{index: 2, generation: 1},
         context: first.query.context,

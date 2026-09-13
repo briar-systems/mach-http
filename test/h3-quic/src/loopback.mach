@@ -22,6 +22,10 @@ use std.types.result;
 use std.types.size.usize;
 use std.types.string.str;
 
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
 pub val STREAM_CAPACITY: usize = 16;
 pub val SEND_STRIDE: usize = 512;
 pub val RECEIVE_STRIDE: usize = 512;
@@ -67,7 +71,7 @@ fun core_result(core: *Core, status: qt.Status, error: u64) qt.CoreResult {
         state: state_of(core)};
 }
 
-fun wrote(value: result.Result[usize, str]) bool {
+fun wrote(value: result.res[usize, str]) bool {
     ret result.is_ok[usize, str](value);
 }
 
@@ -83,7 +87,7 @@ fun take_varint(d: *binary.Decoder, out: *u64) bool {
 }
 
 fun take_u8(d: *binary.Decoder, out: *u8) bool {
-    val read: result.Result[u8, str] = binary.read_u8(d);
+    val read: result.res[u8, str] = binary.read_u8(d);
     if (!result.is_ok[u8, str](read)) { ret false; }
     out[0] = result.unwrap_ok[u8, str](read);
     ret true;
@@ -244,7 +248,7 @@ fun core_receive(core: *Core, input: *qt.Datagram) qt.CoreResult {
         }
         var payload: *u8 = nil;
         if (second != 0) {
-            val bytes: result.Result[*u8, str] = binary.read_bytes(?d, second::usize);
+            val bytes: result.res[*u8, str] = binary.read_bytes(?d, second::usize);
             if (!result.is_ok[*u8, str](bytes)) {
                 ret core_result(core, qt.STATUS_ERROR, 4);
             }
@@ -440,8 +444,8 @@ pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
     endpoint.core.datagrams = ?endpoint.datagrams;
     endpoint.core.next_owner = 1;
     endpoint.close_failed = false;
-    if (!cancel.make_root(?endpoint.scope, false,
-        time.Time{sec: 0, nsec: 0})) { ret 3; }
+    if (!operation_ok(cancel.make_root(?endpoint.scope, false,
+        time.Time{sec: 0, nsec: 0}))) { ret 3; }
     val protocol: qt.Protocol[Core] = qt.Protocol[Core]{context: ?endpoint.core,
         context_range: core_range, receive: core_receive,
         timeout: core_timeout, generate: core_generate,
@@ -650,7 +654,7 @@ pub fun close_link(link: *Link, abortive: bool, code: u64, budget: usize) bool {
         i = i + 1;
     }
     if (!client_closed || !server_closed) { ret false; }
-    ret cancel.destroy(?link.client.scope) && cancel.destroy(?link.server.scope);
+    ret operation_ok(cancel.destroy(?link.client.scope)) && operation_ok(cancel.destroy(?link.server.scope));
 }
 
 # the driver deactivates every stream record and invalidates the manager and the
