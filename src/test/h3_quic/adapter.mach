@@ -1,6 +1,6 @@
 # binds the http/3 stream adapter to the real quic connection driver
 
-use h3quic.loopback;
+use http.test.h3_quic.loopback;
 use h3: http.h3.connection;
 use qt: quic.transport;
 use std.types.bool.bool;
