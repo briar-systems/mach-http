@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.8.0] - 2026-09-13
+
+### Changed
+- Migrated to mach 5.0 and mach-std 2.0.0.
+- Cancel reasons are tested as tag cases, and deadline queries read the std 2.0 `DeadlineQuery`. The `router.Handler` result type stays `res[u8, str]` for now.
+- Dependencies (test/h3-quic only): mach-quic v0.6.0.
+
 ## [0.7.6] - 2026-09-05
 
 ### Added
