@@ -18,11 +18,15 @@ use std.net.ip;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.result;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
 
+
+fun is_ok_usize_u8(outcome: res[usize, u8]) bool {
+    ret sel outcome.ok;
+}
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
 }
@@ -71,12 +75,12 @@ fun core_result(core: *Core, status: qt.Status, error: u64) qt.CoreResult {
         state: state_of(core)};
 }
 
-fun wrote(value: result.res[usize, str]) bool {
-    ret result.is_ok[usize, str](value);
+fun wrote(value: res[usize, binary.EncodeError]) bool {
+    ret (sel value.ok);
 }
 
 fun put_varint(b: *binary.Builder, value: u64) bool {
-    ret result.is_ok[usize, u8](varint.write(b, value, 0));
+    ret is_ok_usize_u8(varint.write(b, value, 0));
 }
 
 fun take_varint(d: *binary.Decoder, out: *u64) bool {
@@ -87,9 +91,9 @@ fun take_varint(d: *binary.Decoder, out: *u64) bool {
 }
 
 fun take_u8(d: *binary.Decoder, out: *u8) bool {
-    val read: result.res[u8, str] = binary.read_u8(d);
-    if (!result.is_ok[u8, str](read)) { ret false; }
-    out[0] = result.unwrap_ok[u8, str](read);
+    val read: res[u8, binary.DecodeError] = binary.read_u8(d);
+    if (sel read.err) { ret false; }
+    out[0] = read.ok;
     ret true;
 }
 
@@ -248,11 +252,11 @@ fun core_receive(core: *Core, input: *qt.Datagram) qt.CoreResult {
         }
         var payload: *u8 = nil;
         if (second != 0) {
-            val bytes: result.res[*u8, str] = binary.read_bytes(?d, second::usize);
-            if (!result.is_ok[*u8, str](bytes)) {
+            val bytes: res[*u8, binary.DecodeError] = binary.read_bytes(?d, second::usize);
+            if (sel bytes.err) {
                 ret core_result(core, qt.STATUS_ERROR, 4);
             }
-            payload = result.unwrap_ok[*u8, str](bytes);
+            payload = bytes.ok;
         }
         val received: sm.ReceiveResult = sm.receive_stream(core.manager, id,
             first, payload, second::usize, end_byte != 0);

@@ -60,3 +60,7 @@ need = []
 
 [dep.http]
 path = "../.."
+
+[dep.quic]
+git = "https://github.com/briar-systems/mach-quic"
+ref = "tag/v0.6.0"
