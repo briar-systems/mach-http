@@ -1,3 +1,9 @@
+use http.core.body;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.core.target;
 use std.chrono.time;
 use std.sync.cancel;
 use std.types.bool.bool;
@@ -6,40 +12,47 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
-use http.core.body;
-use http.core.field;
-use http.core.message;
-use http.core.method;
-use http.core.status;
-use http.core.target;
 
-pub def State: u8;
-pub def FinishStatus: u8;
-pub def Outcome: u8;
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
+
+fun transition_ok(outcome: cancel.Transition) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
+
+fun scope_active(scope: *cancel.Scope) bool {
+    val reason: cancel.Reason = cancel.reason(scope);
+    ret sel reason.active;
+}
+
+pub def State:         u8;
+pub def FinishStatus:  u8;
+pub def Outcome:       u8;
 pub def ServiceStatus: u8;
 
-pub val NEW: State = 1;
-pub val HANDLING: State = 2;
-pub val RESPONDING: State = 3;
-pub val COMPLETE_STATE: State = 4;
+pub val NEW:             State = 1;
+pub val HANDLING:        State = 2;
+pub val RESPONDING:      State = 3;
+pub val COMPLETE_STATE:  State = 4;
 pub val CANCELLED_STATE: State = 5;
 pub val TIMED_OUT_STATE: State = 6;
-pub val FAILED_STATE: State = 7;
+pub val FAILED_STATE:    State = 7;
 
-pub val FINISH_OK: FinishStatus = 1;
-pub val FINISH_INVALID: FinishStatus = 2;
-pub val FINISH_NOT_COMMITTED: FinishStatus = 3;
-pub val FINISH_BODY_PENDING: FinishStatus = 4;
+pub val FINISH_OK:               FinishStatus = 1;
+pub val FINISH_INVALID:          FinishStatus = 2;
+pub val FINISH_NOT_COMMITTED:    FinishStatus = 3;
+pub val FINISH_BODY_PENDING:     FinishStatus = 4;
 pub val FINISH_ALREADY_COMPLETE: FinishStatus = 5;
 
-pub val OUTCOME_OK: Outcome = 1;
+pub val OUTCOME_OK:        Outcome = 1;
 pub val OUTCOME_CANCELLED: Outcome = 2;
 pub val OUTCOME_TIMED_OUT: Outcome = 3;
-pub val OUTCOME_FAILED: Outcome = 4;
+pub val OUTCOME_FAILED:    Outcome = 4;
 
 pub val SERVICE_COMPLETE: ServiceStatus = 1;
-pub val SERVICE_PENDING: ServiceStatus = 2;
-pub val SERVICE_FAILED: ServiceStatus = 3;
+pub val SERVICE_PENDING:  ServiceStatus = 2;
+pub val SERVICE_FAILED:   ServiceStatus = 3;
 
 pub rec Completion {
     outcome:   Outcome;
@@ -75,42 +88,41 @@ fun equal_time(a: time.Time, b: time.Time) bool {
 }
 
 fun deadline_matches(request: *message.Request, scope: *cancel.Scope) bool {
-    var deadline: time.Time;
-    var owner: *cancel.Scope = nil;
-    val has_deadline: bool = cancel.get_deadline(scope, ?deadline, ?owner);
-    if (request.metadata.has_deadline != has_deadline) { ret false; }
-    ret !has_deadline || equal_time(request.metadata.deadline, deadline);
+    val query: cancel.DeadlineQuery = cancel.get_deadline(scope);
+    if (sel query.err)     { ret !request.metadata.has_deadline; }
+    if (sel query.ok.none) { ret !request.metadata.has_deadline; }
+    ret request.metadata.has_deadline && equal_time(request.metadata.deadline, query.ok.some.at);
 }
 
 pub fun init(exchange: *Exchange, request: *message.Request, response: *message.Response,
     informationals: *message.Informational, informational_capacity: usize,
     scope: *cancel.Scope, generation: u64, configured: message.Limits) bool {
     if (exchange == nil || request == nil || response == nil || scope == nil || generation == 0) { ret false; }
-    exchange.request = request;
-    exchange.response = response;
+    exchange.request        = request;
+    exchange.response       = response;
     exchange.informationals = message.init_informationals(informationals, informational_capacity, configured);
-    exchange.scope = scope;
-    exchange.limits = configured;
-    exchange.generation = generation;
-    exchange.state = NEW;
-    exchange.completion = Completion{
-        outcome: 0,
-        status: 0,
-        reuse: body.REUSE_UNKNOWN,
-        bytes_in: 0,
+    exchange.scope          = scope;
+    exchange.limits         = configured;
+    exchange.generation     = generation;
+    exchange.state          = NEW;
+    exchange.completion     = Completion{
+        outcome:   0,
+        status:    0,
+        reuse:     body.REUSE_UNKNOWN,
+        bytes_in:  0,
         bytes_out: 0,
-        error: nil,
+        error:     nil,
     };
     exchange.valid = exchange.informationals.valid && request.generation == generation
         && response.generation == generation && message.validate_request(request, configured)
-        && cancel.reason(scope) == cancel.ACTIVE && deadline_matches(request, scope)
+        && scope_active(scope) && deadline_matches(request, scope)
         && (request.body.scope == nil || request.body.scope == scope);
     ret exchange.valid;
 }
 
 pub fun begin(exchange: *Exchange) bool {
     if (exchange == nil || !exchange.valid || exchange.state != NEW
-     || cancel.reason(exchange.scope) != cancel.ACTIVE) { ret false; }
+        || !scope_active(exchange.scope)) { ret false; }
     exchange.state = HANDLING;
     ret true;
 }
@@ -118,17 +130,17 @@ pub fun begin(exchange: *Exchange) bool {
 pub fun emit_informational(exchange: *Exchange, information: *message.Informational,
     configured: message.Limits) message.InformStatus {
     if (exchange == nil || !exchange.valid || exchange.state != HANDLING
-     || exchange.response.committed || cancel.reason(exchange.scope) != cancel.ACTIVE) { ret message.INFORM_INVALID; }
+        || exchange.response.committed || !scope_active(exchange.scope)) { ret message.INFORM_INVALID; }
     ret message.append_informational(?exchange.informationals, information, configured);
 }
 
 pub fun commit(exchange: *Exchange, configured: message.Limits) message.ResponseStatus {
     if (exchange == nil || !exchange.valid || exchange.state != HANDLING
-     || cancel.reason(exchange.scope) != cancel.ACTIVE) { ret message.RESPONSE_INVALID; }
+        || !scope_active(exchange.scope)) { ret message.RESPONSE_INVALID; }
     if ((exchange.response.body_kind == message.BODY_READER && exchange.response.body_reader.scope != nil
-         && exchange.response.body_reader.scope != exchange.scope)
-     || (exchange.response.body_kind == message.BODY_WRITER && exchange.response.body_writer.scope != nil
-         && exchange.response.body_writer.scope != exchange.scope)) { ret message.RESPONSE_INVALID; }
+        && exchange.response.body_reader.scope != exchange.scope)
+        || (exchange.response.body_kind == message.BODY_WRITER && exchange.response.body_writer.scope != nil
+        && exchange.response.body_writer.scope != exchange.scope)) { ret message.RESPONSE_INVALID; }
     val result: message.ResponseStatus = message.commit_response(exchange.response, exchange.request.method.kind, configured);
     if (result == message.RESPONSE_OK) { exchange.state = RESPONDING; }
     ret result;
@@ -146,7 +158,7 @@ fun response_terminal(exchange: *Exchange) bool {
 }
 
 fun response_progress(exchange: *Exchange) body.Progress {
-    if (exchange.response.body_kind == message.BODY_NONE) { ret body.complete(body.REUSE_ALLOWED); }
+    if (exchange.response.body_kind == message.BODY_NONE)   { ret body.complete(body.REUSE_ALLOWED); }
     if (exchange.response.body_kind == message.BODY_READER) { ret body.reader_result(exchange.response.body_reader); }
     if (exchange.response.body_kind == message.BODY_WRITER) { ret body.writer_result(exchange.response.body_writer); }
     ret body.failed("invalid response body kind", body.REUSE_FORBIDDEN);
@@ -154,15 +166,15 @@ fun response_progress(exchange: *Exchange) body.Progress {
 
 fun combine_reuse(request_reuse: body.Reuse, response_reuse: body.Reuse) body.Reuse {
     if (request_reuse == body.REUSE_FORBIDDEN || response_reuse == body.REUSE_FORBIDDEN) { ret body.REUSE_FORBIDDEN; }
-    if (request_reuse == body.REUSE_ALLOWED && response_reuse == body.REUSE_ALLOWED) { ret body.REUSE_ALLOWED; }
+    if (request_reuse == body.REUSE_ALLOWED && response_reuse == body.REUSE_ALLOWED)     { ret body.REUSE_ALLOWED; }
     ret body.REUSE_UNKNOWN;
 }
 
 fun outcome_for(request: body.Progress, response: body.Progress, reason: cancel.Reason) Outcome {
-    if (reason == cancel.TIMED_OUT || request.status == body.TIMED_OUT || response.status == body.TIMED_OUT) { ret OUTCOME_TIMED_OUT; }
-    if (reason == cancel.CANCELLED || request.status == body.CANCELLED || response.status == body.CANCELLED) { ret OUTCOME_CANCELLED; }
+    if ((sel reason.timed_out) || request.status == body.TIMED_OUT || response.status == body.TIMED_OUT) { ret OUTCOME_TIMED_OUT; }
+    if ((sel reason.cancelled) || request.status == body.CANCELLED || response.status == body.CANCELLED) { ret OUTCOME_CANCELLED; }
     if (request.status == body.ERROR || request.status == body.LIMIT_REACHED
-     || response.status == body.ERROR || response.status == body.LIMIT_REACHED) { ret OUTCOME_FAILED; }
+        || response.status == body.ERROR || response.status == body.LIMIT_REACHED) { ret OUTCOME_FAILED; }
     ret OUTCOME_OK;
 }
 
@@ -180,52 +192,54 @@ fun collections_valid(exchange: *Exchange) bool {
 pub fun finish(exchange: *Exchange) FinishStatus {
     if (exchange == nil || !exchange.valid) { ret FINISH_INVALID; }
     if (exchange.state == COMPLETE_STATE || exchange.state == CANCELLED_STATE
-     || exchange.state == TIMED_OUT_STATE || exchange.state == FAILED_STATE) { ret FINISH_ALREADY_COMPLETE; }
-    if (exchange.state != RESPONDING || !exchange.response.committed) { ret FINISH_NOT_COMMITTED; }
+        || exchange.state == TIMED_OUT_STATE || exchange.state == FAILED_STATE) { ret FINISH_ALREADY_COMPLETE; }
+    if (exchange.state != RESPONDING || !exchange.response.committed)                       { ret FINISH_NOT_COMMITTED; }
     if (!body.reader_terminal_state(exchange.request.body) || !response_terminal(exchange)) { ret FINISH_BODY_PENDING; }
     val request_progress: body.Progress = body.reader_result(exchange.request.body);
-    val response_result: body.Progress = response_progress(exchange);
+    val response_result:  body.Progress = response_progress(exchange);
     if (!collections_valid(exchange)) {
         exchange.completion = Completion{
-            outcome: OUTCOME_FAILED,
-            status: exchange.response.status,
-            reuse: body.REUSE_FORBIDDEN,
-            bytes_in: exchange.request.body.transferred,
+            outcome:   OUTCOME_FAILED,
+            status:    exchange.response.status,
+            reuse:     body.REUSE_FORBIDDEN,
+            bytes_in:  exchange.request.body.transferred,
             bytes_out: 0,
-            error: "field collection changed outside its configured bounds",
+            error:     "field collection changed outside its configured bounds",
         };
         if (exchange.response.body_kind == message.BODY_READER) {
             exchange.completion.bytes_out = exchange.response.body_reader.transferred;
-        } or (exchange.response.body_kind == message.BODY_WRITER) {
+        }
+        or (exchange.response.body_kind == message.BODY_WRITER) {
             exchange.completion.bytes_out = exchange.response.body_writer.transferred;
         }
         exchange.state = FAILED_STATE;
         ret FINISH_OK;
     }
-    val reason: cancel.Reason = cancel.reason(exchange.scope);
-    val outcome: Outcome = outcome_for(request_progress, response_result, reason);
-    var reuse: body.Reuse = combine_reuse(request_progress.reuse, response_result.reuse);
+    val reason:  cancel.Reason = cancel.reason(exchange.scope);
+    val outcome: Outcome       = outcome_for(request_progress, response_result, reason);
+    var reuse:   body.Reuse    = combine_reuse(request_progress.reuse, response_result.reuse);
     if (exchange.response.status == status.SWITCHING_PROTOCOLS) {
         reuse = body.REUSE_FORBIDDEN;
     }
     if (reuse == body.REUSE_UNKNOWN) { ret FINISH_INVALID; }
     exchange.completion = Completion{
-        outcome: outcome,
-        status: exchange.response.status,
-        reuse: reuse,
-        bytes_in: exchange.request.body.transferred,
+        outcome:   outcome,
+        status:    exchange.response.status,
+        reuse:     reuse,
+        bytes_in:  exchange.request.body.transferred,
         bytes_out: response_result.count,
-        error: outcome_error(request_progress, response_result),
+        error:     outcome_error(request_progress, response_result),
     };
     if (exchange.response.body_kind == message.BODY_READER) {
         exchange.completion.bytes_out = exchange.response.body_reader.transferred;
-    } or (exchange.response.body_kind == message.BODY_WRITER) {
+    }
+    or (exchange.response.body_kind == message.BODY_WRITER) {
         exchange.completion.bytes_out = exchange.response.body_writer.transferred;
     }
-    if (outcome == OUTCOME_OK) { exchange.state = COMPLETE_STATE; }
+    if (outcome == OUTCOME_OK)        { exchange.state = COMPLETE_STATE; }
     or (outcome == OUTCOME_CANCELLED) { exchange.state = CANCELLED_STATE; }
     or (outcome == OUTCOME_TIMED_OUT) { exchange.state = TIMED_OUT_STATE; }
-    or { exchange.state = FAILED_STATE; }
+    or                                { exchange.state = FAILED_STATE; }
     ret FINISH_OK;
 }
 
@@ -245,11 +259,11 @@ fun cancel_response(exchange: *Exchange, timed_out: bool) body.Progress {
 pub fun settle_cancellation(exchange: *Exchange) FinishStatus {
     if (exchange == nil || !exchange.valid) { ret FINISH_INVALID; }
     val reason: cancel.Reason = cancel.reason(exchange.scope);
-    if (reason != cancel.CANCELLED && reason != cancel.TIMED_OUT) { ret FINISH_INVALID; }
-    val timed_out: bool = reason == cancel.TIMED_OUT;
+    if (!(sel reason.cancelled) && !(sel reason.timed_out)) { ret FINISH_INVALID; }
+    val timed_out:        bool = (sel reason.timed_out);
     var request_progress: body.Progress;
     if (timed_out) { request_progress = body.timeout_reader(exchange.request.body); }
-    or { request_progress = body.cancel_reader(exchange.request.body); }
+    or             { request_progress = body.cancel_reader(exchange.request.body); }
     val response_result: body.Progress = cancel_response(exchange, timed_out);
     if (request_progress.status == body.PENDING || response_result.status == body.PENDING) { ret FINISH_BODY_PENDING; }
     if (!exchange.response.committed) {
@@ -265,14 +279,14 @@ pub fun settle_cancellation(exchange: *Exchange) FinishStatus {
 pub fun cancel_exchange(exchange: *Exchange) FinishStatus {
     if (exchange == nil || !exchange.valid) { ret FINISH_INVALID; }
     val reason: cancel.Reason = cancel.reason(exchange.scope);
-    if (reason == cancel.ACTIVE) { cancel.cancel(exchange.scope); }
+    if ((sel reason.active)) { transition_ok(cancel.cancel(exchange.scope)); }
     ret settle_cancellation(exchange);
 }
 
 pub fun timeout_exchange(exchange: *Exchange) FinishStatus {
     if (exchange == nil || !exchange.valid) { ret FINISH_INVALID; }
     val reason: cancel.Reason = cancel.reason(exchange.scope);
-    if (reason == cancel.ACTIVE) { cancel.timeout(exchange.scope); }
+    if ((sel reason.active)) { transition_ok(cancel.timeout(exchange.scope)); }
     ret settle_cancellation(exchange);
 }
 
@@ -309,19 +323,19 @@ fun test_write(context: ptr, input: *u8, length: usize) body.Progress {
 fun test_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
     val state: *TestBody = context::*TestBody;
     state.finish_mode = mode;
-    state.calls = state.calls + 1;
+    state.calls       = state.calls + 1;
     if (state.pending && state.calls == 1) { ret body.pending(99); }
-    if (mode == body.REJECT) { ret body.rejected(state.reuse); }
-    if (mode == body.CANCEL) { ret body.cancelled(state.reuse); }
-    if (mode == body.TIMEOUT) { ret body.timed_out(state.reuse); }
+    if (mode == body.REJECT)               { ret body.rejected(state.reuse); }
+    if (mode == body.CANCEL)               { ret body.cancelled(state.reuse); }
+    if (mode == body.TIMEOUT)              { ret body.timed_out(state.reuse); }
     ret body.complete(state.reuse);
 }
 
 fun test_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progress {
     val state: *TestBody = context::*TestBody;
-    if (state.finish_mode == body.CANCEL) { ret body.cancelled(state.reuse); }
+    if (state.finish_mode == body.CANCEL)  { ret body.cancelled(state.reuse); }
     if (state.finish_mode == body.TIMEOUT) { ret body.timed_out(state.reuse); }
-    if (state.finish_mode == body.REJECT) { ret body.rejected(state.reuse); }
+    if (state.finish_mode == body.REJECT)  { ret body.rejected(state.reuse); }
     ret body.complete(state.reuse);
 }
 
@@ -332,71 +346,71 @@ fun test_release(context: ptr) {
 
 fun metadata(version: message.Version) message.Metadata {
     ret message.Metadata{
-        version: version,
-        secure: true,
-        early_data: false,
-        peer: message.unspecified_endpoint(),
-        local: message.unspecified_endpoint(),
-        received_at: time.Time{sec: 1, nsec: 0},
-        has_deadline: false,
-        deadline: time.Time{sec: 0, nsec: 0},
+        version:       version,
+        secure:        true,
+        early_data:    false,
+        peer:          message.unspecified_endpoint(),
+        local:         message.unspecified_endpoint(),
+        received_at:   time.Time{sec: 1, nsec: 0},
+        has_deadline:  false,
+        deadline:      time.Time{sec: 0, nsec: 0},
         request_index: 1,
     };
 }
 
 test "http.core.exchange: informational and final responses share one bounded generation" {
     val configured: message.Limits = message.limits_default();
-    var scope: cancel.Scope;
+    var scope:      cancel.Scope;
     cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
-    var request_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
-    var request_body: body.Reader = body.empty_reader(41);
-    var request: message.Request;
+    var request_body:     body.Reader  = body.empty_reader(41);
+    var request:          message.Request;
     if (!message.init_request(?request, method.from_kind(method.GET),
         target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)), metadata(message.version_h2()),
         request_fields, request_trailers, ?request_body, 41, configured)) { ret 1; }
-    var response_fields: [100]field.Field;
+    var response_fields:   [100]field.Field;
     var response_trailers: [32]field.Field;
-    var response: message.Response;
+    var response:          message.Response;
     if (!message.init_response(?response, ?response_fields[0], 100, ?response_trailers[0], 32, 41, configured)) { ret 2; }
-    var infos: [8]message.Informational;
+    var infos:    [8]message.Informational;
     var exchange: Exchange;
     if (!init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 41, configured) || !begin(?exchange)) { ret 3; }
     var hint_fields: [32]field.Field;
-    var hint: message.Informational;
+    var hint:        message.Informational;
     if (!message.init_informational(?hint, status.EARLY_HINTS, ?hint_fields[0], 32, configured)
-     || emit_informational(?exchange, ?hint, configured) != message.INFORM_OK) { ret 4; }
+        || emit_informational(?exchange, ?hint, configured) != message.INFORM_OK) { ret 4; }
     if (commit(?exchange, configured) != message.RESPONSE_OK || finish(?exchange) != FINISH_OK
-     || exchange.completion.outcome != OUTCOME_OK || !reusable(?exchange)) { ret 5; }
-    if (!cancel.destroy(?scope)) { ret 6; }
+        || exchange.completion.outcome != OUTCOME_OK || !reusable(?exchange)) { ret 5; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 6; }
     ret 0;
 }
 
 test "http.core.exchange: protocol adapters decide reuse after body rejection" {
     val configured: message.Limits = message.limits_default();
-    var scope: cancel.Scope;
+    var scope:      cancel.Scope;
     cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
-    var request_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
-    var body_state: TestBody = test_body(body.REUSE_FORBIDDEN, false);
-    var request_body: body.Reader = body.init_reader(?body_state, test_read, test_finish, test_complete, test_release,
+    var body_state:       TestBody     = test_body(body.REUSE_FORBIDDEN, false);
+    var request_body:     body.Reader  = body.init_reader(?body_state, test_read, test_finish, test_complete, test_release,
         body.OWNER_ENGINE, 51, false, 0, configured.request_body, ?request_trailers, ?scope);
     var request: message.Request;
     message.init_request(?request, method.from_kind(method.POST),
         target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)), metadata(message.version_h1(1, 1)),
         request_fields, request_trailers, ?request_body, 51, configured);
-    var response_fields: [100]field.Field;
+    var response_fields:   [100]field.Field;
     var response_trailers: [32]field.Field;
-    var response: message.Response;
+    var response:          message.Response;
     message.init_response(?response, ?response_fields[0], 100, ?response_trailers[0], 32, 51, configured);
-    var infos: [8]message.Informational;
+    var infos:    [8]message.Informational;
     var exchange: Exchange;
     if (!init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 51, configured) || !begin(?exchange)) { ret 1; }
     if (body.reject(?request_body).status != body.REJECTED || commit(?exchange, configured) != message.RESPONSE_OK
-     || finish(?exchange) != FINISH_OK || exchange.completion.reuse != body.REUSE_FORBIDDEN || reusable(?exchange)) { ret 2; }
-    if (!cancel.destroy(?scope)) { ret 3; }
+        || finish(?exchange) != FINISH_OK || exchange.completion.reuse != body.REUSE_FORBIDDEN || reusable(?exchange)) { ret 2; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 3; }
     cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
-    body_state = test_body(body.REUSE_ALLOWED, false);
+    body_state   = test_body(body.REUSE_ALLOWED, false);
     request_body = body.init_reader(?body_state, test_read, test_finish, test_complete, test_release,
         body.OWNER_ENGINE, 52, false, 0, configured.request_body, ?request_trailers, ?scope);
     message.init_request(?request, method.from_kind(method.POST),
@@ -406,31 +420,31 @@ test "http.core.exchange: protocol adapters decide reuse after body rejection" {
     init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 52, configured);
     begin(?exchange);
     if (body.reject(?request_body).status != body.REJECTED || commit(?exchange, configured) != message.RESPONSE_OK
-     || finish(?exchange) != FINISH_OK || !reusable(?exchange)) { ret 4; }
-    if (!cancel.destroy(?scope)) { ret 5; }
+        || finish(?exchange) != FINISH_OK || !reusable(?exchange)) { ret 4; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 5; }
     ret 0;
 }
 
 test "http.core.exchange: response streaming gates completion and accounts bytes" {
     val configured: message.Limits = message.limits_default();
-    var scope: cancel.Scope;
+    var scope:      cancel.Scope;
     cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
-    var request_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
-    var request_body: body.Reader = body.empty_reader(61);
-    var request: message.Request;
+    var request_body:     body.Reader  = body.empty_reader(61);
+    var request:          message.Request;
     message.init_request(?request, method.from_kind(method.GET),
         target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)), metadata(message.version_h2()),
         request_fields, request_trailers, ?request_body, 61, configured);
-    var response_fields: [100]field.Field;
+    var response_fields:   [100]field.Field;
     var response_trailers: [32]field.Field;
-    var response: message.Response;
+    var response:          message.Response;
     message.init_response(?response, ?response_fields[0], 100, ?response_trailers[0], 32, 61, configured);
-    var state: TestBody = test_body(body.REUSE_ALLOWED, false);
+    var state:  TestBody    = test_body(body.REUSE_ALLOWED, false);
     var writer: body.Writer = body.init_writer(?state, test_write, test_finish, test_complete, test_release,
         body.OWNER_ENGINE, 61, true, 4, configured.response_body, ?response.trailers, ?scope);
     message.set_body_writer(?response, ?writer, configured);
-    var infos: [8]message.Informational;
+    var infos:    [8]message.Informational;
     var exchange: Exchange;
     init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 61, configured);
     begin(?exchange);
@@ -439,71 +453,71 @@ test "http.core.exchange: response streaming gates completion and accounts bytes
     var bytes: [4]u8;
     if (body.write(?writer, ?bytes[0], 4).count != 4 || body.finish(?writer).status != body.COMPLETE) { ret 2; }
     if (finish(?exchange) != FINISH_OK || exchange.completion.bytes_out != 4 || !reusable(?exchange)) { ret 3; }
-    if (!cancel.destroy(?scope)) { ret 4; }
+    if (!operation_ok(cancel.destroy(?scope)))                                                        { ret 4; }
     ret 0;
 }
 
 test "http.core.exchange: post-commit field mutation fails closed" {
     val configured: message.Limits = message.limits_default();
-    var scope: cancel.Scope;
+    var scope:      cancel.Scope;
     cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
-    var request_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
-    var request_body: body.Reader = body.empty_reader(62);
-    var request: message.Request;
+    var request_body:     body.Reader  = body.empty_reader(62);
+    var request:          message.Request;
     message.init_request(?request, method.from_kind(method.GET),
         target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)), metadata(message.version_h1(1, 1)),
         request_fields, request_trailers, ?request_body, 62, configured);
-    var response_fields: [1]field.Field;
+    var response_fields:   [1]field.Field;
     var response_trailers: [1]field.Field;
-    var narrow: message.Limits = configured;
-    narrow.response_fields = field.limits(1, 16, 8, 8);
+    var narrow:            message.Limits = configured;
+    narrow.response_fields   = field.limits(1, 16, 8, 8);
     narrow.response_trailers = field.limits(1, 16, 8, 8);
     var response: message.Response;
     message.init_response(?response, ?response_fields[0], 1, ?response_trailers[0], 1, 62, narrow);
-    var infos: [8]message.Informational;
+    var infos:    [8]message.Informational;
     var exchange: Exchange;
     init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 62, narrow);
     begin(?exchange);
     if (commit(?exchange, narrow) != message.RESPONSE_OK) { ret 1; }
     response.fields.bytes = 1;
     if (finish(?exchange) != FINISH_OK || exchange.state != FAILED_STATE
-     || exchange.completion.outcome != OUTCOME_FAILED || exchange.completion.reuse != body.REUSE_FORBIDDEN) { ret 2; }
-    if (!cancel.destroy(?scope)) { ret 3; }
+        || exchange.completion.outcome != OUTCOME_FAILED || exchange.completion.reuse != body.REUSE_FORBIDDEN) { ret 2; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 3; }
     ret 0;
 }
 
 test "http.core.exchange: cancellation and timeout settle both body directions" {
     val configured: message.Limits = message.limits_default();
-    var scope: cancel.Scope;
+    var scope:      cancel.Scope;
     cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
-    var request_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
-    var state: TestBody = test_body(body.REUSE_ALLOWED, false);
-    var request_body: body.Reader = body.init_reader(?state, test_read, test_finish, test_complete, test_release,
+    var state:            TestBody     = test_body(body.REUSE_ALLOWED, false);
+    var request_body:     body.Reader  = body.init_reader(?state, test_read, test_finish, test_complete, test_release,
         body.OWNER_ENGINE, 71, false, 0, configured.request_body, ?request_trailers, ?scope);
     var request: message.Request;
     message.init_request(?request, method.from_kind(method.POST),
         target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)), metadata(message.version_h3()),
         request_fields, request_trailers, ?request_body, 71, configured);
-    var response_fields: [100]field.Field;
+    var response_fields:   [100]field.Field;
     var response_trailers: [32]field.Field;
-    var response: message.Response;
+    var response:          message.Response;
     message.init_response(?response, ?response_fields[0], 100, ?response_trailers[0], 32, 71, configured);
-    var response_state: TestBody = test_body(body.REUSE_FORBIDDEN, false);
+    var response_state:  TestBody    = test_body(body.REUSE_FORBIDDEN, false);
     var response_writer: body.Writer = body.init_writer(?response_state, test_write, test_finish, test_complete, test_release,
         body.OWNER_ENGINE, 71, false, 0, configured.response_body, ?response.trailers, ?scope);
     message.set_body_writer(?response, ?response_writer, configured);
-    var infos: [8]message.Informational;
+    var infos:    [8]message.Informational;
     var exchange: Exchange;
     init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 71, configured);
     begin(?exchange);
     if (cancel_exchange(?exchange) != FINISH_OK || exchange.state != CANCELLED_STATE
-     || exchange.completion.outcome != OUTCOME_CANCELLED
-     || exchange.completion.reuse != body.REUSE_FORBIDDEN || response_state.releases != 1) { ret 1; }
-    if (!cancel.destroy(?scope)) { ret 2; }
+        || exchange.completion.outcome != OUTCOME_CANCELLED
+        || exchange.completion.reuse != body.REUSE_FORBIDDEN || response_state.releases != 1) { ret 1; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 2; }
     cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
-    state = test_body(body.REUSE_FORBIDDEN, false);
+    state        = test_body(body.REUSE_FORBIDDEN, false);
     request_body = body.init_reader(?state, test_read, test_finish, test_complete, test_release,
         body.OWNER_ENGINE, 72, false, 0, configured.request_body, ?request_trailers, ?scope);
     message.init_request(?request, method.from_kind(method.POST),
@@ -513,35 +527,35 @@ test "http.core.exchange: cancellation and timeout settle both body directions" 
     init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 72, configured);
     begin(?exchange);
     if (timeout_exchange(?exchange) != FINISH_OK || exchange.state != TIMED_OUT_STATE
-     || exchange.completion.outcome != OUTCOME_TIMED_OUT || exchange.completion.reuse != body.REUSE_FORBIDDEN) { ret 3; }
-    if (!cancel.destroy(?scope)) { ret 4; }
+        || exchange.completion.outcome != OUTCOME_TIMED_OUT || exchange.completion.reuse != body.REUSE_FORBIDDEN) { ret 3; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 4; }
     ret 0;
 }
 
 test "http.core.exchange: effective scope deadlines are request metadata" {
     val configured: message.Limits = message.limits_default();
-    val deadline: time.Time = time.Time{sec: 5, nsec: 10};
-    var scope: cancel.Scope;
+    val deadline:   time.Time      = time.Time{sec: 5, nsec: 10};
+    var scope:      cancel.Scope;
     cancel.make_root(?scope, true, deadline);
-    var request_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
-    var request_body: body.Reader = body.empty_reader(81);
-    var request: message.Request;
+    var request_body:     body.Reader  = body.empty_reader(81);
+    var request:          message.Request;
     message.init_request(?request, method.from_kind(method.GET),
         target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)), metadata(message.version_h2()),
         request_fields, request_trailers, ?request_body, 81, configured);
-    var response_fields: [100]field.Field;
+    var response_fields:   [100]field.Field;
     var response_trailers: [32]field.Field;
-    var response: message.Response;
+    var response:          message.Response;
     message.init_response(?response, ?response_fields[0], 100, ?response_trailers[0], 32, 81, configured);
-    var infos: [8]message.Informational;
+    var infos:    [8]message.Informational;
     var exchange: Exchange;
     if (init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 81, configured)) { ret 1; }
     request.metadata.has_deadline = true;
-    request.metadata.deadline = deadline;
+    request.metadata.deadline     = deadline;
     if (!init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 81, configured) || !begin(?exchange)) { ret 2; }
     cancel.expire(?scope, deadline);
     if (settle_cancellation(?exchange) != FINISH_OK || exchange.state != TIMED_OUT_STATE) { ret 3; }
-    if (!cancel.destroy(?scope)) { ret 4; }
+    if (!operation_ok(cancel.destroy(?scope)))                                            { ret 4; }
     ret 0;
 }

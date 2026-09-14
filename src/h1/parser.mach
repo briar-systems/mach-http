@@ -1,3 +1,10 @@
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.core.target;
+use http.h1.framing;
+use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -5,140 +12,133 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.view;
-use std.memory;
-use http.core.field;
-use http.core.message;
-use http.core.method;
-use http.core.status;
-use http.core.target;
-use http.h1.framing;
 
 pub def Kind: u8;
-pub val REQUEST: Kind = 1;
+pub val REQUEST:  Kind = 1;
 pub val RESPONSE: Kind = 2;
 
 pub def Phase: u8;
-pub val START_LINE: Phase = 1;
-pub val HEADER_LINE: Phase = 2;
-pub val FIXED_BODY: Phase = 3;
-pub val CHUNK_SIZE: Phase = 4;
-pub val CHUNK_DATA: Phase = 5;
-pub val CHUNK_DATA_CR: Phase = 6;
-pub val CHUNK_DATA_LF: Phase = 7;
-pub val TRAILER_LINE: Phase = 8;
-pub val CLOSE_BODY: Phase = 9;
+pub val START_LINE:       Phase = 1;
+pub val HEADER_LINE:      Phase = 2;
+pub val FIXED_BODY:       Phase = 3;
+pub val CHUNK_SIZE:       Phase = 4;
+pub val CHUNK_DATA:       Phase = 5;
+pub val CHUNK_DATA_CR:    Phase = 6;
+pub val CHUNK_DATA_LF:    Phase = 7;
+pub val TRAILER_LINE:     Phase = 8;
+pub val CLOSE_BODY:       Phase = 9;
 pub val MESSAGE_COMPLETE: Phase = 10;
-pub val PARSER_ERROR: Phase = 11;
+pub val PARSER_ERROR:     Phase = 11;
 
 pub def FeedStatus: u8;
 pub val PARSE_NEED_INPUT: FeedStatus = 1;
-pub val PARSE_HEADERS: FeedStatus = 2;
-pub val PARSE_BODY: FeedStatus = 3;
-pub val PARSE_MESSAGE: FeedStatus = 4;
-pub val PARSE_ERROR: FeedStatus = 5;
+pub val PARSE_HEADERS:    FeedStatus = 2;
+pub val PARSE_BODY:       FeedStatus = 3;
+pub val PARSE_MESSAGE:    FeedStatus = 4;
+pub val PARSE_ERROR:      FeedStatus = 5;
 
 pub def Error: u8;
-pub val ERROR_NONE: Error = 0;
-pub val ERROR_STATE: Error = 1;
-pub val ERROR_START_LINE_LIMIT: Error = 2;
-pub val ERROR_HEADER_LINE_LIMIT: Error = 3;
-pub val ERROR_HEADER_BYTES_LIMIT: Error = 4;
-pub val ERROR_TRAILER_BYTES_LIMIT: Error = 5;
-pub val ERROR_CHUNK_LINE_LIMIT: Error = 6;
-pub val ERROR_STORAGE_LIMIT: Error = 7;
-pub val ERROR_INVALID_LINE_ENDING: Error = 8;
-pub val ERROR_INVALID_START_LINE: Error = 9;
-pub val ERROR_INVALID_VERSION: Error = 10;
-pub val ERROR_INVALID_METHOD: Error = 11;
-pub val ERROR_INVALID_TARGET: Error = 12;
-pub val ERROR_INVALID_STATUS: Error = 13;
-pub val ERROR_INVALID_FIELD: Error = 14;
-pub val ERROR_INVALID_HOST: Error = 15;
-pub val ERROR_FRAMING: Error = 16;
-pub val ERROR_BODY_LIMIT: Error = 17;
-pub val ERROR_INVALID_CHUNK_SIZE: Error = 18;
-pub val ERROR_INVALID_CHUNK_EXTENSION: Error = 19;
+pub val ERROR_NONE:                     Error = 0;
+pub val ERROR_STATE:                    Error = 1;
+pub val ERROR_START_LINE_LIMIT:         Error = 2;
+pub val ERROR_HEADER_LINE_LIMIT:        Error = 3;
+pub val ERROR_HEADER_BYTES_LIMIT:       Error = 4;
+pub val ERROR_TRAILER_BYTES_LIMIT:      Error = 5;
+pub val ERROR_CHUNK_LINE_LIMIT:         Error = 6;
+pub val ERROR_STORAGE_LIMIT:            Error = 7;
+pub val ERROR_INVALID_LINE_ENDING:      Error = 8;
+pub val ERROR_INVALID_START_LINE:       Error = 9;
+pub val ERROR_INVALID_VERSION:          Error = 10;
+pub val ERROR_INVALID_METHOD:           Error = 11;
+pub val ERROR_INVALID_TARGET:           Error = 12;
+pub val ERROR_INVALID_STATUS:           Error = 13;
+pub val ERROR_INVALID_FIELD:            Error = 14;
+pub val ERROR_INVALID_HOST:             Error = 15;
+pub val ERROR_FRAMING:                  Error = 16;
+pub val ERROR_BODY_LIMIT:               Error = 17;
+pub val ERROR_INVALID_CHUNK_SIZE:       Error = 18;
+pub val ERROR_INVALID_CHUNK_EXTENSION:  Error = 19;
 pub val ERROR_INVALID_CHUNK_TERMINATOR: Error = 20;
-pub val ERROR_INVALID_TRAILER: Error = 21;
-pub val ERROR_INCOMPLETE: Error = 22;
+pub val ERROR_INVALID_TRAILER:          Error = 21;
+pub val ERROR_INCOMPLETE:               Error = 22;
 
 pub rec Limits {
-    max_start_line: usize;
-    max_method_bytes: usize;
-    max_target_bytes: usize;
-    max_header_line: usize;
-    max_header_bytes: usize;
-    max_headers: usize;
+    max_start_line:    usize;
+    max_method_bytes:  usize;
+    max_target_bytes:  usize;
+    max_header_line:   usize;
+    max_header_bytes:  usize;
+    max_headers:       usize;
     max_trailer_bytes: usize;
-    max_trailers: usize;
-    max_chunk_line: usize;
-    max_body_bytes: u64;
+    max_trailers:      usize;
+    max_chunk_line:    usize;
+    max_body_bytes:    u64;
 }
 
 pub rec Parsed {
-    kind: Kind;
-    version: message.Version;
-    method: method.Method;
-    target: target.Target;
-    status: status.Status;
-    reason: view.View;
-    fields: field.Fields;
-    trailers: field.Fields;
-    plan: framing.Plan;
+    kind:       Kind;
+    version:    message.Version;
+    method:     method.Method;
+    target:     target.Target;
+    status:     status.Status;
+    reason:     view.View;
+    fields:     field.Fields;
+    trailers:   field.Fields;
+    plan:       framing.Plan;
     generation: u64;
 }
 
 # parsed views live until reset; body borrows only the current feed input
 pub rec Parser {
-    kind: Kind;
-    phase: Phase;
-    limits: Limits;
-    parsed: Parsed;
+    kind:                    Kind;
+    phase:                   Phase;
+    limits:                  Limits;
+    parsed:                  Parsed;
     response_request_method: method.Kind;
-    line: *u8;
-    line_capacity: usize;
-    line_length: usize;
-    saw_cr: bool;
-    storage: *u8;
-    storage_capacity: usize;
-    storage_length: usize;
-    header_bytes: usize;
-    trailer_bytes: usize;
-    body_bytes: u64;
-    body_remaining: u64;
-    chunk_remaining: u64;
-    wire_bytes: u64;
-    error: Error;
-    error_offset: u64;
-    initialized: bool;
+    line:                    *u8;
+    line_capacity:           usize;
+    line_length:             usize;
+    saw_cr:                  bool;
+    storage:                 *u8;
+    storage_capacity:        usize;
+    storage_length:          usize;
+    header_bytes:            usize;
+    trailer_bytes:           usize;
+    body_bytes:              u64;
+    body_remaining:          u64;
+    chunk_remaining:         u64;
+    wire_bytes:              u64;
+    error:                   Error;
+    error_offset:            u64;
+    initialized:             bool;
 }
 
 pub rec Feed {
-    status: FeedStatus;
-    consumed: usize;
-    body: *u8;
-    body_length: usize;
-    body_final: bool;
-    error: Error;
+    status:       FeedStatus;
+    consumed:     usize;
+    body:         *u8;
+    body_length:  usize;
+    body_final:   bool;
+    error:        Error;
     error_offset: u64;
 }
 
-val LINE_MORE: u8 = 1;
+val LINE_MORE:     u8 = 1;
 val LINE_COMPLETE: u8 = 2;
-val LINE_ERROR: u8 = 3;
+val LINE_ERROR:    u8 = 3;
 
 pub fun limits_default() Limits {
     ret Limits{
-        max_start_line: 8192,
-        max_method_bytes: 32,
-        max_target_bytes: 8192,
-        max_header_line: 8192,
-        max_header_bytes: 32768,
-        max_headers: 100,
+        max_start_line:    8192,
+        max_method_bytes:  32,
+        max_target_bytes:  8192,
+        max_header_line:   8192,
+        max_header_bytes:  32768,
+        max_headers:       100,
         max_trailer_bytes: 8192,
-        max_trailers: 32,
-        max_chunk_line: 4096,
-        max_body_bytes: 16777216,
+        max_trailers:      32,
+        max_chunk_line:    4096,
+        max_body_bytes:    16777216,
     };
 }
 
@@ -163,8 +163,8 @@ fun line_limit_error(parser: *Parser) Error {
 }
 
 fun fail(parser: *Parser, error: Error) {
-    parser.phase = PARSER_ERROR;
-    parser.error = error;
+    parser.phase        = PARSER_ERROR;
+    parser.error        = error;
     parser.error_offset = parser.wire_bytes;
 }
 
@@ -175,7 +175,7 @@ fun feed_result(parser: *Parser, status: FeedStatus, consumed: usize) Feed {
 
 fun account_wire(parser: *Parser, amount: u64) {
     if (amount > (-1)::u64 - parser.wire_bytes) { parser.wire_bytes = (-1)::u64; }
-    or { parser.wire_bytes = parser.wire_bytes + amount; }
+    or                                          { parser.wire_bytes = parser.wire_bytes + amount; }
 }
 
 fun take_line(parser: *Parser, input: *u8, input_length: usize, offset: *usize) u8 {
@@ -184,21 +184,28 @@ fun take_line(parser: *Parser, input: *u8, input_length: usize, offset: *usize) 
         @offset = @offset + 1;
         account_wire(parser, 1);
         if (parser.saw_cr) {
-            if (c != '\n') { fail(parser, ERROR_INVALID_LINE_ENDING); ret LINE_ERROR; }
+            if (c != '\n') {
+                fail(parser, ERROR_INVALID_LINE_ENDING);
+                ret LINE_ERROR;
+            }
             parser.saw_cr = false;
             ret LINE_COMPLETE;
         }
         if (c == '\r') {
             parser.saw_cr = true;
-        } or {
-            if (c == '\n') { fail(parser, ERROR_INVALID_LINE_ENDING); ret LINE_ERROR; }
+        }
+        or {
+            if (c == '\n') {
+                fail(parser, ERROR_INVALID_LINE_ENDING);
+                ret LINE_ERROR;
+            }
             if (parser.line_length >= line_limit(parser)
-             || parser.line_length >= parser.line_capacity) {
+                || parser.line_length >= parser.line_capacity) {
                 fail(parser, line_limit_error(parser));
                 ret LINE_ERROR;
             }
             parser.line[parser.line_length] = c;
-            parser.line_length = parser.line_length + 1;
+            parser.line_length              = parser.line_length + 1;
         }
     }
     ret LINE_MORE;
@@ -206,7 +213,7 @@ fun take_line(parser: *Parser, input: *u8, input_length: usize, offset: *usize) 
 
 fun stored(parser: *Parser, source: *u8, length: usize, output: *view.View) bool {
     if (output == nil || (source == nil && length != 0)
-     || length > parser.storage_capacity - parser.storage_length) { ret false; }
+        || length > parser.storage_capacity - parser.storage_length) { ret false; }
     if (length == 0) {
         @output = view.view(nil, 0);
         ret true;
@@ -214,7 +221,7 @@ fun stored(parser: *Parser, source: *u8, length: usize, output: *view.View) bool
     val start: usize = parser.storage_length;
     memory.raw_copy(?parser.storage[start], source, length);
     parser.storage_length = parser.storage_length + length;
-    @output = view.view(?parser.storage[start], length);
+    @output               = view.view(?parser.storage[start], length);
     ret true;
 }
 
@@ -230,22 +237,22 @@ fun exact(data: *u8, length: usize, text: *u8, text_length: usize) bool {
 
 fun parse_version(data: *u8, length: usize, version: *message.Version) bool {
     if (length != 8 || data == nil || data[0] != 'H' || data[1] != 'T'
-     || data[2] != 'T' || data[3] != 'P' || data[4] != '/'
-     || data[5] != '1' || data[6] != '.' || (data[7] != '0' && data[7] != '1')) { ret false; }
+        || data[2] != 'T' || data[3] != 'P' || data[4] != '/'
+        || data[5] != '1' || data[6] != '.' || (data[7] != '0' && data[7] != '1')) { ret false; }
     @version = message.version_h1(1, data[7] - '0');
     ret true;
 }
 
 fun parsed_method(token: view.View, configured: usize) method.Method {
-    if (exact(token.data, token.len, "GET", 3)) { ret method.from_kind(method.GET); }
-    if (exact(token.data, token.len, "HEAD", 4)) { ret method.from_kind(method.HEAD); }
-    if (exact(token.data, token.len, "POST", 4)) { ret method.from_kind(method.POST); }
-    if (exact(token.data, token.len, "PUT", 3)) { ret method.from_kind(method.PUT); }
-    if (exact(token.data, token.len, "DELETE", 6)) { ret method.from_kind(method.DELETE); }
+    if (exact(token.data, token.len, "GET", 3))     { ret method.from_kind(method.GET); }
+    if (exact(token.data, token.len, "HEAD", 4))    { ret method.from_kind(method.HEAD); }
+    if (exact(token.data, token.len, "POST", 4))    { ret method.from_kind(method.POST); }
+    if (exact(token.data, token.len, "PUT", 3))     { ret method.from_kind(method.PUT); }
+    if (exact(token.data, token.len, "DELETE", 6))  { ret method.from_kind(method.DELETE); }
     if (exact(token.data, token.len, "CONNECT", 7)) { ret method.from_kind(method.CONNECT); }
     if (exact(token.data, token.len, "OPTIONS", 7)) { ret method.from_kind(method.OPTIONS); }
-    if (exact(token.data, token.len, "TRACE", 5)) { ret method.from_kind(method.TRACE); }
-    if (exact(token.data, token.len, "PATCH", 5)) { ret method.from_kind(method.PATCH); }
+    if (exact(token.data, token.len, "TRACE", 5))   { ret method.from_kind(method.TRACE); }
+    if (exact(token.data, token.len, "PATCH", 5))   { ret method.from_kind(method.PATCH); }
     val extension: method.Method = method.extension(token);
     if (!method.valid(extension, configured)) {
         ret method.Method{kind: 0, token: view.view(nil, 0)};
@@ -266,7 +273,7 @@ fun ascii_target(data: *u8, length: usize) bool {
 fun uri_component(data: *u8, start: usize, finish: usize, query: bool) bool {
     var i: usize = start;
     for (i < finish) {
-        val c: u8 = data[i];
+        val c:        u8   = data[i];
         val ordinary: bool = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
             || (c >= 'a' && c <= 'z') || c == '-' || c == '.' || c == '_'
             || c == '~' || c == '!' || c == '$' || c == '&' || c == 39
@@ -275,11 +282,12 @@ fun uri_component(data: *u8, start: usize, finish: usize, query: bool) bool {
             || (query && c == '?');
         if (ordinary) {
             i = i + 1;
-        } or {
-            var first: u8;
+        }
+        or {
+            var first:  u8;
             var second: u8;
             if (c != '%' || i + 2 >= finish || !hex(data[i + 1], ?first)
-             || !hex(data[i + 2], ?second)) { ret false; }
+                || !hex(data[i + 2], ?second)) { ret false; }
             i = i + 3;
         }
     }
@@ -293,26 +301,28 @@ fun subview(raw: view.View, start: usize, length: usize) view.View {
 
 fun parse_absolute(raw: view.View, parsed: *target.Target) bool {
     var scheme_end: usize = raw.len;
-    var i: usize = 0;
+    var i:          usize = 0;
     for (i < raw.len && scheme_end == raw.len) {
         if (raw.data[i] == ':') {
             scheme_end = i;
-        } or {
-        val c: u8 = raw.data[i];
-        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
-         || (i != 0 && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.')))) { ret false; }
+        }
+        or {
+            val c: u8 = raw.data[i];
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                || (i != 0 && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.')))) { ret false; }
         }
         i = i + 1;
     }
     if (scheme_end == 0 || scheme_end + 3 > raw.len || raw.data[scheme_end + 1] != '/'
-     || raw.data[scheme_end + 2] != '/') { ret false; }
+        || raw.data[scheme_end + 2] != '/') { ret false; }
     val authority_start: usize = scheme_end + 3;
-    var authority_end: usize = raw.len;
+    var authority_end:   usize = raw.len;
     i = authority_start;
     for (i < raw.len && authority_end == raw.len) {
         if (raw.data[i] == '/' || raw.data[i] == '?') {
             authority_end = i;
-        } or {
+        }
+        or {
             if (raw.data[i] == '@' || raw.data[i] == '#') { ret false; }
         }
         i = i + 1;
@@ -323,15 +333,15 @@ fun parse_absolute(raw: view.View, parsed: *target.Target) bool {
     var query_at: usize = raw.len;
     i = authority_end;
     for (i < raw.len) {
-        if (raw.data[i] == '#') { ret false; }
+        if (raw.data[i] == '#')                        { ret false; }
         if (raw.data[i] == '?' && query_at == raw.len) { query_at = i; }
         i = i + 1;
     }
-    val path_end: usize = query_at;
+    val path_end:    usize = query_at;
     val path_length: usize = path_end - authority_end;
     if (path_length != 0 && raw.data[authority_end] != '/') { ret false; }
     if (!uri_component(raw.data, authority_end, path_end, false)
-     || (query_at != raw.len && !uri_component(raw.data, query_at + 1, raw.len, true))) { ret false; }
+        || (query_at != raw.len && !uri_component(raw.data, query_at + 1, raw.len, true))) { ret false; }
     var query_start: usize = query_at;
     if (query_at != raw.len) { query_start = query_start + 1; }
     @parsed = target.absolute(raw, subview(raw, 0, scheme_end),
@@ -344,7 +354,7 @@ fun parse_absolute(raw: view.View, parsed: *target.Target) bool {
 fun parse_target(raw: view.View, request_method: method.Kind, parsed: *target.Target) bool {
     if (!ascii_target(raw.data, raw.len)) { ret false; }
     if (raw.len == 1 && raw.data[0] == '*') {
-        @parsed = target.asterisk();
+        @parsed    = target.asterisk();
         parsed.raw = raw;
         ret request_method == method.OPTIONS;
     }
@@ -355,14 +365,14 @@ fun parse_target(raw: view.View, request_method: method.Kind, parsed: *target.Ta
     }
     if (raw.data[0] == '/') {
         var query_at: usize = raw.len;
-        var i: usize = 0;
+        var i:        usize = 0;
         for (i < raw.len) {
-            if (raw.data[i] == '#') { ret false; }
+            if (raw.data[i] == '#')                        { ret false; }
             if (raw.data[i] == '?' && query_at == raw.len) { query_at = i; }
             i = i + 1;
         }
         if (!uri_component(raw.data, 0, query_at, false)
-         || (query_at != raw.len && !uri_component(raw.data, query_at + 1, raw.len, true))) { ret false; }
+            || (query_at != raw.len && !uri_component(raw.data, query_at + 1, raw.len, true))) { ret false; }
         var query_start: usize = query_at;
         if (query_at != raw.len) { query_start = query_start + 1; }
         @parsed = target.origin(raw, subview(raw, 0, query_at),
@@ -373,19 +383,20 @@ fun parse_target(raw: view.View, request_method: method.Kind, parsed: *target.Ta
 }
 
 fun parse_request_line(parser: *Parser) bool {
-    val line: *u8 = parser.line;
+    val line:   *u8   = parser.line;
     val length: usize = parser.line_length;
-    var first: usize = length;
+    var first:  usize = length;
     var second: usize = length;
-    var i: usize = 0;
+    var i:      usize = 0;
     for (i < length) {
         if (line[i] == ' ') {
             if (first == length) { first = i; }
             or {
                 if (second == length) { second = i; }
-                or { ret false; }
+                or                    { ret false; }
             }
-        } or {
+        }
+        or {
             if (line[i] == '\t' || line[i] == 11 || line[i] == 12) { ret false; }
         }
         i = i + 1;
@@ -396,20 +407,26 @@ fun parse_request_line(parser: *Parser) bool {
         ret false;
     }
     var method_view: view.View;
-    if (!stored(parser, line, first, ?method_view)) { fail(parser, ERROR_STORAGE_LIMIT); ret false; }
+    if (!stored(parser, line, first, ?method_view)) {
+        fail(parser, ERROR_STORAGE_LIMIT);
+        ret false;
+    }
     if (method_view.len > parser.limits.max_method_bytes) {
         fail(parser, ERROR_INVALID_METHOD);
         ret false;
     }
     parser.parsed.method = parsed_method(method_view, parser.limits.max_method_bytes);
-    if (parser.parsed.method.kind == 0) { fail(parser, ERROR_INVALID_METHOD); ret false; }
+    if (parser.parsed.method.kind == 0) {
+        fail(parser, ERROR_INVALID_METHOD);
+        ret false;
+    }
     var raw_target: view.View;
     if (!stored(parser, ?line[first + 1], second - first - 1, ?raw_target)) {
         fail(parser, ERROR_STORAGE_LIMIT);
         ret false;
     }
     if (raw_target.len > parser.limits.max_target_bytes
-     || !parse_target(raw_target, parser.parsed.method.kind, ?parser.parsed.target)) {
+        || !parse_target(raw_target, parser.parsed.method.kind, ?parser.parsed.target)) {
         fail(parser, ERROR_INVALID_TARGET);
         ret false;
     }
@@ -427,15 +444,15 @@ fun reason_valid(data: *u8, length: usize) bool {
 }
 
 fun parse_response_line(parser: *Parser) bool {
-    val line: *u8 = parser.line;
+    val line:   *u8   = parser.line;
     val length: usize = parser.line_length;
     if (length < 13 || line[8] != ' ' || line[12] != ' '
-     || !parse_version(line, 8, ?parser.parsed.version)) {
+        || !parse_version(line, 8, ?parser.parsed.version)) {
         fail(parser, ERROR_INVALID_START_LINE);
         ret false;
     }
     if (line[9] < '0' || line[9] > '9' || line[10] < '0' || line[10] > '9'
-     || line[11] < '0' || line[11] > '9') {
+        || line[11] < '0' || line[11] > '9') {
         fail(parser, ERROR_INVALID_STATUS);
         ret false;
     }
@@ -461,7 +478,8 @@ fun account_line(parser: *Parser, trailers: bool) bool {
             ret false;
         }
         parser.trailer_bytes = parser.trailer_bytes + bytes;
-    } or {
+    }
+    or {
         if (bytes > parser.limits.max_header_bytes - parser.header_bytes) {
             fail(parser, ERROR_HEADER_BYTES_LIMIT);
             ret false;
@@ -478,14 +496,14 @@ fun field_error(trailers: bool) Error {
 
 fun parse_field_line(parser: *Parser, trailers: bool) bool {
     if (!account_line(parser, trailers)) { ret false; }
-    val line: *u8 = parser.line;
+    val line:   *u8   = parser.line;
     val length: usize = parser.line_length;
     if (length == 0 || line[0] == ' ' || line[0] == '\t') {
         fail(parser, field_error(trailers));
         ret false;
     }
     var colon: usize = length;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (i < length && colon == length) {
         if (line[i] == ':') { colon = i; }
         i = i + 1;
@@ -512,17 +530,17 @@ fun parse_field_line(parser: *Parser, trailers: bool) bool {
         fail(parser, field_error(trailers));
         ret false;
     }
-    var name: view.View;
+    var name:  view.View;
     var value: view.View;
     if (!stored(parser, line, colon, ?name)
-     || !stored(parser, ?line[value_start], value_end - value_start, ?value)) {
+        || !stored(parser, ?line[value_start], value_end - value_start, ?value)) {
         fail(parser, ERROR_STORAGE_LIMIT);
         ret false;
     }
-    val item: field.Field = field.Field{name: name, value: value, sensitive: false};
+    val item:  field.Field = field.Field{name: name, value: value, sensitive: false};
     var added: field.AddStatus;
     if (trailers) { added = field.append_trailer(?parser.parsed.trailers, item); }
-    or { added = field.append(?parser.parsed.fields, item); }
+    or            { added = field.append(?parser.parsed.fields, item); }
     if (added != field.ADD_OK) {
         fail(parser, field_error(trailers));
         ret false;
@@ -536,14 +554,21 @@ fun validate_host(parser: *Parser) bool {
 }
 
 fun headers_complete(parser: *Parser) bool {
-    if (!validate_host(parser)) { fail(parser, ERROR_INVALID_HOST); ret false; }
+    if (!validate_host(parser)) {
+        fail(parser, ERROR_INVALID_HOST);
+        ret false;
+    }
     if (parser.kind == REQUEST) {
         parser.parsed.plan = framing.request(parser.parsed.version, ?parser.parsed.fields);
-    } or {
+    }
+    or {
         parser.parsed.plan = framing.response(parser.parsed.version, parser.parsed.status,
             parser.response_request_method, ?parser.parsed.fields);
     }
-    if (parser.parsed.plan.error != framing.FRAME_OK) { fail(parser, ERROR_FRAMING); ret false; }
+    if (parser.parsed.plan.error != framing.FRAME_OK) {
+        fail(parser, ERROR_FRAMING);
+        ret false;
+    }
     if (parser.parsed.plan.mode == framing.FRAME_LENGTH) {
         if (parser.parsed.plan.length > parser.limits.max_body_bytes) {
             fail(parser, ERROR_BODY_LIMIT);
@@ -551,14 +576,17 @@ fun headers_complete(parser: *Parser) bool {
         }
         parser.body_remaining = parser.parsed.plan.length;
         if (parser.body_remaining == 0) { parser.phase = MESSAGE_COMPLETE; }
-        or { parser.phase = FIXED_BODY; }
-    } or {
+        or                              { parser.phase = FIXED_BODY; }
+    }
+    or {
         if (parser.parsed.plan.mode == framing.FRAME_CHUNKED) {
             parser.phase = CHUNK_SIZE;
-        } or {
+        }
+        or {
             if (parser.parsed.plan.mode == framing.FRAME_CLOSE) {
                 parser.phase = CLOSE_BODY;
-            } or {
+            }
+            or {
                 parser.phase = MESSAGE_COMPLETE;
             }
         }
@@ -567,9 +595,18 @@ fun headers_complete(parser: *Parser) bool {
 }
 
 fun hex(c: u8, digit: *u8) bool {
-    if (c >= '0' && c <= '9') { @digit = c - '0'; ret true; }
-    if (c >= 'A' && c <= 'F') { @digit = c - 'A' + 10; ret true; }
-    if (c >= 'a' && c <= 'f') { @digit = c - 'a' + 10; ret true; }
+    if (c >= '0' && c <= '9') {
+        @digit = c - '0';
+        ret true;
+    }
+    if (c >= 'A' && c <= 'F') {
+        @digit = c - 'A' + 10;
+        ret true;
+    }
+    if (c >= 'a' && c <= 'f') {
+        @digit = c - 'a' + 10;
+        ret true;
+    }
     ret false;
 }
 
@@ -597,20 +634,23 @@ fun valid_chunk_extensions(data: *u8, length: usize, offset: usize) bool {
                 var closed: bool = false;
                 for (i < length && !closed) {
                     if (data[i] == '"') {
-                        i = i + 1;
+                        i      = i + 1;
                         closed = true;
-                    } or {
-                    if (data[i] == '\\') {
-                        i = i + 1;
-                        if (i >= length || data[i] == '\r' || data[i] == '\n') { ret false; }
-                    } or {
-                        if (data[i] == '\r' || data[i] == '\n' || data[i] == 0 || data[i] == 127) { ret false; }
                     }
-                    i = i + 1;
+                    or {
+                        if (data[i] == '\\') {
+                            i = i + 1;
+                            if (i >= length || data[i] == '\r' || data[i] == '\n') { ret false; }
+                        }
+                        or {
+                            if (data[i] == '\r' || data[i] == '\n' || data[i] == 0 || data[i] == 127) { ret false; }
+                        }
+                        i = i + 1;
                     }
                 }
                 if (!closed) { ret false; }
-            } or {
+            }
+            or {
                 val value_start: usize = i;
                 for (i < length && token_char(data[i])) { i = i + 1; }
                 if (i == value_start) { ret false; }
@@ -621,11 +661,14 @@ fun valid_chunk_extensions(data: *u8, length: usize, offset: usize) bool {
 }
 
 fun parse_chunk_size(parser: *Parser) bool {
-    val line: *u8 = parser.line;
+    val line:   *u8   = parser.line;
     val length: usize = parser.line_length;
-    if (length == 0) { fail(parser, ERROR_INVALID_CHUNK_SIZE); ret false; }
-    var i: usize = 0;
-    var size: u64 = 0;
+    if (length == 0) {
+        fail(parser, ERROR_INVALID_CHUNK_SIZE);
+        ret false;
+    }
+    var i:    usize = 0;
+    var size: u64   = 0;
     for (i < length && line[i] != ';') {
         var digit: u8;
         if (!hex(line[i], ?digit) || size > ((-1)::u64 - digit::u64) / 16) {
@@ -633,9 +676,12 @@ fun parse_chunk_size(parser: *Parser) bool {
             ret false;
         }
         size = size * 16 + digit::u64;
-        i = i + 1;
+        i    = i + 1;
     }
-    if (i == 0) { fail(parser, ERROR_INVALID_CHUNK_SIZE); ret false; }
+    if (i == 0) {
+        fail(parser, ERROR_INVALID_CHUNK_SIZE);
+        ret false;
+    }
     if (i < length && !valid_chunk_extensions(line, length, i)) {
         fail(parser, ERROR_INVALID_CHUNK_EXTENSION);
         ret false;
@@ -646,7 +692,7 @@ fun parse_chunk_size(parser: *Parser) bool {
     }
     parser.chunk_remaining = size;
     if (size == 0) { parser.phase = TRAILER_LINE; }
-    or { parser.phase = CHUNK_DATA; }
+    or             { parser.phase = CHUNK_DATA; }
     ret true;
 }
 
@@ -655,39 +701,39 @@ fun init_common(parser: *Parser, kind: Kind, request_method: method.Kind,
     fields: *field.Field, field_capacity: usize, trailers: *field.Field,
     trailer_capacity: usize, configured: Limits) bool {
     if (parser == nil || (kind != REQUEST && kind != RESPONSE)
-     || line == nil || line_capacity < configured.max_start_line
-     || line_capacity < configured.max_header_line || line_capacity < configured.max_chunk_line
-     || storage == nil || storage_capacity == 0 || fields == nil || trailers == nil
-     || field_capacity < configured.max_headers || trailer_capacity < configured.max_trailers
-     || !limits_valid(configured)) { ret false; }
-    parser.kind = kind;
-    parser.phase = START_LINE;
-    parser.limits = configured;
+        || line == nil || line_capacity < configured.max_start_line
+        || line_capacity < configured.max_header_line || line_capacity < configured.max_chunk_line
+        || storage == nil || storage_capacity == 0 || fields == nil || trailers == nil
+        || field_capacity < configured.max_headers || trailer_capacity < configured.max_trailers
+        || !limits_valid(configured)) { ret false; }
+    parser.kind                    = kind;
+    parser.phase                   = START_LINE;
+    parser.limits                  = configured;
     parser.response_request_method = request_method;
-    parser.line = line;
-    parser.line_capacity = line_capacity;
-    parser.line_length = 0;
-    parser.saw_cr = false;
-    parser.storage = storage;
-    parser.storage_capacity = storage_capacity;
-    parser.storage_length = 0;
-    parser.header_bytes = 0;
-    parser.trailer_bytes = 0;
-    parser.body_bytes = 0;
-    parser.body_remaining = 0;
-    parser.chunk_remaining = 0;
-    parser.wire_bytes = 0;
-    parser.error = ERROR_NONE;
-    parser.error_offset = 0;
-    parser.parsed.kind = kind;
-    parser.parsed.fields = field.init(fields, field_capacity,
+    parser.line                    = line;
+    parser.line_capacity           = line_capacity;
+    parser.line_length             = 0;
+    parser.saw_cr                  = false;
+    parser.storage                 = storage;
+    parser.storage_capacity        = storage_capacity;
+    parser.storage_length          = 0;
+    parser.header_bytes            = 0;
+    parser.trailer_bytes           = 0;
+    parser.body_bytes              = 0;
+    parser.body_remaining          = 0;
+    parser.chunk_remaining         = 0;
+    parser.wire_bytes              = 0;
+    parser.error                   = ERROR_NONE;
+    parser.error_offset            = 0;
+    parser.parsed.kind             = kind;
+    parser.parsed.fields           = field.init(fields, field_capacity,
         field.limits(configured.max_headers, configured.max_header_bytes,
-            configured.max_header_line, configured.max_header_line));
+        configured.max_header_line, configured.max_header_line));
     parser.parsed.trailers = field.init(trailers, trailer_capacity,
         field.limits(configured.max_trailers, configured.max_trailer_bytes,
-            configured.max_header_line, configured.max_header_line));
+        configured.max_header_line, configured.max_header_line));
     parser.parsed.generation = 1;
-    parser.initialized = parser.parsed.fields.valid && parser.parsed.trailers.valid;
+    parser.initialized       = parser.parsed.fields.valid && parser.parsed.trailers.valid;
     ret parser.initialized;
 }
 
@@ -709,28 +755,28 @@ pub fun init_response(parser: *Parser, request_method: method.Kind,
 
 pub fun reset(parser: *Parser) bool {
     if (parser == nil || !parser.initialized) { ret false; }
-    parser.phase = START_LINE;
-    parser.line_length = 0;
-    parser.saw_cr = false;
-    parser.storage_length = 0;
-    parser.header_bytes = 0;
-    parser.trailer_bytes = 0;
-    parser.body_bytes = 0;
-    parser.body_remaining = 0;
+    parser.phase           = START_LINE;
+    parser.line_length     = 0;
+    parser.saw_cr          = false;
+    parser.storage_length  = 0;
+    parser.header_bytes    = 0;
+    parser.trailer_bytes   = 0;
+    parser.body_bytes      = 0;
+    parser.body_remaining  = 0;
     parser.chunk_remaining = 0;
-    parser.wire_bytes = 0;
-    parser.error = ERROR_NONE;
-    parser.error_offset = 0;
+    parser.wire_bytes      = 0;
+    parser.error           = ERROR_NONE;
+    parser.error_offset    = 0;
     field.reset(?parser.parsed.fields);
     field.reset(?parser.parsed.trailers);
     parser.parsed.version = message.Version{wire: 0, major: 0, minor: 0};
-    parser.parsed.method = method.Method{kind: 0, token: view.view(nil, 0)};
-    parser.parsed.target = target.Target{form: 0, raw: view.view(nil, 0),
+    parser.parsed.method  = method.Method{kind: 0, token: view.view(nil, 0)};
+    parser.parsed.target  = target.Target{form: 0, raw: view.view(nil, 0),
         scheme: view.view(nil, 0), authority: view.view(nil, 0), path: view.view(nil, 0),
-        query: view.view(nil, 0)};
-    parser.parsed.status = 0;
-    parser.parsed.reason = view.view(nil, 0);
-    parser.parsed.plan = framing.none(false);
+        query:  view.view(nil, 0)};
+    parser.parsed.status     = 0;
+    parser.parsed.reason     = view.view(nil, 0);
+    parser.parsed.plan       = framing.none(false);
     parser.parsed.generation = parser.parsed.generation + 1;
     if (parser.parsed.generation == 0) { parser.parsed.generation = 1; }
     ret true;
@@ -740,10 +786,10 @@ pub fun feed(parser: *Parser, input: *u8, input_length: usize) Feed {
     if (parser == nil || !parser.initialized || (input == nil && input_length != 0)) {
         var invalid: Feed;
         invalid.status = PARSE_ERROR;
-        invalid.error = ERROR_STATE;
+        invalid.error  = ERROR_STATE;
         ret invalid;
     }
-    if (parser.phase == PARSER_ERROR) { ret feed_result(parser, PARSE_ERROR, 0); }
+    if (parser.phase == PARSER_ERROR)     { ret feed_result(parser, PARSE_ERROR, 0); }
     if (parser.phase == MESSAGE_COMPLETE) { ret feed_result(parser, PARSE_MESSAGE, 0); }
     var offset: usize = 0;
     for (true) {
@@ -752,7 +798,8 @@ pub fun feed(parser: *Parser, input: *u8, input_length: usize) Feed {
             var available: usize = input_length - offset;
             if (parser.phase == FIXED_BODY && available::u64 > parser.body_remaining) {
                 available = parser.body_remaining::usize;
-            } or {
+            }
+            or {
                 if (parser.phase == CHUNK_DATA && available::u64 > parser.chunk_remaining) {
                     available = parser.chunk_remaining::usize;
                 }
@@ -772,77 +819,87 @@ pub fun feed(parser: *Parser, input: *u8, input_length: usize) Feed {
             var final: bool = false;
             if (parser.phase == FIXED_BODY) {
                 parser.body_remaining = parser.body_remaining - available::u64;
-                if (parser.body_remaining == 0) { parser.phase = MESSAGE_COMPLETE; final = true; }
-            } or {
+                if (parser.body_remaining == 0) {
+                    parser.phase = MESSAGE_COMPLETE;
+                    final        = true;
+                }
+            }
+            or {
                 if (parser.phase == CHUNK_DATA) {
                     parser.chunk_remaining = parser.chunk_remaining - available::u64;
                     if (parser.chunk_remaining == 0) { parser.phase = CHUNK_DATA_CR; }
                 }
             }
             var result: Feed = feed_result(parser, PARSE_BODY, offset);
-            result.body = ?input[body_start];
+            result.body        = ?input[body_start];
             result.body_length = available;
-            result.body_final = final;
+            result.body_final  = final;
             ret result;
-        } or {
-        if (parser.phase == CHUNK_DATA_CR || parser.phase == CHUNK_DATA_LF) {
-            if (offset == input_length) { ret feed_result(parser, PARSE_NEED_INPUT, offset); }
-            var expected: u8 = '\n';
-            if (parser.phase == CHUNK_DATA_CR) { expected = '\r'; }
-            if (input[offset] != expected) {
+        }
+        or {
+            if (parser.phase == CHUNK_DATA_CR || parser.phase == CHUNK_DATA_LF) {
+                if (offset == input_length) { ret feed_result(parser, PARSE_NEED_INPUT, offset); }
+                var expected: u8 = '\n';
+                if (parser.phase == CHUNK_DATA_CR) { expected = '\r'; }
+                if (input[offset] != expected) {
+                    account_wire(parser, 1);
+                    offset = offset + 1;
+                    fail(parser, ERROR_INVALID_CHUNK_TERMINATOR);
+                    ret feed_result(parser, PARSE_ERROR, offset);
+                }
                 account_wire(parser, 1);
                 offset = offset + 1;
-                fail(parser, ERROR_INVALID_CHUNK_TERMINATOR);
-                ret feed_result(parser, PARSE_ERROR, offset);
+                if (parser.phase == CHUNK_DATA_CR) { parser.phase = CHUNK_DATA_LF; }
+                or                                 { parser.phase = CHUNK_SIZE; }
             }
-            account_wire(parser, 1);
-            offset = offset + 1;
-            if (parser.phase == CHUNK_DATA_CR) { parser.phase = CHUNK_DATA_LF; }
-            or { parser.phase = CHUNK_SIZE; }
-        } or {
-        val line_status: u8 = take_line(parser, input, input_length, ?offset);
-        if (line_status == LINE_ERROR) { ret feed_result(parser, PARSE_ERROR, offset); }
-        if (line_status == LINE_MORE) { ret feed_result(parser, PARSE_NEED_INPUT, offset); }
-        if (parser.phase == START_LINE) {
-            var valid: bool = false;
-            if (parser.kind == REQUEST) { valid = parse_request_line(parser); }
-            or { valid = parse_response_line(parser); }
-            parser.line_length = 0;
-            if (!valid) {
-                if (parser.phase != PARSER_ERROR) { fail(parser, ERROR_INVALID_START_LINE); }
-                ret feed_result(parser, PARSE_ERROR, offset);
+            or {
+                val line_status: u8 = take_line(parser, input, input_length, ?offset);
+                if (line_status == LINE_ERROR) { ret feed_result(parser, PARSE_ERROR, offset); }
+                if (line_status == LINE_MORE)  { ret feed_result(parser, PARSE_NEED_INPUT, offset); }
+                if (parser.phase == START_LINE) {
+                    var valid: bool = false;
+                    if (parser.kind == REQUEST) { valid = parse_request_line(parser); }
+                    or                          { valid = parse_response_line(parser); }
+                    parser.line_length = 0;
+                    if (!valid) {
+                        if (parser.phase != PARSER_ERROR) { fail(parser, ERROR_INVALID_START_LINE); }
+                        ret feed_result(parser, PARSE_ERROR, offset);
+                    }
+                    parser.phase = HEADER_LINE;
+                }
+                or {
+                    if (parser.phase == HEADER_LINE) {
+                        if (parser.line_length == 0) {
+                            parser.line_length = 0;
+                            if (!headers_complete(parser)) { ret feed_result(parser, PARSE_ERROR, offset); }
+                            ret feed_result(parser, PARSE_HEADERS, offset);
+                        }
+                        if (!parse_field_line(parser, false)) { ret feed_result(parser, PARSE_ERROR, offset); }
+                        parser.line_length = 0;
+                    }
+                    or {
+                        if (parser.phase == CHUNK_SIZE) {
+                            if (!parse_chunk_size(parser)) { ret feed_result(parser, PARSE_ERROR, offset); }
+                            parser.line_length = 0;
+                        }
+                        or {
+                            if (parser.phase == TRAILER_LINE) {
+                                if (parser.line_length == 0) {
+                                    parser.line_length = 0;
+                                    parser.phase       = MESSAGE_COMPLETE;
+                                    ret feed_result(parser, PARSE_MESSAGE, offset);
+                                }
+                                if (!parse_field_line(parser, true)) { ret feed_result(parser, PARSE_ERROR, offset); }
+                                parser.line_length = 0;
+                            }
+                            or {
+                                fail(parser, ERROR_STATE);
+                                ret feed_result(parser, PARSE_ERROR, offset);
+                            }
+                        }
+                    }
+                }
             }
-            parser.phase = HEADER_LINE;
-        } or {
-        if (parser.phase == HEADER_LINE) {
-            if (parser.line_length == 0) {
-                parser.line_length = 0;
-                if (!headers_complete(parser)) { ret feed_result(parser, PARSE_ERROR, offset); }
-                ret feed_result(parser, PARSE_HEADERS, offset);
-            }
-            if (!parse_field_line(parser, false)) { ret feed_result(parser, PARSE_ERROR, offset); }
-            parser.line_length = 0;
-        } or {
-        if (parser.phase == CHUNK_SIZE) {
-            if (!parse_chunk_size(parser)) { ret feed_result(parser, PARSE_ERROR, offset); }
-            parser.line_length = 0;
-        } or {
-        if (parser.phase == TRAILER_LINE) {
-            if (parser.line_length == 0) {
-                parser.line_length = 0;
-                parser.phase = MESSAGE_COMPLETE;
-                ret feed_result(parser, PARSE_MESSAGE, offset);
-            }
-            if (!parse_field_line(parser, true)) { ret feed_result(parser, PARSE_ERROR, offset); }
-            parser.line_length = 0;
-        } or {
-            fail(parser, ERROR_STATE);
-            ret feed_result(parser, PARSE_ERROR, offset);
-        }
-        }
-        }
-        }
-        }
         }
     }
     ret feed_result(parser, PARSE_NEED_INPUT, offset);
@@ -852,10 +909,10 @@ pub fun finish_eof(parser: *Parser, clean: bool) Feed {
     if (parser == nil || !parser.initialized) {
         var invalid: Feed;
         invalid.status = PARSE_ERROR;
-        invalid.error = ERROR_STATE;
+        invalid.error  = ERROR_STATE;
         ret invalid;
     }
-    if (parser.phase == PARSER_ERROR) { ret feed_result(parser, PARSE_ERROR, 0); }
+    if (parser.phase == PARSER_ERROR)     { ret feed_result(parser, PARSE_ERROR, 0); }
     if (parser.phase == MESSAGE_COMPLETE) { ret feed_result(parser, PARSE_MESSAGE, 0); }
     if (parser.phase == CLOSE_BODY && clean) {
         parser.phase = MESSAGE_COMPLETE;
@@ -868,16 +925,16 @@ pub fun finish_eof(parser: *Parser, clean: bool) Feed {
 test "http.h1.parser: defaults are independently bounded" {
     val configured: Limits = limits_default();
     if (configured.max_start_line == 0 || configured.max_header_bytes == 0
-     || configured.max_headers == 0 || configured.max_trailer_bytes == 0
-     || configured.max_chunk_line == 0 || configured.max_body_bytes == 0) { ret 1; }
+        || configured.max_headers == 0 || configured.max_trailer_bytes == 0
+        || configured.max_chunk_line == 0 || configured.max_body_bytes == 0) { ret 1; }
     ret 0;
 }
 
 fun rejected_request(wire: str) bool {
-    var parser: Parser;
-    var line: [8192]u8;
-    var storage: [32768]u8;
-    var fields: [100]field.Field;
+    var parser:   Parser;
+    var line:     [8192]u8;
+    var storage:  [32768]u8;
+    var fields:   [100]field.Field;
     var trailers: [32]field.Field;
     if (!init_request(?parser, ?line[0], 8192, ?storage[0], 32768,
         ?fields[0], 100, ?trailers[0], 32, limits_default())) { ret false; }
@@ -886,46 +943,46 @@ fun rejected_request(wire: str) bool {
     for (offset < length) {
         val result: Feed = feed(?parser, ?wire[offset], length - offset);
         offset = offset + result.consumed;
-        if (result.status == PARSE_ERROR) { ret true; }
+        if (result.status == PARSE_ERROR)                           { ret true; }
         if (result.status == PARSE_MESSAGE || result.consumed == 0) { ret false; }
     }
     ret finish_eof(?parser, true).status == PARSE_ERROR;
 }
 
 rec ParseSummary {
-    code: status.Status;
-    mode: framing.Mode;
-    field_count: usize;
+    code:          status.Status;
+    mode:          framing.Mode;
+    field_count:   usize;
     trailer_count: usize;
-    consumed: usize;
-    body_length: usize;
+    consumed:      usize;
+    body_length:   usize;
 }
 
 fun response_summary(wire: str, stride: usize, body_output: *u8,
     body_capacity: usize, summary: *ParseSummary) bool {
     if (wire == nil || stride == 0 || body_output == nil || summary == nil) { ret false; }
-    var parser: Parser;
-    var line: [8192]u8;
-    var storage: [32768]u8;
-    var fields: [100]field.Field;
+    var parser:   Parser;
+    var line:     [8192]u8;
+    var storage:  [32768]u8;
+    var fields:   [100]field.Field;
     var trailers: [32]field.Field;
     if (!init_response(?parser, method.GET, ?line[0], 8192, ?storage[0], 32768,
         ?fields[0], 100, ?trailers[0], 32, limits_default())) { ret false; }
-    val length: usize = str_len(wire);
-    var offset: usize = 0;
+    val length:      usize = str_len(wire);
+    var offset:      usize = 0;
     var body_length: usize = 0;
-    var complete: bool = false;
+    var complete:    bool  = false;
     for (!complete && offset < length) {
         var available: usize = length - offset;
         if (available > stride) { available = stride; }
         val result: Feed = feed(?parser, ?wire[offset], available);
         if (result.status == PARSE_ERROR || result.consumed == 0) { ret false; }
-        if (result.body_length > body_capacity - body_length) { ret false; }
+        if (result.body_length > body_capacity - body_length)     { ret false; }
         if (result.body_length != 0) {
             memory.raw_copy(?body_output[body_length], result.body, result.body_length);
             body_length = body_length + result.body_length;
         }
-        offset = offset + result.consumed;
+        offset   = offset + result.consumed;
         complete = result.status == PARSE_MESSAGE;
     }
     if (!complete) {
@@ -933,30 +990,30 @@ fun response_summary(wire: str, stride: usize, body_output: *u8,
         complete = done.status == PARSE_MESSAGE;
     }
     if (!complete) { ret false; }
-    summary.code = parser.parsed.status;
-    summary.mode = parser.parsed.plan.mode;
-    summary.field_count = parser.parsed.fields.len;
+    summary.code          = parser.parsed.status;
+    summary.mode          = parser.parsed.plan.mode;
+    summary.field_count   = parser.parsed.fields.len;
     summary.trailer_count = parser.parsed.trailers.len;
-    summary.consumed = offset;
-    summary.body_length = body_length;
+    summary.consumed      = offset;
+    summary.body_length   = body_length;
     ret true;
 }
 
 test "http.h1.parser: request parsing survives every byte fragmentation" {
-    val source: str = "POST /upload?x=1 HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nX-Test: a\r\n\r\nhello";
+    val source: str   = "POST /upload?x=1 HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nX-Test: a\r\n\r\nhello";
     val length: usize = str_len(source);
-    var wire: [128]u8;
+    var wire:   [128]u8;
     memory.raw_copy(?wire[0], source, length);
-    var parser: Parser;
-    var line: [8192]u8;
-    var storage: [32768]u8;
-    var fields: [100]field.Field;
+    var parser:   Parser;
+    var line:     [8192]u8;
+    var storage:  [32768]u8;
+    var fields:   [100]field.Field;
     var trailers: [32]field.Field;
     if (!init_request(?parser, ?line[0], 8192, ?storage[0], 32768,
         ?fields[0], 100, ?trailers[0], 32, limits_default())) { ret 1; }
-    var body: [5]u8;
+    var body:        [5]u8;
     var body_length: usize = 0;
-    var i: usize = 0;
+    var i:           usize = 0;
     for (i < length) {
         val result: Feed = feed(?parser, ?wire[i], 1);
         if (result.status == PARSE_ERROR || result.consumed != 1) { ret 2; }
@@ -967,45 +1024,45 @@ test "http.h1.parser: request parsing survives every byte fragmentation" {
         if (result.body_length != 0) {
             if (result.body != ?wire[i] || result.body_length != 1 || body_length >= 5) { ret 4; }
             body[body_length] = result.body[0];
-            body_length = body_length + 1;
+            body_length       = body_length + 1;
         }
         i = i + 1;
     }
     if (feed(?parser, nil, 0).status != PARSE_MESSAGE || body_length != 5
-     || !memory.raw_equal(?body[0], "hello", 5) || parser.parsed.target.form != target.ORIGIN
-     || parser.parsed.fields.len != 3 || parser.parsed.plan.mode != framing.FRAME_LENGTH) { ret 5; }
+        || !memory.raw_equal(?body[0], "hello", 5) || parser.parsed.target.form != target.ORIGIN
+        || parser.parsed.fields.len != 3 || parser.parsed.plan.mode != framing.FRAME_LENGTH) { ret 5; }
     val generation: u64 = parser.parsed.generation;
     if (!reset(?parser) || parser.parsed.generation == generation
-     || parser.parsed.fields.len != 0 || parser.phase != START_LINE) { ret 6; }
+        || parser.parsed.fields.len != 0 || parser.phase != START_LINE) { ret 6; }
     ret 0;
 }
 
 test "http.h1.parser: whole and fragmented chunked responses agree" {
-    val wire: str = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n4;part=\"a\"\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Sum: 9\r\n\r\n";
+    val wire:       str = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n4;part=\"a\"\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Sum: 9\r\n\r\n";
     var whole_body: [32]u8;
-    var byte_body: [32]u8;
-    var whole: ParseSummary;
-    var bytewise: ParseSummary;
+    var byte_body:  [32]u8;
+    var whole:      ParseSummary;
+    var bytewise:   ParseSummary;
     if (!response_summary(wire, str_len(wire), ?whole_body[0], 32, ?whole)
-     || !response_summary(wire, 1, ?byte_body[0], 32, ?bytewise)) { ret 1; }
+        || !response_summary(wire, 1, ?byte_body[0], 32, ?bytewise)) { ret 1; }
     if (whole.code != status.OK || whole.mode != framing.FRAME_CHUNKED
-     || whole.field_count != 2 || whole.trailer_count != 1 || whole.body_length != 9
-     || whole.consumed != str_len(wire)) { ret 2; }
+        || whole.field_count != 2 || whole.trailer_count != 1 || whole.body_length != 9
+        || whole.consumed != str_len(wire)) { ret 2; }
     if (bytewise.code != whole.code || bytewise.mode != whole.mode
-     || bytewise.field_count != whole.field_count || bytewise.trailer_count != whole.trailer_count
-     || bytewise.body_length != whole.body_length || bytewise.consumed != whole.consumed
-     || !memory.raw_equal(?whole_body[0], ?byte_body[0], whole.body_length)
-     || !memory.raw_equal(?whole_body[0], "Wikipedia", 9)) { ret 3; }
+        || bytewise.field_count != whole.field_count || bytewise.trailer_count != whole.trailer_count
+        || bytewise.body_length != whole.body_length || bytewise.consumed != whole.consumed
+        || !memory.raw_equal(?whole_body[0], ?byte_body[0], whole.body_length)
+        || !memory.raw_equal(?whole_body[0], "Wikipedia", 9)) { ret 3; }
     var stride: usize = 2;
     for (stride < str_len(wire)) {
         var candidate_body: [32]u8;
-        var candidate: ParseSummary;
+        var candidate:      ParseSummary;
         if (!response_summary(wire, stride, ?candidate_body[0], 32, ?candidate)
-         || candidate.code != whole.code || candidate.mode != whole.mode
-         || candidate.field_count != whole.field_count
-         || candidate.trailer_count != whole.trailer_count
-         || candidate.body_length != whole.body_length || candidate.consumed != whole.consumed
-         || !memory.raw_equal(?whole_body[0], ?candidate_body[0], whole.body_length)) { ret 4; }
+            || candidate.code != whole.code || candidate.mode != whole.mode
+            || candidate.field_count != whole.field_count
+            || candidate.trailer_count != whole.trailer_count
+            || candidate.body_length != whole.body_length || candidate.consumed != whole.consumed
+            || !memory.raw_equal(?whole_body[0], ?candidate_body[0], whole.body_length)) { ret 4; }
         stride = stride + 1;
     }
     ret 0;
@@ -1013,74 +1070,74 @@ test "http.h1.parser: whole and fragmented chunked responses agree" {
 
 test "http.h1.parser: hostile framing and request smuggling corpus is rejected" {
     if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")) { ret 1; }
-    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx")) { ret 2; }
-    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1, 1\r\n\r\nx")) { ret 3; }
-    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n")) { ret 4; }
+    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"))                  { ret 2; }
+    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1, 1\r\n\r\nx"))                                    { ret 3; }
+    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"))                         { ret 4; }
     if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n")) { ret 5; }
-    if (!rejected_request("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n")) { ret 6; }
-    if (!rejected_request("GET / HTTP/1.1\r\nHost : x\r\n\r\n")) { ret 7; }
-    if (!rejected_request("GET / HTTP/1.1\r\nHost: x\r\n folded\r\n\r\n")) { ret 8; }
-    if (!rejected_request("GET / HTTP/1.1\nHost: x\n\n")) { ret 9; }
-    if (!rejected_request("GET  / HTTP/1.1\r\nHost: x\r\n\r\n")) { ret 10; }
-    if (!rejected_request("GET / HTTP/1.1\r\n\r\n")) { ret 11; }
-    if (!rejected_request("GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n")) { ret 12; }
-    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 18446744073709551616\r\n\r\n")) { ret 13; }
-    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n")) { ret 14; }
-    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxX")) { ret 15; }
+    if (!rejected_request("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"))                                          { ret 6; }
+    if (!rejected_request("GET / HTTP/1.1\r\nHost : x\r\n\r\n"))                                                             { ret 7; }
+    if (!rejected_request("GET / HTTP/1.1\r\nHost: x\r\n folded\r\n\r\n"))                                                   { ret 8; }
+    if (!rejected_request("GET / HTTP/1.1\nHost: x\n\n"))                                                                    { ret 9; }
+    if (!rejected_request("GET  / HTTP/1.1\r\nHost: x\r\n\r\n"))                                                             { ret 10; }
+    if (!rejected_request("GET / HTTP/1.1\r\n\r\n"))                                                                         { ret 11; }
+    if (!rejected_request("GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n"))                                                   { ret 12; }
+    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 18446744073709551616\r\n\r\n"))                     { ret 13; }
+    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n"))          { ret 14; }
+    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxX"))                        { ret 15; }
     if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 1\r\n\r\n")) { ret 16; }
-    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1 ;x=y\r\na\r\n0\r\n\r\n")) { ret 17; }
-    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1; x=y\r\na\r\n0\r\n\r\n")) { ret 18; }
-    if (!rejected_request("GET / HTTP/1.1\r\nHost: x:abc\r\n\r\n")) { ret 19; }
-    if (!rejected_request("GET / HTTP/1.1\r\nHost: x:99999\r\n\r\n")) { ret 20; }
-    if (!rejected_request("GET / HTTP/1.1\r\nHost: ::1\r\n\r\n")) { ret 21; }
-    if (!rejected_request("GET /bad%zz HTTP/1.1\r\nHost: x\r\n\r\n")) { ret 22; }
-    if (!rejected_request("GET http://x:99999/ HTTP/1.1\r\nHost: x\r\n\r\n")) { ret 23; }
-    if (!rejected_request("CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n")) { ret 24; }
+    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1 ;x=y\r\na\r\n0\r\n\r\n"))       { ret 17; }
+    if (!rejected_request("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1; x=y\r\na\r\n0\r\n\r\n"))       { ret 18; }
+    if (!rejected_request("GET / HTTP/1.1\r\nHost: x:abc\r\n\r\n"))                                                          { ret 19; }
+    if (!rejected_request("GET / HTTP/1.1\r\nHost: x:99999\r\n\r\n"))                                                        { ret 20; }
+    if (!rejected_request("GET / HTTP/1.1\r\nHost: ::1\r\n\r\n"))                                                            { ret 21; }
+    if (!rejected_request("GET /bad%zz HTTP/1.1\r\nHost: x\r\n\r\n"))                                                        { ret 22; }
+    if (!rejected_request("GET http://x:99999/ HTTP/1.1\r\nHost: x\r\n\r\n"))                                                { ret 23; }
+    if (!rejected_request("CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n"))                                      { ret 24; }
     ret 0;
 }
 
 test "http.h1.parser: body and line limits fail at their own boundaries" {
     var configured: Limits = limits_default();
     configured.max_body_bytes = 4;
-    var parser: Parser;
-    var line: [8192]u8;
-    var storage: [32768]u8;
-    var fields: [100]field.Field;
+    var parser:   Parser;
+    var line:     [8192]u8;
+    var storage:  [32768]u8;
+    var fields:   [100]field.Field;
     var trailers: [32]field.Field;
     if (!init_request(?parser, ?line[0], 8192, ?storage[0], 32768,
         ?fields[0], 100, ?trailers[0], 32, configured)) { ret 1; }
     val too_large: str = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n";
     if (feed(?parser, too_large, str_len(too_large)).status != PARSE_ERROR
-     || parser.error != ERROR_BODY_LIMIT) { ret 2; }
-    configured = limits_default();
+        || parser.error != ERROR_BODY_LIMIT) { ret 2; }
+    configured                 = limits_default();
     configured.max_header_line = 4;
     var short_line: [8192]u8;
     if (!init_request(?parser, ?short_line[0], 8192, ?storage[0], 32768,
         ?fields[0], 100, ?trailers[0], 32, configured)) { ret 3; }
     val long_header: str = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     if (feed(?parser, long_header, str_len(long_header)).status != PARSE_ERROR
-     || parser.error != ERROR_HEADER_LINE_LIMIT) { ret 4; }
+        || parser.error != ERROR_HEADER_LINE_LIMIT) { ret 4; }
     ret 0;
 }
 
 test "http.h1.parser: http 1.0 close bodies and bodyless responses end exactly" {
-    var parser: Parser;
-    var line: [8192]u8;
-    var storage: [32768]u8;
-    var fields: [100]field.Field;
+    var parser:   Parser;
+    var line:     [8192]u8;
+    var storage:  [32768]u8;
+    var fields:   [100]field.Field;
     var trailers: [32]field.Field;
     if (!init_response(?parser, method.GET, ?line[0], 8192, ?storage[0], 32768,
         ?fields[0], 100, ?trailers[0], 32, limits_default())) { ret 1; }
-    val close_wire: str = "HTTP/1.0 200 OK\r\n\r\nhello";
-    val head: Feed = feed(?parser, close_wire, str_len(close_wire));
+    val close_wire: str  = "HTTP/1.0 200 OK\r\n\r\nhello";
+    val head:       Feed = feed(?parser, close_wire, str_len(close_wire));
     if (head.status != PARSE_HEADERS || parser.parsed.plan.mode != framing.FRAME_CLOSE
-     || parser.parsed.plan.keep_alive) { ret 2; }
+        || parser.parsed.plan.keep_alive) { ret 2; }
     val content: Feed = feed(?parser, ?close_wire[head.consumed], str_len(close_wire) - head.consumed);
     if (content.status != PARSE_BODY || content.body_length != 5
-     || !memory.raw_equal(content.body, "hello", 5)
-     || finish_eof(?parser, true).status != PARSE_MESSAGE) { ret 3; }
+        || !memory.raw_equal(content.body, "hello", 5)
+        || finish_eof(?parser, true).status != PARSE_MESSAGE) { ret 3; }
     if (!reset(?parser)) { ret 4; }
-    val empty_wire: str = "HTTP/1.1 204 No Content\r\nDate: x\r\n\r\nNEXT";
+    val empty_wire: str  = "HTTP/1.1 204 No Content\r\nDate: x\r\n\r\nNEXT";
     val empty_head: Feed = feed(?parser, empty_wire, str_len(empty_wire));
     if (empty_head.status != PARSE_HEADERS || parser.parsed.plan.mode != framing.FRAME_NONE) { ret 5; }
     val complete: Feed = feed(?parser, ?empty_wire[empty_head.consumed],

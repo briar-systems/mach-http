@@ -1,5 +1,9 @@
 # bounded origin-isolated connection pooling
 
+use http.client.memory;
+use http.client.policy;
+use http.core.body;
+use http.core.message;
 use std.chrono.time;
 use std.net.ip;
 use std.sync.mutex;
@@ -8,10 +12,6 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.view;
-use http.client.policy;
-use http.client.memory;
-use http.core.body;
-use http.core.message;
 
 pub def ConnectionState: u8;
 pub val CONNECTION_EMPTY:      ConnectionState = 0;
@@ -42,12 +42,12 @@ rec StoredOrigin {
 }
 
 rec StoredProxy {
-    kind:     policy.ProxyKind;
-    host:     [253]u8;
-    host_len: usize;
-    port:     u16;
-    secure:   bool;
-    identity: u64;
+    kind:       policy.ProxyKind;
+    host:       [253]u8;
+    host_len:   usize;
+    port:       u16;
+    secure:     bool;
+    identity:   u64;
     transports: u8;
 }
 
@@ -57,19 +57,19 @@ rec StoredRoute {
 }
 
 pub rec Connection {
-    state:           ConnectionState;
-    generation:      u32;
-    route:           StoredRoute;
-    endpoint:        ip.Endpoint;
-    transport:       policy.TransportKind;
-    wire:            message.Wire;
-    driver:          ptr;
-    max_streams:     usize;
-    active_streams:  usize;
-    created_at:      time.Time;
-    last_used_at:    time.Time;
-    idle_deadline:   time.Time;
-    close_published: bool;
+    state:            ConnectionState;
+    generation:       u32;
+    route:            StoredRoute;
+    endpoint:         ip.Endpoint;
+    transport:        policy.TransportKind;
+    wire:             message.Wire;
+    driver:           ptr;
+    max_streams:      usize;
+    active_streams:   usize;
+    created_at:       time.Time;
+    last_used_at:     time.Time;
+    idle_deadline:    time.Time;
+    close_published:  bool;
     cancel_published: bool;
 }
 
@@ -80,28 +80,28 @@ pub rec LeaseSlot {
 }
 
 pub rec Config {
-    max_connections:           usize;
-    max_connections_per_route: usize;
-    max_leases:                usize;
-    max_idle:                  usize;
-    max_idle_per_route:        usize;
-    idle_timeout_ns:           u64;
+    max_connections:            usize;
+    max_connections_per_route:  usize;
+    max_leases:                 usize;
+    max_idle:                   usize;
+    max_idle_per_route:         usize;
+    idle_timeout_ns:            u64;
     max_streams_per_connection: usize;
 }
 
 pub rec Pool {
-    connections: *Connection;
-    capacity:    usize;
-    leases:      *LeaseSlot;
-    lease_capacity: usize;
-    configured: Config;
-    next_connection: usize;
-    next_lease: usize;
+    connections:      *Connection;
+    capacity:         usize;
+    leases:           *LeaseSlot;
+    lease_capacity:   usize;
+    configured:       Config;
+    next_connection:  usize;
+    next_lease:       usize;
     live_connections: usize;
-    live_leases: usize;
-    accepting: bool;
-    lock: mutex.Mutex;
-    initialized: bool;
+    live_leases:      usize;
+    accepting:        bool;
+    lock:             mutex.Mutex;
+    initialized:      bool;
 }
 
 pub def AcquireStatus: u8;
@@ -166,14 +166,14 @@ pub rec Close {
 }
 
 pub rec Snapshot {
-    accepting:       bool;
+    accepting:        bool;
     live_connections: usize;
-    connecting:      usize;
-    open:            usize;
-    draining:        usize;
-    closing:         usize;
-    idle:            usize;
-    live_leases:     usize;
+    connecting:       usize;
+    open:             usize;
+    draining:         usize;
+    closing:          usize;
+    idle:             usize;
+    live_leases:      usize;
 }
 
 fun empty_connection_token() ConnectionToken {
@@ -190,14 +190,14 @@ fun empty_endpoint() ip.Endpoint {
     var i: usize = 0;
     for (i < 4) {
         result.addr.v4.octets[i] = 0;
-        i = i + 1;
+        i                        = i + 1;
     }
     i = 0;
     for (i < 16) {
         result.addr.v6.octets[i] = 0;
-        i = i + 1;
+        i                        = i + 1;
     }
-    result.port = 0;
+    result.port  = 0;
     result.scope = 0;
     ret result;
 }
@@ -231,7 +231,7 @@ fun time_before_or_equal(first: time.Time, second: time.Time) bool {
 }
 
 fun deadline(now: time.Time, duration_ns: u64) time.Time {
-    val seconds: u64 = duration_ns / 1000000000;
+    val seconds:     u64 = duration_ns / 1000000000;
     val nanoseconds: u64 = duration_ns % 1000000000;
     if (seconds > 0x7fffffffffffffff ||
         now.sec > 0x7fffffffffffffff - seconds::i64) {
@@ -244,7 +244,7 @@ fun deadline(now: time.Time, duration_ns: u64) time.Time {
             result.nsec = 999999999;
             ret result;
         }
-        result.sec = result.sec + 1;
+        result.sec  = result.sec + 1;
         result.nsec = result.nsec - 1000000000;
     }
     ret result;
@@ -252,8 +252,8 @@ fun deadline(now: time.Time, duration_ns: u64) time.Time {
 
 pub fun config_default() Config {
     ret Config{max_connections: 256, max_connections_per_route: 16,
-        max_leases: 4096, max_idle: 128, max_idle_per_route: 8,
-        idle_timeout_ns: 60000000000,
+        max_leases:                 4096, max_idle: 128, max_idle_per_route: 8,
+        idle_timeout_ns:            60000000000,
         max_streams_per_connection: 1024};
 }
 
@@ -283,53 +283,53 @@ fun pool_object(pool: *Pool) bool {
 fun pool_ready(pool: *Pool) bool {
     if (!pool_object(pool) || !pool.initialized) { ret false; }
     ret memory.count(pool.connections::ptr, pool.capacity,
-            $size_of(Connection))
+        $size_of(Connection))
         && memory.count(pool.leases::ptr, pool.lease_capacity,
-            $size_of(LeaseSlot));
+        $size_of(LeaseSlot));
 }
 
 fun overlaps_pool(pool: *Pool, value: ptr, size: usize) bool {
     ret memory.overlap(value, size, pool::ptr, $size_of(Pool))
         || memory.overlap(value, size, pool.connections::ptr,
-            pool.capacity * $size_of(Connection))
+        pool.capacity * $size_of(Connection))
         || memory.overlap(value, size, pool.leases::ptr,
-            pool.lease_capacity * $size_of(LeaseSlot));
+        pool.lease_capacity * $size_of(LeaseSlot));
 }
 
 fun route_aliases_pool(pool: *Pool, route: policy.Route) bool {
     ret overlaps_pool(pool, route.origin.host.data::ptr, route.origin.host.len)
         || (route.proxy.kind != policy.PROXY_NONE
-            && overlaps_pool(pool, route.proxy.host.data::ptr,
-                route.proxy.host.len));
+        && overlaps_pool(pool, route.proxy.host.data::ptr,
+        route.proxy.host.len));
 }
 
 fun clear_connection(connection: *Connection) {
-    connection.state = CONNECTION_EMPTY;
-    connection.route.origin.scheme = 0;
-    connection.route.origin.host_len = 0;
-    connection.route.origin.port = 0;
-    connection.route.proxy.kind = policy.PROXY_NONE;
-    connection.route.proxy.host_len = 0;
-    connection.route.proxy.port = 0;
-    connection.route.proxy.secure = false;
-    connection.route.proxy.identity = 0;
+    connection.state                  = CONNECTION_EMPTY;
+    connection.route.origin.scheme    = 0;
+    connection.route.origin.host_len  = 0;
+    connection.route.origin.port      = 0;
+    connection.route.proxy.kind       = policy.PROXY_NONE;
+    connection.route.proxy.host_len   = 0;
+    connection.route.proxy.port       = 0;
+    connection.route.proxy.secure     = false;
+    connection.route.proxy.identity   = 0;
     connection.route.proxy.transports = 0;
     var i: usize = 0;
     for (i < 253) {
         connection.route.origin.host[i] = 0;
-        connection.route.proxy.host[i] = 0;
-        i = i + 1;
+        connection.route.proxy.host[i]  = 0;
+        i                               = i + 1;
     }
-    connection.endpoint = empty_endpoint();
-    connection.transport = 0;
-    connection.wire = 0;
-    connection.driver = nil;
-    connection.max_streams = 0;
-    connection.active_streams = 0;
-    connection.created_at = time.Time{sec: 0, nsec: 0};
-    connection.last_used_at = time.Time{sec: 0, nsec: 0};
-    connection.idle_deadline = time.Time{sec: 0, nsec: 0};
-    connection.close_published = false;
+    connection.endpoint         = empty_endpoint();
+    connection.transport        = 0;
+    connection.wire             = 0;
+    connection.driver           = nil;
+    connection.max_streams      = 0;
+    connection.active_streams   = 0;
+    connection.created_at       = time.Time{sec: 0, nsec: 0};
+    connection.last_used_at     = time.Time{sec: 0, nsec: 0};
+    connection.idle_deadline    = time.Time{sec: 0, nsec: 0};
+    connection.close_published  = false;
     connection.cancel_published = false;
 }
 
@@ -341,23 +341,23 @@ pub fun init(pool: *Pool, connections: *Connection, capacity: usize,
         || pool.initialized
         || !config_valid(configured, capacity, lease_capacity)) { ret false; }
     if (memory.overlap(pool::ptr, $size_of(Pool), connections::ptr,
-            capacity * $size_of(Connection))
+        capacity * $size_of(Connection))
         || memory.overlap(pool::ptr, $size_of(Pool), leases::ptr,
-            lease_capacity * $size_of(LeaseSlot))
+        lease_capacity * $size_of(LeaseSlot))
         || memory.overlap(connections::ptr,
-            capacity * $size_of(Connection), leases::ptr,
-            lease_capacity * $size_of(LeaseSlot))) { ret false; }
-    pool.connections = connections;
-    pool.capacity = capacity;
-    pool.leases = leases;
-    pool.lease_capacity = lease_capacity;
-    pool.configured = configured;
-    pool.next_connection = 0;
-    pool.next_lease = 0;
+        capacity * $size_of(Connection), leases::ptr,
+        lease_capacity * $size_of(LeaseSlot))) { ret false; }
+    pool.connections      = connections;
+    pool.capacity         = capacity;
+    pool.leases           = leases;
+    pool.lease_capacity   = lease_capacity;
+    pool.configured       = configured;
+    pool.next_connection  = 0;
+    pool.next_lease       = 0;
     pool.live_connections = 0;
-    pool.live_leases = 0;
-    pool.accepting = true;
-    pool.lock = mutex.make();
+    pool.live_leases      = 0;
+    pool.accepting        = true;
+    pool.lock             = mutex.make();
     var i: usize = 0;
     for (i < capacity) {
         connections[i].generation = 0;
@@ -366,10 +366,10 @@ pub fun init(pool: *Pool, connections: *Connection, capacity: usize,
     }
     i = 0;
     for (i < lease_capacity) {
-        leases[i].state = LEASE_EMPTY;
+        leases[i].state      = LEASE_EMPTY;
         leases[i].generation = 0;
         leases[i].connection = empty_connection_token();
-        i = i + 1;
+        i                    = i + 1;
     }
     pool.initialized = true;
     ret true;
@@ -379,11 +379,11 @@ fun host_same(stored: *u8, stored_len: usize, value: view.View) bool {
     if (stored_len != value.len || value.data == nil) { ret false; }
     var i: usize = 0;
     for (i < stored_len) {
-        var first: u8 = stored[i];
+        var first:  u8 = stored[i];
         var second: u8 = value.data[i];
-        if (first >= 'A' && first <= 'Z') { first = first + 32; }
+        if (first >= 'A' && first <= 'Z')   { first = first + 32; }
         if (second >= 'A' && second <= 'Z') { second = second + 32; }
-        if (first != second) { ret false; }
+        if (first != second)                { ret false; }
         i = i + 1;
     }
     ret true;
@@ -393,7 +393,7 @@ fun route_same(stored: *StoredRoute, route: policy.Route) bool {
     if (stored.origin.scheme != route.origin.scheme
         || stored.origin.port != route.origin.port
         || !host_same(?stored.origin.host[0], stored.origin.host_len,
-            route.origin.host)
+        route.origin.host)
         || stored.proxy.kind != route.proxy.kind
         || stored.proxy.port != route.proxy.port
         || stored.proxy.secure != route.proxy.secure
@@ -405,24 +405,24 @@ fun route_same(stored: *StoredRoute, route: policy.Route) bool {
 }
 
 fun store_route(output: *StoredRoute, route: policy.Route) {
-    output.origin.scheme = route.origin.scheme;
+    output.origin.scheme   = route.origin.scheme;
     output.origin.host_len = route.origin.host.len;
-    output.origin.port = route.origin.port;
+    output.origin.port     = route.origin.port;
     var i: usize = 0;
     for (i < route.origin.host.len) {
         output.origin.host[i] = route.origin.host.data[i];
-        i = i + 1;
+        i                     = i + 1;
     }
-    output.proxy.kind = route.proxy.kind;
-    output.proxy.host_len = route.proxy.host.len;
-    output.proxy.port = route.proxy.port;
-    output.proxy.secure = route.proxy.secure;
-    output.proxy.identity = route.proxy.identity;
+    output.proxy.kind       = route.proxy.kind;
+    output.proxy.host_len   = route.proxy.host.len;
+    output.proxy.port       = route.proxy.port;
+    output.proxy.secure     = route.proxy.secure;
+    output.proxy.identity   = route.proxy.identity;
     output.proxy.transports = route.proxy.transports;
-    i = 0;
+    i                       = 0;
     for (i < route.proxy.host.len) {
         output.proxy.host[i] = route.proxy.host.data[i];
-        i = i + 1;
+        i                    = i + 1;
     }
 }
 
@@ -454,7 +454,7 @@ fun lease_for_locked(pool: *Pool, token: LeaseToken) *LeaseSlot {
 
 fun claim_lease_locked(pool: *Pool, connection: ConnectionToken,
     state: u8, token: *LeaseToken) *LeaseSlot {
-    if (token == nil) { ret nil; }
+    if (token == nil)                                   { ret nil; }
     if (pool.live_leases >= pool.configured.max_leases) { ret nil; }
     var checked: usize = 0;
     for (checked < pool.lease_capacity) {
@@ -463,10 +463,10 @@ fun claim_lease_locked(pool: *Pool, connection: ConnectionToken,
         val lease: *LeaseSlot = ?pool.leases[index];
         if (lease.state == LEASE_EMPTY && lease.generation != 0xffffffff) {
             lease.generation = lease.generation + 1;
-            lease.state = state;
+            lease.state      = state;
             lease.connection = connection;
             pool.live_leases = pool.live_leases + 1;
-            token.index = index::u32;
+            token.index      = index::u32;
             token.generation = lease.generation;
             ret lease;
         }
@@ -476,7 +476,7 @@ fun claim_lease_locked(pool: *Pool, connection: ConnectionToken,
 }
 
 fun release_lease_locked(pool: *Pool, lease: *LeaseSlot) {
-    lease.state = LEASE_EMPTY;
+    lease.state      = LEASE_EMPTY;
     lease.connection = empty_connection_token();
     pool.live_leases = pool.live_leases - 1;
 }
@@ -490,7 +490,7 @@ fun lease_value(token: LeaseToken, lease: *LeaseSlot,
 fun wire_matches(configured: policy.ProtocolPolicy, wire: message.Wire) bool {
     ret policy.wire_allowed(configured, wire)
         && (configured.prior_knowledge == 0
-            || configured.prior_knowledge == wire);
+        || configured.prior_knowledge == wire);
 }
 
 fun connection_usable(connection: *Connection, route: policy.Route,
@@ -505,10 +505,10 @@ fun connection_usable(connection: *Connection, route: policy.Route,
 }
 
 fun better(first: *Connection, second: *Connection) bool {
-    if (second == nil) { ret true; }
+    if (second == nil)                                           { ret true; }
     if (first.active_streams != 0 && second.active_streams == 0) { ret true; }
     if (first.active_streams == 0 && second.active_streams != 0) { ret false; }
-    if (first.wire != second.wire) { ret first.wire > second.wire; }
+    if (first.wire != second.wire)                               { ret first.wire > second.wire; }
     if (first.active_streams != second.active_streams) {
         ret first.active_streams < second.active_streams;
     }
@@ -527,14 +527,14 @@ pub fun acquire(pool: *Pool, route: policy.Route,
         mutex.unlock(?pool.lock);
         ret Acquire{status: ACQUIRE_DRAINING, lease: empty_lease()};
     }
-    var selected: *Connection = nil;
-    var selected_index: usize = 0;
-    var i: usize = 0;
+    var selected:       *Connection = nil;
+    var selected_index: usize       = 0;
+    var i:              usize       = 0;
     for (i < pool.capacity) {
         val candidate: *Connection = ?pool.connections[i];
         if (connection_usable(candidate, route, configured, now)
             && better(candidate, selected)) {
-            selected = candidate;
+            selected       = candidate;
             selected_index = i;
         }
         i = i + 1;
@@ -544,9 +544,10 @@ pub fun acquire(pool: *Pool, route: policy.Route,
         ret Acquire{status: ACQUIRE_MISS, lease: empty_lease()};
     }
     val connection_token: ConnectionToken = ConnectionToken{
-        index: selected_index::u32, generation: selected.generation};
+        index: selected_index::u32, generation: selected.generation
+    };
     var lease_token: LeaseToken;
-    val lease: *LeaseSlot = claim_lease_locked(pool, connection_token,
+    val lease:       *LeaseSlot = claim_lease_locked(pool, connection_token,
         LEASE_LIVE, ?lease_token);
     if (lease == nil) {
         mutex.unlock(?pool.lock);
@@ -562,8 +563,8 @@ fun endpoint_valid(endpoint: ip.Endpoint, expected_port: u16) bool {
     if (endpoint.port != expected_port || endpoint.port == 0
         || (endpoint.addr.is_v6 != 0 && endpoint.addr.is_v6 != 1)
         || (endpoint.addr.is_v6 == 0 && endpoint.scope != 0)) { ret false; }
-    var nonzero: bool = false;
-    var i: usize = 0;
+    var nonzero: bool  = false;
+    var i:       usize = 0;
     if (endpoint.addr.is_v6 == 0) {
         for (i < 4) {
             if (endpoint.addr.v4.octets[i] != 0) { nonzero = true; }
@@ -600,7 +601,7 @@ fun endpoint_same(first: ip.Endpoint, second: ip.Endpoint) bool {
 
 fun route_count_locked(pool: *Pool, route: policy.Route) usize {
     var count: usize = 0;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (i < pool.capacity) {
         if (pool.connections[i].state != CONNECTION_EMPTY
             && route_same(?pool.connections[i].route, route)) {
@@ -612,7 +613,7 @@ fun route_count_locked(pool: *Pool, route: policy.Route) usize {
 }
 
 fun claim_connection_locked(pool: *Pool, token: *ConnectionToken) *Connection {
-    if (token == nil) { ret nil; }
+    if (token == nil)                                             { ret nil; }
     if (pool.live_connections >= pool.configured.max_connections) { ret nil; }
     var checked: usize = 0;
     for (checked < pool.capacity) {
@@ -622,10 +623,10 @@ fun claim_connection_locked(pool: *Pool, token: *ConnectionToken) *Connection {
         if (connection.state == CONNECTION_EMPTY
             && connection.generation != 0xffffffff) {
             connection.generation = connection.generation + 1;
-            connection.state = CONNECTION_CONNECTING;
+            connection.state      = CONNECTION_CONNECTING;
             pool.live_connections = pool.live_connections + 1;
-            token.index = index::u32;
-            token.generation = connection.generation;
+            token.index           = index::u32;
+            token.generation      = connection.generation;
             ret connection;
         }
         checked = checked + 1;
@@ -639,7 +640,7 @@ pub fun reserve(pool: *Pool, route: policy.Route, endpoint: ip.Endpoint,
     if (route.proxy.kind != policy.PROXY_NONE) { expected_port = route.proxy.port; }
     if (!pool_ready(pool) || !policy.route_valid(route, 253)
         || (transport != policy.TRANSPORT_TCP
-            && transport != policy.TRANSPORT_QUIC)
+        && transport != policy.TRANSPORT_QUIC)
         || !policy.proxy_supports(route.proxy, transport)
         || !endpoint_valid(endpoint, expected_port) || !time_valid(now)
         || route_aliases_pool(pool, route)) {
@@ -656,14 +657,14 @@ pub fun reserve(pool: *Pool, route: policy.Route, endpoint: ip.Endpoint,
         ret empty_reservation(RESERVE_SATURATED);
     }
     var connection_token: ConnectionToken;
-    val connection: *Connection = claim_connection_locked(pool,
+    val connection:       *Connection = claim_connection_locked(pool,
         ?connection_token);
     if (connection == nil) {
         mutex.unlock(?pool.lock);
         ret empty_reservation(RESERVE_SATURATED);
     }
     var lease_token: LeaseToken;
-    val lease: *LeaseSlot = claim_lease_locked(pool, connection_token,
+    val lease:       *LeaseSlot = claim_lease_locked(pool, connection_token,
         LEASE_PENDING, ?lease_token);
     if (lease == nil) {
         clear_connection(connection);
@@ -672,10 +673,10 @@ pub fun reserve(pool: *Pool, route: policy.Route, endpoint: ip.Endpoint,
         ret empty_reservation(RESERVE_SATURATED);
     }
     store_route(?connection.route, route);
-    connection.endpoint = endpoint;
-    connection.transport = transport;
-    connection.created_at = now;
-    connection.last_used_at = now;
+    connection.endpoint      = endpoint;
+    connection.transport     = transport;
+    connection.created_at    = now;
+    connection.last_used_at  = now;
     connection.idle_deadline = deadline(now, pool.configured.idle_timeout_ns);
     mutex.unlock(?pool.lock);
     ret Reservation{status: RESERVE_OK, connection: connection_token,
@@ -708,11 +709,11 @@ pub fun activate(pool: *Pool, reservation: Reservation,
         || !memory.range(driver, 1) || !time_valid(now)
         || overlaps_pool(pool, driver, 1)
         || (wire != message.WIRE_H1 && wire != message.WIRE_H2
-            && wire != message.WIRE_H3)
+        && wire != message.WIRE_H3)
         || (wire == message.WIRE_H3
-            && reservation.transport != policy.TRANSPORT_QUIC)
+        && reservation.transport != policy.TRANSPORT_QUIC)
         || (wire != message.WIRE_H3
-            && reservation.transport != policy.TRANSPORT_TCP)
+        && reservation.transport != policy.TRANSPORT_TCP)
         || (wire == message.WIRE_H1 && max_streams != 1)
         || max_streams > pool.configured.max_streams_per_connection) {
         ret Activated{status: ACTIVATE_INVALID, lease: empty_lease()};
@@ -734,13 +735,13 @@ pub fun activate(pool: *Pool, reservation: Reservation,
         mutex.unlock(?pool.lock);
         ret Activated{status: ACTIVATE_INVALID, lease: empty_lease()};
     }
-    connection.state = CONNECTION_OPEN;
-    connection.wire = wire;
-    connection.driver = driver;
-    connection.max_streams = max_streams;
+    connection.state          = CONNECTION_OPEN;
+    connection.wire           = wire;
+    connection.driver         = driver;
+    connection.max_streams    = max_streams;
     connection.active_streams = 0;
-    connection.last_used_at = now;
-    connection.idle_deadline = deadline(now, pool.configured.idle_timeout_ns);
+    connection.last_used_at   = now;
+    connection.idle_deadline  = deadline(now, pool.configured.idle_timeout_ns);
     if (!pool.accepting) {
         release_lease_locked(pool, lease);
         connection.state = CONNECTION_CLOSING;
@@ -753,7 +754,7 @@ pub fun activate(pool: *Pool, reservation: Reservation,
             || pool.configured.max_idle_per_route == 0
             || idle_count_locked(pool) > pool.configured.max_idle
             || idle_route_count_locked(pool, ?connection.route)
-                > pool.configured.max_idle_per_route) {
+            > pool.configured.max_idle_per_route) {
             connection.state = CONNECTION_CLOSING;
             mutex.unlock(?pool.lock);
             ret Activated{status: ACTIVATE_CLOSE, lease: empty_lease()};
@@ -762,7 +763,7 @@ pub fun activate(pool: *Pool, reservation: Reservation,
         ret Activated{status: ACTIVATE_WAIT, lease: empty_lease()};
     }
     connection.active_streams = 1;
-    lease.state = LEASE_LIVE;
+    lease.state               = LEASE_LIVE;
     val value: Lease = lease_value(reservation.lease, lease, connection);
     mutex.unlock(?pool.lock);
     ret Activated{status: ACTIVATE_OK, lease: value};
@@ -794,7 +795,7 @@ pub fun fail_connect(pool: *Pool, reservation: Reservation) bool {
 
 fun idle_count_locked(pool: *Pool) usize {
     var count: usize = 0;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (i < pool.capacity) {
         val connection: *Connection = ?pool.connections[i];
         if (connection.state == CONNECTION_OPEN
@@ -829,14 +830,14 @@ fun stored_route_same(first: *StoredRoute, second: *StoredRoute) bool {
         && first.proxy.identity == second.proxy.identity
         && first.proxy.transports == second.proxy.transports
         && stored_host_same(?first.origin.host[0], first.origin.host_len,
-            ?second.origin.host[0], second.origin.host_len)
+        ?second.origin.host[0], second.origin.host_len)
         && stored_host_same(?first.proxy.host[0], first.proxy.host_len,
-            ?second.proxy.host[0], second.proxy.host_len);
+        ?second.proxy.host[0], second.proxy.host_len);
 }
 
 fun idle_route_count_locked(pool: *Pool, route: *StoredRoute) usize {
     var count: usize = 0;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (i < pool.capacity) {
         val connection: *Connection = ?pool.connections[i];
         if (connection.state == CONNECTION_OPEN
@@ -856,7 +857,7 @@ pub fun release(pool: *Pool, value: Lease, reuse: body.Reuse,
         ret RELEASE_INVALID;
     }
     mutex.lock(?pool.lock);
-    val lease: *LeaseSlot = lease_for_locked(pool, value.token);
+    val lease:      *LeaseSlot  = lease_for_locked(pool, value.token);
     val connection: *Connection = connection_for_locked(pool,
         value.connection);
     if (lease == nil || connection == nil || lease.state != LEASE_LIVE
@@ -868,7 +869,7 @@ pub fun release(pool: *Pool, value: Lease, reuse: body.Reuse,
     }
     release_lease_locked(pool, lease);
     connection.active_streams = connection.active_streams - 1;
-    connection.last_used_at = now;
+    connection.last_used_at   = now;
     if (reuse == body.REUSE_FORBIDDEN) {
         connection.state = CONNECTION_DRAINING;
     }
@@ -881,7 +882,7 @@ pub fun release(pool: *Pool, value: Lease, reuse: body.Reuse,
         || pool.configured.max_idle_per_route == 0
         || idle_count_locked(pool) > pool.configured.max_idle
         || idle_route_count_locked(pool, ?connection.route)
-            > pool.configured.max_idle_per_route) {
+        > pool.configured.max_idle_per_route) {
         connection.state = CONNECTION_CLOSING;
         mutex.unlock(?pool.lock);
         ret RELEASE_CLOSE;
@@ -902,7 +903,8 @@ pub fun mark_draining(pool: *Pool, token: ConnectionToken) bool {
     }
     if (connection.active_streams == 0) {
         connection.state = CONNECTION_CLOSING;
-    } or {
+    }
+    or {
         connection.state = CONNECTION_DRAINING;
     }
     mutex.unlock(?pool.lock);
@@ -919,7 +921,7 @@ pub fun update_max_streams(pool: *Pool, token: ConnectionToken,
     val connection: *Connection = connection_for_locked(pool, token);
     if (connection == nil
         || (connection.state != CONNECTION_OPEN
-            && connection.state != CONNECTION_DRAINING)
+        && connection.state != CONNECTION_DRAINING)
         || (connection.wire == message.WIRE_H1 && max_streams != 1)) {
         mutex.unlock(?pool.lock);
         ret false;
@@ -951,8 +953,8 @@ pub fun take_close(pool: *Pool, now: time.Time) Close {
             connection.close_published = true;
             val result: Close = Close{found: true,
                 connection: ConnectionToken{index: i::u32,
-                    generation: connection.generation},
-                driver: connection.driver, wire: connection.wire};
+                generation: connection.generation},
+                driver:     connection.driver, wire: connection.wire};
             mutex.unlock(?pool.lock);
             ret result;
         }
@@ -993,7 +995,8 @@ pub fun drain(pool: *Pool) bool {
         if (connection.state == CONNECTION_OPEN) {
             if (connection.active_streams == 0) {
                 connection.state = CONNECTION_CLOSING;
-            } or {
+            }
+            or {
                 connection.state = CONNECTION_DRAINING;
             }
         }
@@ -1018,7 +1021,8 @@ pub fun take_connect_cancel(pool: *Pool) ConnectCancel {
         if (connection.state == CONNECTION_CONNECTING
             && !connection.cancel_published) {
             val connection_token: ConnectionToken = ConnectionToken{
-                index: i::u32, generation: connection.generation};
+                index: i::u32, generation: connection.generation
+            };
             var j: usize = 0;
             for (j < pool.lease_capacity) {
                 val lease: *LeaseSlot = ?pool.leases[j];
@@ -1027,11 +1031,11 @@ pub fun take_connect_cancel(pool: *Pool) ConnectCancel {
                     connection.cancel_published = true;
                     val result: ConnectCancel = ConnectCancel{found: true,
                         reservation: Reservation{status: RESERVE_OK,
-                            connection: connection_token,
-                            lease: LeaseToken{index: j::u32,
-                                generation: lease.generation},
-                            endpoint: connection.endpoint,
-                            transport: connection.transport}};
+                        connection:  connection_token,
+                        lease:       LeaseToken{index: j::u32,
+                        generation:  lease.generation},
+                        endpoint:    connection.endpoint,
+                        transport:   connection.transport}};
                     mutex.unlock(?pool.lock);
                     ret result;
                 }
@@ -1046,26 +1050,29 @@ pub fun take_connect_cancel(pool: *Pool) ConnectCancel {
 
 pub fun snapshot(pool: *Pool) Snapshot {
     var result: Snapshot = Snapshot{accepting: false, live_connections: 0,
-        connecting: 0, open: 0, draining: 0, closing: 0, idle: 0,
+        connecting:  0, open: 0, draining: 0, closing: 0, idle: 0,
         live_leases: 0};
     if (!pool_ready(pool)) { ret result; }
     mutex.lock(?pool.lock);
-    result.accepting = pool.accepting;
+    result.accepting        = pool.accepting;
     result.live_connections = pool.live_connections;
-    result.live_leases = pool.live_leases;
+    result.live_leases      = pool.live_leases;
     var i: usize = 0;
     for (i < pool.capacity) {
         val connection: *Connection = ?pool.connections[i];
         if (connection.state == CONNECTION_CONNECTING) {
             result.connecting = result.connecting + 1;
-        } or (connection.state == CONNECTION_OPEN) {
+        }
+        or (connection.state == CONNECTION_OPEN) {
             result.open = result.open + 1;
             if (connection.active_streams == 0) {
                 result.idle = result.idle + 1;
             }
-        } or (connection.state == CONNECTION_DRAINING) {
+        }
+        or (connection.state == CONNECTION_DRAINING) {
             result.draining = result.draining + 1;
-        } or (connection.state == CONNECTION_CLOSING) {
+        }
+        or (connection.state == CONNECTION_CLOSING) {
             result.closing = result.closing + 1;
         }
         i = i + 1;
@@ -1081,13 +1088,13 @@ pub fun destroy(pool: *Pool) bool {
         mutex.unlock(?pool.lock);
         ret false;
     }
-    pool.connections = nil;
-    pool.capacity = 0;
-    pool.leases = nil;
+    pool.connections    = nil;
+    pool.capacity       = 0;
+    pool.leases         = nil;
     pool.lease_capacity = 0;
-    pool.configured = Config{max_connections: 0,
-        max_connections_per_route: 0, max_leases: 0, max_idle: 0,
-        max_idle_per_route: 0, idle_timeout_ns: 0,
+    pool.configured     = Config{max_connections: 0,
+        max_connections_per_route:  0, max_leases: 0, max_idle: 0,
+        max_idle_per_route:         0, idle_timeout_ns: 0,
         max_streams_per_connection: 0};
     pool.initialized = false;
     mutex.unlock(?pool.lock);
@@ -1101,23 +1108,23 @@ fun test_route(host: *u8, len: usize) policy.Route {
 
 test "http.client.pool: multiplexed leases release exactly once" {
     var connections: [2]Connection;
-    var leases: [4]LeaseSlot;
-    var value: Pool;
-    var configured: Config = config_default();
-    configured.max_connections = 2;
+    var leases:      [4]LeaseSlot;
+    var value:       Pool;
+    var configured:  Config = config_default();
+    configured.max_connections           = 2;
     configured.max_connections_per_route = 2;
-    configured.max_leases = 4;
-    configured.max_idle = 2;
-    configured.max_idle_per_route = 2;
+    configured.max_leases                = 4;
+    configured.max_idle                  = 2;
+    configured.max_idle_per_route        = 2;
     if (!init(?value, ?connections[0], 2, ?leases[0], 4,
         configured)) { ret 1; }
-    val route: policy.Route = test_route("example.com", 11);
-    val now: time.Time = time.Time{sec: 10, nsec: 0};
-    val reserved: Reservation = reserve(?value, route,
+    val route:    policy.Route = test_route("example.com", 11);
+    val now:      time.Time    = time.Time{sec: 10, nsec: 0};
+    val reserved: Reservation  = reserve(?value, route,
         ip.endpoint(192, 0, 2, 1, 443), policy.TRANSPORT_TCP, now);
-    var driver_storage: u8 = 1;
-    val driver: ptr = (?driver_storage)::ptr;
-    val first: Activated = activate(?value, reserved, message.WIRE_H2,
+    var driver_storage: u8        = 1;
+    val driver:         ptr       = (?driver_storage)::ptr;
+    val first:          Activated = activate(?value, reserved, message.WIRE_H2,
         driver, 3, now);
     val second: Acquire = acquire(?value, route, policy.protocols_default(), now);
     if (reserved.status != RESERVE_OK || first.status != ACTIVATE_OK
@@ -1127,12 +1134,12 @@ test "http.client.pool: multiplexed leases release exactly once" {
         || lease_equal(first.lease.token, second.lease.token)) { ret 2; }
     if (!update_max_streams(?value, first.lease.connection, 0)
         || acquire(?value, route, policy.protocols_default(), now).status
-            != ACQUIRE_MISS
+        != ACQUIRE_MISS
         || release(?value, first.lease, body.REUSE_ALLOWED, now) != RELEASE_OK
         || release(?value, first.lease, body.REUSE_ALLOWED, now)
-            != RELEASE_INVALID
+        != RELEASE_INVALID
         || acquire(?value, route, policy.protocols_default(), now).status
-            != ACQUIRE_MISS
+        != ACQUIRE_MISS
         || !update_max_streams(?value, second.lease.connection, 3)) {
         ret 3;
     }
@@ -1155,39 +1162,39 @@ test "http.client.pool: multiplexed leases release exactly once" {
 
 test "http.client.pool: routes and proxy identities isolate retention" {
     var connections: [2]Connection;
-    var leases: [2]LeaseSlot;
-    var value: Pool;
-    var configured: Config = config_default();
-    configured.max_connections = 2;
+    var leases:      [2]LeaseSlot;
+    var value:       Pool;
+    var configured:  Config = config_default();
+    configured.max_connections           = 2;
     configured.max_connections_per_route = 1;
-    configured.max_leases = 2;
-    configured.max_idle = 1;
-    configured.max_idle_per_route = 1;
+    configured.max_leases                = 2;
+    configured.max_idle                  = 1;
+    configured.max_idle_per_route        = 1;
     if (!init(?value, ?connections[0], 2, ?leases[0], 2,
         configured)) { ret 1; }
-    val first_route: policy.Route = test_route("example.com", 11);
+    val first_route:  policy.Route = test_route("example.com", 11);
     var second_route: policy.Route = first_route;
     second_route.proxy = policy.Proxy{kind: policy.PROXY_HTTP_TUNNEL,
-        host: view.view("proxy.example", 13), port: 8443,
+        host:   view.view("proxy.example", 13), port: 8443,
         secure: true, identity: 9, transports: policy.PROXY_TCP};
-    val now: time.Time = time.Time{sec: 20, nsec: 0};
+    val now:   time.Time   = time.Time{sec: 20, nsec: 0};
     val first: Reservation = reserve(?value, first_route,
         ip.endpoint(192, 0, 2, 1, 443), policy.TRANSPORT_TCP, now);
-    var first_driver: u8 = 1;
+    var first_driver: u8        = 1;
     val first_active: Activated = activate(?value, first, message.WIRE_H1,
         (?first_driver)::ptr, 1, now);
     if (first_active.status != ACTIVATE_OK
         || !driver_owned(?value, (?first_driver)::ptr)
         || update_max_streams(?value, first_active.lease.connection, 0)
         || reserve(?value, first_route, ip.endpoint(192, 0, 2, 2, 443),
-            policy.TRANSPORT_TCP, now).status != RESERVE_SATURATED
+        policy.TRANSPORT_TCP, now).status != RESERVE_SATURATED
         || acquire(?value, second_route, policy.protocols_default(), now).status
-            != ACQUIRE_MISS) { ret 2; }
+        != ACQUIRE_MISS) { ret 2; }
     val second: Reservation = reserve(?value, second_route,
         ip.endpoint(192, 0, 2, 3, 8443), policy.TRANSPORT_TCP, now);
     if (second.status != RESERVE_OK
         || activate(?value, second, message.WIRE_H1,
-            (?first_driver)::ptr, 1, now).status != ACTIVATE_INVALID
+        (?first_driver)::ptr, 1, now).status != ACTIVATE_INVALID
         || !fail_connect(?value, second)
         || fail_connect(?value, second)) { ret 3; }
     if (release(?value, first_active.lease, body.REUSE_ALLOWED, now)
@@ -1199,63 +1206,63 @@ test "http.client.pool: routes and proxy identities isolate retention" {
 
 test "http.client.pool: idle limits timeout and drain publish close once" {
     var connections: [2]Connection;
-    var leases: [2]LeaseSlot;
-    var value: Pool;
-    var configured: Config = config_default();
-    configured.max_connections = 2;
+    var leases:      [2]LeaseSlot;
+    var value:       Pool;
+    var configured:  Config = config_default();
+    configured.max_connections           = 2;
     configured.max_connections_per_route = 2;
-    configured.max_leases = 2;
-    configured.max_idle = 1;
-    configured.max_idle_per_route = 1;
-    configured.idle_timeout_ns = 10;
+    configured.max_leases                = 2;
+    configured.max_idle                  = 1;
+    configured.max_idle_per_route        = 1;
+    configured.idle_timeout_ns           = 10;
     if (!init(?value, ?connections[0], 2, ?leases[0], 2,
         configured)) { ret 1; }
     val route: policy.Route = test_route("example.com", 11);
-    val now: time.Time = time.Time{sec: 30, nsec: 0};
-    val first: Reservation = reserve(?value, route,
+    val now:   time.Time    = time.Time{sec: 30, nsec: 0};
+    val first: Reservation  = reserve(?value, route,
         ip.endpoint(192, 0, 2, 1, 443), policy.TRANSPORT_TCP, now);
-    var first_driver: u8 = 1;
-    val activated: Activated = activate(?value, first, message.WIRE_H1,
+    var first_driver: u8        = 1;
+    val activated:    Activated = activate(?value, first, message.WIRE_H1,
         (?first_driver)::ptr, 1, now);
     if (activated.status != ACTIVATE_OK
         || release(?value, activated.lease, body.REUSE_ALLOWED, now)
-            != RELEASE_OK) { ret 2; }
+        != RELEASE_OK) { ret 2; }
     val later: time.Time = time.Time{sec: 30, nsec: 10};
-    val close: Close = take_close(?value, later);
-    if (!close.found) { ret 3; }
+    val close: Close     = take_close(?value, later);
+    if (!close.found)                    { ret 3; }
     if (!connections[0].close_published) { ret 4; }
     if (take_close(?value, later).found) { ret 5; }
-    if (!retire(?value, close)) { ret 6; }
-    if (!drain(?value)) { ret 7; }
-    if (!destroy(?value)) { ret 8; }
+    if (!retire(?value, close))          { ret 6; }
+    if (!drain(?value))                  { ret 7; }
+    if (!destroy(?value))                { ret 8; }
     ret 0;
 }
 
 test "http.client.pool: drain publishes connect cancellation and owns late drivers" {
     var connections: [1]Connection;
-    var leases: [1]LeaseSlot;
-    var value: Pool;
-    var configured: Config = config_default();
-    configured.max_connections = 1;
+    var leases:      [1]LeaseSlot;
+    var value:       Pool;
+    var configured:  Config = config_default();
+    configured.max_connections           = 1;
     configured.max_connections_per_route = 1;
-    configured.max_leases = 1;
-    configured.max_idle = 1;
-    configured.max_idle_per_route = 1;
+    configured.max_leases                = 1;
+    configured.max_idle                  = 1;
+    configured.max_idle_per_route        = 1;
     if (!init(?value, ?connections[0], 1, ?leases[0], 1,
         configured)) { ret 1; }
-    val route: policy.Route = test_route("example.com", 11);
-    val now: time.Time = time.Time{sec: 40, nsec: 0};
-    val reserved: Reservation = reserve(?value, route,
+    val route:    policy.Route = test_route("example.com", 11);
+    val now:      time.Time    = time.Time{sec: 40, nsec: 0};
+    val reserved: Reservation  = reserve(?value, route,
         ip.endpoint(192, 0, 2, 4, 443), policy.TRANSPORT_TCP, now);
     if (reserved.status != RESERVE_OK || !drain(?value)) { ret 2; }
     val cancellation: ConnectCancel = take_connect_cancel(?value);
     if (!cancellation.found
         || !connection_equal(cancellation.reservation.connection,
-            reserved.connection)
+        reserved.connection)
         || take_connect_cancel(?value).found) { ret 3; }
-    var driver_storage: u8 = 1;
-    val driver: ptr = (?driver_storage)::ptr;
-    val activated: Activated = activate(?value, reserved, message.WIRE_H2,
+    var driver_storage: u8        = 1;
+    val driver:         ptr       = (?driver_storage)::ptr;
+    val activated:      Activated = activate(?value, reserved, message.WIRE_H2,
         driver, 8, now);
     if (activated.status != ACTIVATE_CLOSE || snapshot(?value).live_leases != 0
         || fail_connect(?value, reserved)) { ret 4; }
@@ -1267,34 +1274,34 @@ test "http.client.pool: drain publishes connect cancellation and owns late drive
 
 test "http.client.pool: proxy transport capabilities gate QUIC routes" {
     var connections: [1]Connection;
-    var leases: [1]LeaseSlot;
-    var value: Pool;
-    var configured: Config = config_default();
-    configured.max_connections = 1;
+    var leases:      [1]LeaseSlot;
+    var value:       Pool;
+    var configured:  Config = config_default();
+    configured.max_connections           = 1;
     configured.max_connections_per_route = 1;
-    configured.max_leases = 1;
-    configured.max_idle = 0;
-    configured.max_idle_per_route = 0;
+    configured.max_leases                = 1;
+    configured.max_idle                  = 0;
+    configured.max_idle_per_route        = 0;
     if (!init(?value, ?connections[0], 1, ?leases[0], 1,
         configured)) { ret 1; }
     var route: policy.Route = test_route("example.com", 11);
     route.proxy = policy.Proxy{kind: policy.PROXY_HTTP_TUNNEL,
-        host: view.view("proxy.example", 13), port: 8443, secure: true,
+        host:     view.view("proxy.example", 13), port: 8443, secure: true,
         identity: 1, transports: policy.PROXY_TCP};
     val now: time.Time = time.Time{sec: 50, nsec: 0};
     if (reserve(?value, route, ip.endpoint(192, 0, 2, 5, 8443),
         policy.TRANSPORT_QUIC, now).status != RESERVE_INVALID) { ret 2; }
     route.proxy = policy.Proxy{kind: policy.PROXY_CONNECT_UDP,
-        host: view.view("proxy.example", 13), port: 8443, secure: true,
+        host:     view.view("proxy.example", 13), port: 8443, secure: true,
         identity: 2, transports: policy.PROXY_DATAGRAM};
     val reserved: Reservation = reserve(?value, route,
         ip.endpoint(192, 0, 2, 5, 8443), policy.TRANSPORT_QUIC, now);
-    var driver_storage: u8 = 1;
-    val activated: Activated = activate(?value, reserved, message.WIRE_H3,
+    var driver_storage: u8        = 1;
+    val activated:      Activated = activate(?value, reserved, message.WIRE_H3,
         (?driver_storage)::ptr, 16, now);
     if (reserved.status != RESERVE_OK || activated.status != ACTIVATE_OK
         || release(?value, activated.lease, body.REUSE_ALLOWED, now)
-            != RELEASE_CLOSE) { ret 3; }
+        != RELEASE_CLOSE) { ret 3; }
     val close: Close = take_close(?value, now);
     if (!close.found || !retire(?value, close) || !drain(?value)
         || !destroy(?value)) { ret 4; }
