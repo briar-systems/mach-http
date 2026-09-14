@@ -4,8 +4,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
-use std.types.result.Result;
-use std.types.result.is_err;
+use std.types.result.res;
 use std.types.string.str;
 use std.types.view;
 use std.net.ip;
@@ -187,8 +186,8 @@ pub fun ipv6_valid(host: view.View) bool {
     }
     if (!colon) { ret false; }
     text[host.len] = 0;
-    val parsed: Result[ip.IPv6, str] = ip.ipv6_parse(?text[0]);
-    ret !is_err[ip.IPv6, str](parsed);
+    val parsed: res[ip.IPv6, ip.ParseError] = ip.ipv6_parse(?text[0]);
+    ret (sel parsed.ok);
 }
 
 pub fun origin_valid(origin: Origin, max_host_bytes: usize) bool {

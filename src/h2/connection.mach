@@ -5,10 +5,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.ok;
-use std.types.result.unwrap_ok;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.view;
 use std.memory;
@@ -26,6 +23,20 @@ use http.core.transport;
 use http.h2.frame;
 use http.h2.hpack;
 
+
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
+fun scope_active(scope: *cancel.Scope) bool {
+    val reason: cancel.Reason = cancel.reason(scope);
+    ret sel reason.active;
+}
+
+fun scope_cancelled(scope: *cancel.Scope) bool {
+    val reason: cancel.Reason = cancel.reason(scope);
+    ret sel reason.cancelled;
+}
 pub def Role: u8;
 pub val SERVER: Role = 1;
 pub val CLIENT: Role = 2;
@@ -648,7 +659,7 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     if (engine == nil || engine.initialized || (role != SERVER && role != CLIENT)
      || connection_transport == nil || !connection_transport.initialized
      || scope == nil || scope.root != connection_transport.operation_root
-     || cancel.reason(scope) != cancel.ACTIVE || streams == nil || memories == nil
+     || !scope_active(scope) || streams == nil || memories == nil
      || !config_valid(configured, capacity) || read_buffer == nil || read_capacity == 0
      || write_buffer == nil || write_capacity < 57
      || frame_payload == nil || frame_payload_capacity < configured.local.max_frame_size::usize
@@ -811,7 +822,7 @@ pub fun bind_exchange(engine: *Engine, id: u32,
      || bound.generation != stream.generation
      || bound.request.metadata.version.wire != message.WIRE_H2
      || bound.request.metadata.request_index != id::u64
-     || bound.scope == nil || cancel.reason(bound.scope) != cancel.ACTIVE) { ret false; }
+     || bound.scope == nil || !scope_active(bound.scope)) { ret false; }
     stream.exchange = bound;
     ret true;
 }
@@ -881,7 +892,7 @@ pub fun abandon_exchange(engine: *Engine, id: u32,
      && abandoned.state != exchange.CANCELLED_STATE
      && abandoned.state != exchange.TIMED_OUT_STATE
      && abandoned.state != exchange.FAILED_STATE
-     && cancel.reason(abandoned.scope) == cancel.ACTIVE) {
+     && scope_active(abandoned.scope)) {
         exchange.cancel_exchange(abandoned);
     }
     stream.exchange = nil;
@@ -895,13 +906,13 @@ fun close_cause(error: Error) lifecycle.Cause {
 
 fun submit_close(engine: *Engine) {
     if (engine.close_pending || engine.state == CLOSED) { ret; }
-    val submitted: Result[transport.Token, io_error.Error] = transport.close_with_cause(
+    val submitted: res[transport.Token, io_error.Error] = transport.close_with_cause(
         engine.transport, close_cause(engine.error), engine.next_generation::usize);
-    if (is_err[transport.Token, io_error.Error](submitted)) {
-        engine.state = CLOSED;
-    } or {
-        engine.close_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    if (sel submitted.ok) {
+        engine.close_token = submitted.ok;
         engine.close_pending = true;
+    } or {
+        engine.state = CLOSED;
     }
 }
 
@@ -910,7 +921,7 @@ fun fail_connection(engine: *Engine, error: Error, h2_error: u32) Event {
         engine.error = error;
         engine.h2_error = h2_error;
         engine.state = FAILED;
-        if (cancel.reason(engine.scope) == cancel.ACTIVE && error == ERROR_CANCELLED) {
+        if (scope_active(engine.scope) && error == ERROR_CANCELLED) {
             cancel.cancel(engine.scope);
         }
         var i: usize = 0;
@@ -1042,14 +1053,14 @@ pub fun submit_read(engine: *Engine) bool {
     }
     engine.input_length = 0;
     engine.input_offset = 0;
-    val submitted: Result[transport.Token, io_error.Error] = transport.read(
+    val submitted: res[transport.Token, io_error.Error] = transport.read(
         engine.transport, engine.scope, engine.read_buffer, engine.read_capacity,
         engine.next_generation::usize);
-    if (is_err[transport.Token, io_error.Error](submitted)) {
+    if ((sel submitted.err)) {
         fail_connection(engine, ERROR_TRANSPORT, H2_INTERNAL_ERROR);
         ret false;
     }
-    engine.read_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    engine.read_token = submitted.ok;
     engine.read_pending = true;
     ret true;
 }
@@ -1058,14 +1069,14 @@ pub fun submit_write(engine: *Engine) bool {
     if (engine == nil || !engine.initialized || engine.write_pending
      || engine.state == CLOSED || engine.state == CLOSING) { ret false; }
     if (engine.write_length == 0 && !prepare_output(engine)) { ret false; }
-    val submitted: Result[transport.Token, io_error.Error] = transport.write(
+    val submitted: res[transport.Token, io_error.Error] = transport.write(
         engine.transport, engine.scope, ?engine.write_buffer[engine.write_offset],
         engine.write_length - engine.write_offset, engine.write_stream::usize);
-    if (is_err[transport.Token, io_error.Error](submitted)) {
+    if ((sel submitted.err)) {
         fail_connection(engine, ERROR_TRANSPORT, H2_INTERNAL_ERROR);
         ret false;
     }
-    engine.write_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    engine.write_token = submitted.ok;
     engine.write_pending = true;
     ret true;
 }
@@ -2441,14 +2452,14 @@ pub fun tick(engine: *Engine) Event {
         ret invalid;
     }
     val reason: cancel.Reason = cancel.reason(engine.scope);
-    if (reason != cancel.ACTIVE) {
+    if (!(sel reason.active)) {
         ret fail_connection(engine, ERROR_CANCELLED, H2_CANCEL);
     }
     var i: usize = 0;
     for (i < engine.stream_capacity) {
         val stream: *Stream = ?engine.streams[i];
         if (stream.live && stream.state != STREAM_CLOSED && stream.exchange != nil
-         && cancel.reason(stream.exchange.scope) != cancel.ACTIVE) {
+         && !scope_active(stream.exchange.scope)) {
             if (!queue_reset(engine, stream.id, H2_CANCEL)) {
                 ret fail_connection(engine, ERROR_LIMIT, H2_ENHANCE_YOUR_CALM);
             }
@@ -2506,36 +2517,36 @@ rec TestIO {
 }
 
 fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
-    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    buffer: *u8, length: usize) res[bool, io_error.Error] {
     val io: *TestIO = context::*TestIO;
     io.read_token = token;
     io.read_buffer = buffer;
     io.read_length = length;
     io.read_calls = io.read_calls + 1;
-    ret ok[bool, io_error.Error](true);
+    ret res[bool, io_error.Error].ok{true};
 }
 
 fun test_write(context: ptr, token: transport.Token, scope: *cancel.Scope,
-    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    buffer: *u8, length: usize) res[bool, io_error.Error] {
     val io: *TestIO = context::*TestIO;
     io.write_token = token;
     io.write_buffer = buffer;
     io.write_length = length;
     io.write_calls = io.write_calls + 1;
-    ret ok[bool, io_error.Error](true);
+    ret res[bool, io_error.Error].ok{true};
 }
 
 fun test_shutdown(context: ptr, token: transport.Token,
-    scope: *cancel.Scope) Result[bool, io_error.Error] {
-    ret ok[bool, io_error.Error](true);
+    scope: *cancel.Scope) res[bool, io_error.Error] {
+    ret res[bool, io_error.Error].ok{true};
 }
 
 fun test_close(context: ptr, token: transport.Token,
-    scope: *cancel.Scope) Result[bool, io_error.Error] {
+    scope: *cancel.Scope) res[bool, io_error.Error] {
     val io: *TestIO = context::*TestIO;
     io.close_token = token;
     io.close_calls = io.close_calls + 1;
-    ret ok[bool, io_error.Error](true);
+    ret res[bool, io_error.Error].ok{true};
 }
 
 rec Fixture {
@@ -2588,8 +2599,8 @@ fun test_config() Config {
 
 fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
     val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!cancel.make_root(?fixture.operation_root, false, none)
-     || !cancel.make_root(?fixture.control_root, false, none)) { ret false; }
+    if (!operation_ok(cancel.make_root(?fixture.operation_root, false, none))
+     || !operation_ok(cancel.make_root(?fixture.control_root, false, none))) { ret false; }
     fixture.adapter.runtime = ?fixture.runtime;
     fixture.adapter.context = (?fixture.io)::ptr;
     fixture.adapter.security = transport.PLAINTEXT;
@@ -2754,7 +2765,7 @@ fun make_exchange(storage: *ExchangeMemory, generation: u64,
     stream_id: u32) bool {
     val configured: message.Limits = message.limits_default();
     val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!cancel.make_root(?storage.scope, false, none)) { ret false; }
+    if (!operation_ok(cancel.make_root(?storage.scope, false, none))) { ret false; }
     var fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     storage.reader = body.empty_reader(generation);
@@ -2851,8 +2862,8 @@ test "http.h2.connection: destroy returns pooled storage for a second connection
      || fixture.engine.outbound_table.count != 0) { ret 8; }
     if (destroy(?fixture.engine)) { ret 9; }
     val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!cancel.make_root(?fixture.pooled_operation_root, false, none)
-     || !cancel.make_root(?fixture.pooled_control_root, false, none)
+    if (!operation_ok(cancel.make_root(?fixture.pooled_operation_root, false, none))
+     || !operation_ok(cancel.make_root(?fixture.pooled_control_root, false, none))
      || !transport.init(?fixture.pooled_wire, fixture.adapter,
         ?fixture.pooled_operation_root, ?fixture.pooled_control_root,
         ?fixture.pooled_slots[0], 3)) { ret 10; }
@@ -2970,14 +2981,14 @@ test "http.h2.connection: teardown abandonment initiates cancellation" {
     if (send_headers(?fixture.engine, 1, ?response[0], 1,
         true, true).status != OFFER_OUTPUT || !drain_output(?fixture)
      || stream_for(?fixture.engine, 1).state != STREAM_CLOSED
-     || cancel.reason(?storage.scope) != cancel.ACTIVE) { ret 3; }
+     || !scope_active(?storage.scope)) { ret 3; }
     if (abandon_exchange(?fixture.engine, 1,
         request.generation) != ?storage.exchange
-     || cancel.reason(?storage.scope) != cancel.CANCELLED
+     || !scope_cancelled(?storage.scope)
      || storage.exchange.state != exchange.CANCELLED_STATE
      || exchange_for(?fixture.engine, 1) != nil
      || !release_stream(?fixture.engine, 1, request.generation)) { ret 4; }
-    if (!cancel.destroy(?storage.scope)) { ret 5; }
+    if (!operation_ok(cancel.destroy(?storage.scope))) { ret 5; }
     ret 0;
 }
 
@@ -3035,7 +3046,7 @@ test "http.h2.connection: teardown detaches pending exchange generation safely" 
     if (abandon_exchange(?fixture.engine, 3,
         second_request.generation) != ?second.exchange
      || !release_stream(?fixture.engine, 3, second_request.generation)) { ret 9; }
-    if (!cancel.destroy(?first.scope) || !cancel.destroy(?second.scope)) { ret 10; }
+    if (!operation_ok(cancel.destroy(?first.scope)) || !operation_ok(cancel.destroy(?second.scope))) { ret 10; }
     ret 0;
 }
 
@@ -3153,7 +3164,7 @@ test "http.h2.connection: goaway retry cancellation and graceful drain preserve 
      || second_stream.state != STREAM_CLOSED
      || !release_stream(?client.engine, second, second_stream.generation)) { ret 4; }
     if (!cancel_stream(?client.engine, first, H2_CANCEL)
-     || cancel.reason(?first_exchange.scope) != cancel.CANCELLED
+     || !scope_cancelled(?first_exchange.scope)
      || stream_for(?client.engine, first).state != STREAM_CLOSED) { ret 5; }
     var server: Fixture;
     if (!make_fixture(?server, SERVER, test_config())

@@ -3,10 +3,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.ok;
-use std.types.result.unwrap_ok;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
@@ -26,6 +23,19 @@ use http.h1.framing;
 use http.h1.parser;
 use http.h1.serializer;
 
+
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
+
+fun transition_ok(outcome: cancel.Transition) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
+fun scope_active(scope: *cancel.Scope) bool {
+    val reason: cancel.Reason = cancel.reason(scope);
+    ret sel reason.active;
+}
 pub def Role: u8;
 pub val SERVER: Role = 1;
 pub val CLIENT: Role = 2;
@@ -332,7 +342,7 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     configured: Config, now: time.Time) bool {
     if (engine == nil || engine.initialized || (role != SERVER && role != CLIENT)
      || connection_transport == nil || !connection_transport.initialized || scope == nil
-     || scope.root != connection_transport.operation_root || cancel.reason(scope) != cancel.ACTIVE
+     || scope.root != connection_transport.operation_root || !scope_active(scope)
      || slots == nil || memories == nil || capacity == 0 || !config_valid(configured, capacity)
      || read_buffer == nil || read_capacity == 0 || write_buffer == nil || write_capacity == 0
      || !valid_now(now)) { ret false; }
@@ -513,10 +523,10 @@ fun close_cause(error: Error) lifecycle.Cause {
 
 fun submit_abort(engine: *Engine) {
     if (engine.close_pending || engine.state == CLOSED) { ret; }
-    val submitted: Result[transport.Token, io_error.Error] = transport.close_with_cause(
+    val submitted: res[transport.Token, io_error.Error] = transport.close_with_cause(
         engine.transport, close_cause(engine.error), engine.next_sequence::usize);
-    if (!is_err[transport.Token, io_error.Error](submitted)) {
-        engine.close_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    if ((sel submitted.ok)) {
+        engine.close_token = submitted.ok;
         engine.close_pending = true;
     } or {
         engine.state = CLOSED;
@@ -529,7 +539,7 @@ fun fail(engine: *Engine, error: Error) Event {
     if (error >= ERROR_HEADER_TIMEOUT && error <= ERROR_TOTAL_TIMEOUT) {
         cancel.timeout(engine.scope);
     } or {
-        if (error == ERROR_CANCELLED) { cancel.cancel(engine.scope); }
+        if (error == ERROR_CANCELLED) { transition_ok(cancel.cancel(engine.scope)); }
     }
     submit_abort(engine);
     if (error >= ERROR_HEADER_TIMEOUT && error <= ERROR_TOTAL_TIMEOUT) {
@@ -570,8 +580,8 @@ pub fun tick(engine: *Engine, now: time.Time) Event {
         ret empty_event(engine, EVENT_ERROR);
     }
     val reason: cancel.Reason = cancel.reason(engine.scope);
-    if (reason == cancel.TIMED_OUT) { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
-    if (reason != cancel.ACTIVE) { ret fail(engine, ERROR_CANCELLED); }
+    if ((sel reason.timed_out)) { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
+    if (!(sel reason.active)) { ret fail(engine, ERROR_CANCELLED); }
     if (expired(engine.total_deadline, now)) { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
     if (engine.count == 0 && expired(engine.idle_deadline, now)) { ret fail(engine, ERROR_IDLE_TIMEOUT); }
     var offset: usize = 0;
@@ -697,11 +707,11 @@ pub fun submit_read(engine: *Engine) bool {
         && current_inbound(engine) == NO_SLOT)) { ret false; }
     engine.input_length = 0;
     engine.input_offset = 0;
-    val submitted: Result[transport.Token, io_error.Error] = transport.read(
+    val submitted: res[transport.Token, io_error.Error] = transport.read(
         engine.transport, engine.scope, engine.read_buffer, engine.read_capacity,
         engine.next_sequence::usize);
-    if (is_err[transport.Token, io_error.Error](submitted)) { fail(engine, ERROR_TRANSPORT); ret false; }
-    engine.read_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    if ((sel submitted.err)) { fail(engine, ERROR_TRANSPORT); ret false; }
+    engine.read_token = submitted.ok;
     engine.read_pending = true;
     ret true;
 }
@@ -710,11 +720,11 @@ pub fun submit_write(engine: *Engine) bool {
     if (engine == nil || !engine.initialized || engine.write_pending
      || engine.write_length == 0 || engine.write_offset >= engine.write_length
      || (engine.state != OPEN && engine.state != DRAINING)) { ret false; }
-    val submitted: Result[transport.Token, io_error.Error] = transport.write(
+    val submitted: res[transport.Token, io_error.Error] = transport.write(
         engine.transport, engine.scope, ?engine.write_buffer[engine.write_offset],
         engine.write_length - engine.write_offset, engine.slots[engine.write_slot].sequence::usize);
-    if (is_err[transport.Token, io_error.Error](submitted)) { fail(engine, ERROR_TRANSPORT); ret false; }
-    engine.write_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+    if ((sel submitted.err)) { fail(engine, ERROR_TRANSPORT); ret false; }
+    engine.write_token = submitted.ok;
     engine.write_pending = true;
     ret true;
 }
@@ -1127,20 +1137,20 @@ pub fun progress_close(engine: *Engine) bool {
     if (engine == nil || !engine.initialized || engine.state != DRAINING
      || !protocol_done(engine)) { ret false; }
     if (!engine.shutdown_done && !engine.shutdown_pending) {
-        val submitted: Result[transport.Token, io_error.Error] = transport.shutdown_write(
+        val submitted: res[transport.Token, io_error.Error] = transport.shutdown_write(
             engine.transport, engine.scope, engine.next_sequence::usize);
-        if (is_err[transport.Token, io_error.Error](submitted)) { fail(engine, ERROR_TRANSPORT); ret false; }
-        engine.shutdown_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+        if ((sel submitted.err)) { fail(engine, ERROR_TRANSPORT); ret false; }
+        engine.shutdown_token = submitted.ok;
         engine.shutdown_pending = true;
         ret true;
     }
     if (engine.shutdown_done && !engine.close_pending) {
         engine.state = CLOSING;
         engine.error = ERROR_NONE;
-        val submitted: Result[transport.Token, io_error.Error] = transport.close(
+        val submitted: res[transport.Token, io_error.Error] = transport.close(
             engine.transport, engine.next_sequence::usize);
-        if (is_err[transport.Token, io_error.Error](submitted)) { engine.state = CLOSED; ret false; }
-        engine.close_token = unwrap_ok[transport.Token, io_error.Error](submitted);
+        if ((sel submitted.err)) { engine.state = CLOSED; ret false; }
+        engine.close_token = submitted.ok;
         engine.close_pending = true;
         ret true;
     }
@@ -1170,39 +1180,39 @@ rec TestIO {
 }
 
 fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
-    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    buffer: *u8, length: usize) res[bool, io_error.Error] {
     val state: *TestIO = context::*TestIO;
     state.read_token = token;
     state.read_buffer = buffer;
     state.read_length = length;
     state.read_calls = state.read_calls + 1;
-    ret ok[bool, io_error.Error](true);
+    ret res[bool, io_error.Error].ok{true};
 }
 
 fun test_write(context: ptr, token: transport.Token, scope: *cancel.Scope,
-    buffer: *u8, length: usize) Result[bool, io_error.Error] {
+    buffer: *u8, length: usize) res[bool, io_error.Error] {
     val state: *TestIO = context::*TestIO;
     state.write_token = token;
     state.write_buffer = buffer;
     state.write_length = length;
     state.write_calls = state.write_calls + 1;
-    ret ok[bool, io_error.Error](true);
+    ret res[bool, io_error.Error].ok{true};
 }
 
 fun test_shutdown(context: ptr, token: transport.Token,
-    scope: *cancel.Scope) Result[bool, io_error.Error] {
+    scope: *cancel.Scope) res[bool, io_error.Error] {
     val state: *TestIO = context::*TestIO;
     state.shutdown_token = token;
     state.shutdown_calls = state.shutdown_calls + 1;
-    ret ok[bool, io_error.Error](true);
+    ret res[bool, io_error.Error].ok{true};
 }
 
 fun test_close(context: ptr, token: transport.Token,
-    scope: *cancel.Scope) Result[bool, io_error.Error] {
+    scope: *cancel.Scope) res[bool, io_error.Error] {
     val state: *TestIO = context::*TestIO;
     state.close_token = token;
     state.close_calls = state.close_calls + 1;
-    ret ok[bool, io_error.Error](true);
+    ret res[bool, io_error.Error].ok{true};
 }
 
 rec Fixture {
@@ -1272,7 +1282,7 @@ fun application_body_release(context: ptr) {
 fun make_pending_body(pending: *PendingBody, generation: u64,
     token: u64) bool {
     val none: time.Time = test_now(0);
-    if (!cancel.make_root(?pending.scope, false, none)) { ret false; }
+    if (!operation_ok(cancel.make_root(?pending.scope, false, none))) { ret false; }
     pending.trailers = field.init(nil, 0, field.limits(0, 0, 0, 0));
     pending.token = token;
     pending.reader = body.init_reader(pending, application_body_read,
@@ -1305,8 +1315,8 @@ fun test_now(seconds: i64) time.Time {
 
 fun make_fixture(fixture: *Fixture, role: Role, pipeline: usize) bool {
     val none: time.Time = test_now(0);
-    if (!cancel.make_root(?fixture.operation_root, false, none)
-     || !cancel.make_root(?fixture.control_root, false, none)) { ret false; }
+    if (!operation_ok(cancel.make_root(?fixture.operation_root, false, none))
+     || !operation_ok(cancel.make_root(?fixture.control_root, false, none))) { ret false; }
     fixture.adapter.runtime = ?fixture.runtime;
     fixture.adapter.context = (?fixture.io)::ptr;
     fixture.adapter.security = transport.PLAINTEXT;
@@ -1429,8 +1439,8 @@ test "http.h1.connection: destroy returns pooled storage for a second connection
      || fixture.engine.count != 0 || fixture.engine.slots != nil) { ret 10; }
     if (destroy(?fixture.engine)) { ret 11; }
     val none: time.Time = test_now(0);
-    if (!cancel.make_root(?fixture.pooled_operation_root, false, none)
-     || !cancel.make_root(?fixture.pooled_control_root, false, none)
+    if (!operation_ok(cancel.make_root(?fixture.pooled_operation_root, false, none))
+     || !operation_ok(cancel.make_root(?fixture.pooled_control_root, false, none))
      || !transport.init(?fixture.pooled_transport, fixture.adapter,
         ?fixture.pooled_operation_root, ?fixture.pooled_control_root,
         ?fixture.pooled_slots[0], 3)) { ret 12; }
@@ -1510,7 +1520,7 @@ test "http.h1.connection: late body completion is isolated from a reused slot" {
      || !destroy(?fixture.engine)
      || body.complete_reader(?active_body.reader, 702).status != body.CANCELLED
      || active_body.complete_calls != 1 || active_body.release_calls != 1) { ret 7; }
-    if (!cancel.destroy(?old_body.scope) || !cancel.destroy(?active_body.scope)) { ret 8; }
+    if (!operation_ok(cancel.destroy(?old_body.scope)) || !operation_ok(cancel.destroy(?active_body.scope))) { ret 8; }
     ret 0;
 }
 
@@ -1665,7 +1675,7 @@ test "http.h1.connection: absolute deadlines and hostile completions close once"
      || progress_fixture.io.close_calls != 1) { ret 5; }
     var cancel_fixture: Fixture;
     if (!make_fixture(?cancel_fixture, SERVER, 1)
-     || !cancel.cancel(?cancel_fixture.operation_root)) { ret 6; }
+     || !transition_ok(cancel.cancel(?cancel_fixture.operation_root))) { ret 6; }
     val cancelled: Event = tick(?cancel_fixture.engine, test_now(100));
     if (cancelled.kind != EVENT_CANCELLED || cancelled.error != ERROR_CANCELLED
      || cancel_fixture.io.close_calls != 1) { ret 7; }

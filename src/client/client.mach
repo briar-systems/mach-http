@@ -21,6 +21,14 @@ use http.core.method;
 use http.core.status;
 use http.core.target;
 
+
+fun operation_ok(outcome: cancellation.Operation) bool {
+    ret sel outcome.ok;
+}
+
+fun transition_ok(outcome: cancellation.Transition) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
 pub def State: u8;
 pub val STATE_FREE:             State = 0;
 pub val STATE_ROUTING:          State = 1;
@@ -1021,11 +1029,19 @@ fun request_route_valid(request: *message.Request,
     ret true;
 }
 
+# the scope's effective deadline, or false when it has none or cannot be read
+fun scope_deadline(scope: *cancellation.Scope, deadline: *time.Time) bool {
+    val query: cancellation.DeadlineQuery = cancellation.get_deadline(scope);
+    if (sel query.err) { ret false; }
+    if (sel query.ok.none) { ret false; }
+    @deadline = query.ok.some.at;
+    ret true;
+}
+
 fun deadline_matches(request: *message.Request,
     scope: *cancellation.Scope) bool {
     var deadline: time.Time;
-    var owner: *cancellation.Scope = nil;
-    val has_deadline: bool = cancellation.get_deadline(scope, ?deadline, ?owner);
+    val has_deadline: bool = scope_deadline(scope, ?deadline);
     if (request.metadata.has_deadline != has_deadline) { ret false; }
     ret !has_deadline || (request.metadata.deadline.sec == deadline.sec
         && request.metadata.deadline.nsec == deadline.nsec);
@@ -1034,9 +1050,7 @@ fun deadline_matches(request: *message.Request,
 fun submission_deadline_matches(request: *message.Request,
     parent: *cancellation.Scope) bool {
     var parent_deadline: time.Time;
-    var owner: *cancellation.Scope = nil;
-    val inherited: bool = cancellation.get_deadline(parent,
-        ?parent_deadline, ?owner);
+    val inherited: bool = scope_deadline(parent, ?parent_deadline);
     if (!request.metadata.has_deadline) { ret !inherited; }
     if (!inherited
         || time.time_before(request.metadata.deadline, parent_deadline)) {
@@ -1089,7 +1103,7 @@ pub fun submit(client: *Client, parent: *cancellation.Scope,
         || !protocol_route_valid(route, protocols)
         || !replay_matches_request(replay, request)
         || retry_policy.max_attempts == 0
-        || cancellation.reason(parent) != cancellation.ACTIVE) {
+        || !parent_active(parent)) {
         ret Submission{status: SUBMIT_INVALID, token: empty_token()};
     }
     if (!client.accepting) {
@@ -1114,8 +1128,8 @@ pub fun submit(client: *Client, parent: *cancellation.Scope,
     slot.reservation = empty_reservation();
     slot.lease = empty_lease();
     slot.completion = empty_completion();
-    val scope_made: bool = cancellation.make_child(?slot.scope, parent,
-        request.metadata.has_deadline, request.metadata.deadline);
+    val scope_made: bool = operation_ok(cancellation.make_child(?slot.scope, parent,
+        request.metadata.has_deadline, request.metadata.deadline));
     if (!scope_made) {
         clear_slot(client, token.index::usize);
         client.live_requests = client.live_requests - 1;
@@ -1147,14 +1161,19 @@ fun set_terminal(slot: *RequestSlot, outcome: Outcome, error: ErrorKind,
     slot.state = STATE_TERMINAL;
 }
 
+fun parent_active(parent: *cancellation.Scope) bool {
+    val reason: cancellation.Reason = cancellation.reason(parent);
+    ret sel reason.active;
+}
+
 fun settle_cancel(slot: *RequestSlot) bool {
     val reason: cancellation.Reason = cancellation.reason(?slot.scope);
-    if (reason == cancellation.CANCELLED) {
+    if (sel reason.cancelled) {
         set_terminal(slot, OUTCOME_CANCELLED, ERROR_CANCELLED,
             no_resolver_error(), 0, nil);
         ret true;
     }
-    if (reason == cancellation.TIMED_OUT) {
+    if (sel reason.timed_out) {
         set_terminal(slot, OUTCOME_TIMED_OUT, ERROR_TIMED_OUT,
             no_resolver_error(), 0, nil);
         ret true;
@@ -1934,20 +1953,20 @@ pub fun follow_redirect(client: *Client, token: Token, exchange: pool.Lease,
 pub fun cancel_request(client: *Client, token: Token) bool {
     if (!client_ready(client)) { ret false; }
     val slot: *RequestSlot = slot_for(client, token);
-    ret slot != nil && cancellation.cancel(?slot.scope);
+    ret slot != nil && transition_ok(cancellation.cancel(?slot.scope));
 }
 
 pub fun expire_request(client: *Client, token: Token, now: time.Time) bool {
     if (!client_ready(client) || !time_valid(now)) { ret false; }
     val slot: *RequestSlot = slot_for(client, token);
-    ret slot != nil && cancellation.expire(?slot.scope, now);
+    ret slot != nil && transition_ok(cancellation.expire(?slot.scope, now));
 }
 
 pub fun release_request(client: *Client, token: Token) bool {
     if (!client_ready(client)) { ret false; }
     val slot: *RequestSlot = slot_for(client, token);
     if (slot == nil || slot.state != STATE_TERMINAL
-        || !cancellation.destroy(?slot.scope)) { ret false; }
+        || !operation_ok(cancellation.destroy(?slot.scope))) { ret false; }
     clear_slot(client, token.index::usize);
     client.live_requests = client.live_requests - 1;
     ret true;
@@ -2222,8 +2241,8 @@ test "http.client.client: hostile aliases and capacity overflow are transactiona
         || !init(?client, ?cache, ?connections, ?slots[0], 2,
             ?request_endpoints[0], 2, configured)) { ret 6; }
     var parent: cancellation.Scope;
-    if (!cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0})) { ret 7; }
+    if (!operation_ok(cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0}))) { ret 7; }
     var reader: body.Reader;
     var request: message.Request;
     if (!test_request(?request, ?reader, 92, false,
@@ -2317,7 +2336,7 @@ fun test_shutdown(client: *Client, cache: *dns.Cache,
     if (maintenance(client, now).kind != MAINTENANCE_NONE) { ret false; }
     if (!destroy(client) || !dns.destroy(cache)
         || !pool.destroy(connections)
-        || !cancellation.destroy(parent)) { ret false; }
+        || !operation_ok(cancellation.destroy(parent))) { ret false; }
     ret true;
 }
 
@@ -2353,8 +2372,8 @@ test "http.client.client: dns alpn exchange and graceful drain preserve ownershi
         ?request_endpoints[0], 4, client_config)) { ret 3; }
 
     var parent: cancellation.Scope;
-    if (!cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0})) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0}))) { ret 4; }
     var reader: body.Reader;
     var request: message.Request;
     if (!test_request(?request, ?reader, 1, false,
@@ -2525,8 +2544,8 @@ test "http.client.client: request deadlines settle before transport publication"
     if (!init(?client, ?cache, ?connections, ?slots[0], 1,
         ?request_endpoints[0], 1, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0})) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0}))) { ret 4; }
     val deadline: time.Time = time.Time{sec: 5, nsec: 10};
     var reader: body.Reader;
     var request: message.Request;
@@ -2580,8 +2599,8 @@ test "http.client.client: multi-origin saturation resumes after exact lease rele
     if (!init(?client, ?cache, ?connections, ?slots[0], 2,
         ?request_endpoints[0], 2, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0})) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0}))) { ret 4; }
     var first_reader: body.Reader;
     var second_reader: body.Reader;
     var first_request: message.Request;
@@ -2669,8 +2688,8 @@ test "http.client.client: cross-origin redirects require rewritten safe requests
     if (!init(?client, ?cache, ?connections, ?slots[0], 1,
         ?request_endpoints[0], 1, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0})) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0}))) { ret 4; }
     var reader: body.Reader;
     var request: message.Request;
     if (!test_request(?request, ?reader, 31, false,
@@ -2793,8 +2812,8 @@ test "http.client.client: retries publish replay and never buffer streams" {
     if (!init(?client, ?cache, ?connections, ?slots[0], 1,
         ?request_endpoints[0], 1, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0})) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0}))) { ret 4; }
     val route: policy.Route = test_route("retry.example", 13);
     val retry_twice: policy.RetryPolicy = policy.RetryPolicy{
         max_attempts: 2, retry_request_timeout: false,
@@ -3082,8 +3101,8 @@ test "http.client.client: temporary dns failures wait for cache retry time" {
     if (!init(?client, ?cache, ?connections, ?slots[0], 1,
         ?request_endpoints[0], 1, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0})) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0}))) { ret 4; }
     var reader: body.Reader;
     var request: message.Request;
     if (!test_request(?request, ?reader, 51, false,
@@ -3154,8 +3173,8 @@ test "http.client.client: cancellation wins connect and exchange races" {
     if (!init(?client, ?cache, ?connections, ?slots[0], 2,
         ?request_endpoints[0], 2, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0})) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, false,
+        time.Time{sec: 0, nsec: 0}))) { ret 4; }
     val route: policy.Route = test_route("race.example", 12);
     val now: time.Time = time.Time{sec: 12, nsec: 0};
     var first_reader: body.Reader;
@@ -3357,7 +3376,7 @@ test "http.client.client: hostile ownership and lifecycle inputs stay transactio
             time.Time{sec: 1, nsec: 0}) != dns.COMPLETE_INVALID) { ret 3; }
     val parent_deadline: time.Time = time.Time{sec: 5, nsec: 0};
     var parent: cancellation.Scope;
-    if (!cancellation.make_root(?parent, true, parent_deadline)) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, true, parent_deadline))) { ret 4; }
     var deadline_reader: body.Reader;
     var deadline_request: message.Request;
     if (!test_request(?deadline_request, ?deadline_reader, 71, true,

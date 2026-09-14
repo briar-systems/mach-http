@@ -21,6 +21,10 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.view;
 
+
+fun transition_ok(outcome: cancel.Transition) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
 val SLOTS: usize = 6;
 val EXCHANGES: usize = 12;
 val REQUEST_BYTES: usize = 96;
@@ -500,7 +504,7 @@ test "h3quic: stream reset and application cancellation settle exactly once" {
     if (start_request(?other, true) != 0) { ret 12; }
     cycle(?other, 16);
     if (other.used != 1) { ret 13; }
-    if (!cancel.cancel(?other.exchanges[0].scope)) { ret 14; }
+    if (!transition_ok(cancel.cancel(?other.exchanges[0].scope))) { ret 14; }
     cycle(?other, 48);
     if (session.count_of(?second.server, h3.EVENT_STREAM_RESET) != 1) { ret 15; }
     if (session.count_of(?second.client, h3.EVENT_STREAM_RESET) != 1) { ret 16; }
@@ -801,7 +805,7 @@ test "h3quic: an abortive close settles with a request still live on both ends" 
     if (settled.close_mode != lifecycle.ABORTIVE
      || settled.close_cause != lifecycle.EXPLICIT
      || settled.terminal_cause != lifecycle.CANCELLATION
-     || settled.cancellation_reason != cancel.CANCELLED
+     || !(sel settled.cancellation_reason.cancelled)
      || settled.application_error != h3.H3_REQUEST_CANCELLED) { ret 12; }
     # the engines were never told, and the closed drivers own no stream storage
     # for them to reach

@@ -14,6 +14,10 @@ use http.core.method;
 use http.core.status;
 use http.core.target;
 
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
 pub def Status: u8;
 pub val NEGOTIATED: Status = 1;
 pub val INVALID_EXCHANGE: Status = 2;
@@ -436,7 +440,7 @@ fun test_metadata(version: message.Version) message.Metadata {
 test "http.websocket.negotiation: h1 upgrade commits common exchange" {
     val configured: message.Limits = message.limits_default();
     var scope: cancel.Scope;
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
     var request_items: [8]field.Field;
     var request_fields: field.Fields = field.init(?request_items[0], 8,
         configured.request_fields);
@@ -474,14 +478,14 @@ test "http.websocket.negotiation: h1 upgrade commits common exchange" {
      || exchange_value.state != exchange.RESPONDING
      || exchange.finish(?exchange_value) != exchange.FINISH_OK
      || exchange_value.completion.reuse != body.REUSE_FORBIDDEN) { ret 6; }
-    if (!cancel.destroy(?scope)) { ret 7; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 7; }
     ret 0;
 }
 
 fun extended_test(version: message.Version, generation: u64) i32 {
     val configured: message.Limits = message.limits_default();
     var scope: cancel.Scope;
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
     var request_items: [3]field.Field;
     var request_fields: field.Fields = field.init(?request_items[0], 3,
         configured.request_fields);
@@ -511,7 +515,7 @@ fun extended_test(version: message.Version, generation: u64) i32 {
      || response.status != status.OK || !response.committed
      || validate_extended_response(?response, version.wire,
         view.view("chat, mach", 10)).status != NEGOTIATED) { ret 3; }
-    if (!cancel.destroy(?scope)) { ret 4; }
+    if (!operation_ok(cancel.destroy(?scope))) { ret 4; }
     ret 0;
 }
 

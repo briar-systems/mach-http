@@ -1,10 +1,7 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.result.Result;
-use std.types.result.err;
-use std.types.result.is_err;
-use std.types.result.ok;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
@@ -76,7 +73,7 @@ pub rec Params {
     request_generation: u64;
 }
 
-pub def Handler: fun(ptr, *message.Request, *message.Response, *Params) Result[u8, str];
+pub def Handler: fun(ptr, *message.Request, *message.Response, *Params) res[u8, str];
 
 pub rec Route {
     method: view.View;
@@ -853,19 +850,19 @@ pub fun dispatch(router: *Router, request: *message.Request,
 }
 
 pub fun invoke(router: *Router, matched: *Dispatch, request: *message.Request,
-    response: *message.Response) Result[u8, str] {
+    response: *message.Response) res[u8, str] {
     if (router == nil || !router.initialized || matched == nil || request == nil
      || response == nil || matched.status != DISPATCH_MATCH
      || matched.handler::usize == 0 || matched.params.router_generation != router.generation
      || matched.params.request_generation != request.generation) {
-        ret err[u8, str]("stale route dispatch");
+        ret res[u8, str].err{"stale route dispatch"};
     }
     ret matched.handler(matched.handler_ctx, request, response, ?matched.params);
 }
 
 fun test_handler(context: ptr, request: *message.Request,
-    response: *message.Response, params: *Params) Result[u8, str] {
-    ret ok[u8, str](HANDLER_RESPOND);
+    response: *message.Response, params: *Params) res[u8, str] {
+    ret res[u8, str].ok{HANDLER_RESPOND};
 }
 
 fun test_route(route_method: str, method_length: usize, host: str, host_length: usize,
@@ -1029,13 +1026,16 @@ test "http.router.router: dispatch and invocation reject stale generations" {
         view.view("example.com", 11), nil, 0);
     if (matched.status != DISPATCH_MATCH || matched.source_index != 0) { ret 2; }
     var response: message.Response;
-    if (is_err[u8, str](invoke(?router, ?matched, ?request, ?response))) { ret 3; }
+    val first: res[u8, str] = invoke(?router, ?matched, ?request, ?response);
+    if (sel first.err) { ret 3; }
     request.generation = 18;
-    if (!is_err[u8, str](invoke(?router, ?matched, ?request, ?response))) { ret 4; }
+    val stale: res[u8, str] = invoke(?router, ?matched, ?request, ?response);
+    if (sel stale.ok) { ret 4; }
     request.generation = 17;
     if (compile(?router, ?spec, 1, ?route, 1, ?segment, 1,
         limits_default()).status != COMPILE_OK || router.generation != 2) { ret 5; }
-    if (!is_err[u8, str](invoke(?router, ?matched, ?request, ?response))) { ret 5; }
+    val recompiled: res[u8, str] = invoke(?router, ?matched, ?request, ?response);
+    if (sel recompiled.ok) { ret 5; }
     ret 0;
 }
 
