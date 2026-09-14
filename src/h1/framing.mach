@@ -1,54 +1,54 @@
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.view;
-use http.core.field;
-use http.core.message;
-use http.core.method;
-use http.core.status;
 
 pub def Mode: u8;
-pub val FRAME_NONE: Mode = 1;
-pub val FRAME_LENGTH: Mode = 2;
+pub val FRAME_NONE:    Mode = 1;
+pub val FRAME_LENGTH:  Mode = 2;
 pub val FRAME_CHUNKED: Mode = 3;
-pub val FRAME_CLOSE: Mode = 4;
-pub val FRAME_TUNNEL: Mode = 5;
+pub val FRAME_CLOSE:   Mode = 4;
+pub val FRAME_TUNNEL:  Mode = 5;
 
 pub def Error: u8;
-pub val FRAME_OK: Error = 0;
-pub val FRAME_INVALID_VERSION: Error = 1;
-pub val FRAME_INVALID_CONTENT_LENGTH: Error = 2;
-pub val FRAME_DUPLICATE_CONTENT_LENGTH: Error = 3;
-pub val FRAME_INVALID_TRANSFER_ENCODING: Error = 4;
+pub val FRAME_OK:                          Error = 0;
+pub val FRAME_INVALID_VERSION:             Error = 1;
+pub val FRAME_INVALID_CONTENT_LENGTH:      Error = 2;
+pub val FRAME_DUPLICATE_CONTENT_LENGTH:    Error = 3;
+pub val FRAME_INVALID_TRANSFER_ENCODING:   Error = 4;
 pub val FRAME_DUPLICATE_TRANSFER_ENCODING: Error = 5;
-pub val FRAME_AMBIGUOUS: Error = 6;
-pub val FRAME_HTTP10_TRANSFER_ENCODING: Error = 7;
-pub val FRAME_REQUEST_TRANSFER_ENCODING: Error = 8;
+pub val FRAME_AMBIGUOUS:                   Error = 6;
+pub val FRAME_HTTP10_TRANSFER_ENCODING:    Error = 7;
+pub val FRAME_REQUEST_TRANSFER_ENCODING:   Error = 8;
 pub val FRAME_FORBIDDEN_TRANSFER_ENCODING: Error = 9;
-pub val FRAME_INVALID_CONNECTION: Error = 10;
-pub val FRAME_FORBIDDEN_CONTENT_LENGTH: Error = 11;
-pub val FRAME_INVALID_FIELDS: Error = 12;
+pub val FRAME_INVALID_CONNECTION:          Error = 10;
+pub val FRAME_FORBIDDEN_CONTENT_LENGTH:    Error = 11;
+pub val FRAME_INVALID_FIELDS:              Error = 12;
 
 pub rec Plan {
-    mode: Mode;
-    length: u64;
-    keep_alive: bool;
+    mode:           Mode;
+    length:         u64;
+    keep_alive:     bool;
     transfer_coded: bool;
-    error: Error;
+    error:          Error;
 }
 
 rec Transfer {
-    present: bool;
+    present:       bool;
     final_chunked: bool;
-    non_chunked: bool;
-    valid: bool;
+    non_chunked:   bool;
+    valid:         bool;
 }
 
 rec Connection {
-    close: bool;
+    close:      bool;
     keep_alive: bool;
-    valid: bool;
+    valid:      bool;
 }
 
 fun token_char(c: u8) bool {
@@ -95,9 +95,10 @@ fun valid_host_part(value: view.View, start: usize, finish: usize, literal: bool
         val c: u8 = value.data[i];
         if (host_char(c) || (literal && c == ':')) {
             i = i + 1;
-        } or {
+        }
+        or {
             if (c != '%' || i + 2 >= finish || !hex_char(value.data[i + 1])
-             || !hex_char(value.data[i + 2])) { ret false; }
+                || !hex_char(value.data[i + 2])) { ret false; }
             i = i + 3;
         }
     }
@@ -106,14 +107,14 @@ fun valid_host_part(value: view.View, start: usize, finish: usize, literal: bool
 
 fun valid_port(value: view.View, start: usize) bool {
     if (start >= value.len) { ret false; }
-    var i: usize = start;
-    var port: u32 = 0;
+    var i:    usize = start;
+    var port: u32   = 0;
     for (i < value.len) {
         if (value.data[i] < '0' || value.data[i] > '9') { ret false; }
         val digit: u32 = (value.data[i] - '0')::u32;
         if (port > (65535 - digit) / 10) { ret false; }
         port = port * 10 + digit;
-        i = i + 1;
+        i    = i + 1;
     }
     ret true;
 }
@@ -124,11 +125,11 @@ pub fun host_value(value: view.View) bool {
         var close: usize = 1;
         for (close < value.len && value.data[close] != ']') { close = close + 1; }
         if (close == value.len || !valid_host_part(value, 1, close, true)) { ret false; }
-        if (close + 1 == value.len) { ret true; }
+        if (close + 1 == value.len)                                        { ret true; }
         ret value.data[close + 1] == ':' && valid_port(value, close + 2);
     }
     var colon: usize = value.len;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (i < value.len) {
         if (value.data[i] == ':') {
             if (colon != value.len) { ret false; }
@@ -157,11 +158,11 @@ pub fun connect_authority(value: view.View) bool {
 
 pub fun request_host(version: message.Version, fields: *field.Fields) bool {
     if (version.major != 1 || (version.minor != 0 && version.minor != 1)
-     || fields == nil || !field.validate(fields, fields.limits, false)) { ret false; }
+        || fields == nil || !field.validate(fields, fields.limits, false)) { ret false; }
     if (version.minor == 0) { ret true; }
     var count: usize = 0;
-    var valid: bool = false;
-    var i: usize = 0;
+    var valid: bool  = false;
+    var i:     usize = 0;
     for (i < fields.len) {
         if (field_is(?fields.items[i], "host", 4)) {
             count = count + 1;
@@ -191,8 +192,9 @@ fun parse_quoted(value: view.View, offset: usize) usize {
         if (c == '\\') {
             i = i + 1;
             if (i >= value.len || value.data[i] == '\r' || value.data[i] == '\n'
-             || value.data[i] == 0 || value.data[i] == 127) { ret value.len + 1; }
-        } or (c == '\r' || c == '\n' || c == 0 || c == 127 || (c < ' ' && c != '\t')) {
+                || value.data[i] == 0 || value.data[i] == 127) { ret value.len + 1; }
+        }
+        or (c == '\r' || c == '\n' || c == 0 || c == 127 || (c < ' ' && c != '\t')) {
             ret value.len + 1;
         }
         i = i + 1;
@@ -201,14 +203,14 @@ fun parse_quoted(value: view.View, offset: usize) usize {
 }
 
 fun parse_parameter(value: view.View, offset: usize) usize {
-    var i: usize = skip_ows(value, offset);
+    var i:          usize = skip_ows(value, offset);
     val name_start: usize = i;
     for (i < value.len && token_char(value.data[i])) { i = i + 1; }
     if (i == name_start) { ret value.len + 1; }
     i = skip_ows(value, i);
     if (i >= value.len || value.data[i] != '=') { ret i; }
     i = skip_ows(value, i + 1);
-    if (i >= value.len) { ret value.len + 1; }
+    if (i >= value.len)       { ret value.len + 1; }
     if (value.data[i] == '"') { ret parse_quoted(value, i); }
     val item_start: usize = i;
     for (i < value.len && token_char(value.data[i])) { i = i + 1; }
@@ -219,9 +221,9 @@ fun parse_parameter(value: view.View, offset: usize) usize {
 fun parse_transfer(value: view.View) Transfer {
     var result: Transfer = Transfer{present: true, final_chunked: false, non_chunked: false, valid: false};
     if (value.data == nil || value.len == 0) { ret result; }
-    var i: usize = 0;
-    var count: usize = 0;
-    var saw_chunked: bool = false;
+    var i:           usize = 0;
+    var count:       usize = 0;
+    var saw_chunked: bool  = false;
     for (true) {
         i = skip_ows(value, i);
         val start: usize = i;
@@ -230,17 +232,18 @@ fun parse_transfer(value: view.View) Transfer {
         val chunked: bool = equal_token((value.data::usize + start)::ptr::*u8,
             i - start, "chunked", 7);
         if (chunked && saw_chunked) { ret result; }
-        if (chunked) { saw_chunked = true; } or { result.non_chunked = true; }
+        if (chunked)                { saw_chunked = true; }
+        or                          { result.non_chunked = true; }
         i = skip_ows(value, i);
         var has_parameter: bool = false;
         for (i < value.len && value.data[i] == ';') {
             has_parameter = true;
-            i = parse_parameter(value, i + 1);
+            i             = parse_parameter(value, i + 1);
             if (i > value.len) { ret result; }
             i = skip_ows(value, i);
         }
         if (chunked && has_parameter) { ret result; }
-        count = count + 1;
+        count                = count + 1;
         result.final_chunked = chunked;
         if (i == value.len) {
             result.valid = count != 0;
@@ -263,12 +266,13 @@ fun parse_connection_value(value: view.View, result: *Connection) bool {
         if (i == start) { ret false; }
         if (equal_token((value.data::usize + start)::ptr::*u8, i - start, "close", 5)) {
             result.close = true;
-        } or (equal_token((value.data::usize + start)::ptr::*u8,
+        }
+        or (equal_token((value.data::usize + start)::ptr::*u8,
             i - start, "keep-alive", 10)) {
             result.keep_alive = true;
         }
         i = skip_ows(value, i);
-        if (i == value.len) { ret true; }
+        if (i == value.len)       { ret true; }
         if (value.data[i] != ',') { ret false; }
         i = i + 1;
         if (i == value.len) { ret false; }
@@ -278,11 +282,14 @@ fun parse_connection_value(value: view.View, result: *Connection) bool {
 
 fun connection_fields(fields: *field.Fields) Connection {
     var result: Connection = Connection{close: false, keep_alive: false, valid: true};
-    if (fields == nil || !fields.valid) { result.valid = false; ret result; }
+    if (fields == nil || !fields.valid) {
+        result.valid = false;
+        ret result;
+    }
     var i: usize = 0;
     for (i < fields.len) {
         if (field_is(?fields.items[i], "connection", 10)
-         && !parse_connection_value(fields.items[i].value, ?result)) {
+            && !parse_connection_value(fields.items[i].value, ?result)) {
             result.valid = false;
             ret result;
         }
@@ -293,22 +300,22 @@ fun connection_fields(fields: *field.Fields) Connection {
 
 fun content_length(fields: *field.Fields, present: *bool, length: *u64) Error {
     @present = false;
-    @length = 0;
+    @length  = 0;
     var i: usize = 0;
     for (i < fields.len) {
         val item: *field.Field = ?fields.items[i];
         if (field_is(item, "content-length", 14)) {
             if (@present) { ret FRAME_DUPLICATE_CONTENT_LENGTH; }
             @present = true;
-            val value: view.View = item.value;
-            var at: usize = skip_ows(value, 0);
-            val start: usize = at;
-            var parsed: u64 = 0;
+            val value:  view.View = item.value;
+            var at:     usize     = skip_ows(value, 0);
+            val start:  usize     = at;
+            var parsed: u64       = 0;
             for (at < value.len && value.data[at] >= '0' && value.data[at] <= '9') {
                 val digit: u64 = (value.data[at] - '0')::u64;
                 if (parsed > ((-1)::u64 - digit) / 10) { ret FRAME_INVALID_CONTENT_LENGTH; }
                 parsed = parsed * 10 + digit;
-                at = at + 1;
+                at     = at + 1;
             }
             if (at == start) { ret FRAME_INVALID_CONTENT_LENGTH; }
             at = skip_ows(value, at);
@@ -336,7 +343,7 @@ fun transfer_encoding(fields: *field.Fields, transfer: *Transfer) Error {
 }
 
 fun persistent(version: message.Version, connection: Connection) bool {
-    if (connection.close) { ret false; }
+    if (connection.close)                         { ret false; }
     if (version.major == 1 && version.minor == 1) { ret true; }
     ret connection.keep_alive;
 }
@@ -352,24 +359,24 @@ pub fun none(keep_alive: bool) Plan {
 fun inspect(version: message.Version, fields: *field.Fields, content_present: *bool,
     length: *u64, transfer: *Transfer, keep_alive: *bool) Error {
     if (!message.valid_version(version) || version.wire != message.WIRE_H1) { ret FRAME_INVALID_VERSION; }
-    if (fields == nil || !field.validate(fields, fields.limits, false)) { ret FRAME_INVALID_FIELDS; }
+    if (fields == nil || !field.validate(fields, fields.limits, false))     { ret FRAME_INVALID_FIELDS; }
     val connection: Connection = connection_fields(fields);
     if (!connection.valid) { ret FRAME_INVALID_CONNECTION; }
     @keep_alive = persistent(version, connection);
     val length_error: Error = content_length(fields, content_present, length);
     if (length_error != FRAME_OK) { ret length_error; }
     val transfer_error: Error = transfer_encoding(fields, transfer);
-    if (transfer_error != FRAME_OK) { ret transfer_error; }
-    if (transfer.present && @content_present) { ret FRAME_AMBIGUOUS; }
+    if (transfer_error != FRAME_OK)             { ret transfer_error; }
+    if (transfer.present && @content_present)   { ret FRAME_AMBIGUOUS; }
     if (transfer.present && version.minor == 0) { ret FRAME_HTTP10_TRANSFER_ENCODING; }
     ret FRAME_OK;
 }
 
 pub fun request(version: message.Version, fields: *field.Fields) Plan {
-    var has_length: bool;
-    var length: u64;
-    var transfer: Transfer;
-    var keep_alive: bool;
+    var has_length:    bool;
+    var length:        u64;
+    var transfer:      Transfer;
+    var keep_alive:    bool;
     val framing_error: Error = inspect(version, fields, ?has_length, ?length, ?transfer, ?keep_alive);
     if (framing_error != FRAME_OK) { ret error_plan(framing_error); }
     if (transfer.present) {
@@ -387,21 +394,21 @@ pub fun request(version: message.Version, fields: *field.Fields) Plan {
 pub fun response(version: message.Version, code: status.Status, request_method: method.Kind,
     fields: *field.Fields) Plan {
     if (!status.valid(code)) { ret error_plan(FRAME_INVALID_VERSION); }
-    var has_length: bool;
-    var length: u64;
-    var transfer: Transfer;
-    var keep_alive: bool;
+    var has_length:    bool;
+    var length:        u64;
+    var transfer:      Transfer;
+    var keep_alive:    bool;
     val framing_error: Error = inspect(version, fields, ?has_length, ?length, ?transfer, ?keep_alive);
     if (framing_error != FRAME_OK) { ret error_plan(framing_error); }
-    val tunnel: bool = request_method == method.CONNECT && code >= 200 && code < 300;
+    val tunnel:   bool = request_method == method.CONNECT && code >= 200 && code < 300;
     val bodyless: bool = request_method == method.HEAD || status.is_informational(code)
         || code == status.NO_CONTENT || code == status.RESET_CONTENT || code == status.NOT_MODIFIED;
     if (transfer.present && (code == status.NO_CONTENT || code == status.RESET_CONTENT
-     || status.is_informational(code) || tunnel)) {
+        || status.is_informational(code) || tunnel)) {
         ret error_plan(FRAME_FORBIDDEN_TRANSFER_ENCODING);
     }
     if (has_length && (code == status.NO_CONTENT || status.is_informational(code) || tunnel
-     || (code == status.RESET_CONTENT && length != 0))) {
+        || (code == status.RESET_CONTENT && length != 0))) {
         ret error_plan(FRAME_FORBIDDEN_CONTENT_LENGTH);
     }
     if (tunnel) {
@@ -426,7 +433,7 @@ pub fun response(version: message.Version, code: status.Status, request_method: 
 }
 
 test "http.h1.framing: requests reject ambiguous and duplicate lengths" {
-    var items: [2]field.Field;
+    var items:  [2]field.Field;
     var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 128, 32, 64));
     field.append(?fields, field.Field{name: view.view("Content-Length", 14), value: view.view("5", 1), sensitive: false});
     if (request(message.version_h1(1, 1), ?fields).mode != FRAME_LENGTH) { ret 1; }
@@ -440,10 +447,10 @@ test "http.h1.framing: requests reject ambiguous and duplicate lengths" {
 }
 
 test "http.h1.framing: response rules preserve bodyless and persistence semantics" {
-    var items: [2]field.Field;
+    var items:  [2]field.Field;
     var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 128, 32, 64));
     field.append(?fields, field.Field{name: view.view("Content-Length", 14), value: view.view("10", 2), sensitive: false});
-    if (response(message.version_h1(1, 1), status.OK, method.HEAD, ?fields).mode != FRAME_NONE) { ret 1; }
+    if (response(message.version_h1(1, 1), status.OK, method.HEAD, ?fields).mode != FRAME_NONE)  { ret 1; }
     if (response(message.version_h1(1, 1), status.OK, method.GET, ?fields).mode != FRAME_LENGTH) { ret 2; }
     field.reset(?fields);
     field.append(?fields, field.Field{name: view.view("Connection", 10), value: view.view("close", 5), sensitive: false});
@@ -464,12 +471,12 @@ test "http.h1.framing: response rules preserve bodyless and persistence semantic
 }
 
 test "http.h1.framing: transfer coding is strict and version aware" {
-    var item: field.Field;
+    var item:   field.Field;
     var fields: field.Fields = field.init(?item, 1, field.limits(1, 128, 32, 64));
     field.append(?fields, field.Field{name: view.view("Transfer-Encoding", 17),
         value: view.view("gzip, chunked", 13), sensitive: false});
     val chunked: Plan = request(message.version_h1(1, 1), ?fields);
-    if (chunked.mode != FRAME_CHUNKED || !chunked.transfer_coded) { ret 1; }
+    if (chunked.mode != FRAME_CHUNKED || !chunked.transfer_coded)                           { ret 1; }
     if (request(message.version_h1(1, 0), ?fields).error != FRAME_HTTP10_TRANSFER_ENCODING) { ret 2; }
     field.reset(?fields);
     field.append(?fields, field.Field{name: view.view("Transfer-Encoding", 17),
@@ -479,7 +486,7 @@ test "http.h1.framing: transfer coding is strict and version aware" {
 }
 
 test "http.h1.framing: host authority is singular and syntax checked" {
-    var items: [2]field.Field;
+    var items:  [2]field.Field;
     var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 128, 32, 64));
     field.append(?fields, field.Field{name: view.view("Host", 4),
         value: view.view("[::1]:8080", 10), sensitive: false});

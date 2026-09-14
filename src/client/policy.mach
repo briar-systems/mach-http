@@ -1,17 +1,17 @@
 # client origin, protocol, redirect, and retry policy
 
-use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
-use std.types.size.usize;
-use std.types.result.res;
-use std.types.string.str;
-use std.types.view;
-use std.net.ip;
+use http.client.memory;
 use http.core.message;
 use http.core.method;
 use http.core.status;
-use http.client.memory;
+use std.net.ip;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
 
 pub def Scheme: u8;
 pub val HTTP:  Scheme = 1;
@@ -22,7 +22,7 @@ pub val PROXY_NONE:         ProxyKind = 0;
 pub val PROXY_HTTP_FORWARD: ProxyKind = 1;
 pub val PROXY_HTTP_TUNNEL:  ProxyKind = 2;
 pub val PROXY_SOCKS5:       ProxyKind = 3;
-pub val PROXY_CONNECT_UDP:   ProxyKind = 4;
+pub val PROXY_CONNECT_UDP:  ProxyKind = 4;
 
 pub def TransportKind: u8;
 pub val TRANSPORT_TCP:  TransportKind = 1;
@@ -43,11 +43,11 @@ pub rec Origin {
 
 # identity isolates connections using different proxy credentials or policy
 pub rec Proxy {
-    kind:     ProxyKind;
-    host:     view.View;
-    port:     u16;
-    secure:   bool;
-    identity: u64;
+    kind:       ProxyKind;
+    host:       view.View;
+    port:       u16;
+    secure:     bool;
+    identity:   u64;
     transports: u8;
 }
 
@@ -85,19 +85,19 @@ pub rec Replay {
 }
 
 pub rec RedirectPolicy {
-    max_redirects:       usize;
+    max_redirects:        usize;
     allow_http_downgrade: bool;
-    legacy_post_to_get:  bool;
+    legacy_post_to_get:   bool;
 }
 
 pub def RedirectStatus: u8;
-pub val REDIRECT_FOLLOW:      RedirectStatus = 1;
+pub val REDIRECT_FOLLOW:       RedirectStatus = 1;
 pub val REDIRECT_NOT_REDIRECT: RedirectStatus = 2;
-pub val REDIRECT_LIMIT:       RedirectStatus = 3;
-pub val REDIRECT_UNSAFE:      RedirectStatus = 4;
-pub val REDIRECT_DOWNGRADE:   RedirectStatus = 5;
-pub val REDIRECT_INVALID:     RedirectStatus = 6;
-pub val REDIRECT_CANCELLED:   RedirectStatus = 7;
+pub val REDIRECT_LIMIT:        RedirectStatus = 3;
+pub val REDIRECT_UNSAFE:       RedirectStatus = 4;
+pub val REDIRECT_DOWNGRADE:    RedirectStatus = 5;
+pub val REDIRECT_INVALID:      RedirectStatus = 6;
+pub val REDIRECT_CANCELLED:    RedirectStatus = 7;
 
 pub rec Redirect {
     status:                 RedirectStatus;
@@ -157,12 +157,12 @@ pub fun host_valid(host: view.View, maximum: usize) bool {
         || host.len > 253 || host.data[0] == '.' || host.data[host.len - 1] == '.') {
         ret false;
     }
-    var i: usize = 0;
-    var colon: bool = false;
+    var i:     usize = 0;
+    var colon: bool  = false;
     for (i < host.len) {
         val byte: u8 = host.data[i];
         if (!ascii_host_byte(byte)) { ret false; }
-        if (byte == ':') { colon = true; }
+        if (byte == ':')            { colon = true; }
         i = i + 1;
     }
     if (colon && !ipv6_valid(host)) { ret false; }
@@ -171,9 +171,9 @@ pub fun host_valid(host: view.View, maximum: usize) bool {
 
 pub fun ipv6_valid(host: view.View) bool {
     if (!memory.borrowed(host) || host.len == 0 || host.len > 253) { ret false; }
-    var text: [254]u8;
-    var i: usize = 0;
-    var colon: bool = false;
+    var text:  [254]u8;
+    var i:     usize = 0;
+    var colon: bool  = false;
     for (i < host.len) {
         val byte: u8 = host.data[i];
         if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f')
@@ -182,7 +182,7 @@ pub fun ipv6_valid(host: view.View) bool {
         }
         if (byte == ':') { colon = true; }
         text[i] = byte;
-        i = i + 1;
+        i       = i + 1;
     }
     if (!colon) { ret false; }
     text[host.len] = 0;
@@ -285,7 +285,7 @@ pub fun protocols_default() ProtocolPolicy {
 
 pub fun protocol_valid(configured: ProtocolPolicy) bool {
     if (configured.allowed == 0 || (configured.allowed & 0xf8) != 0) { ret false; }
-    if (configured.prior_knowledge == 0) { ret true; }
+    if (configured.prior_knowledge == 0)                             { ret true; }
     if (configured.prior_knowledge == message.WIRE_H1) {
         ret (configured.allowed & ALLOW_H1) != 0;
     }
@@ -318,8 +318,8 @@ fun exact(value: view.View, text: *u8, len: usize) bool {
 
 pub fun wire_for_alpn(value: view.View) message.Wire {
     if (exact(value, "http/1.1", 8)) { ret message.WIRE_H1; }
-    if (exact(value, "h2", 2)) { ret message.WIRE_H2; }
-    if (exact(value, "h3", 2)) { ret message.WIRE_H3; }
+    if (exact(value, "h2", 2))       { ret message.WIRE_H2; }
+    if (exact(value, "h3", 2))       { ret message.WIRE_H3; }
     ret 0;
 }
 
@@ -368,11 +368,11 @@ pub fun offers(configured: ProtocolPolicy, transport: TransportKind,
     var written: usize = 0;
     if ((configured.allowed & ALLOW_H2) != 0) {
         output[written] = alpn_for_wire(message.WIRE_H2);
-        written = written + 1;
+        written         = written + 1;
     }
     if ((configured.allowed & ALLOW_H1) != 0) {
         output[written] = alpn_for_wire(message.WIRE_H1);
-        written = written + 1;
+        written         = written + 1;
     }
     ret written;
 }
@@ -404,7 +404,7 @@ pub fun select(configured: ProtocolPolicy, secure: bool,
     if (negotiated.len == 0) {
         if (transport == TRANSPORT_TCP && !configured.require_alpn
             && (configured.prior_knowledge == 0
-                || configured.prior_knowledge == message.WIRE_H1)
+            || configured.prior_knowledge == message.WIRE_H1)
             && (configured.allowed & ALLOW_H1) != 0) {
             ret Selection{status: SELECT_OK, wire: message.WIRE_H1};
         }
@@ -415,7 +415,7 @@ pub fun select(configured: ProtocolPolicy, secure: bool,
         || (transport == TRANSPORT_QUIC && selected != message.WIRE_H3)
         || (transport == TRANSPORT_TCP && selected == message.WIRE_H3)
         || (configured.prior_knowledge != 0
-            && selected != configured.prior_knowledge)) {
+        && selected != configured.prior_knowledge)) {
         ret Selection{status: SELECT_UNSUPPORTED, wire: 0};
     }
     ret Selection{status: SELECT_OK, wire: selected};
@@ -446,9 +446,12 @@ pub fun redirect(configured: RedirectPolicy, code: status.Status,
     current_method: method.Method, replay: Replay, source: Route, target: Route,
     followed: usize) Redirect {
     var result: Redirect = Redirect{status: REDIRECT_INVALID,
-        next_method: current_method, drop_body: false,
+        next_method:            current_method, drop_body: false,
         strip_origin_sensitive: true, strip_proxy_sensitive: true};
-    if (!redirect_code(code)) { result.status = REDIRECT_NOT_REDIRECT; ret result; }
+    if (!redirect_code(code)) {
+        result.status = REDIRECT_NOT_REDIRECT;
+        ret result;
+    }
     if (!memory.borrowed(current_method.token)
         || !method.valid(current_method, 32) || !replay_valid(replay)
         || !route_valid(source, 253)
@@ -463,18 +466,18 @@ pub fun redirect(configured: RedirectPolicy, code: status.Status,
         ret result;
     }
     result.strip_origin_sensitive = !origin_equal(source.origin, target.origin);
-    result.strip_proxy_sensitive = !proxy_equal(source.proxy, target.proxy);
+    result.strip_proxy_sensitive  = !proxy_equal(source.proxy, target.proxy);
     if (code == status.SEE_OTHER && current_method.kind != method.HEAD) {
         result.next_method = method.from_kind(method.GET);
-        result.drop_body = true;
-        result.status = REDIRECT_FOLLOW;
+        result.drop_body   = true;
+        result.status      = REDIRECT_FOLLOW;
         ret result;
     }
     if ((code == status.MOVED_PERMANENTLY || code == status.FOUND)
         && configured.legacy_post_to_get && current_method.kind == method.POST) {
         result.next_method = method.from_kind(method.GET);
-        result.drop_body = true;
-        result.status = REDIRECT_FOLLOW;
+        result.drop_body   = true;
+        result.status      = REDIRECT_FOLLOW;
         ret result;
     }
     if (replay.body != BODY_EMPTY && !replayable(replay)) {
@@ -488,7 +491,7 @@ pub fun redirect(configured: RedirectPolicy, code: status.Status,
 pub fun retry_policy_default() RetryPolicy {
     ret RetryPolicy{max_attempts: 3, retry_request_timeout: false,
         retry_too_early: true, retry_rate_limit: false,
-        retry_server: false};
+        retry_server:    false};
 }
 
 pub fun retry_reason_valid(reason: RetryReason) bool {
@@ -513,9 +516,9 @@ pub fun failure_valid(failure: Failure) bool {
 
 fun policy_allows(configured: RetryPolicy, reason: RetryReason) bool {
     if (reason == RETRY_REQUEST_TIMEOUT) { ret configured.retry_request_timeout; }
-    if (reason == RETRY_TOO_EARLY) { ret configured.retry_too_early; }
-    if (reason == RETRY_RATE_LIMIT) { ret configured.retry_rate_limit; }
-    if (reason == RETRY_SERVER) { ret configured.retry_server; }
+    if (reason == RETRY_TOO_EARLY)       { ret configured.retry_too_early; }
+    if (reason == RETRY_RATE_LIMIT)      { ret configured.retry_rate_limit; }
+    if (reason == RETRY_SERVER)          { ret configured.retry_server; }
     ret true;
 }
 
@@ -531,7 +534,7 @@ pub fun retry(configured: RetryPolicy, replay: Replay, failure: Failure,
             consume_budget: false};
     }
     if ((!response_retry_reason(failure.reason)
-            && !failure.definitely_unprocessed)
+        && !failure.definitely_unprocessed)
         || !policy_allows(configured, failure.reason)
         || !replayable(replay)) {
         ret RetryDecision{status: RETRY_DENIED, delay_ns: 0,
@@ -543,25 +546,25 @@ pub fun retry(configured: RetryPolicy, replay: Replay, failure: Failure,
 
 test "http.client.policy: alpn and prior knowledge select only allowed wires" {
     val configured: ProtocolPolicy = protocols_default();
-    var offered: [3]view.View;
+    var offered:    [3]view.View;
     if (offers(configured, TRANSPORT_TCP, ?offered[0], 3) != 2
         || !exact(offered[0], "h2", 2) || !exact(offered[1], "http/1.1", 8)
         || offers(configured, TRANSPORT_QUIC, ?offered[0], 3) != 1
         || !exact(offered[0], "h3", 2)) { ret 1; }
     if (select(configured, true, TRANSPORT_TCP,
-            view.view("h2", 2)).wire != message.WIRE_H2
+        view.view("h2", 2)).wire != message.WIRE_H2
         || select(configured, true, TRANSPORT_QUIC,
-            view.view("h3", 2)).wire != message.WIRE_H3
+        view.view("h3", 2)).wire != message.WIRE_H3
         || select(configured, true, TRANSPORT_TCP,
-            view.view("h3", 2)).status != SELECT_UNSUPPORTED
+        view.view("h3", 2)).status != SELECT_UNSUPPORTED
         || select(configured, false, TRANSPORT_TCP,
-            view.view(nil, 0)).wire != message.WIRE_H1) { ret 2; }
+        view.view(nil, 0)).wire != message.WIRE_H1) { ret 2; }
     val h2c: ProtocolPolicy = ProtocolPolicy{allowed: ALLOW_H2,
         prior_knowledge: message.WIRE_H2, require_alpn: false};
     if (select(h2c, false, TRANSPORT_TCP,
-            view.view(nil, 0)).wire != message.WIRE_H2
+        view.view(nil, 0)).wire != message.WIRE_H2
         || select(h2c, true, TRANSPORT_TCP,
-            view.view("http/1.1", 8)).status != SELECT_UNSUPPORTED) { ret 3; }
+        view.view("http/1.1", 8)).status != SELECT_UNSUPPORTED) { ret 3; }
     ret 0;
 }
 
@@ -572,59 +575,59 @@ test "http.client.policy: redirects preserve replay and origin security" {
         host: view.view("other.example", 13), port: 443}, proxy: no_proxy()};
     val clear: Route = Route{origin: Origin{scheme: HTTP,
         host: view.view("example.com", 11), port: 80}, proxy: no_proxy()};
-    val streaming: Replay = Replay{explicit: true, body: BODY_STREAMING};
-    val buffered: Replay = Replay{explicit: true, body: BODY_REWINDABLE};
+    val streaming:  Replay         = Replay{explicit: true, body: BODY_STREAMING};
+    val buffered:   Replay         = Replay{explicit: true, body: BODY_REWINDABLE};
     val configured: RedirectPolicy = redirect_policy_default();
     if (redirect(configured, status.TEMPORARY_REDIRECT,
-            method.from_kind(method.POST), streaming, secure, secure, 0).status
-            != REDIRECT_UNSAFE
+        method.from_kind(method.POST), streaming, secure, secure, 0).status
+        != REDIRECT_UNSAFE
         || redirect(configured, status.SEE_OTHER, method.from_kind(method.POST),
-            streaming, secure, other, 0).next_method.kind != method.GET
+        streaming, secure, other, 0).next_method.kind != method.GET
         || !redirect(configured, status.SEE_OTHER, method.from_kind(method.POST),
-            streaming, secure, other, 0).strip_origin_sensitive
+        streaming, secure, other, 0).strip_origin_sensitive
         || redirect(configured, status.PERMANENT_REDIRECT,
-            method.from_kind(method.PUT), buffered, secure, secure, 0).status
-            != REDIRECT_FOLLOW
+        method.from_kind(method.PUT), buffered, secure, secure, 0).status
+        != REDIRECT_FOLLOW
         || redirect(configured, status.FOUND, method.from_kind(method.GET),
-            Replay{explicit: true, body: BODY_EMPTY}, secure, clear, 0).status
-            != REDIRECT_DOWNGRADE
+        Replay{explicit: true, body: BODY_EMPTY}, secure, clear, 0).status
+        != REDIRECT_DOWNGRADE
         || redirect(RedirectPolicy{max_redirects: 0,
-            allow_http_downgrade: false, legacy_post_to_get: false},
-            status.FOUND, method.from_kind(method.GET),
-            Replay{explicit: true, body: BODY_EMPTY}, secure, secure, 0).status
-            != REDIRECT_LIMIT) { ret 1; }
+        allow_http_downgrade: false, legacy_post_to_get: false},
+        status.FOUND, method.from_kind(method.GET),
+        Replay{explicit: true, body: BODY_EMPTY}, secure, secure, 0).status
+        != REDIRECT_LIMIT) { ret 1; }
     ret 0;
 }
 
 test "http.client.policy: retries require explicit and unambiguous replay safety" {
     val configured: RetryPolicy = retry_policy_default();
-    val safe: Replay = Replay{explicit: true, body: BODY_REWINDABLE};
-    val streaming: Replay = Replay{explicit: true, body: BODY_STREAMING};
-    val refused: Failure = Failure{reason: RETRY_REFUSED_STREAM,
+    val safe:       Replay      = Replay{explicit: true, body: BODY_REWINDABLE};
+    val streaming:  Replay      = Replay{explicit: true, body: BODY_STREAMING};
+    val refused:    Failure     = Failure{reason: RETRY_REFUSED_STREAM,
         definitely_unprocessed: true, response_started: false,
-        response_complete: false, retry_after_ns: 0};
+        response_complete:      false, retry_after_ns: 0};
     val ambiguous: Failure = Failure{reason: RETRY_TRANSPORT,
         definitely_unprocessed: false, response_started: false,
-        response_complete: false, retry_after_ns: 0};
+        response_complete:      false, retry_after_ns: 0};
     var response_policy: RetryPolicy = configured;
     response_policy.retry_server = true;
     val server: Failure = Failure{reason: RETRY_SERVER,
         definitely_unprocessed: false, response_started: true,
-        response_complete: true, retry_after_ns: 5};
+        response_complete:      true, retry_after_ns: 5};
     if (retry(configured, safe, refused, 1).status != RETRY_ALLOWED
         || retry(configured, streaming, refused, 1).status != RETRY_DENIED
         || retry(configured, Replay{explicit: false, body: BODY_EMPTY},
-            refused, 1).status != RETRY_DENIED
+        refused, 1).status != RETRY_DENIED
         || retry(configured, safe, ambiguous, 1).status != RETRY_DENIED
         || retry(configured, safe, Failure{reason: RETRY_GOAWAY,
-            definitely_unprocessed: false, response_started: false,
-            response_complete: false, retry_after_ns: 0}, 1).status
-            != RETRY_DENIED
+        definitely_unprocessed: false, response_started: false,
+        response_complete:      false, retry_after_ns: 0}, 1).status
+        != RETRY_DENIED
         || retry(configured, safe, refused, 3).status != RETRY_LIMITED
         || retry(response_policy, safe, server, 1).status != RETRY_ALLOWED
         || retry(response_policy, safe, Failure{reason: RETRY_SERVER,
-            definitely_unprocessed: false, response_started: true,
-            response_complete: false, retry_after_ns: 0}, 1).status
-            != RETRY_INVALID) { ret 1; }
+        definitely_unprocessed: false, response_started: true,
+        response_complete:      false, retry_after_ns: 0}, 1).status
+        != RETRY_INVALID) { ret 1; }
     ret 0;
 }

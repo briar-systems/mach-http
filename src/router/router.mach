@@ -1,3 +1,7 @@
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.target;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -5,138 +9,134 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
-use http.core.field;
-use http.core.message;
-use http.core.method;
-use http.core.target;
 
 pub val HANDLER_RESPOND: u8 = 1;
-pub val HANDLER_NEXT: u8 = 2;
+pub val HANDLER_NEXT:    u8 = 2;
 
 pub def HostKind: u8;
-pub val HOST_ANY: HostKind = 1;
+pub val HOST_ANY:    HostKind = 1;
 pub val HOST_SUFFIX: HostKind = 2;
-pub val HOST_EXACT: HostKind = 3;
+pub val HOST_EXACT:  HostKind = 3;
 
 pub def SegmentKind: u8;
-pub val SEGMENT_LITERAL: SegmentKind = 1;
+pub val SEGMENT_LITERAL:   SegmentKind = 1;
 pub val SEGMENT_PARAMETER: SegmentKind = 2;
 pub val SEGMENT_CATCH_ALL: SegmentKind = 3;
 
 pub def CompileStatus: u8;
-pub val COMPILE_OK: CompileStatus = 1;
-pub val COMPILE_INVALID: CompileStatus = 2;
-pub val COMPILE_ROUTE_CAPACITY: CompileStatus = 3;
+pub val COMPILE_OK:               CompileStatus = 1;
+pub val COMPILE_INVALID:          CompileStatus = 2;
+pub val COMPILE_ROUTE_CAPACITY:   CompileStatus = 3;
 pub val COMPILE_SEGMENT_CAPACITY: CompileStatus = 4;
-pub val COMPILE_METHOD: CompileStatus = 5;
-pub val COMPILE_HOST: CompileStatus = 6;
-pub val COMPILE_PATTERN: CompileStatus = 7;
-pub val COMPILE_PARAMETER: CompileStatus = 8;
-pub val COMPILE_UNREACHABLE: CompileStatus = 9;
-pub val COMPILE_CONFLICT: CompileStatus = 10;
-pub val COMPILE_HANDLER: CompileStatus = 11;
+pub val COMPILE_METHOD:           CompileStatus = 5;
+pub val COMPILE_HOST:             CompileStatus = 6;
+pub val COMPILE_PATTERN:          CompileStatus = 7;
+pub val COMPILE_PARAMETER:        CompileStatus = 8;
+pub val COMPILE_UNREACHABLE:      CompileStatus = 9;
+pub val COMPILE_CONFLICT:         CompileStatus = 10;
+pub val COMPILE_HANDLER:          CompileStatus = 11;
 
 pub def DispatchStatus: u8;
-pub val DISPATCH_MATCH: DispatchStatus = 1;
-pub val DISPATCH_NOT_FOUND: DispatchStatus = 2;
-pub val DISPATCH_INVALID: DispatchStatus = 3;
-pub val DISPATCH_METHOD: DispatchStatus = 4;
-pub val DISPATCH_HOST: DispatchStatus = 5;
-pub val DISPATCH_PATH: DispatchStatus = 6;
+pub val DISPATCH_MATCH:            DispatchStatus = 1;
+pub val DISPATCH_NOT_FOUND:        DispatchStatus = 2;
+pub val DISPATCH_INVALID:          DispatchStatus = 3;
+pub val DISPATCH_METHOD:           DispatchStatus = 4;
+pub val DISPATCH_HOST:             DispatchStatus = 5;
+pub val DISPATCH_PATH:             DispatchStatus = 6;
 pub val DISPATCH_CAPTURE_CAPACITY: DispatchStatus = 7;
 
 pub val NO_INDEX: usize = (-1)::usize;
 
 pub rec Limits {
-    max_routes: usize;
-    max_segments: usize;
+    max_routes:               usize;
+    max_segments:             usize;
     max_parameters_per_route: usize;
-    max_method_bytes: usize;
-    max_host_bytes: usize;
-    max_pattern_bytes: usize;
-    max_path_bytes: usize;
+    max_method_bytes:         usize;
+    max_host_bytes:           usize;
+    max_pattern_bytes:        usize;
+    max_path_bytes:           usize;
 }
 
 pub rec Capture {
-    name: view.View;
-    value: view.View;
-    decoded_length: usize;
-    catch_all: bool;
-    router_generation: u64;
+    name:               view.View;
+    value:              view.View;
+    decoded_length:     usize;
+    catch_all:          bool;
+    router_generation:  u64;
     request_generation: u64;
 }
 
 pub rec Params {
-    items: *Capture;
-    len: usize;
-    router_generation: u64;
+    items:              *Capture;
+    len:                usize;
+    router_generation:  u64;
     request_generation: u64;
 }
 
 pub def Handler: fun(ptr, *message.Request, *message.Response, *Params) res[u8, str];
 
 pub rec Route {
-    method: view.View;
-    host: view.View;
-    pattern: view.View;
+    method:      view.View;
+    host:        view.View;
+    pattern:     view.View;
     handler_ctx: ptr;
-    handler: Handler;
+    handler:     Handler;
 }
 
 pub rec HostPattern {
-    kind: HostKind;
-    name: view.View;
+    kind:     HostKind;
+    name:     view.View;
     has_port: bool;
-    port: u16;
+    port:     u16;
 }
 
 pub rec Segment {
-    kind: SegmentKind;
-    value: view.View;
+    kind:           SegmentKind;
+    value:          view.View;
     pattern_offset: usize;
 }
 
 pub rec CompiledRoute {
-    method: view.View;
-    any_method: bool;
-    host: HostPattern;
-    segment_start: usize;
-    segment_count: usize;
+    method:          view.View;
+    any_method:      bool;
+    host:            HostPattern;
+    segment_start:   usize;
+    segment_count:   usize;
     parameter_count: usize;
-    non_path: bool;
-    source_index: usize;
-    handler_ctx: ptr;
-    handler: Handler;
+    non_path:        bool;
+    source_index:    usize;
+    handler_ctx:     ptr;
+    handler:         Handler;
 }
 
 pub rec Router {
-    routes: *CompiledRoute;
-    route_len: usize;
-    route_capacity: usize;
-    segments: *Segment;
-    segment_len: usize;
+    routes:           *CompiledRoute;
+    route_len:        usize;
+    route_capacity:   usize;
+    segments:         *Segment;
+    segment_len:      usize;
     segment_capacity: usize;
-    configured: Limits;
-    generation: u64;
-    initialized: bool;
+    configured:       Limits;
+    generation:       u64;
+    initialized:      bool;
 }
 
 pub rec Compile {
-    status: CompileStatus;
-    route: usize;
+    status:         CompileStatus;
+    route:          usize;
     conflict_route: usize;
     pattern_offset: usize;
-    needed: usize;
-    capacity: usize;
+    needed:         usize;
+    capacity:       usize;
 }
 
 pub rec Dispatch {
-    status: DispatchStatus;
-    route: usize;
+    status:       DispatchStatus;
+    route:        usize;
     source_index: usize;
-    handler_ctx: ptr;
-    handler: Handler;
-    params: Params;
+    handler_ctx:  ptr;
+    handler:      Handler;
+    params:       Params;
 }
 
 rec PathCursor {
@@ -145,21 +145,21 @@ rec PathCursor {
 }
 
 rec Authority {
-    name: view.View;
+    name:     view.View;
     has_port: bool;
-    port: u16;
-    valid: bool;
+    port:     u16;
+    valid:    bool;
 }
 
 pub fun limits_default() Limits {
     ret Limits{
-        max_routes: 256,
-        max_segments: 2048,
+        max_routes:               256,
+        max_segments:             2048,
         max_parameters_per_route: 16,
-        max_method_bytes: 32,
-        max_host_bytes: 1024,
-        max_pattern_bytes: 8192,
-        max_path_bytes: 8192,
+        max_method_bytes:         32,
+        max_host_bytes:           1024,
+        max_pattern_bytes:        8192,
+        max_path_bytes:           8192,
     };
 }
 
@@ -208,7 +208,7 @@ fun insensitive_equal(a: view.View, b: view.View) bool {
 
 fun insensitive_suffix(value: view.View, suffix: view.View) bool {
     if (value.len <= suffix.len || value.data == nil || suffix.data == nil
-     || value.data[value.len - suffix.len - 1] != '.') { ret false; }
+        || value.data[value.len - suffix.len - 1] != '.') { ret false; }
     ret insensitive_equal(subview(value, value.len - suffix.len, suffix.len), suffix);
 }
 
@@ -225,11 +225,12 @@ fun decoded_next(value: view.View, offset: *usize, output: *u8) bool {
     if (c == '%') {
         if (@offset + 2 >= value.len) { ret false; }
         val high: i16 = hex(value.data[@offset + 1]);
-        val low: i16 = hex(value.data[@offset + 2]);
+        val low:  i16 = hex(value.data[@offset + 2]);
         if (high < 0 || low < 0) { ret false; }
-        c = (high * 16 + low)::u8;
+        c       = (high * 16 + low)::u8;
         @offset = @offset + 3;
-    } or {
+    }
+    or {
         @offset = @offset + 1;
     }
     if (c == 0 || c == '\\' || c == '/' || c < ' ' || c == 127) { ret false; }
@@ -239,8 +240,8 @@ fun decoded_next(value: view.View, offset: *usize, output: *u8) bool {
 
 fun semantic_length(value: view.View) usize {
     var offset: usize = 0;
-    var count: usize = 0;
-    var c: u8 = 0;
+    var count:  usize = 0;
+    var c:      u8    = 0;
     for (offset < value.len) {
         if (!decoded_next(value, ?offset, ?c)) { ret NO_INDEX; }
         count = count + 1;
@@ -250,12 +251,13 @@ fun semantic_length(value: view.View) usize {
 
 fun catch_all_length(value: view.View) usize {
     var offset: usize = 0;
-    var count: usize = 0;
-    var c: u8 = 0;
+    var count:  usize = 0;
+    var c:      u8    = 0;
     for (offset < value.len) {
         if (value.data[offset] == '/') {
             offset = offset + 1;
-        } or {
+        }
+        or {
             if (!decoded_next(value, ?offset, ?c)) { ret NO_INDEX; }
         }
         count = count + 1;
@@ -264,10 +266,10 @@ fun catch_all_length(value: view.View) usize {
 }
 
 fun semantic_equal(a: view.View, b: view.View) bool {
-    var left: usize = 0;
+    var left:  usize = 0;
     var right: usize = 0;
-    var ac: u8 = 0;
-    var bc: u8 = 0;
+    var ac:    u8    = 0;
+    var bc:    u8    = 0;
     for (left < a.len && right < b.len) {
         if (!decoded_next(a, ?left, ?ac) || !decoded_next(b, ?right, ?bc) || ac != bc) {
             ret false;
@@ -278,10 +280,10 @@ fun semantic_equal(a: view.View, b: view.View) bool {
 
 fun dot_segment(value: view.View) bool {
     var offset: usize = 0;
-    var first: u8 = 0;
-    var second: u8 = 0;
-    if (!decoded_next(value, ?offset, ?first) || first != '.') { ret false; }
-    if (offset == value.len) { ret true; }
+    var first:  u8    = 0;
+    var second: u8    = 0;
+    if (!decoded_next(value, ?offset, ?first) || first != '.')   { ret false; }
+    if (offset == value.len)                                     { ret true; }
     if (!decoded_next(value, ?offset, ?second) || second != '.') { ret false; }
     ret offset == value.len;
 }
@@ -301,12 +303,12 @@ fun path_cursor(path: view.View) PathCursor {
 
 fun next_path_segment(path: view.View, cursor: *PathCursor, output: *view.View) bool {
     if (cursor == nil || output == nil || cursor.done || cursor.next > path.len) { ret false; }
-    val start: usize = cursor.next;
+    val start:  usize = cursor.next;
     var finish: usize = start;
     for (finish < path.len && path.data[finish] != '/') { finish = finish + 1; }
     @output = subview(path, start, finish - start);
     if (finish == path.len) { cursor.done = true; }
-    or { cursor.next = finish + 1; }
+    or                      { cursor.next = finish + 1; }
     ret true;
 }
 
@@ -314,7 +316,7 @@ fun path_valid(path: view.View, max_bytes: usize) bool {
     if (path.data == nil || path.len == 0 || path.len > max_bytes || path.data[0] != '/') {
         ret false;
     }
-    var cursor: PathCursor = path_cursor(path);
+    var cursor:  PathCursor = path_cursor(path);
     var segment: view.View;
     for (next_path_segment(path, ?cursor, ?segment)) {
         if (!segment_valid(segment)) { ret false; }
@@ -354,7 +356,7 @@ fun host_name_valid(value: view.View, literal: bool) bool {
     for (i < value.len) {
         if (!host_char(value.data[i], literal)) { ret false; }
         if (!literal && value.data[i] == '.'
-         && (i == 0 || i + 1 == value.len || value.data[i - 1] == '.')) { ret false; }
+            && (i == 0 || i + 1 == value.len || value.data[i - 1] == '.')) { ret false; }
         i = i + 1;
     }
     ret true;
@@ -362,14 +364,14 @@ fun host_name_valid(value: view.View, literal: bool) bool {
 
 fun parse_port(value: view.View, start: usize, output: *u16) bool {
     if (output == nil || start >= value.len) { ret false; }
-    var port: u32 = 0;
-    var i: usize = start;
+    var port: u32   = 0;
+    var i:    usize = start;
     for (i < value.len) {
         if (value.data[i] < '0' || value.data[i] > '9') { ret false; }
         val digit: u32 = (value.data[i] - '0')::u32;
         if (port > (65535 - digit) / 10) { ret false; }
         port = port * 10 + digit;
-        i = i + 1;
+        i    = i + 1;
     }
     @output = port::u16;
     ret true;
@@ -383,21 +385,22 @@ fun parse_authority(value: view.View, allow_pattern: bool) Authority {
     }
     if (value.data == nil) { ret parsed; }
     var name_start_offset: usize = 0;
-    var name_finish: usize = value.len;
+    var name_finish:       usize = value.len;
     if (value.data[0] == '[') {
         var close: usize = 1;
         for (close < value.len && value.data[close] != ']') { close = close + 1; }
         if (close == value.len || close == 1
-         || !host_name_valid(subview(value, 1, close - 1), true)) { ret parsed; }
+            || !host_name_valid(subview(value, 1, close - 1), true)) { ret parsed; }
         name_finish = close + 1;
         if (name_finish < value.len) {
             if (value.data[name_finish] != ':'
-             || !parse_port(value, name_finish + 1, ?parsed.port)) { ret parsed; }
+                || !parse_port(value, name_finish + 1, ?parsed.port)) { ret parsed; }
             parsed.has_port = true;
         }
-    } or {
+    }
+    or {
         var colon: usize = value.len;
-        var i: usize = 0;
+        var i:     usize = 0;
         for (i < value.len) {
             if (value.data[i] == ':') {
                 if (colon != value.len) { ret parsed; }
@@ -412,7 +415,7 @@ fun parse_authority(value: view.View, allow_pattern: bool) Authority {
         }
         if (allow_pattern && name_finish != 0 && value.data[0] == '*') {
             if (name_finish == 1) {
-                parsed.name = view.view(nil, 0);
+                parsed.name  = view.view(nil, 0);
                 parsed.valid = true;
                 ret parsed;
             }
@@ -425,7 +428,7 @@ fun parse_authority(value: view.View, allow_pattern: bool) Authority {
         if (!host_name_valid(subview(value, name_start_offset,
             name_finish - name_start_offset), false)) { ret parsed; }
     }
-    parsed.name = subview(value, name_start_offset, name_finish - name_start_offset);
+    parsed.name  = subview(value, name_start_offset, name_finish - name_start_offset);
     parsed.valid = true;
     ret parsed;
 }
@@ -448,10 +451,10 @@ fun compile_host(value: view.View, max_bytes: usize, output: *HostPattern) bool 
 }
 
 fun host_matches(pattern: HostPattern, actual: Authority) bool {
-    if (!actual.valid) { ret false; }
+    if (!actual.valid)                                                         { ret false; }
     if (pattern.has_port && (!actual.has_port || actual.port != pattern.port)) { ret false; }
-    if (pattern.kind == HOST_ANY) { ret true; }
-    if (pattern.kind == HOST_EXACT) { ret insensitive_equal(pattern.name, actual.name); }
+    if (pattern.kind == HOST_ANY)                                              { ret true; }
+    if (pattern.kind == HOST_EXACT)                                            { ret insensitive_equal(pattern.name, actual.name); }
     ret insensitive_suffix(actual.name, pattern.name);
 }
 
@@ -473,7 +476,7 @@ fun parameter_duplicate(router: *Router, route: *CompiledRoute, name: view.View)
     for (i < route.segment_count) {
         val segment: *Segment = ?router.segments[route.segment_start + i];
         if ((segment.kind == SEGMENT_PARAMETER || segment.kind == SEGMENT_CATCH_ALL)
-         && exact(segment.value, name.data, name.len)) { ret true; }
+            && exact(segment.value, name.data, name.len)) { ret true; }
         i = i + 1;
     }
     ret false;
@@ -482,24 +485,25 @@ fun parameter_duplicate(router: *Router, route: *CompiledRoute, name: view.View)
 fun append_segment(router: *Router, route: *CompiledRoute, kind: SegmentKind,
     value: view.View, offset: usize, source_index: usize) Compile {
     if (router.segment_len >= router.configured.max_segments
-     || router.segment_len >= router.segment_capacity) {
+        || router.segment_len >= router.segment_capacity) {
         var capacity: usize = router.segment_capacity;
         if (capacity > router.configured.max_segments) { capacity = router.configured.max_segments; }
         ret compile_result(COMPILE_SEGMENT_CAPACITY, source_index, NO_INDEX,
             offset, router.segment_len + 1, capacity);
     }
     if ((kind == SEGMENT_PARAMETER || kind == SEGMENT_CATCH_ALL)
-     && route.parameter_count >= router.configured.max_parameters_per_route) {
+        && route.parameter_count >= router.configured.max_parameters_per_route) {
         ret compile_result(COMPILE_PARAMETER, source_index, NO_INDEX, offset,
             route.parameter_count + 1, router.configured.max_parameters_per_route);
     }
     if ((kind == SEGMENT_PARAMETER || kind == SEGMENT_CATCH_ALL)
-     && parameter_duplicate(router, route, value)) {
+        && parameter_duplicate(router, route, value)) {
         ret compile_result(COMPILE_PARAMETER, source_index, NO_INDEX, offset, 0, 0);
     }
     router.segments[router.segment_len] = Segment{
-        kind: kind, value: value, pattern_offset: offset};
-    router.segment_len = router.segment_len + 1;
+        kind: kind, value: value, pattern_offset: offset
+    };
+    router.segment_len  = router.segment_len + 1;
     route.segment_count = route.segment_count + 1;
     if (kind == SEGMENT_PARAMETER || kind == SEGMENT_CATCH_ALL) {
         route.parameter_count = route.parameter_count + 1;
@@ -510,7 +514,7 @@ fun append_segment(router: *Router, route: *CompiledRoute, kind: SegmentKind,
 fun compile_pattern(router: *Router, route: *CompiledRoute,
     pattern: view.View, source_index: usize) Compile {
     if (pattern.data == nil || pattern.len == 0
-     || pattern.len > router.configured.max_pattern_bytes) {
+        || pattern.len > router.configured.max_pattern_bytes) {
         ret compile_result(COMPILE_PATTERN, source_index, NO_INDEX, 0,
             pattern.len, router.configured.max_pattern_bytes);
     }
@@ -526,17 +530,18 @@ fun compile_pattern(router: *Router, route: *CompiledRoute,
     for (start <= pattern.len) {
         var finish: usize = start;
         for (finish < pattern.len && pattern.data[finish] != '/') { finish = finish + 1; }
-        val raw: view.View = subview(pattern, start, finish - start);
-        var kind: SegmentKind = SEGMENT_LITERAL;
-        var value: view.View = raw;
+        val raw:   view.View   = subview(pattern, start, finish - start);
+        var kind:  SegmentKind = SEGMENT_LITERAL;
+        var value: view.View   = raw;
         if (raw.len != 0 && raw.data[0] == ':') {
-            kind = SEGMENT_PARAMETER;
+            kind  = SEGMENT_PARAMETER;
             value = subview(raw, 1, raw.len - 1);
             if (!parameter_name(value)) {
                 ret compile_result(COMPILE_PARAMETER, source_index, NO_INDEX, start, 0, 0);
             }
-        } or (raw.len != 0 && raw.data[0] == '*') {
-            kind = SEGMENT_CATCH_ALL;
+        }
+        or (raw.len != 0 && raw.data[0] == '*') {
+            kind  = SEGMENT_CATCH_ALL;
             value = subview(raw, 1, raw.len - 1);
             if (!parameter_name(value)) {
                 ret compile_result(COMPILE_PARAMETER, source_index, NO_INDEX, start, 0, 0);
@@ -544,14 +549,15 @@ fun compile_pattern(router: *Router, route: *CompiledRoute,
             if (finish != pattern.len) {
                 ret compile_result(COMPILE_UNREACHABLE, source_index, NO_INDEX, finish + 1, 0, 0);
             }
-        } or {
+        }
+        or {
             if (!segment_valid(raw)) {
                 ret compile_result(COMPILE_PATTERN, source_index, NO_INDEX, start, 0, 0);
             }
         }
         val added: Compile = append_segment(router, route, kind, value, start, source_index);
         if (added.status != COMPILE_OK) { ret added; }
-        if (finish == pattern.len) { brk; }
+        if (finish == pattern.len)      { brk; }
         start = finish + 1;
     }
     ret compile_result(COMPILE_OK, source_index, NO_INDEX, 0, 0, 0);
@@ -568,13 +574,13 @@ fun method_same(a: *CompiledRoute, b: *CompiledRoute) bool {
 }
 
 fun path_same(router: *Router, a: *CompiledRoute, b: *CompiledRoute) bool {
-    if (a.non_path || b.non_path) { ret a.non_path && b.non_path; }
+    if (a.non_path || b.non_path)           { ret a.non_path && b.non_path; }
     if (a.segment_count != b.segment_count) { ret false; }
     var i: usize = 0;
     for (i < a.segment_count) {
-        val left: *Segment = ?router.segments[a.segment_start + i];
+        val left:  *Segment = ?router.segments[a.segment_start + i];
         val right: *Segment = ?router.segments[b.segment_start + i];
-        if (left.kind != right.kind) { ret false; }
+        if (left.kind != right.kind)                                                  { ret false; }
         if (left.kind == SEGMENT_LITERAL && !semantic_equal(left.value, right.value)) { ret false; }
         i = i + 1;
     }
@@ -586,7 +592,7 @@ fun find_conflict(router: *Router, candidate: *CompiledRoute) usize {
     for (i < router.route_len) {
         val existing: *CompiledRoute = ?router.routes[i];
         if (host_same(existing.host, candidate.host) && method_same(existing, candidate)
-         && path_same(router, existing, candidate)) { ret existing.source_index; }
+            && path_same(router, existing, candidate)) { ret existing.source_index; }
         i = i + 1;
     }
     ret NO_INDEX;
@@ -597,8 +603,8 @@ pub fun compile(router: *Router, specs: *Route, count: usize,
     segment_storage: *Segment, segment_capacity: usize,
     configured: Limits) Compile {
     if (router == nil || !limits_valid(configured)
-     || (count != 0 && specs == nil) || (route_capacity != 0 && route_storage == nil)
-     || (segment_capacity != 0 && segment_storage == nil)) {
+        || (count != 0 && specs == nil) || (route_capacity != 0 && route_storage == nil)
+        || (segment_capacity != 0 && segment_storage == nil)) {
         ret compile_result(COMPILE_INVALID, NO_INDEX, NO_INDEX, 0, 0, 0);
     }
     if (router.generation == (-1)::u64) {
@@ -606,15 +612,15 @@ pub fun compile(router: *Router, specs: *Route, count: usize,
         ret compile_result(COMPILE_INVALID, NO_INDEX, NO_INDEX, 0, 0, 0);
     }
     val generation: u64 = router.generation + 1;
-    router.routes = route_storage;
-    router.route_len = 0;
-    router.route_capacity = route_capacity;
-    router.segments = segment_storage;
-    router.segment_len = 0;
+    router.routes           = route_storage;
+    router.route_len        = 0;
+    router.route_capacity   = route_capacity;
+    router.segments         = segment_storage;
+    router.segment_len      = 0;
     router.segment_capacity = segment_capacity;
-    router.configured = configured;
-    router.generation = generation;
-    router.initialized = false;
+    router.configured       = configured;
+    router.generation       = generation;
+    router.initialized      = false;
     if (count > configured.max_routes || count > route_capacity) {
         var capacity: usize = route_capacity;
         if (capacity > configured.max_routes) { capacity = configured.max_routes; }
@@ -631,12 +637,12 @@ pub fun compile(router: *Router, specs: *Route, count: usize,
                 spec.method.len, configured.max_method_bytes);
         }
         var compiled: CompiledRoute;
-        compiled.method = spec.method;
-        compiled.any_method = method_any(spec.method);
+        compiled.method        = spec.method;
+        compiled.any_method    = method_any(spec.method);
         compiled.segment_start = router.segment_len;
-        compiled.source_index = i;
-        compiled.handler_ctx = spec.handler_ctx;
-        compiled.handler = spec.handler;
+        compiled.source_index  = i;
+        compiled.handler_ctx   = spec.handler_ctx;
+        compiled.handler       = spec.handler;
         if (!compile_host(spec.host, configured.max_host_bytes, ?compiled.host)) {
             ret compile_result(COMPILE_HOST, i, NO_INDEX, 0,
                 spec.host.len, configured.max_host_bytes);
@@ -648,28 +654,28 @@ pub fun compile(router: *Router, specs: *Route, count: usize,
             ret compile_result(COMPILE_CONFLICT, i, conflict, 0, 0, 0);
         }
         router.routes[router.route_len] = compiled;
-        router.route_len = router.route_len + 1;
-        i = i + 1;
+        router.route_len                = router.route_len + 1;
+        i                               = i + 1;
     }
     router.initialized = true;
     ret compile_result(COMPILE_OK, NO_INDEX, NO_INDEX, 0, 0, 0);
 }
 
 fun segment_rank(kind: SegmentKind) usize {
-    if (kind == SEGMENT_LITERAL) { ret 3; }
+    if (kind == SEGMENT_LITERAL)   { ret 3; }
     if (kind == SEGMENT_PARAMETER) { ret 2; }
     ret 1;
 }
 
 fun path_precedes(router: *Router, a: *CompiledRoute, b: *CompiledRoute) bool {
-    var i: usize = 0;
+    var i:      usize = 0;
     var shared: usize = a.segment_count;
     if (shared > b.segment_count) { shared = b.segment_count; }
     for (i < shared) {
-        val left: *Segment = ?router.segments[a.segment_start + i];
-        val right: *Segment = ?router.segments[b.segment_start + i];
-        val left_rank: usize = segment_rank(left.kind);
-        val right_rank: usize = segment_rank(right.kind);
+        val left:       *Segment = ?router.segments[a.segment_start + i];
+        val right:      *Segment = ?router.segments[b.segment_start + i];
+        val left_rank:  usize    = segment_rank(left.kind);
+        val right_rank: usize    = segment_rank(right.kind);
         if (left_rank != right_rank) { ret left_rank > right_rank; }
         i = i + 1;
     }
@@ -686,9 +692,9 @@ fun route_precedes(router: *Router, a: *CompiledRoute, b: *CompiledRoute) bool {
         ret a.host.name.len > b.host.name.len;
     }
     if (a.host.has_port != b.host.has_port) { ret a.host.has_port; }
-    if (path_precedes(router, a, b)) { ret true; }
-    if (path_precedes(router, b, a)) { ret false; }
-    if (a.any_method != b.any_method) { ret !a.any_method; }
+    if (path_precedes(router, a, b))        { ret true; }
+    if (path_precedes(router, b, a))        { ret false; }
+    if (a.any_method != b.any_method)       { ret !a.any_method; }
     ret a.source_index < b.source_index;
 }
 
@@ -696,10 +702,10 @@ fun capture_value(params: *Params, segment: *Segment, value: view.View) bool {
     if (params == nil || params.items == nil) { ret false; }
     var length: usize = semantic_length(value);
     if (segment.kind == SEGMENT_CATCH_ALL) { length = catch_all_length(value); }
-    if (length == NO_INDEX) { ret false; }
+    if (length == NO_INDEX)                { ret false; }
     params.items[params.len] = Capture{name: segment.value, value: value,
-        decoded_length: length, catch_all: segment.kind == SEGMENT_CATCH_ALL,
-        router_generation: params.router_generation,
+        decoded_length:     length, catch_all: segment.kind == SEGMENT_CATCH_ALL,
+        router_generation:  params.router_generation,
         request_generation: params.request_generation};
     params.len = params.len + 1;
     ret true;
@@ -707,20 +713,21 @@ fun capture_value(params: *Params, segment: *Segment, value: view.View) bool {
 
 pub fun decode_capture(capture: *Capture, output: *u8, output_capacity: usize) bool {
     if (capture == nil || capture.router_generation == 0 || capture.request_generation == 0
-     || capture.decoded_length > output_capacity
-     || (capture.decoded_length != 0 && output == nil)) { ret false; }
-    var input_offset: usize = 0;
+        || capture.decoded_length > output_capacity
+        || (capture.decoded_length != 0 && output == nil)) { ret false; }
+    var input_offset:  usize = 0;
     var output_offset: usize = 0;
-    var c: u8 = 0;
+    var c:             u8    = 0;
     for (input_offset < capture.value.len) {
         if (capture.catch_all && capture.value.data[input_offset] == '/') {
-            c = '/';
+            c            = '/';
             input_offset = input_offset + 1;
-        } or {
+        }
+        or {
             if (!decoded_next(capture.value, ?input_offset, ?c)) { ret false; }
         }
         output[output_offset] = c;
-        output_offset = output_offset + 1;
+        output_offset         = output_offset + 1;
     }
     ret output_offset == capture.decoded_length;
 }
@@ -728,12 +735,12 @@ pub fun decode_capture(capture: *Capture, output: *u8, output_capacity: usize) b
 fun path_matches(router: *Router, route: *CompiledRoute, path: view.View,
     params: *Params, write_captures: bool) bool {
     var cursor: PathCursor = path_cursor(path);
-    var i: usize = 0;
+    var i:      usize      = 0;
     for (i < route.segment_count) {
         val compiled: *Segment = ?router.segments[route.segment_start + i];
         if (compiled.kind == SEGMENT_CATCH_ALL) {
             var remaining: view.View = view.view(nil, 0);
-            if (!cursor.done) { remaining = subview(path, cursor.next, path.len - cursor.next); }
+            if (!cursor.done)                                                  { remaining = subview(path, cursor.next, path.len - cursor.next); }
             if (write_captures && !capture_value(params, compiled, remaining)) { ret false; }
             ret true;
         }
@@ -741,8 +748,9 @@ fun path_matches(router: *Router, route: *CompiledRoute, path: view.View,
         if (!next_path_segment(path, ?cursor, ?actual)) { ret false; }
         if (compiled.kind == SEGMENT_LITERAL) {
             if (!semantic_equal(compiled.value, actual)) { ret false; }
-        } or {
-            if (actual.len == 0) { ret false; }
+        }
+        or {
+            if (actual.len == 0)                                            { ret false; }
             if (write_captures && !capture_value(params, compiled, actual)) { ret false; }
         }
         i = i + 1;
@@ -753,7 +761,7 @@ fun path_matches(router: *Router, route: *CompiledRoute, path: view.View,
 fun route_matches(router: *Router, route: *CompiledRoute, request: *message.Request,
     actual_host: Authority, path: view.View, non_path: bool) bool {
     if (!method_matches(route, request) || !host_matches(route.host, actual_host)
-     || route.non_path != non_path) { ret false; }
+        || route.non_path != non_path) { ret false; }
     if (non_path) { ret true; }
     ret path_matches(router, route, path, nil, false);
 }
@@ -761,14 +769,14 @@ fun route_matches(router: *Router, route: *CompiledRoute, request: *message.Requ
 fun request_authority(request: *message.Request, valid: *bool) view.View {
     @valid = false;
     if (request == nil || !request.fields.valid || request.fields.len > request.fields.capacity
-     || (request.fields.len != 0 && request.fields.items == nil)) { ret view.view(nil, 0); }
+        || (request.fields.len != 0 && request.fields.items == nil)) { ret view.view(nil, 0); }
     if (request.target.authority.len != 0) {
         @valid = request.target.authority.data != nil;
         ret request.target.authority;
     }
     var found: view.View = view.view(nil, 0);
-    var count: usize = 0;
-    var i: usize = 0;
+    var count: usize     = 0;
+    var i:     usize     = 0;
     for (i < request.fields.len) {
         if (field.name_equal(request.fields.items[i].name, view.view("host", 4))) {
             found = request.fields.items[i].value;
@@ -783,13 +791,13 @@ fun request_authority(request: *message.Request, valid: *bool) view.View {
 fun empty_dispatch(status: DispatchStatus) Dispatch {
     ret Dispatch{status: status, route: NO_INDEX, source_index: NO_INDEX,
         handler_ctx: nil, handler: 0::Handler,
-        params: Params{items: nil, len: 0, router_generation: 0, request_generation: 0}};
+        params:      Params{items: nil, len: 0, router_generation: 0, request_generation: 0}};
 }
 
 pub fun dispatch_with_authority(router: *Router, request: *message.Request,
     authority: view.View, captures: *Capture, capture_capacity: usize) Dispatch {
     if (router == nil || !router.initialized || request == nil || request.generation == 0
-     || (capture_capacity != 0 && captures == nil)) { ret empty_dispatch(DISPATCH_INVALID); }
+        || (capture_capacity != 0 && captures == nil)) { ret empty_dispatch(DISPATCH_INVALID); }
     if (!method.valid(request.method, router.configured.max_method_bytes)) {
         ret empty_dispatch(DISPATCH_METHOD);
     }
@@ -799,9 +807,9 @@ pub fun dispatch_with_authority(router: *Router, request: *message.Request,
     val actual_host: Authority = parse_authority(authority, false);
     if (!actual_host.valid) { ret empty_dispatch(DISPATCH_HOST); }
     if (request.target.form < target.ORIGIN || request.target.form > target.ASTERISK
-     || (request.target.form == target.AUTHORITY && request.method.kind != method.CONNECT)
-     || (request.target.form == target.ASTERISK && request.method.kind != method.OPTIONS)
-     || (request.target.form != target.AUTHORITY && request.method.kind == method.CONNECT)) {
+        || (request.target.form == target.AUTHORITY && request.method.kind != method.CONNECT)
+        || (request.target.form == target.ASTERISK && request.method.kind != method.OPTIONS)
+        || (request.target.form != target.AUTHORITY && request.method.kind == method.CONNECT)) {
         ret empty_dispatch(DISPATCH_INVALID);
     }
     val non_path: bool = request.target.form == target.ASTERISK
@@ -816,11 +824,11 @@ pub fun dispatch_with_authority(router: *Router, request: *message.Request,
         }
     }
     var selected: usize = NO_INDEX;
-    var i: usize = 0;
+    var i:        usize = 0;
     for (i < router.route_len) {
         val candidate: *CompiledRoute = ?router.routes[i];
         if (route_matches(router, candidate, request, actual_host, path, non_path)
-         && (selected == NO_INDEX
+            && (selected == NO_INDEX
             || route_precedes(router, candidate, ?router.routes[selected]))) {
             selected = i;
         }
@@ -843,7 +851,7 @@ pub fun dispatch_with_authority(router: *Router, request: *message.Request,
 pub fun dispatch(router: *Router, request: *message.Request,
     captures: *Capture, capture_capacity: usize) Dispatch {
     if (request == nil) { ret empty_dispatch(DISPATCH_INVALID); }
-    var valid: bool = false;
+    var valid:     bool      = false;
     val authority: view.View = request_authority(request, ?valid);
     if (!valid) { ret empty_dispatch(DISPATCH_HOST); }
     ret dispatch_with_authority(router, request, authority, captures, capture_capacity);
@@ -852,9 +860,9 @@ pub fun dispatch(router: *Router, request: *message.Request,
 pub fun invoke(router: *Router, matched: *Dispatch, request: *message.Request,
     response: *message.Response) res[u8, str] {
     if (router == nil || !router.initialized || matched == nil || request == nil
-     || response == nil || matched.status != DISPATCH_MATCH
-     || matched.handler::usize == 0 || matched.params.router_generation != router.generation
-     || matched.params.request_generation != request.generation) {
+        || response == nil || matched.status != DISPATCH_MATCH
+        || matched.handler::usize == 0 || matched.params.router_generation != router.generation
+        || matched.params.request_generation != request.generation) {
         ret res[u8, str].err{"stale route dispatch"};
     }
     ret matched.handler(matched.handler_ctx, request, response, ?matched.params);
@@ -868,20 +876,21 @@ fun test_handler(context: ptr, request: *message.Request,
 fun test_route(route_method: str, method_length: usize, host: str, host_length: usize,
     pattern: str, pattern_length: usize) Route {
     ret Route{method: view.view(route_method, method_length),
-        host: view.view(host, host_length), pattern: view.view(pattern, pattern_length),
+        host:        view.view(host, host_length), pattern: view.view(pattern, pattern_length),
         handler_ctx: nil, handler: test_handler};
 }
 
 fun test_request(request: *message.Request, request_method: method.Method,
     path: view.View, host_items: *field.Field, host_capacity: usize,
     host: view.View, generation: u64) bool {
-    request.method = request_method;
-    request.target = target.origin(path, path, view.view(nil, 0));
+    request.method     = request_method;
+    request.target     = target.origin(path, path, view.view(nil, 0));
     request.generation = generation;
-    request.fields = field.init(host_items, host_capacity,
+    request.fields     = field.init(host_items, host_capacity,
         field.limits(host_capacity, 2048, 32, 1024));
     if (host.len != 0 && field.append(?request.fields, field.Field{
-        name: view.view("Host", 4), value: host, sensitive: false}) != field.ADD_OK) { ret false; }
+        name: view.view("Host", 4), value: host, sensitive: false
+    }) != field.ADD_OK) { ret false; }
     ret true;
 }
 
@@ -893,59 +902,59 @@ test "http.router.router: precedence is deterministic across host path and metho
     specs[3] = test_route("GET", 3, "api.example.com", 15, "/users/me", 9);
     specs[4] = test_route("GET", 3, "*.example.com", 13, "/users/*tail", 12);
     specs[5] = test_route("POST", 4, "api.example.com:8443", 20, "/users/me", 9);
-    var routes: [6]CompiledRoute;
+    var routes:   [6]CompiledRoute;
     var segments: [16]Segment;
-    var router: Router;
+    var router:   Router;
     if (compile(?router, ?specs[0], 6, ?routes[0], 6, ?segments[0], 16,
         limits_default()).status != COMPILE_OK) { ret 1; }
-    var request: message.Request;
+    var request:   message.Request;
     var host_item: field.Field;
     if (!test_request(?request, method.from_kind(method.GET), view.view("/users/me", 9),
         ?host_item, 1, view.view("API.EXAMPLE.COM:443", 19), 11)) { ret 2; }
     var captures: [2]Capture;
-    val matched: Dispatch = dispatch(?router, ?request, ?captures[0], 2);
+    val matched:  Dispatch = dispatch(?router, ?request, ?captures[0], 2);
     if (matched.status != DISPATCH_MATCH || matched.source_index != 3
-     || matched.params.len != 0) { ret 3; }
-    request.method = method.from_kind(method.POST);
+        || matched.params.len != 0) { ret 3; }
+    request.method  = method.from_kind(method.POST);
     host_item.value = view.view("api.example.com:8443", 20);
     val port_match: Dispatch = dispatch(?router, ?request, ?captures[0], 2);
     if (port_match.status != DISPATCH_MATCH || port_match.source_index != 5) { ret 4; }
-    request.method = method.from_kind(method.GET);
+    request.method  = method.from_kind(method.GET);
     host_item.value = view.view("x.example.com", 13);
-    request.target = target.origin(view.view("/users/42", 9),
+    request.target  = target.origin(view.view("/users/42", 9),
         view.view("/users/42", 9), view.view(nil, 0));
     val parameter: Dispatch = dispatch(?router, ?request, ?captures[0], 2);
     if (parameter.status != DISPATCH_MATCH || parameter.source_index != 1
-     || parameter.params.len != 1 || !exact(captures[0].name, "id", 2)
-     || !exact(captures[0].value, "42", 2)) { ret 5; }
+        || parameter.params.len != 1 || !exact(captures[0].name, "id", 2)
+        || !exact(captures[0].value, "42", 2)) { ret 5; }
     ret 0;
 }
 
 test "http.router.router: parameters and catch alls preserve raw bounded views" {
-    var spec: Route = test_route("GET", 3, "", 0, "/files/:bucket/*path", 20);
-    var route: CompiledRoute;
+    var spec:     Route = test_route("GET", 3, "", 0, "/files/:bucket/*path", 20);
+    var route:    CompiledRoute;
     var segments: [3]Segment;
-    var router: Router;
+    var router:   Router;
     if (compile(?router, ?spec, 1, ?route, 1, ?segments[0], 3,
         limits_default()).status != COMPILE_OK) { ret 1; }
-    var request: message.Request;
+    var request:   message.Request;
     var host_item: field.Field;
-    val path: view.View = view.view("/files/a%62/c%20d/e", 19);
+    val path:      view.View = view.view("/files/a%62/c%20d/e", 19);
     if (!test_request(?request, method.from_kind(method.GET), path,
         ?host_item, 1, view.view("x", 1), 9)) { ret 2; }
     var captures: [2]Capture;
-    val matched: Dispatch = dispatch(?router, ?request, ?captures[0], 2);
+    val matched:  Dispatch = dispatch(?router, ?request, ?captures[0], 2);
     if (matched.status != DISPATCH_MATCH || matched.params.len != 2
-     || !exact(captures[0].name, "bucket", 6) || !exact(captures[0].value, "a%62", 4)
-     || captures[0].decoded_length != 2 || !exact(captures[1].name, "path", 4)
-     || !exact(captures[1].value, "c%20d/e", 7) || captures[1].decoded_length != 5
-     || captures[0].router_generation != 1 || captures[0].request_generation != 9) { ret 3; }
+        || !exact(captures[0].name, "bucket", 6) || !exact(captures[0].value, "a%62", 4)
+        || captures[0].decoded_length != 2 || !exact(captures[1].name, "path", 4)
+        || !exact(captures[1].value, "c%20d/e", 7) || captures[1].decoded_length != 5
+        || captures[0].router_generation != 1 || captures[0].request_generation != 9) { ret 3; }
     var decoded_bucket: [2]u8;
-    var decoded_path: [5]u8;
+    var decoded_path:   [5]u8;
     if (!decode_capture(?captures[0], ?decoded_bucket[0], 2)
-     || !decode_capture(?captures[1], ?decoded_path[0], 5)
-     || !exact(view.view(?decoded_bucket[0], 2), "ab", 2)
-     || !exact(view.view(?decoded_path[0], 5), "c d/e", 5)) { ret 4; }
+        || !decode_capture(?captures[1], ?decoded_path[0], 5)
+        || !exact(view.view(?decoded_bucket[0], 2), "ab", 2)
+        || !exact(view.view(?decoded_path[0], 5), "c d/e", 5)) { ret 4; }
     if (dispatch(?router, ?request, ?captures[0], 1).status != DISPATCH_CAPTURE_CAPACITY) { ret 5; }
     request.target = target.origin(view.view("/files/x/%2f", 12),
         view.view("/files/x/%2f", 12), view.view(nil, 0));
@@ -972,24 +981,24 @@ test "http.router.router: compilation reports conflicts unreachable routes and c
     var conflicts: [2]Route;
     conflicts[0] = test_route("GET", 3, "EXAMPLE.COM", 11, "/users/:id", 10);
     conflicts[1] = test_route("GET", 3, "example.com.", 12, "/users/:name", 12);
-    var routes: [2]CompiledRoute;
+    var routes:   [2]CompiledRoute;
     var segments: [8]Segment;
-    var router: Router;
+    var router:   Router;
     val conflict: Compile = compile(?router, ?conflicts[0], 2,
         ?routes[0], 2, ?segments[0], 8, limits_default());
     if (conflict.status != COMPILE_CONFLICT || conflict.route != 1
-     || conflict.conflict_route != 0 || router.initialized) { ret 1; }
+        || conflict.conflict_route != 0 || router.initialized) { ret 1; }
     conflicts[0] = test_route("GET", 3, "", 0, "/a", 2);
     conflicts[1] = test_route("GET", 3, "", 0, "/%61", 4);
     val encoded_conflict: Compile = compile(?router, ?conflicts[0], 2,
         ?routes[0], 2, ?segments[0], 8, limits_default());
     if (encoded_conflict.status != COMPILE_CONFLICT
-     || encoded_conflict.conflict_route != 0) { ret 2; }
-    var unreachable: Route = test_route("GET", 3, "", 0, "/a/*rest/end", 12);
-    val blocked: Compile = compile(?router, ?unreachable, 1,
+        || encoded_conflict.conflict_route != 0) { ret 2; }
+    var unreachable: Route   = test_route("GET", 3, "", 0, "/a/*rest/end", 12);
+    val blocked:     Compile = compile(?router, ?unreachable, 1,
         ?routes[0], 2, ?segments[0], 8, limits_default());
     if (blocked.status != COMPILE_UNREACHABLE || blocked.route != 0
-     || blocked.pattern_offset != 9) { ret 3; }
+        || blocked.pattern_offset != 9) { ret 3; }
     var malformed: Route = test_route("GET", 3, "", 0, "/a/:9bad", 8);
     if (compile(?router, ?malformed, 1, ?routes[0], 2, ?segments[0], 8,
         limits_default()).status != COMPILE_PARAMETER) { ret 4; }
@@ -999,11 +1008,11 @@ test "http.router.router: compilation reports conflicts unreachable routes and c
     val route_limit: Compile = compile(?router, ?valid[0], 2,
         ?routes[0], 1, ?segments[0], 8, limits_default());
     if (route_limit.status != COMPILE_ROUTE_CAPACITY || route_limit.needed != 2
-     || route_limit.capacity != 1) { ret 5; }
+        || route_limit.capacity != 1) { ret 5; }
     val segment_limit: Compile = compile(?router, ?valid[0], 2,
         ?routes[0], 2, ?segments[0], 3, limits_default());
     if (segment_limit.status != COMPILE_SEGMENT_CAPACITY || segment_limit.needed != 4
-     || segment_limit.capacity != 3) { ret 6; }
+        || segment_limit.capacity != 3) { ret 6; }
     var bad_host: Route = test_route("GET", 3, "bad%2ehost", 10, "/", 1);
     if (compile(?router, ?bad_host, 1, ?routes[0], 2, ?segments[0], 8,
         limits_default()).status != COMPILE_HOST) { ret 7; }
@@ -1011,22 +1020,22 @@ test "http.router.router: compilation reports conflicts unreachable routes and c
 }
 
 test "http.router.router: dispatch and invocation reject stale generations" {
-    var spec: Route = test_route("*", 1, "*", 1, "*", 1);
-    var route: CompiledRoute;
+    var spec:    Route = test_route("*", 1, "*", 1, "*", 1);
+    var route:   CompiledRoute;
     var segment: Segment;
-    var router: Router;
+    var router:  Router;
     if (compile(?router, ?spec, 1, ?route, 1, ?segment, 1,
         limits_default()).status != COMPILE_OK) { ret 1; }
     var request: message.Request;
-    request.method = method.from_kind(method.OPTIONS);
-    request.target = target.asterisk();
+    request.method     = method.from_kind(method.OPTIONS);
+    request.target     = target.asterisk();
     request.generation = 17;
-    request.fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    request.fields     = field.init(nil, 0, field.limits(0, 0, 0, 0));
     val matched: Dispatch = dispatch_with_authority(?router, ?request,
         view.view("example.com", 11), nil, 0);
     if (matched.status != DISPATCH_MATCH || matched.source_index != 0) { ret 2; }
     var response: message.Response;
-    val first: res[u8, str] = invoke(?router, ?matched, ?request, ?response);
+    val first:    res[u8, str] = invoke(?router, ?matched, ?request, ?response);
     if (sel first.err) { ret 3; }
     request.generation = 18;
     val stale: res[u8, str] = invoke(?router, ?matched, ?request, ?response);
@@ -1040,13 +1049,13 @@ test "http.router.router: dispatch and invocation reject stale generations" {
 }
 
 test "http.router.router: hostile request dimensions fail before matching" {
-    var spec: Route = test_route("GET", 3, "example.com", 11, "/ok", 3);
-    var route: CompiledRoute;
+    var spec:    Route = test_route("GET", 3, "example.com", 11, "/ok", 3);
+    var route:   CompiledRoute;
     var segment: Segment;
-    var router: Router;
+    var router:  Router;
     if (compile(?router, ?spec, 1, ?route, 1, ?segment, 1,
         limits_default()).status != COMPILE_OK) { ret 1; }
-    var request: message.Request;
+    var request:    message.Request;
     var host_items: [2]field.Field;
     if (!test_request(?request, method.from_kind(method.GET), view.view("/missing", 8),
         ?host_items[0], 2, view.view("example.com", 11), 1)) { ret 2; }
@@ -1058,10 +1067,10 @@ test "http.router.router: hostile request dimensions fail before matching" {
     host_items[0].value = view.view("example.com", 11);
     if (field.append(?request.fields, field.Field{name: view.view("host", 4),
         value: view.view("example.com", 11), sensitive: false}) != field.ADD_OK
-     || dispatch(?router, ?request, nil, 0).status != DISPATCH_HOST) { ret 5; }
-    request.fields.len = 1;
+        || dispatch(?router, ?request, nil, 0).status != DISPATCH_HOST) { ret 5; }
+    request.fields.len   = 1;
     request.fields.bytes = 15;
-    request.method = method.extension(view.view("BAD METHOD", 10));
+    request.method       = method.extension(view.view("BAD METHOD", 10));
     if (dispatch(?router, ?request, nil, 0).status != DISPATCH_METHOD) { ret 6; }
     request.method = method.from_kind(method.GET);
     request.target = target.authority(view.view("example.com:443", 15));

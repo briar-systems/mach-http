@@ -7,7 +7,7 @@ use std.types.size.usize;
 use std.types.view;
 
 pub fun range(data: ptr, size: usize) bool {
-    if (size == 0) { ret true; }
+    if (size == 0)   { ret true; }
     if (data == nil) { ret false; }
     ret data::usize <= ~(0::usize) - (size - 1);
 }
@@ -29,7 +29,7 @@ pub fun overlap(first: ptr, first_size: usize,
         || !range(first, first_size) || !range(second, second_size)) {
         ret false;
     }
-    val first_end: usize = first::usize + (first_size - 1);
+    val first_end:  usize = first::usize + (first_size - 1);
     val second_end: usize = second::usize + (second_size - 1);
     ret first::usize <= second_end && second::usize <= first_end;
 }
@@ -42,11 +42,11 @@ test "http.client.memory: borrowed ranges reject wrapping arithmetic" {
         || count((?bytes[0])::ptr, ~(0::usize), 2)
         || borrowed(view.view((~(0::usize))::*u8, 2))
         || !overlap((~(0::usize))::ptr, 1,
-            (~(0::usize))::ptr, 1)
+        (~(0::usize))::ptr, 1)
         || !overlap(((~(0::usize)) - 1)::ptr, 2,
-            (~(0::usize))::ptr, 1)
+        (~(0::usize))::ptr, 1)
         || overlap(((~(0::usize)) - 1)::ptr, 1,
-            (~(0::usize))::ptr, 1)
+        (~(0::usize))::ptr, 1)
         || !overlap((?bytes[0])::ptr, 4, (?bytes[3])::ptr, 2)
         || overlap((?bytes[0])::ptr, 4, (?bytes[4])::ptr, 2)) { ret 1; }
     ret 0;

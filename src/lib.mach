@@ -1,7 +1,7 @@
 use std.runtime;
-use std.types.string.str;
-use std.types.size.usize;
 use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
 
 pub val VERSION: str = "0.7.6";
 
@@ -20,7 +20,7 @@ fwd http.h1.connection;
 fwd h2_frame: http.h2.frame;
 fwd http.h2.hpack;
 fwd h2_connection: http.h2.connection;
-fwd h3_frame: http.h3.frame;
+fwd h3_frame:      http.h3.frame;
 fwd http.h3.qpack;
 fwd h3_connection: http.h3.connection;
 fwd http.websocket;
@@ -36,16 +36,16 @@ fwd http.router.router;
 # CI proves the constant matches the manifest, so the test only pins the shape:
 # three dot-separated numeric components
 test "http: exported version is major.minor.patch" {
-    var dots: usize = 0;
+    var dots:   usize = 0;
     var digits: usize = 0;
-    var i: usize = 0;
+    var i:      usize = 0;
     for (VERSION[i] != 0) {
         var digit: bool = VERSION[i] >= '0' && VERSION[i] <= '9';
         if (!digit && VERSION[i] != '.') { ret 1; }
-        if (digit) { digits = digits + 1; }
+        if (digit)                       { digits = digits + 1; }
         if (!digit) {
             if (digits == 0) { ret 2; }
-            dots = dots + 1;
+            dots   = dots + 1;
             digits = 0;
         }
         i = i + 1;

@@ -1,22 +1,22 @@
 # strict borrowed HTTP URL parsing
 
+use http.client.memory;
+use http.client.policy;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
-use http.client.memory;
-use http.client.policy;
 
 pub def Status: u8;
-pub val URL_OK:              Status = 1;
-pub val URL_INVALID:         Status = 2;
-pub val URL_LIMIT:           Status = 3;
-pub val URL_SCHEME:          Status = 4;
-pub val URL_AUTHORITY:       Status = 5;
-pub val URL_HOST:            Status = 6;
-pub val URL_PORT:            Status = 7;
+pub val URL_OK:               Status = 1;
+pub val URL_INVALID:          Status = 2;
+pub val URL_LIMIT:            Status = 3;
+pub val URL_SCHEME:           Status = 4;
+pub val URL_AUTHORITY:        Status = 5;
+pub val URL_HOST:             Status = 6;
+pub val URL_PORT:             Status = 7;
 pub val URL_PERCENT_ENCODING: Status = 8;
 
 pub rec Limits {
@@ -29,19 +29,19 @@ pub rec Limits {
 }
 
 pub rec URL {
-    raw:          view.View;
-    scheme:       policy.Scheme;
-    scheme_text:  view.View;
-    authority:    view.View;
-    host:         view.View;
-    port:         u16;
+    raw:           view.View;
+    scheme:        policy.Scheme;
+    scheme_text:   view.View;
+    authority:     view.View;
+    host:          view.View;
+    port:          u16;
     explicit_port: bool;
-    ipv6_literal: bool;
-    path:         view.View;
-    query:        view.View;
-    has_query:    bool;
-    fragment:     view.View;
-    has_fragment: bool;
+    ipv6_literal:  bool;
+    path:          view.View;
+    query:         view.View;
+    has_query:     bool;
+    fragment:      view.View;
+    has_fragment:  bool;
 }
 
 pub rec Parsed {
@@ -51,15 +51,15 @@ pub rec Parsed {
 
 pub fun limits_default() Limits {
     ret Limits{max_url_bytes: 8192, max_authority_bytes: 1024,
-        max_host_bytes: 253, max_path_bytes: 4096, max_query_bytes: 4096,
+        max_host_bytes:     253, max_path_bytes: 4096, max_query_bytes: 4096,
         max_fragment_bytes: 4096};
 }
 
 fun empty_url() URL {
     val absent: view.View = view.view(nil, 0);
     ret URL{raw: absent, scheme: 0, scheme_text: absent, authority: absent,
-        host: absent, port: 0, explicit_port: false, ipv6_literal: false,
-        path: absent, query: absent, has_query: false, fragment: absent,
+        host:         absent, port: 0, explicit_port: false, ipv6_literal: false,
+        path:         absent, query: absent, has_query: false, fragment: absent,
         has_fragment: false};
 }
 
@@ -106,7 +106,8 @@ fun percent_valid(value: view.View) bool {
             if (i + 2 >= value.len || !hex(value.data[i + 1])
                 || !hex(value.data[i + 2])) { ret false; }
             i = i + 3;
-        } or {
+        }
+        or {
             if (current < 0x21 || current > 0x7e) { ret false; }
             i = i + 1;
         }
@@ -154,7 +155,7 @@ fun reg_name_valid(value: view.View) bool {
     var i: usize = 0;
     for (i < value.len) {
         if (!reg_name_char(value.data[i])) { ret false; }
-        if (value.data[i] == '%') { i = i + 2; }
+        if (value.data[i] == '%')          { i = i + 2; }
         i = i + 1;
     }
     ret true;
@@ -162,15 +163,15 @@ fun reg_name_valid(value: view.View) bool {
 
 fun parse_port(value: view.View, output: *u16) bool {
     if (value.data == nil || value.len == 0 || output == nil) { ret false; }
-    var number: u32 = 0;
-    var i: usize = 0;
+    var number: u32   = 0;
+    var i:      usize = 0;
     for (i < value.len) {
         val digit: u8 = value.data[i];
         if (digit < '0' || digit > '9') { ret false; }
         val unit: u32 = (digit - '0')::u32;
         if (number > (65535 - unit) / 10) { ret false; }
         number = number * 10 + unit;
-        i = i + 1;
+        i      = i + 1;
     }
     if (number == 0) { ret false; }
     @output = number::u16;
@@ -208,18 +209,20 @@ pub fun parse(input: view.View, configured: Limits) Parsed {
     if (scheme_end == input.len || scheme_end + 2 >= input.len
         || input.data[scheme_end + 1] != '/'
         || input.data[scheme_end + 2] != '/') { ret parsed_status(URL_SCHEME); }
-    val scheme_text: view.View = view.view(input.data, scheme_end);
-    var scheme: policy.Scheme = 0;
-    var port: u16 = 0;
+    val scheme_text: view.View     = view.view(input.data, scheme_end);
+    var scheme:      policy.Scheme = 0;
+    var port:        u16           = 0;
     if (text_fold(scheme_text, "http", 4)) {
         scheme = policy.HTTP;
-        port = 80;
-    } or (text_fold(scheme_text, "https", 5)) {
+        port   = 80;
+    }
+    or (text_fold(scheme_text, "https", 5)) {
         scheme = policy.HTTPS;
-        port = 443;
-    } or { ret parsed_status(URL_SCHEME); }
+        port   = 443;
+    }
+    or { ret parsed_status(URL_SCHEME); }
     val authority_start: usize = scheme_end + 3;
-    val authority_end: usize = first_of(input, authority_start, '/', '?', '#');
+    val authority_end:   usize = first_of(input, authority_start, '/', '?', '#');
     if (authority_end == authority_start
         || authority_end - authority_start > configured.max_authority_bytes) {
         ret parsed_status(URL_AUTHORITY);
@@ -234,9 +237,9 @@ pub fun parse(input: view.View, configured: Limits) Parsed {
         }
         i = i + 1;
     }
-    var host: view.View;
+    var host:          view.View;
     var explicit_port: bool = false;
-    var ipv6_literal: bool = false;
+    var ipv6_literal:  bool = false;
     if (authority.data[0] == '[') {
         var close: usize = 1;
         for (close < authority.len && authority.data[close] != ']') {
@@ -245,7 +248,7 @@ pub fun parse(input: view.View, configured: Limits) Parsed {
         if (close == authority.len || close == 1) {
             ret parsed_status(URL_HOST);
         }
-        host = view.view(?authority.data[1], close - 1);
+        host         = view.view(?authority.data[1], close - 1);
         ipv6_literal = true;
         if (!policy.ipv6_valid(host)) { ret parsed_status(URL_HOST); }
         if (close + 1 < authority.len) {
@@ -257,10 +260,12 @@ pub fun parse(input: view.View, configured: Limits) Parsed {
                 authority.len - close - 2), ?port)) {
                 ret parsed_status(URL_PORT);
             }
-        } or (close + 1 != authority.len) {
+        }
+        or (close + 1 != authority.len) {
             ret parsed_status(URL_AUTHORITY);
         }
-    } or {
+    }
+    or {
         var colon: usize = authority.len;
         i = 0;
         for (i < authority.len) {
@@ -272,7 +277,7 @@ pub fun parse(input: view.View, configured: Limits) Parsed {
         }
         host = authority;
         if (colon != authority.len) {
-            host = view.view(authority.data, colon);
+            host          = view.view(authority.data, colon);
             explicit_port = true;
             if (!parse_port(view.view(?authority.data[colon + 1],
                 authority.len - colon - 1), ?port)) {
@@ -293,23 +298,26 @@ pub fun parse(input: view.View, configured: Limits) Parsed {
         ret parsed_status(URL_PERCENT_ENCODING);
     }
     if (!component_valid(path, true, false)) { ret parsed_status(URL_INVALID); }
-    var query: view.View = view.view(nil, 0);
-    var has_query: bool = false;
-    var fragment: view.View = view.view(nil, 0);
-    var has_fragment: bool = false;
-    var fragment_at: usize = input.len;
+    var query:        view.View = view.view(nil, 0);
+    var has_query:    bool      = false;
+    var fragment:     view.View = view.view(nil, 0);
+    var has_fragment: bool      = false;
+    var fragment_at:  usize     = input.len;
     i = authority_end;
     for (i < input.len) {
-        if (input.data[i] == '#') { fragment_at = i; brk; }
+        if (input.data[i] == '#') {
+            fragment_at = i;
+            brk;
+        }
         i = i + 1;
     }
     if (path_end < input.len && input.data[path_end] == '?') {
         has_query = true;
-        query = view.view(?input.data[path_end + 1], fragment_at - path_end - 1);
+        query     = view.view(?input.data[path_end + 1], fragment_at - path_end - 1);
     }
     if (fragment_at < input.len) {
         has_fragment = true;
-        fragment = view.view(?input.data[fragment_at + 1],
+        fragment     = view.view(?input.data[fragment_at + 1],
             input.len - fragment_at - 1);
     }
     if (query.len > configured.max_query_bytes
@@ -324,10 +332,10 @@ pub fun parse(input: view.View, configured: Limits) Parsed {
         ret parsed_status(URL_INVALID);
     }
     ret Parsed{status: URL_OK, url: URL{raw: input, scheme: scheme,
-        scheme_text: scheme_text, authority: authority, host: host, port: port,
+        scheme_text:   scheme_text, authority: authority, host: host, port: port,
         explicit_port: explicit_port, ipv6_literal: ipv6_literal, path: path,
-        query: query, has_query: has_query, fragment: fragment,
-        has_fragment: has_fragment}};
+        query:         query, has_query: has_query, fragment: fragment,
+        has_fragment:  has_fragment}};
 }
 
 pub fun route(value: URL, proxy: policy.Proxy) policy.Route {
@@ -369,28 +377,31 @@ test "http.client.url: authority literals and unsafe forms are distinguished" {
     if (literal.status != URL_OK || !literal.url.ipv6_literal
         || literal.url.host.len != 11 || literal.url.port != 443) { ret 1; }
     if (parse(view.view("https://user@example.com/", 25),
-            limits_default()).status != URL_AUTHORITY
+        limits_default()).status != URL_AUTHORITY
         || parse(view.view("https://example.com/%zz", 23),
-            limits_default()).status != URL_PERCENT_ENCODING
+        limits_default()).status != URL_PERCENT_ENCODING
         || parse(view.view("https://example.com:0/", 22),
-            limits_default()).status != URL_PORT
+        limits_default()).status != URL_PORT
         || parse(view.view("https://example.com:65536/", 26),
-            limits_default()).status != URL_PORT
+        limits_default()).status != URL_PORT
         || parse(view.view("ftp://example.com/", 18),
-            limits_default()).status != URL_SCHEME) { ret 2; }
+        limits_default()).status != URL_SCHEME) { ret 2; }
     var nul_url: [22]u8;
-    val prefix: str = "https://example.com/";
-    var i: usize = 0;
-    for (i < 20) { nul_url[i] = prefix[i]; i = i + 1; }
+    val prefix:  str   = "https://example.com/";
+    var i:       usize = 0;
+    for (i < 20) {
+        nul_url[i] = prefix[i];
+        i          = i + 1;
+    }
     nul_url[20] = 0;
     nul_url[21] = 'x';
     var bounded: Limits = limits_default();
     bounded.max_url_bytes = 8;
     if (parse(view.view("https://example.com/", 20), bounded).status
-            != URL_LIMIT
+        != URL_LIMIT
         || parse(view.view(?nul_url[0], 22), limits_default()).status
-            != URL_INVALID
+        != URL_INVALID
         || parse(view.view((~(0::usize))::*u8, 2), limits_default()).status
-            != URL_INVALID) { ret 3; }
+        != URL_INVALID) { ret 3; }
     ret 0;
 }
