@@ -1,70 +1,70 @@
+use http.core.method;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use http.core.method;
 
 pub def Status: u16;
 
-pub val CONTINUE: Status = 100;
-pub val SWITCHING_PROTOCOLS: Status = 101;
-pub val PROCESSING: Status = 102;
-pub val EARLY_HINTS: Status = 103;
-pub val OK: Status = 200;
-pub val CREATED: Status = 201;
-pub val ACCEPTED: Status = 202;
-pub val NON_AUTHORITATIVE_INFORMATION: Status = 203;
-pub val NO_CONTENT: Status = 204;
-pub val RESET_CONTENT: Status = 205;
-pub val PARTIAL_CONTENT: Status = 206;
-pub val MULTI_STATUS: Status = 207;
-pub val ALREADY_REPORTED: Status = 208;
-pub val IM_USED: Status = 226;
-pub val MULTIPLE_CHOICES: Status = 300;
-pub val MOVED_PERMANENTLY: Status = 301;
-pub val FOUND: Status = 302;
-pub val SEE_OTHER: Status = 303;
-pub val NOT_MODIFIED: Status = 304;
-pub val USE_PROXY: Status = 305;
-pub val TEMPORARY_REDIRECT: Status = 307;
-pub val PERMANENT_REDIRECT: Status = 308;
-pub val BAD_REQUEST: Status = 400;
-pub val UNAUTHORIZED: Status = 401;
-pub val PAYMENT_REQUIRED: Status = 402;
-pub val FORBIDDEN: Status = 403;
-pub val NOT_FOUND: Status = 404;
-pub val METHOD_NOT_ALLOWED: Status = 405;
-pub val NOT_ACCEPTABLE: Status = 406;
-pub val PROXY_AUTHENTICATION_REQUIRED: Status = 407;
-pub val REQUEST_TIMEOUT: Status = 408;
-pub val CONFLICT: Status = 409;
-pub val GONE: Status = 410;
-pub val LENGTH_REQUIRED: Status = 411;
-pub val PRECONDITION_FAILED: Status = 412;
-pub val CONTENT_TOO_LARGE: Status = 413;
-pub val URI_TOO_LONG: Status = 414;
-pub val UNSUPPORTED_MEDIA_TYPE: Status = 415;
-pub val RANGE_NOT_SATISFIABLE: Status = 416;
-pub val EXPECTATION_FAILED: Status = 417;
-pub val MISDIRECTED_REQUEST: Status = 421;
-pub val UNPROCESSABLE_CONTENT: Status = 422;
-pub val LOCKED: Status = 423;
-pub val FAILED_DEPENDENCY: Status = 424;
-pub val TOO_EARLY: Status = 425;
-pub val UPGRADE_REQUIRED: Status = 426;
-pub val PRECONDITION_REQUIRED: Status = 428;
-pub val TOO_MANY_REQUESTS: Status = 429;
+pub val CONTINUE:                        Status = 100;
+pub val SWITCHING_PROTOCOLS:             Status = 101;
+pub val PROCESSING:                      Status = 102;
+pub val EARLY_HINTS:                     Status = 103;
+pub val OK:                              Status = 200;
+pub val CREATED:                         Status = 201;
+pub val ACCEPTED:                        Status = 202;
+pub val NON_AUTHORITATIVE_INFORMATION:   Status = 203;
+pub val NO_CONTENT:                      Status = 204;
+pub val RESET_CONTENT:                   Status = 205;
+pub val PARTIAL_CONTENT:                 Status = 206;
+pub val MULTI_STATUS:                    Status = 207;
+pub val ALREADY_REPORTED:                Status = 208;
+pub val IM_USED:                         Status = 226;
+pub val MULTIPLE_CHOICES:                Status = 300;
+pub val MOVED_PERMANENTLY:               Status = 301;
+pub val FOUND:                           Status = 302;
+pub val SEE_OTHER:                       Status = 303;
+pub val NOT_MODIFIED:                    Status = 304;
+pub val USE_PROXY:                       Status = 305;
+pub val TEMPORARY_REDIRECT:              Status = 307;
+pub val PERMANENT_REDIRECT:              Status = 308;
+pub val BAD_REQUEST:                     Status = 400;
+pub val UNAUTHORIZED:                    Status = 401;
+pub val PAYMENT_REQUIRED:                Status = 402;
+pub val FORBIDDEN:                       Status = 403;
+pub val NOT_FOUND:                       Status = 404;
+pub val METHOD_NOT_ALLOWED:              Status = 405;
+pub val NOT_ACCEPTABLE:                  Status = 406;
+pub val PROXY_AUTHENTICATION_REQUIRED:   Status = 407;
+pub val REQUEST_TIMEOUT:                 Status = 408;
+pub val CONFLICT:                        Status = 409;
+pub val GONE:                            Status = 410;
+pub val LENGTH_REQUIRED:                 Status = 411;
+pub val PRECONDITION_FAILED:             Status = 412;
+pub val CONTENT_TOO_LARGE:               Status = 413;
+pub val URI_TOO_LONG:                    Status = 414;
+pub val UNSUPPORTED_MEDIA_TYPE:          Status = 415;
+pub val RANGE_NOT_SATISFIABLE:           Status = 416;
+pub val EXPECTATION_FAILED:              Status = 417;
+pub val MISDIRECTED_REQUEST:             Status = 421;
+pub val UNPROCESSABLE_CONTENT:           Status = 422;
+pub val LOCKED:                          Status = 423;
+pub val FAILED_DEPENDENCY:               Status = 424;
+pub val TOO_EARLY:                       Status = 425;
+pub val UPGRADE_REQUIRED:                Status = 426;
+pub val PRECONDITION_REQUIRED:           Status = 428;
+pub val TOO_MANY_REQUESTS:               Status = 429;
 pub val REQUEST_HEADER_FIELDS_TOO_LARGE: Status = 431;
-pub val UNAVAILABLE_FOR_LEGAL_REASONS: Status = 451;
-pub val INTERNAL_SERVER_ERROR: Status = 500;
-pub val NOT_IMPLEMENTED: Status = 501;
-pub val BAD_GATEWAY: Status = 502;
-pub val SERVICE_UNAVAILABLE: Status = 503;
-pub val GATEWAY_TIMEOUT: Status = 504;
-pub val HTTP_VERSION_NOT_SUPPORTED: Status = 505;
-pub val VARIANT_ALSO_NEGOTIATES: Status = 506;
-pub val INSUFFICIENT_STORAGE: Status = 507;
-pub val LOOP_DETECTED: Status = 508;
-pub val NOT_EXTENDED: Status = 510;
+pub val UNAVAILABLE_FOR_LEGAL_REASONS:   Status = 451;
+pub val INTERNAL_SERVER_ERROR:           Status = 500;
+pub val NOT_IMPLEMENTED:                 Status = 501;
+pub val BAD_GATEWAY:                     Status = 502;
+pub val SERVICE_UNAVAILABLE:             Status = 503;
+pub val GATEWAY_TIMEOUT:                 Status = 504;
+pub val HTTP_VERSION_NOT_SUPPORTED:      Status = 505;
+pub val VARIANT_ALSO_NEGOTIATES:         Status = 506;
+pub val INSUFFICIENT_STORAGE:            Status = 507;
+pub val LOOP_DETECTED:                   Status = 508;
+pub val NOT_EXTENDED:                    Status = 510;
 pub val NETWORK_AUTHENTICATION_REQUIRED: Status = 511;
 
 pub fun valid(code: Status) bool {
@@ -81,21 +81,21 @@ pub fun is_final(code: Status) bool {
 
 pub fun permits_content(method_kind: method.Kind, code: Status) bool {
     if (method_kind == method.HEAD || is_informational(code) || code == NO_CONTENT
-     || code == RESET_CONTENT || code == NOT_MODIFIED) { ret false; }
+        || code == RESET_CONTENT || code == NOT_MODIFIED) { ret false; }
     if (method_kind == method.CONNECT && code >= 200 && code < 300) { ret false; }
     ret is_final(code);
 }
 
 test "http.core.status: status classes and finality are explicit" {
     if (!valid(CONTINUE) || !valid(NETWORK_AUTHENTICATION_REQUIRED) || valid(99) || valid(600)) { ret 1; }
-    if (!is_informational(EARLY_HINTS) || is_final(EARLY_HINTS) || !is_final(OK)) { ret 2; }
+    if (!is_informational(EARLY_HINTS) || is_final(EARLY_HINTS) || !is_final(OK))               { ret 2; }
     ret 0;
 }
 
 test "http.core.status: payload eligibility follows method and status semantics" {
     if (permits_content(method.HEAD, OK) || permits_content(method.GET, NO_CONTENT)
-     || permits_content(method.GET, RESET_CONTENT) || permits_content(method.GET, NOT_MODIFIED)
-     || permits_content(method.CONNECT, OK)) { ret 1; }
+        || permits_content(method.GET, RESET_CONTENT) || permits_content(method.GET, NOT_MODIFIED)
+        || permits_content(method.CONNECT, OK)) { ret 1; }
     if (!permits_content(method.GET, OK) || !permits_content(method.POST, BAD_REQUEST)) { ret 2; }
     ret 0;
 }

@@ -1,127 +1,129 @@
 # strict incremental http/2 frame codec
 
+use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
-use std.memory;
 
-pub val FRAME_DATA: u8 = 0;
-pub val FRAME_HEADERS: u8 = 1;
-pub val FRAME_PRIORITY: u8 = 2;
-pub val FRAME_RESET_STREAM: u8 = 3;
-pub val FRAME_SETTINGS: u8 = 4;
-pub val FRAME_PUSH_PROMISE: u8 = 5;
-pub val FRAME_PING: u8 = 6;
-pub val FRAME_GOAWAY: u8 = 7;
+pub val FRAME_DATA:          u8 = 0;
+pub val FRAME_HEADERS:       u8 = 1;
+pub val FRAME_PRIORITY:      u8 = 2;
+pub val FRAME_RESET_STREAM:  u8 = 3;
+pub val FRAME_SETTINGS:      u8 = 4;
+pub val FRAME_PUSH_PROMISE:  u8 = 5;
+pub val FRAME_PING:          u8 = 6;
+pub val FRAME_GOAWAY:        u8 = 7;
 pub val FRAME_WINDOW_UPDATE: u8 = 8;
-pub val FRAME_CONTINUATION: u8 = 9;
+pub val FRAME_CONTINUATION:  u8 = 9;
 
-pub val FLAG_ACK: u8 = 0x1;
-pub val FLAG_END_STREAM: u8 = 0x1;
+pub val FLAG_ACK:         u8 = 0x1;
+pub val FLAG_END_STREAM:  u8 = 0x1;
 pub val FLAG_END_HEADERS: u8 = 0x4;
-pub val FLAG_PADDED: u8 = 0x8;
-pub val FLAG_PRIORITY: u8 = 0x20;
+pub val FLAG_PADDED:      u8 = 0x8;
+pub val FLAG_PRIORITY:    u8 = 0x20;
 
-pub val SETTINGS_HEADER_TABLE_SIZE: u16 = 1;
-pub val SETTINGS_ENABLE_PUSH: u16 = 2;
-pub val SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 3;
-pub val SETTINGS_INITIAL_WINDOW_SIZE: u16 = 4;
-pub val SETTINGS_MAX_FRAME_SIZE: u16 = 5;
-pub val SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 6;
+pub val SETTINGS_HEADER_TABLE_SIZE:       u16 = 1;
+pub val SETTINGS_ENABLE_PUSH:             u16 = 2;
+pub val SETTINGS_MAX_CONCURRENT_STREAMS:  u16 = 3;
+pub val SETTINGS_INITIAL_WINDOW_SIZE:     u16 = 4;
+pub val SETTINGS_MAX_FRAME_SIZE:          u16 = 5;
+pub val SETTINGS_MAX_HEADER_LIST_SIZE:    u16 = 6;
 pub val SETTINGS_ENABLE_CONNECT_PROTOCOL: u16 = 8;
 
 pub val DEFAULT_MAX_FRAME_SIZE: u32 = 16384;
-pub val MAX_FRAME_SIZE: u32 = 16777215;
+pub val MAX_FRAME_SIZE:         u32 = 16777215;
 
 pub def Error: u8;
-pub val ERROR_NONE: Error = 0;
-pub val ERROR_STATE: Error = 1;
-pub val ERROR_FRAME_SIZE: Error = 2;
-pub val ERROR_PROTOCOL: Error = 3;
+pub val ERROR_NONE:         Error = 0;
+pub val ERROR_STATE:        Error = 1;
+pub val ERROR_FRAME_SIZE:   Error = 2;
+pub val ERROR_PROTOCOL:     Error = 3;
 pub val ERROR_FLOW_CONTROL: Error = 4;
-pub val ERROR_TRUNCATED: Error = 5;
-pub val ERROR_OUTPUT: Error = 6;
+pub val ERROR_TRUNCATED:    Error = 5;
+pub val ERROR_OUTPUT:       Error = 6;
 
 pub def EventKind: u8;
 pub val EVENT_NEED_INPUT: EventKind = 1;
-pub val EVENT_HEADER: EventKind = 2;
-pub val EVENT_PAYLOAD: EventKind = 3;
-pub val EVENT_FRAME_END: EventKind = 4;
-pub val EVENT_ERROR: EventKind = 5;
+pub val EVENT_HEADER:     EventKind = 2;
+pub val EVENT_PAYLOAD:    EventKind = 3;
+pub val EVENT_FRAME_END:  EventKind = 4;
+pub val EVENT_ERROR:      EventKind = 5;
 
 pub rec Limits { max_frame_size: u32; }
 
 pub rec Header {
-    length: u32;
-    typ: u8;
-    flags: u8;
+    length:    u32;
+    typ:       u8;
+    flags:     u8;
     stream_id: u32;
 }
 
 pub rec Event {
-    kind: EventKind;
-    consumed: usize;
-    header: Header;
-    data: *u8;
+    kind:        EventKind;
+    consumed:    usize;
+    header:      Header;
+    data:        *u8;
     data_length: usize;
     frame_final: bool;
-    error: Error;
+    error:       Error;
 }
 
 pub rec Parser {
-    limits: Limits;
-    state: u8;
-    header_bytes: [9]u8;
-    header_length: usize;
-    header: Header;
-    remaining: u32;
-    payload_offset: u32;
-    prefix: [6]u8;
-    prefix_length: usize;
-    setting: [6]u8;
-    setting_length: usize;
-    settings_seen: u16;
+    limits:              Limits;
+    state:               u8;
+    header_bytes:        [9]u8;
+    header_length:       usize;
+    header:              Header;
+    remaining:           u32;
+    payload_offset:      u32;
+    prefix:              [6]u8;
+    prefix_length:       usize;
+    setting:             [6]u8;
+    setting_length:      usize;
+    settings_seen:       u16;
     continuation_stream: u32;
-    held: bool;
-    error: Error;
-    initialized: bool;
+    held:                bool;
+    error:               Error;
+    initialized:         bool;
 }
 
 pub def WriteStatus: u8;
-pub val WRITE_OUTPUT: WriteStatus = 1;
-pub val WRITE_DONE: WriteStatus = 2;
+pub val WRITE_OUTPUT:  WriteStatus = 1;
+pub val WRITE_DONE:    WriteStatus = 2;
 pub val WRITE_BLOCKED: WriteStatus = 3;
-pub val WRITE_ERROR: WriteStatus = 4;
+pub val WRITE_ERROR:   WriteStatus = 4;
 
 pub rec Write {
-    status: WriteStatus;
+    status:   WriteStatus;
     consumed: usize;
-    written: usize;
-    error: Error;
+    written:  usize;
+    error:    Error;
 }
 
 pub rec Writer {
-    limits: Limits;
+    limits:              Limits;
     continuation_stream: u32;
-    header: Header;
-    remaining: u32;
-    payload_offset: u32;
-    prefix: [6]u8;
-    prefix_length: usize;
-    setting: [6]u8;
-    setting_length: usize;
-    settings_seen: u16;
-    active: bool;
-    error: Error;
-    initialized: bool;
+    header:              Header;
+    remaining:           u32;
+    payload_offset:      u32;
+    prefix:              [6]u8;
+    prefix_length:       usize;
+    setting:             [6]u8;
+    setting_length:      usize;
+    settings_seen:       u16;
+    active:              bool;
+    error:               Error;
+    initialized:         bool;
 }
 
-val STATE_HEADER: u8 = 1;
+val STATE_HEADER:  u8 = 1;
 val STATE_PAYLOAD: u8 = 2;
-val STATE_FAILED: u8 = 3;
+val STATE_FAILED:  u8 = 3;
 
-pub fun limits_default() Limits { ret Limits{max_frame_size: DEFAULT_MAX_FRAME_SIZE}; }
+pub fun limits_default() Limits {
+    ret Limits{max_frame_size: DEFAULT_MAX_FRAME_SIZE};
+}
 
 fun limits_valid(limits: Limits) bool {
     ret limits.max_frame_size >= DEFAULT_MAX_FRAME_SIZE
@@ -154,24 +156,24 @@ fun setting_value(bytes: *u8) u32 {
 }
 
 fun setting_bit(identifier: u16) u16 {
-    if (identifier >= 1 && identifier <= 6) { ret 1::u16 << identifier::u8; }
+    if (identifier >= 1 && identifier <= 6)             { ret 1::u16 << identifier::u8; }
     if (identifier == SETTINGS_ENABLE_CONNECT_PROTOCOL) { ret 1::u16 << 8; }
     ret 0;
 }
 
 fun validate_setting(bytes: *u8, seen: *u16) Error {
     val identifier: u16 = setting_id(bytes);
-    val value: u32 = setting_value(bytes);
-    val bit: u16 = setting_bit(identifier);
+    val value:      u32 = setting_value(bytes);
+    val bit:        u16 = setting_bit(identifier);
     if (bit != 0 && ((@seen) & bit) != 0) { ret ERROR_PROTOCOL; }
-    if (bit != 0) { @seen = (@seen) | bit; }
+    if (bit != 0)                         { @seen = (@seen) | bit; }
     if ((identifier == SETTINGS_ENABLE_PUSH || identifier == SETTINGS_ENABLE_CONNECT_PROTOCOL)
         && value > 1) { ret ERROR_PROTOCOL; }
     if (identifier == SETTINGS_INITIAL_WINDOW_SIZE && value > 0x7fffffff) {
         ret ERROR_FLOW_CONTROL;
     }
     if (identifier == SETTINGS_MAX_FRAME_SIZE
-     && (value < DEFAULT_MAX_FRAME_SIZE || value > MAX_FRAME_SIZE)) {
+        && (value < DEFAULT_MAX_FRAME_SIZE || value > MAX_FRAME_SIZE)) {
         ret ERROR_PROTOCOL;
     }
     ret ERROR_NONE;
@@ -180,7 +182,7 @@ fun validate_setting(bytes: *u8, seen: *u16) Error {
 fun base_length(header: Header) usize {
     var needed: usize = 0;
     if ((header.flags & FLAG_PADDED) != 0
-     && (header.typ == FRAME_DATA || header.typ == FRAME_HEADERS
+        && (header.typ == FRAME_DATA || header.typ == FRAME_HEADERS
         || header.typ == FRAME_PUSH_PROMISE)) { needed = needed + 1; }
     if (header.typ == FRAME_HEADERS && (header.flags & FLAG_PRIORITY) != 0) {
         needed = needed + 5;
@@ -191,9 +193,9 @@ fun base_length(header: Header) usize {
 
 fun validate_header(header: Header, limits: Limits, continuation_stream: u32) Error {
     if (header.length > limits.max_frame_size) { ret ERROR_FRAME_SIZE; }
-    if (header.stream_id > 0x7fffffff) { ret ERROR_PROTOCOL; }
+    if (header.stream_id > 0x7fffffff)         { ret ERROR_PROTOCOL; }
     if (continuation_stream != 0
-     && (header.typ != FRAME_CONTINUATION || header.stream_id != continuation_stream)) {
+        && (header.typ != FRAME_CONTINUATION || header.stream_id != continuation_stream)) {
         ret ERROR_PROTOCOL;
     }
     if (continuation_stream == 0 && header.typ == FRAME_CONTINUATION) {
@@ -202,25 +204,25 @@ fun validate_header(header: Header, limits: Limits, continuation_stream: u32) Er
     if ((header.typ == FRAME_DATA || header.typ == FRAME_HEADERS
         || header.typ == FRAME_PRIORITY || header.typ == FRAME_RESET_STREAM
         || header.typ == FRAME_PUSH_PROMISE || header.typ == FRAME_CONTINUATION)
-     && header.stream_id == 0) { ret ERROR_PROTOCOL; }
+        && header.stream_id == 0) { ret ERROR_PROTOCOL; }
     if ((header.typ == FRAME_SETTINGS || header.typ == FRAME_PING
         || header.typ == FRAME_GOAWAY) && header.stream_id != 0) { ret ERROR_PROTOCOL; }
-    if (header.typ == FRAME_PRIORITY && header.length != 5) { ret ERROR_FRAME_SIZE; }
+    if (header.typ == FRAME_PRIORITY && header.length != 5)     { ret ERROR_FRAME_SIZE; }
     if (header.typ == FRAME_RESET_STREAM && header.length != 4) { ret ERROR_FRAME_SIZE; }
     if (header.typ == FRAME_SETTINGS
-     && (((header.flags & FLAG_ACK) != 0 && header.length != 0)
+        && (((header.flags & FLAG_ACK) != 0 && header.length != 0)
         || (header.length % 6) != 0)) { ret ERROR_FRAME_SIZE; }
-    if (header.typ == FRAME_PING && header.length != 8) { ret ERROR_FRAME_SIZE; }
-    if (header.typ == FRAME_GOAWAY && header.length < 8) { ret ERROR_FRAME_SIZE; }
+    if (header.typ == FRAME_PING && header.length != 8)          { ret ERROR_FRAME_SIZE; }
+    if (header.typ == FRAME_GOAWAY && header.length < 8)         { ret ERROR_FRAME_SIZE; }
     if (header.typ == FRAME_WINDOW_UPDATE && header.length != 4) { ret ERROR_FRAME_SIZE; }
-    if (header.length::usize < base_length(header)) { ret ERROR_FRAME_SIZE; }
+    if (header.length::usize < base_length(header))              { ret ERROR_FRAME_SIZE; }
     ret ERROR_NONE;
 }
 
 fun decode_header(bytes: *u8) Header {
     ret Header{
         length: (bytes[0]::u32 << 16) | (bytes[1]::u32 << 8) | bytes[2]::u32,
-        typ: bytes[3],
+        typ:   bytes[3],
         flags: bytes[4],
         stream_id: ((bytes[5]::u32 << 24) | (bytes[6]::u32 << 16)
             | (bytes[7]::u32 << 8) | bytes[8]::u32) & 0x7fffffff,
@@ -229,29 +231,29 @@ fun decode_header(bytes: *u8) Header {
 
 pub fun parser_init(parser: *Parser, limits: Limits) bool {
     if (parser == nil || parser.initialized || !limits_valid(limits)) { ret false; }
-    parser.limits = limits;
-    parser.state = STATE_HEADER;
-    parser.header_length = 0;
-    parser.remaining = 0;
-    parser.payload_offset = 0;
-    parser.prefix_length = 0;
-    parser.setting_length = 0;
-    parser.settings_seen = 0;
+    parser.limits              = limits;
+    parser.state               = STATE_HEADER;
+    parser.header_length       = 0;
+    parser.remaining           = 0;
+    parser.payload_offset      = 0;
+    parser.prefix_length       = 0;
+    parser.setting_length      = 0;
+    parser.settings_seen       = 0;
     parser.continuation_stream = 0;
-    parser.held = false;
-    parser.error = ERROR_NONE;
-    parser.initialized = true;
+    parser.held                = false;
+    parser.error               = ERROR_NONE;
+    parser.initialized         = true;
     ret true;
 }
 
 fun validate_payload_byte(parser: *Parser, byte: u8) Error {
     if (parser.prefix_length < 6) {
         parser.prefix[parser.prefix_length] = byte;
-        parser.prefix_length = parser.prefix_length + 1;
+        parser.prefix_length                = parser.prefix_length + 1;
     }
     if (parser.header.typ == FRAME_SETTINGS) {
         parser.setting[parser.setting_length] = byte;
-        parser.setting_length = parser.setting_length + 1;
+        parser.setting_length                 = parser.setting_length + 1;
         if (parser.setting_length == 6) {
             val error: Error = validate_setting(?parser.setting[0], ?parser.settings_seen);
             if (error != ERROR_NONE) { ret error; }
@@ -269,27 +271,27 @@ fun u31(bytes: *u8) u32 {
 fun finish_payload(header: Header, prefix: *u8, prefix_length: usize) Error {
     var offset: usize = 0;
     if ((header.flags & FLAG_PADDED) != 0
-     && (header.typ == FRAME_DATA || header.typ == FRAME_HEADERS
+        && (header.typ == FRAME_DATA || header.typ == FRAME_HEADERS
         || header.typ == FRAME_PUSH_PROMISE)) { offset = 1; }
     if (offset != 0) {
         val required: usize = base_length(header) + prefix[0]::usize;
         if (required > header.length::usize) { ret ERROR_PROTOCOL; }
     }
     if (header.typ == FRAME_PRIORITY) {
-        if (prefix_length < 5) { ret ERROR_FRAME_SIZE; }
+        if (prefix_length < 5)               { ret ERROR_FRAME_SIZE; }
         if (u31(prefix) == header.stream_id) { ret ERROR_PROTOCOL; }
     }
     if (header.typ == FRAME_HEADERS && (header.flags & FLAG_PRIORITY) != 0) {
-        if (prefix_length < offset + 5) { ret ERROR_FRAME_SIZE; }
+        if (prefix_length < offset + 5)               { ret ERROR_FRAME_SIZE; }
         if (u31(?prefix[offset]) == header.stream_id) { ret ERROR_PROTOCOL; }
     }
     if (header.typ == FRAME_PUSH_PROMISE) {
         if (prefix_length < offset + 4) { ret ERROR_FRAME_SIZE; }
-        if (u31(?prefix[offset]) == 0) { ret ERROR_PROTOCOL; }
+        if (u31(?prefix[offset]) == 0)  { ret ERROR_PROTOCOL; }
     }
     if (header.typ == FRAME_WINDOW_UPDATE) {
         if (prefix_length < 4) { ret ERROR_FRAME_SIZE; }
-        if (u31(prefix) == 0) { ret ERROR_PROTOCOL; }
+        if (u31(prefix) == 0)  { ret ERROR_PROTOCOL; }
     }
     ret ERROR_NONE;
 }
@@ -298,7 +300,8 @@ fun update_continuation(stream: *u32, header: Header) {
     if ((header.typ == FRAME_HEADERS || header.typ == FRAME_PUSH_PROMISE
         || header.typ == FRAME_CONTINUATION) && (header.flags & FLAG_END_HEADERS) == 0) {
         @stream = header.stream_id;
-    } or (header.typ == FRAME_CONTINUATION
+    }
+    or (header.typ == FRAME_CONTINUATION
         || header.typ == FRAME_HEADERS || header.typ == FRAME_PUSH_PROMISE) {
         @stream = 0;
     }
@@ -309,24 +312,24 @@ fun end_frame(parser: *Parser, consumed: usize) Event {
     if (error != ERROR_NONE) { ret fail(parser, consumed, error); }
     update_continuation(?parser.continuation_stream, parser.header);
     var event: Event = empty_event(EVENT_FRAME_END, consumed);
-    event.header = parser.header;
-    event.frame_final = true;
-    parser.state = STATE_HEADER;
+    event.header         = parser.header;
+    event.frame_final    = true;
+    parser.state         = STATE_HEADER;
     parser.header_length = 0;
     ret event;
 }
 
 pub fun feed(parser: *Parser, input: *u8, length: usize, eof: bool) Event {
     if (parser == nil || !parser.initialized || parser.held
-     || parser.state == STATE_FAILED || (input == nil && length != 0)) {
+        || parser.state == STATE_FAILED || (input == nil && length != 0)) {
         ret fail(parser, 0, ERROR_STATE);
     }
     var consumed: usize = 0;
     if (parser.state == STATE_HEADER) {
         for (parser.header_length < 9 && consumed < length) {
             parser.header_bytes[parser.header_length] = input[consumed];
-            parser.header_length = parser.header_length + 1;
-            consumed = consumed + 1;
+            parser.header_length                      = parser.header_length + 1;
+            consumed                                  = consumed + 1;
         }
         if (parser.header_length < 9) {
             if (eof) { ret fail(parser, consumed, ERROR_TRUNCATED); }
@@ -336,12 +339,12 @@ pub fun feed(parser: *Parser, input: *u8, length: usize, eof: bool) Event {
         val error: Error = validate_header(parser.header, parser.limits,
             parser.continuation_stream);
         if (error != ERROR_NONE) { ret fail(parser, consumed, error); }
-        parser.remaining = parser.header.length;
+        parser.remaining      = parser.header.length;
         parser.payload_offset = 0;
-        parser.prefix_length = 0;
+        parser.prefix_length  = 0;
         parser.setting_length = 0;
-        parser.settings_seen = 0;
-        parser.state = STATE_PAYLOAD;
+        parser.settings_seen  = 0;
+        parser.state          = STATE_PAYLOAD;
         var event: Event = empty_event(EVENT_HEADER, consumed);
         event.header = parser.header;
         ret event;
@@ -359,14 +362,14 @@ pub fun feed(parser: *Parser, input: *u8, length: usize, eof: bool) Event {
         if (error != ERROR_NONE) { ret fail(parser, i + 1, error); }
         i = i + 1;
     }
-    parser.remaining = parser.remaining - take::u32;
+    parser.remaining      = parser.remaining - take::u32;
     parser.payload_offset = parser.payload_offset + take::u32;
     var event: Event = empty_event(EVENT_PAYLOAD, take);
-    event.header = parser.header;
-    event.data = input;
+    event.header      = parser.header;
+    event.data        = input;
     event.data_length = take;
     event.frame_final = parser.remaining == 0;
-    parser.held = true;
+    parser.held       = true;
     ret event;
 }
 
@@ -378,11 +381,11 @@ pub fun release(parser: *Parser) bool {
 
 pub fun writer_init(writer: *Writer, limits: Limits) bool {
     if (writer == nil || writer.initialized || !limits_valid(limits)) { ret false; }
-    writer.limits = limits;
+    writer.limits              = limits;
     writer.continuation_stream = 0;
-    writer.active = false;
-    writer.error = ERROR_NONE;
-    writer.initialized = true;
+    writer.active              = false;
+    writer.error               = ERROR_NONE;
+    writer.initialized         = true;
     ret true;
 }
 
@@ -412,24 +415,24 @@ pub fun begin(writer: *Writer, header: Header, output: *u8,
     if (!encode_header(header, output, output_capacity)) {
         ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_NONE};
     }
-    writer.header = header;
-    writer.remaining = header.length;
+    writer.header         = header;
+    writer.remaining      = header.length;
     writer.payload_offset = 0;
-    writer.prefix_length = 0;
+    writer.prefix_length  = 0;
     writer.setting_length = 0;
-    writer.settings_seen = 0;
-    writer.active = true;
+    writer.settings_seen  = 0;
+    writer.active         = true;
     ret Write{status: WRITE_OUTPUT, consumed: 0, written: 9, error: ERROR_NONE};
 }
 
 fun writer_payload_byte(writer: *Writer, byte: u8) Error {
     if (writer.prefix_length < 6) {
         writer.prefix[writer.prefix_length] = byte;
-        writer.prefix_length = writer.prefix_length + 1;
+        writer.prefix_length                = writer.prefix_length + 1;
     }
     if (writer.header.typ == FRAME_SETTINGS) {
         writer.setting[writer.setting_length] = byte;
-        writer.setting_length = writer.setting_length + 1;
+        writer.setting_length                 = writer.setting_length + 1;
         if (writer.setting_length == 6) {
             val error: Error = validate_setting(?writer.setting[0], ?writer.settings_seen);
             if (error != ERROR_NONE) { ret error; }
@@ -442,11 +445,11 @@ fun writer_payload_byte(writer: *Writer, byte: u8) Error {
 pub fun write(writer: *Writer, output: *u8, output_capacity: usize,
     payload: *u8, payload_length: usize) Write {
     if (writer == nil || !writer.initialized || !writer.active || output == nil
-     || output_capacity == 0 || (payload == nil && payload_length != 0)) {
+        || output_capacity == 0 || (payload == nil && payload_length != 0)) {
         ret Write{status: WRITE_ERROR, consumed: 0, written: 0, error: ERROR_STATE};
     }
     var take: usize = payload_length;
-    if (take > output_capacity) { take = output_capacity; }
+    if (take > output_capacity)         { take = output_capacity; }
     if (take > writer.remaining::usize) { take = writer.remaining::usize; }
     if (take == 0 && writer.remaining != 0) {
         ret Write{status: WRITE_BLOCKED, consumed: 0, written: 0, error: ERROR_NONE};
@@ -455,14 +458,14 @@ pub fun write(writer: *Writer, output: *u8, output_capacity: usize,
     for (i < take) {
         val error: Error = writer_payload_byte(writer, payload[i]);
         if (error != ERROR_NONE) {
-            writer.error = error;
+            writer.error  = error;
             writer.active = false;
             ret Write{status: WRITE_ERROR, consumed: i + 1, written: i, error: error};
         }
         output[i] = payload[i];
-        i = i + 1;
+        i         = i + 1;
     }
-    writer.remaining = writer.remaining - take::u32;
+    writer.remaining      = writer.remaining - take::u32;
     writer.payload_offset = writer.payload_offset + take::u32;
     if (writer.remaining == 0) {
         val error: Error = finish_payload(writer.header, ?writer.prefix[0],
@@ -506,9 +509,15 @@ test "http.h2.frame: rfc header is incremental across every byte" {
     var parser: Parser;
     if (!parser_init(?parser, limits_default())) { ret 1; }
     var bytes: [12]u8;
-    bytes[0] = 0; bytes[1] = 0; bytes[2] = 3;
-    bytes[3] = FRAME_DATA; bytes[4] = FLAG_END_STREAM; bytes[8] = 1;
-    bytes[9] = 1; bytes[10] = 2; bytes[11] = 3;
+    bytes[0]  = 0;
+    bytes[1]  = 0;
+    bytes[2]  = 3;
+    bytes[3]  = FRAME_DATA;
+    bytes[4]  = FLAG_END_STREAM;
+    bytes[8]  = 1;
+    bytes[9]  = 1;
+    bytes[10] = 2;
+    bytes[11] = 3;
     var i: usize = 0;
     for (i < 9) {
         val event: Event = feed(?parser, ?bytes[i], 1, false);
@@ -532,20 +541,25 @@ test "http.h2.frame: continuation and typed lengths fail closed" {
     var parser: Parser;
     parser_init(?parser, limits_default());
     var headers: [9]u8;
-    headers[2] = 0; headers[3] = FRAME_HEADERS; headers[8] = 1;
+    headers[2] = 0;
+    headers[3] = FRAME_HEADERS;
+    headers[8] = 1;
     if (feed(?parser, ?headers[0], 9, false).kind != EVENT_HEADER
-     || feed(?parser, nil, 0, false).kind != EVENT_FRAME_END) { ret 1; }
+        || feed(?parser, nil, 0, false).kind != EVENT_FRAME_END) { ret 1; }
     var ping: [17]u8;
-    ping[2] = 8; ping[3] = FRAME_PING;
+    ping[2] = 8;
+    ping[3] = FRAME_PING;
     if (feed(?parser, ?ping[0], 9, false).error != ERROR_PROTOCOL) { ret 2; }
     var parser_two: Parser;
     parser_init(?parser_two, limits_default());
-    ping[3] = FRAME_PING; ping[8] = 1;
+    ping[3] = FRAME_PING;
+    ping[8] = 1;
     if (feed(?parser_two, ?ping[0], 9, false).error != ERROR_PROTOCOL) { ret 3; }
     var parser_three: Parser;
     parser_init(?parser_three, limits_default());
     memory.raw_zero(?ping[0], 17);
-    ping[2] = 7; ping[3] = FRAME_PING;
+    ping[2] = 7;
+    ping[3] = FRAME_PING;
     if (feed(?parser_three, ?ping[0], 9, false).error != ERROR_FRAME_SIZE) { ret 4; }
     ret 0;
 }
@@ -553,15 +567,16 @@ test "http.h2.frame: continuation and typed lengths fail closed" {
 test "http.h2.frame: settings and flow control values are bounded" {
     var setting: [12]u8;
     if (!encode_setting(SETTINGS_MAX_FRAME_SIZE, 32768, ?setting[0], 12)
-     || encode_setting(SETTINGS_INITIAL_WINDOW_SIZE, 0x80000000, ?setting[0], 12)
-     || !encode_window_update(1, ?setting[6], 6)
-     || encode_window_update(0, ?setting[6], 6)) { ret 1; }
+        || encode_setting(SETTINGS_INITIAL_WINDOW_SIZE, 0x80000000, ?setting[0], 12)
+        || !encode_window_update(1, ?setting[6], 6)
+        || encode_window_update(0, ?setting[6], 6)) { ret 1; }
     encode_setting(SETTINGS_ENABLE_PUSH, 1, ?setting[0], 12);
     memory.raw_copy(?setting[6], ?setting[0], 6);
     var parser: Parser;
     parser_init(?parser, limits_default());
     var header: [9]u8;
-    header[2] = 12; header[3] = FRAME_SETTINGS;
+    header[2] = 12;
+    header[3] = FRAME_SETTINGS;
     if (feed(?parser, ?header[0], 9, false).kind != EVENT_HEADER) { ret 2; }
     val event: Event = feed(?parser, ?setting[0], 12, false);
     if (event.error != ERROR_PROTOCOL) { ret 3; }
@@ -576,12 +591,14 @@ test "http.h2.frame: writer preserves partial output and sequence" {
         flags: FLAG_END_STREAM, stream_id: 1};
     if (begin(?writer, header, ?output[0], 16).written != 9) { ret 2; }
     var payload: [3]u8;
-    payload[0] = 1; payload[1] = 2; payload[2] = 3;
-    val first: Write = write(?writer, ?output[9], 1, ?payload[0], 3);
+    payload[0] = 1;
+    payload[1] = 2;
+    payload[2] = 3;
+    val first:  Write = write(?writer, ?output[9], 1, ?payload[0], 3);
     val second: Write = write(?writer, ?output[10], 6, ?payload[1], 2);
     if (first.status != WRITE_OUTPUT || first.consumed != 1
-     || second.status != WRITE_DONE || second.consumed != 2
-     || output[9] != 1 || output[11] != 3) { ret 3; }
+        || second.status != WRITE_DONE || second.consumed != 2
+        || output[9] != 1 || output[11] != 3) { ret 3; }
     ret 0;
 }
 
@@ -589,23 +606,28 @@ test "http.h2.frame: padding and window attacks fail at frame boundary" {
     var parser: Parser;
     parser_init(?parser, limits_default());
     var header: [9]u8;
-    header[2] = 2; header[3] = FRAME_DATA; header[4] = FLAG_PADDED; header[8] = 1;
+    header[2] = 2;
+    header[3] = FRAME_DATA;
+    header[4] = FLAG_PADDED;
+    header[8] = 1;
     if (feed(?parser, ?header[0], 9, false).kind != EVENT_HEADER) { ret 1; }
     var padded: [2]u8;
     padded[0] = 2;
     if (feed(?parser, ?padded[0], 2, false).kind != EVENT_PAYLOAD
-     || !release(?parser) || feed(?parser, nil, 0, false).error != ERROR_PROTOCOL) {
+        || !release(?parser) || feed(?parser, nil, 0, false).error != ERROR_PROTOCOL) {
         ret 2;
     }
     var window_parser: Parser;
     parser_init(?window_parser, limits_default());
     memory.raw_zero(?header[0], 9);
-    header[2] = 4; header[3] = FRAME_WINDOW_UPDATE; header[8] = 1;
+    header[2] = 4;
+    header[3] = FRAME_WINDOW_UPDATE;
+    header[8] = 1;
     if (feed(?window_parser, ?header[0], 9, false).kind != EVENT_HEADER) { ret 3; }
     var zero: [4]u8;
     if (feed(?window_parser, ?zero[0], 4, false).kind != EVENT_PAYLOAD
-     || !release(?window_parser)
-     || feed(?window_parser, nil, 0, false).error != ERROR_PROTOCOL) { ret 4; }
+        || !release(?window_parser)
+        || feed(?window_parser, nil, 0, false).error != ERROR_PROTOCOL) { ret 4; }
     ret 0;
 }
 
@@ -613,22 +635,26 @@ test "http.h2.frame: oversized and truncated frames are distinguished" {
     var parser: Parser;
     parser_init(?parser, limits_default());
     var oversized: [9]u8;
-    oversized[0] = 0; oversized[1] = 0x40; oversized[2] = 1;
-    oversized[3] = FRAME_DATA; oversized[8] = 1;
+    oversized[0] = 0;
+    oversized[1] = 0x40;
+    oversized[2] = 1;
+    oversized[3] = FRAME_DATA;
+    oversized[8] = 1;
     if (feed(?parser, ?oversized[0], 9, false).error != ERROR_FRAME_SIZE) { ret 1; }
     var truncated_header: Parser;
     parser_init(?truncated_header, limits_default());
     if (feed(?truncated_header, ?oversized[0], 8, true).error != ERROR_TRUNCATED) { ret 2; }
     var truncated_payload: Parser;
     parser_init(?truncated_payload, limits_default());
-    oversized[1] = 0; oversized[2] = 2;
+    oversized[1] = 0;
+    oversized[2] = 2;
     if (feed(?truncated_payload, ?oversized[0], 9, false).kind != EVENT_HEADER
-     || feed(?truncated_payload, nil, 0, true).error != ERROR_TRUNCATED) { ret 3; }
+        || feed(?truncated_payload, nil, 0, true).error != ERROR_TRUNCATED) { ret 3; }
     var extension: Parser;
     parser_init(?extension, limits_default());
     memory.raw_zero(?oversized[0], 9);
     oversized[3] = 0xf0;
     if (feed(?extension, ?oversized[0], 9, false).kind != EVENT_HEADER
-     || feed(?extension, nil, 0, false).kind != EVENT_FRAME_END) { ret 4; }
+        || feed(?extension, nil, 0, false).kind != EVENT_FRAME_END) { ret 4; }
     ret 0;
 }

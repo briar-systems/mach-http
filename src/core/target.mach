@@ -1,16 +1,16 @@
+use http.core.method;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.view;
-use http.core.method;
 
 pub def Form: u8;
 
-pub val ORIGIN: Form = 1;
-pub val ABSOLUTE: Form = 2;
+pub val ORIGIN:    Form = 1;
+pub val ABSOLUTE:  Form = 2;
 pub val AUTHORITY: Form = 3;
-pub val ASTERISK: Form = 4;
+pub val ASTERISK:  Form = 4;
 
 pub rec Limits {
     max_raw_bytes:       usize;
@@ -40,20 +40,20 @@ fun bounded(value: view.View, max_bytes: usize) bool {
 pub fun limits(max_raw_bytes: usize, max_scheme_bytes: usize, max_authority_bytes: usize,
     max_path_bytes: usize, max_query_bytes: usize) Limits {
     ret Limits{
-        max_raw_bytes: max_raw_bytes,
-        max_scheme_bytes: max_scheme_bytes,
+        max_raw_bytes:       max_raw_bytes,
+        max_scheme_bytes:    max_scheme_bytes,
         max_authority_bytes: max_authority_bytes,
-        max_path_bytes: max_path_bytes,
-        max_query_bytes: max_query_bytes,
+        max_path_bytes:      max_path_bytes,
+        max_query_bytes:     max_query_bytes,
     };
 }
 
 pub fun valid(target: Target, configured: Limits) bool {
     if (!present(target.raw) || !bounded(target.raw, configured.max_raw_bytes)
-     || !bounded(target.scheme, configured.max_scheme_bytes)
-     || !bounded(target.authority, configured.max_authority_bytes)
-     || !bounded(target.path, configured.max_path_bytes)
-     || !bounded(target.query, configured.max_query_bytes)) { ret false; }
+        || !bounded(target.scheme, configured.max_scheme_bytes)
+        || !bounded(target.authority, configured.max_authority_bytes)
+        || !bounded(target.path, configured.max_path_bytes)
+        || !bounded(target.query, configured.max_query_bytes)) { ret false; }
     if (target.form == ORIGIN) {
         ret !present(target.scheme) && !present(target.authority) && present(target.path)
             && target.path.data[0] == '/';
@@ -72,21 +72,21 @@ pub fun valid(target: Target, configured: Limits) bool {
 }
 
 pub fun valid_for_method(target: Target, method_kind: method.Kind, configured: Limits) bool {
-    if (!valid(target, configured)) { ret false; }
+    if (!valid(target, configured))    { ret false; }
     if (method_kind == method.CONNECT) { ret target.form == AUTHORITY; }
-    if (target.form == AUTHORITY) { ret false; }
-    if (target.form == ASTERISK) { ret method_kind == method.OPTIONS; }
+    if (target.form == AUTHORITY)      { ret false; }
+    if (target.form == ASTERISK)       { ret method_kind == method.OPTIONS; }
     ret true;
 }
 
 pub fun origin(raw: view.View, path: view.View, query: view.View) Target {
     ret Target{
-        form: ORIGIN,
-        raw: raw,
-        scheme: view.view(nil, 0),
+        form:      ORIGIN,
+        raw:       raw,
+        scheme:    view.view(nil, 0),
         authority: view.view(nil, 0),
-        path: path,
-        query: query,
+        path:      path,
+        query:     query,
     };
 }
 
@@ -96,41 +96,41 @@ pub fun absolute(raw: view.View, scheme: view.View, authority: view.View, path: 
 
 pub fun authority(raw: view.View) Target {
     ret Target{
-        form: AUTHORITY,
-        raw: raw,
-        scheme: view.view(nil, 0),
+        form:      AUTHORITY,
+        raw:       raw,
+        scheme:    view.view(nil, 0),
         authority: raw,
-        path: view.view(nil, 0),
-        query: view.view(nil, 0),
+        path:      view.view(nil, 0),
+        query:     view.view(nil, 0),
     };
 }
 
 pub fun asterisk() Target {
     ret Target{
-        form: ASTERISK,
-        raw: view.view("*", 1),
-        scheme: view.view(nil, 0),
+        form:      ASTERISK,
+        raw:       view.view("*", 1),
+        scheme:    view.view(nil, 0),
         authority: view.view(nil, 0),
-        path: view.view(nil, 0),
-        query: view.view(nil, 0),
+        path:      view.view(nil, 0),
+        query:     view.view(nil, 0),
     };
 }
 
 test "http.core.target: all request-target forms are represented" {
     val configured: Limits = limits(128, 8, 64, 64, 32);
-    if (!valid_for_method(origin(view.view("/a?q", 4), view.view("/a", 2), view.view("q", 1)), method.GET, configured)) { ret 1; }
+    if (!valid_for_method(origin(view.view("/a?q", 4), view.view("/a", 2), view.view("q", 1)), method.GET, configured))                                                     { ret 1; }
     if (!valid_for_method(absolute(view.view("https://x/a", 11), view.view("https", 5), view.view("x", 1), view.view("/a", 2), view.view(nil, 0)), method.GET, configured)) { ret 2; }
-    if (!valid_for_method(authority(view.view("x:443", 5)), method.CONNECT, configured)) { ret 3; }
-    if (!valid_for_method(asterisk(), method.OPTIONS, configured)) { ret 4; }
+    if (!valid_for_method(authority(view.view("x:443", 5)), method.CONNECT, configured))                                                                                    { ret 3; }
+    if (!valid_for_method(asterisk(), method.OPTIONS, configured))                                                                                                          { ret 4; }
     ret 0;
 }
 
 test "http.core.target: forms and dimensions fail independently" {
     val configured: Limits = limits(8, 5, 4, 3, 2);
-    if (valid_for_method(authority(view.view("x:1", 3)), method.GET, configured)) { ret 1; }
-    if (valid_for_method(asterisk(), method.GET, configured)) { ret 2; }
-    if (valid(origin(view.view("long-path", 9), view.view("/a", 2), view.view(nil, 0)), configured)) { ret 3; }
-    if (valid(origin(view.view("/abcd", 5), view.view("/abcd", 5), view.view(nil, 0)), configured)) { ret 4; }
+    if (valid_for_method(authority(view.view("x:1", 3)), method.GET, configured))                                                               { ret 1; }
+    if (valid_for_method(asterisk(), method.GET, configured))                                                                                   { ret 2; }
+    if (valid(origin(view.view("long-path", 9), view.view("/a", 2), view.view(nil, 0)), configured))                                            { ret 3; }
+    if (valid(origin(view.view("/abcd", 5), view.view("/abcd", 5), view.view(nil, 0)), configured))                                             { ret 4; }
     if (valid(absolute(view.view("s://abcde", 9), view.view("s", 1), view.view("abcde", 5), view.view(nil, 0), view.view(nil, 0)), configured)) { ret 5; }
     ret 0;
 }
