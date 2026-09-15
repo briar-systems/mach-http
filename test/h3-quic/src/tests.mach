@@ -2,9 +2,9 @@
 
 use std.runtime;
 
-use http.test.h3_quic.adapter;
-use http.test.h3_quic.loopback;
-use http.test.h3_quic.session;
+use h3quic.adapter;
+use h3quic.loopback;
+use h3quic.session;
 
 use h3: http.h3.connection;
 use http.core.exchange;

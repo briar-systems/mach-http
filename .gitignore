@@ -1,4 +1,6 @@
 out/
+test/*/dep/
+test/*/out/
 *.swp
 *.swo
 .wt/
