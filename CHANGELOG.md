@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-15
+
+### Fixed
+- mach-quic, mach-tls and mach-crypto are no longer dependencies of mach-http. The h3-quic tests are back in their own `test/h3-quic` project, so a consumer of mach-http no longer has to realize them (#82). v0.8.1 should not be used.
+
 ## [0.8.1] - 2026-09-15
 
 ### Changed
