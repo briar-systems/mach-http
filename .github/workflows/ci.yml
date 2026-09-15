@@ -28,6 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           mach dep pull .
+          mach dep pull test/h3-quic
 
       - name: Build
         run: mach build .
@@ -37,6 +38,12 @@ jobs:
 
       - name: Test (release)
         run: mach test . --profile release
+
+      # qualifies http.h3.connection against the real mach-quic driver. the QUIC
+      # dependency lives in this subproject rather than the library so that no
+      # consumer of http has to build it.
+      - name: Test HTTP/3 over the real QUIC driver
+        run: mach test test/h3-quic
 
       # the manifest version and the exported constant must agree. the drift
       # this catches has reached both long-lived branches once already:

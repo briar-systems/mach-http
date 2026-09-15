@@ -1,7 +1,7 @@
 # one http/3 endpoint driven over a real quic driver, plus the two-endpoint fabric
 
-use http.test.h3_quic.adapter;
-use http.test.h3_quic.loopback;
+use h3quic.adapter;
+use h3quic.loopback;
 
 use h3: http.h3.connection;
 use http.h3.frame;

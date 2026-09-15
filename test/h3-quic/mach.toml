@@ -1,6 +1,6 @@
 [project]
-id = "http"
-version = "0.8.1"
+id = "h3quic"
+version = "0.0.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -50,14 +50,17 @@ simd = "scalarize"
 vectorize = true
 float_reassoc = false
 
-[artifact.http]
+[artifact.h3quic]
 kind = "static"
-entry = "lib.mach"
-out = "lib/http"
+entry = "tests.mach"
+out = "lib/h3quic"
 targets = ["*"]
 link = []
 need = []
 
-[dep.std]
-git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v2.0.0"
+[dep.http]
+path = "../.."
+
+[dep.quic]
+git = "https://github.com/briar-systems/mach-quic"
+ref = "tag/v0.6.1"
