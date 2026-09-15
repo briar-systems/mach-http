@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-15
+
+### Changed
+- Dependencies (tests only): mach-quic v0.6.1, which brings mach-crypto v0.9.1 and mach-tls v0.3.1.
+- The h3-quic tests are part of the root test set (#79).
+
 ## [0.8.0] - 2026-09-13
 
 ### Changed

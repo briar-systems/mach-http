@@ -1,6 +1,6 @@
 [project]
 id = "http"
-version = "0.8.0"
+version = "0.8.1"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -64,4 +64,4 @@ ref = "tag/v2.0.0"
 
 [dep.quic]
 git = "https://github.com/briar-systems/mach-quic"
-ref = "tag/v0.6.0"
+ref = "tag/v0.6.1"
