@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+- Dependencies: mach-std v3.2.0 (was v2.0.0). No source changes were needed (#89).
+- Dependencies (tests only): the h3-quic tests use mach-quic v0.9.0, which brings mach-crypto v0.10.1 and mach-tls v0.4.1 (#89).
+
 ## [0.8.2] - 2026-09-15
 
 ### Fixed
