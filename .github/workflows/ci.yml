@@ -2,67 +2,31 @@ name: CI
 
 on:
   pull_request:
-    branches: [dev, main]
-  # release branches also build on push. a pull_request trigger is selected from
-  # the base branch, so adding `main` above cannot take effect for the very PR
-  # that adds it -- the first release PR would still land untested.
-  push:
-    branches:
-      - 'chore/release-*'
-      - 'hotfix/*'
+  workflow_dispatch:
+    inputs:
+      heavy:
+        description: heavy work to run on this ref
+        type: choice
+        default: none
+        options: [none, all, aarch64-linux, x86_64-windows, aarch64-darwin, x86_64-darwin]
+
+permissions:
+  contents: read
 
 jobs:
-  linux-x86_64:
-    name: linux x86_64
+  lib:
+    uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
+    with:
+      heavy: ${{ inputs.heavy }}
+      # qualifies http.h3.connection against the real mach-quic driver. quic lives
+      # in this subproject so no consumer of http has to build it
+      subprojects: '[{"path": "test/h3-quic", "clean-dep": true}]'
+
+  gate:
+    if: always()
+    needs: [lib]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Seed mach
-        uses: ./.github/actions/seed-mach
-
-      - name: Report the seed
-        run: mach info
-
-      - name: Resolve dependencies
-        run: |
-          set -euo pipefail
-          mach dep pull .
-          mach dep pull test/h3-quic
-
-      - name: Build
-        run: mach build .
-
-      - name: Test
-        run: mach test .
-
-      - name: Test (release)
-        run: mach test . --profile release
-
-      # qualifies http.h3.connection against the real mach-quic driver. the QUIC
-      # dependency lives in this subproject rather than the library so that no
-      # consumer of http has to build it.
-      - name: Test HTTP/3 over the real QUIC driver
-        run: mach test test/h3-quic
-
-      # the manifest version and the exported constant must agree. the drift
-      # this catches has reached both long-lived branches once already:
-      # src/lib.mach reported 0.4.0 while the manifest had moved to 0.5.0. it
-      # guards exactly the release branches this workflow builds.
-      - name: Check the release version constant
-        run: |
-          set -euo pipefail
-          manifest=$(awk -F'"' '/^version = "/ { print $2; exit }' mach.toml)
-          exported=$(awk -F'"' '/^pub val VERSION: str = "/ { print $2; exit }' src/lib.mach)
-          if [ -z "$manifest" ] || [ -z "$exported" ]; then
-            echo "::error::release version is missing: mach.toml=${manifest:-<none>} src/lib.mach=${exported:-<none>}"
-            exit 1
-          fi
-          if [ "$manifest" != "$exported" ]; then
-            echo "::error::release version mismatch: mach.toml=$manifest src/lib.mach=$exported"
-            exit 1
-          fi
-          echo "release version $manifest"
-
-      - name: Build every target
-        run: mach build . --all-targets --profile release
+      - uses: briar-systems/.github/.github/actions/gate@main
+        with:
+          needs: ${{ toJSON(needs) }}
