@@ -5,16 +5,16 @@
 # and flow-control work, frames it with rfc 9000 variable-length integers, and
 # lets the harness deliver, drop, or reorder each datagram between two drivers.
 
-use qt: quic.transport;
 use quic.connection.ownership;
-use sm: quic.stream.stream;
 use dq: quic.stream.datagram;
+use sm: quic.stream.stream;
+use qt: quic.transport;
 use quic.wire.varint;
 
-use std.encoding.binary;
-use std.sync.cancel;
 use std.chrono.time;
+use std.encoding.binary;
 use std.net.ip;
+use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -22,47 +22,47 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
-
-
 fun is_ok_usize_u8(outcome: res[usize, u8]) bool {
     ret sel outcome.ok;
 }
+
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
 }
-pub val STREAM_CAPACITY: usize = 16;
-pub val SEND_STRIDE: usize = 512;
-pub val RECEIVE_STRIDE: usize = 512;
-pub val ATTEMPT_CAPACITY: usize = 32;
-pub val SEND_SLOTS: usize = 4;
-pub val OWNER_SLOTS: usize = 8;
-pub val DATAGRAM_BYTES: usize = 256;
 
-val FRAME_STREAM: u8 = 1;
-val FRAME_RESET: u8 = 2;
-val FRAME_STOP: u8 = 3;
-val FRAME_MAX_DATA: u8 = 4;
-val FRAME_MAX_STREAM_DATA: u8 = 5;
+pub val STREAM_CAPACITY:  usize = 16;
+pub val SEND_STRIDE:      usize = 512;
+pub val RECEIVE_STRIDE:   usize = 512;
+pub val ATTEMPT_CAPACITY: usize = 32;
+pub val SEND_SLOTS:       usize = 4;
+pub val OWNER_SLOTS:      usize = 8;
+pub val DATAGRAM_BYTES:   usize = 256;
+
+val FRAME_STREAM:           u8 = 1;
+val FRAME_RESET:            u8 = 2;
+val FRAME_STOP:             u8 = 3;
+val FRAME_MAX_DATA:         u8 = 4;
+val FRAME_MAX_STREAM_DATA:  u8 = 5;
 val FRAME_MAX_STREAMS_BIDI: u8 = 6;
-val FRAME_MAX_STREAMS_UNI: u8 = 7;
+val FRAME_MAX_STREAMS_UNI:  u8 = 7;
 
 # reserved for the frame kind, stream id, offset, fin, and length prefix
 val FRAME_OVERHEAD: usize = 32;
 
 pub rec Core {
-    manager: *sm.Manager;
-    datagrams: *dq.Queue;
+    manager:      *sm.Manager;
+    datagrams:    *dq.Queue;
     owner_tokens: [8]sm.AttemptToken;
-    owner_used: [8]bool;
-    next_owner: u64;
-    next_stream: usize;
-    outstanding: usize;
-    delivered: usize;
-    lost: usize;
-    closing: bool;
-    abortive: bool;
-    closed: bool;
-    close_error: u64;
+    owner_used:   [8]bool;
+    next_owner:   u64;
+    next_stream:  usize;
+    outstanding:  usize;
+    delivered:    usize;
+    lost:         usize;
+    closing:      bool;
+    abortive:     bool;
+    closed:       bool;
+    close_error:  u64;
 }
 
 fun state_of(core: *Core) qt.ConnectionState {
@@ -103,47 +103,47 @@ fun encode_prepared(prepared: *sm.Prepared, output: *u8, capacity: usize) usize 
         var end: u8 = 0;
         if (prepared.fin) { end = 1; }
         if (!wrote(binary.builder_write_u8(?b, FRAME_STREAM))
-         || !put_varint(?b, prepared.handle.id)
-         || !put_varint(?b, prepared.offset)
-         || !wrote(binary.builder_write_u8(?b, end))
-         || !put_varint(?b, prepared.data.len::u64)) { ret 0; }
+            || !put_varint(?b, prepared.handle.id)
+            || !put_varint(?b, prepared.offset)
+            || !wrote(binary.builder_write_u8(?b, end))
+            || !put_varint(?b, prepared.data.len::u64)) { ret 0; }
         if (prepared.data.len != 0
-         && !wrote(binary.builder_write_bytes(?b, prepared.data.data,
+            && !wrote(binary.builder_write_bytes(?b, prepared.data.data,
             prepared.data.len))) { ret 0; }
         ret b.len;
     }
     if (prepared.kind == sm.SEND_RESET) {
         if (!wrote(binary.builder_write_u8(?b, FRAME_RESET))
-         || !put_varint(?b, prepared.handle.id)
-         || !put_varint(?b, prepared.application_error)
-         || !put_varint(?b, prepared.final_size)) { ret 0; }
+            || !put_varint(?b, prepared.handle.id)
+            || !put_varint(?b, prepared.application_error)
+            || !put_varint(?b, prepared.final_size)) { ret 0; }
         ret b.len;
     }
     if (prepared.kind == sm.SEND_STOP) {
         if (!wrote(binary.builder_write_u8(?b, FRAME_STOP))
-         || !put_varint(?b, prepared.handle.id)
-         || !put_varint(?b, prepared.application_error)) { ret 0; }
+            || !put_varint(?b, prepared.handle.id)
+            || !put_varint(?b, prepared.application_error)) { ret 0; }
         ret b.len;
     }
     if (prepared.kind == sm.SEND_MAX_DATA) {
         if (!wrote(binary.builder_write_u8(?b, FRAME_MAX_DATA))
-         || !put_varint(?b, prepared.maximum)) { ret 0; }
+            || !put_varint(?b, prepared.maximum)) { ret 0; }
         ret b.len;
     }
     if (prepared.kind == sm.SEND_MAX_STREAM_DATA) {
         if (!wrote(binary.builder_write_u8(?b, FRAME_MAX_STREAM_DATA))
-         || !put_varint(?b, prepared.handle.id)
-         || !put_varint(?b, prepared.maximum)) { ret 0; }
+            || !put_varint(?b, prepared.handle.id)
+            || !put_varint(?b, prepared.maximum)) { ret 0; }
         ret b.len;
     }
     if (prepared.kind == sm.SEND_MAX_STREAMS_BIDI) {
         if (!wrote(binary.builder_write_u8(?b, FRAME_MAX_STREAMS_BIDI))
-         || !put_varint(?b, prepared.maximum)) { ret 0; }
+            || !put_varint(?b, prepared.maximum)) { ret 0; }
         ret b.len;
     }
     if (prepared.kind == sm.SEND_MAX_STREAMS_UNI) {
         if (!wrote(binary.builder_write_u8(?b, FRAME_MAX_STREAMS_UNI))
-         || !put_varint(?b, prepared.maximum)) { ret 0; }
+            || !put_varint(?b, prepared.maximum)) { ret 0; }
         ret b.len;
     }
     ret 0;
@@ -181,11 +181,11 @@ fun core_range(core: *Core) ownership.Range {
 }
 
 fun core_generate(core: *Core, output: *u8, capacity: usize,
-                  now_ns: u64) qt.CoreDatagram {
+    now_ns: u64) qt.CoreDatagram {
     var result_value: qt.CoreDatagram;
     result_value.state = state_of(core);
     if (core.closed || core.closing || output == nil
-     || capacity <= FRAME_OVERHEAD) {
+        || capacity <= FRAME_OVERHEAD) {
         result_value.status = qt.STATUS_EMPTY;
         ret result_value;
     }
@@ -204,30 +204,30 @@ fun core_generate(core: *Core, output: *u8, capacity: usize,
     }
     if (prepared.status != sm.STATUS_OK) {
         result_value.status = qt.STATUS_BLOCKED;
-        result_value.error = prepared.error::u64;
+        result_value.error  = prepared.error::u64;
         ret result_value;
     }
     val written: usize = encode_prepared(?prepared, output, capacity);
     if (written == 0 || written > capacity) {
         sm.cancel_prepared(core.manager, prepared);
         result_value.status = qt.STATUS_ERROR;
-        result_value.error = 10;
+        result_value.error  = 10;
         ret result_value;
     }
     if (sm.publish(core.manager, prepared).status != sm.STATUS_OK) {
         result_value.status = qt.STATUS_ERROR;
-        result_value.error = 11;
+        result_value.error  = 11;
         ret result_value;
     }
     core.owner_tokens[slot] = prepared.token;
-    core.owner_used[slot] = true;
-    core.outstanding = core.outstanding + 1;
-    result_value.status = qt.STATUS_OK;
-    result_value.owner = core.next_owner;
-    result_value.count = written;
-    result_value.local = ip.endpoint(127, 0, 0, 1, 4433);
-    result_value.peer = ip.endpoint(127, 0, 0, 1, 4434);
-    core.next_owner = core.next_owner + 1;
+    core.owner_used[slot]   = true;
+    core.outstanding        = core.outstanding + 1;
+    result_value.status     = qt.STATUS_OK;
+    result_value.owner      = core.next_owner;
+    result_value.count      = written;
+    result_value.local      = ip.endpoint(127, 0, 0, 1, 4433);
+    result_value.peer       = ip.endpoint(127, 0, 0, 1, 4434);
+    core.next_owner         = core.next_owner + 1;
     ret result_value;
 }
 
@@ -237,17 +237,17 @@ fun core_receive(core: *Core, input: *qt.Datagram) qt.CoreResult {
     }
     # a draining endpoint has already cancelled every stream
     if (core.closing || core.closed) { ret core_result(core, qt.STATUS_OK, 0); }
-    var d: binary.Decoder = binary.decoder(input.data, input.length, binary.BIG);
-    var kind: u8 = 0;
+    var d:    binary.Decoder = binary.decoder(input.data, input.length, binary.BIG);
+    var kind: u8             = 0;
     if (!take_u8(?d, ?kind)) { ret core_result(core, qt.STATUS_ERROR, 2); }
-    var id: u64 = 0;
-    var first: u64 = 0;
+    var id:     u64 = 0;
+    var first:  u64 = 0;
     var second: u64 = 0;
     if (kind == FRAME_STREAM) {
         var end_byte: u8 = 0;
         if (!take_varint(?d, ?id) || !take_varint(?d, ?first)
-         || !take_u8(?d, ?end_byte) || !take_varint(?d, ?second)
-         || second::usize > d.len - d.pos) {
+            || !take_u8(?d, ?end_byte) || !take_varint(?d, ?second)
+            || second::usize > d.len - d.pos) {
             ret core_result(core, qt.STATUS_ERROR, 3);
         }
         var payload: *u8 = nil;
@@ -268,7 +268,7 @@ fun core_receive(core: *Core, input: *qt.Datagram) qt.CoreResult {
     }
     if (kind == FRAME_RESET) {
         if (!take_varint(?d, ?id) || !take_varint(?d, ?first)
-         || !take_varint(?d, ?second)) {
+            || !take_varint(?d, ?second)) {
             ret core_result(core, qt.STATUS_ERROR, 5);
         }
         val received: sm.ReceiveResult = sm.receive_reset(core.manager, id,
@@ -292,7 +292,7 @@ fun core_receive(core: *Core, input: *qt.Datagram) qt.CoreResult {
     }
     if (kind == FRAME_MAX_DATA) {
         if (!take_varint(?d, ?first)
-         || sm.update_max_data(core.manager, first).status != sm.STATUS_OK) {
+            || sm.update_max_data(core.manager, first).status != sm.STATUS_OK) {
             ret core_result(core, qt.STATUS_ERROR, 7);
         }
         core.delivered = core.delivered + 1;
@@ -314,7 +314,7 @@ fun core_receive(core: *Core, input: *qt.Datagram) qt.CoreResult {
         var direction: u8 = sm.DIRECTION_BIDIRECTIONAL;
         if (kind == FRAME_MAX_STREAMS_UNI) { direction = sm.DIRECTION_UNIDIRECTIONAL; }
         if (!take_varint(?d, ?first)
-         || sm.update_max_streams(core.manager, direction,
+            || sm.update_max_streams(core.manager, direction,
             first).status != sm.STATUS_OK) {
             ret core_result(core, qt.STATUS_ERROR, 9);
         }
@@ -329,7 +329,7 @@ fun core_timeout(core: *Core, generation: u64, now_ns: u64) qt.CoreResult {
 }
 
 fun core_complete(core: *Core, owner: u64, status: qt.SendStatus, count: usize,
-                  now_ns: u64) qt.CoreResult {
+    now_ns: u64) qt.CoreResult {
     val slot: usize = (owner % OWNER_SLOTS::u64)::usize;
     if (!core.owner_used[slot]) { ret core_result(core, qt.STATUS_ERROR, 14); }
     var terminal: u8 = sm.TERMINAL_LOST;
@@ -346,8 +346,8 @@ fun core_complete(core: *Core, owner: u64, status: qt.SendStatus, count: usize,
 }
 
 fun core_begin_close(core: *Core, abortive: bool, application_error: u64,
-                     reason: *u8, reason_length: usize,
-                     now_ns: u64) qt.CoreResult {
+    reason: *u8, reason_length: usize,
+    now_ns: u64) qt.CoreResult {
     if (reason_length > 0 && reason == nil) {
         ret core_result(core, qt.STATUS_ERROR, 16);
     }
@@ -369,10 +369,10 @@ fun core_ready(core: *Core) bool {
 # the close if either still is. finishing twice is what a retry loop does after
 # one endpoint settles ahead of the other, so a settled core reports done.
 fun core_finish(core: *Core) bool {
-    if (core.closed) { ret true; }
+    if (core.closed)       { ret true; }
     if (!core_ready(core)) { ret false; }
     if (sm.finish_close(core.manager).status != sm.STATUS_OK
-     || dq.finish_close(core.datagrams).status != dq.STATUS_OK) { ret false; }
+        || dq.finish_close(core.datagrams).status != dq.STATUS_OK) { ret false; }
     core.closed = true;
     ret true;
 }
@@ -383,78 +383,79 @@ fun core_timer(core: *Core) qt.CoreTimer {
 }
 
 pub rec Endpoint {
-    stream_records: [16]sm.Stream;
-    send_data: [8192]u8;
-    send_pending: [8192]bool;
-    send_acked: [8192]bool;
-    send_inflight: [8192]u8;
-    receive_data: [8192]u8;
+    stream_records:  [16]sm.Stream;
+    send_data:       [8192]u8;
+    send_pending:    [8192]bool;
+    send_acked:      [8192]bool;
+    send_inflight:   [8192]u8;
+    receive_data:    [8192]u8;
     receive_present: [8192]bool;
-    attempts: [32]sm.Attempt;
-    manager: sm.Manager;
-    datagrams: dq.Queue;
-    sends: [4]qt.SendSlot;
-    core: Core;
-    scope: cancel.Scope;
-    driver: qt.Driver[Core];
-    close_failed: bool;
+    attempts:        [32]sm.Attempt;
+    manager:         sm.Manager;
+    datagrams:       dq.Queue;
+    sends:           [4]qt.SendSlot;
+    core:            Core;
+    scope:           cancel.Scope;
+    driver:          qt.Driver[Core];
+    close_failed:    bool;
 }
 
 fun stream_config(source: u64, role: u8, window: u64) sm.Config {
     var value: sm.Config;
-    value.source = source;
-    value.role = role;
-    value.local_bidirectional_limit = 4;
-    value.local_unidirectional_limit = 4;
-    value.peer_bidirectional_limit = 4;
-    value.peer_unidirectional_limit = 4;
-    value.send_max_data = 4096;
-    value.receive_max_data = 4096;
-    value.send_local_bidirectional_limit = window;
-    value.send_peer_bidirectional_limit = window;
-    value.send_unidirectional_limit = window;
+    value.source                            = source;
+    value.role                              = role;
+    value.local_bidirectional_limit         = 4;
+    value.local_unidirectional_limit        = 4;
+    value.peer_bidirectional_limit          = 4;
+    value.peer_unidirectional_limit         = 4;
+    value.send_max_data                     = 4096;
+    value.receive_max_data                  = 4096;
+    value.send_local_bidirectional_limit    = window;
+    value.send_peer_bidirectional_limit     = window;
+    value.send_unidirectional_limit         = window;
     value.receive_local_bidirectional_limit = window;
-    value.receive_peer_bidirectional_limit = window;
-    value.receive_unidirectional_limit = window;
+    value.receive_peer_bidirectional_limit  = window;
+    value.receive_unidirectional_limit      = window;
     ret value;
 }
 
 # window bounds each stream's initial flow-control allowance, so a small one
 # forces the driver to accept writes partially until credit catches up
 pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
-                      window: u64) usize {
+    window: u64) usize {
     var role: u8 = sm.ROLE_SERVER;
     if (client) { role = sm.ROLE_CLIENT; }
     val stream_storage: sm.Storage = sm.Storage{
-        streams: ?endpoint.stream_records[0], stream_capacity: STREAM_CAPACITY,
-        send_data: ?endpoint.send_data[0], send_data_length: 8192,
-        send_pending: ?endpoint.send_pending[0],
-        send_acked: ?endpoint.send_acked[0],
-        send_inflight: ?endpoint.send_inflight[0], send_state_length: 8192,
-        send_stride: SEND_STRIDE,
-        receive_data: ?endpoint.receive_data[0], receive_data_length: 8192,
+        streams:         ?endpoint.stream_records[0], stream_capacity: STREAM_CAPACITY,
+        send_data:       ?endpoint.send_data[0], send_data_length: 8192,
+        send_pending:    ?endpoint.send_pending[0],
+        send_acked:      ?endpoint.send_acked[0],
+        send_inflight:   ?endpoint.send_inflight[0], send_state_length: 8192,
+        send_stride:     SEND_STRIDE,
+        receive_data:    ?endpoint.receive_data[0], receive_data_length: 8192,
         receive_present: ?endpoint.receive_present[0], receive_state_length: 8192,
-        receive_stride: RECEIVE_STRIDE,
-        attempts: ?endpoint.attempts[0], attempt_capacity: ATTEMPT_CAPACITY};
+        receive_stride:  RECEIVE_STRIDE,
+        attempts:        ?endpoint.attempts[0], attempt_capacity: ATTEMPT_CAPACITY
+    };
     if (window == 0 || window > SEND_STRIDE::u64
-     || !sm.initialize(?endpoint.manager, stream_config(source, role, window),
+        || !sm.initialize(?endpoint.manager, stream_config(source, role, window),
         stream_storage)) { ret 1; }
     # the engine deliberately has no datagram surface, so the queue stays empty
     var datagram_storage: dq.Storage;
     if (!dq.initialize(?endpoint.datagrams, dq.Config{source: source,
         peer_max_frame_size: 0, local_max_frame_size: 0, enabled: false},
         datagram_storage)) { ret 2; }
-    endpoint.core.manager = ?endpoint.manager;
-    endpoint.core.datagrams = ?endpoint.datagrams;
+    endpoint.core.manager    = ?endpoint.manager;
+    endpoint.core.datagrams  = ?endpoint.datagrams;
     endpoint.core.next_owner = 1;
-    endpoint.close_failed = false;
+    endpoint.close_failed    = false;
     if (!operation_ok(cancel.make_root(?endpoint.scope, false,
         time.Time{sec: 0, nsec: 0}))) { ret 3; }
     val protocol: qt.Protocol[Core] = qt.Protocol[Core]{context: ?endpoint.core,
         context_range: core_range, receive: core_receive,
-        timeout: core_timeout, generate: core_generate,
+        timeout:       core_timeout, generate: core_generate,
         complete_send: core_complete, begin_close: core_begin_close,
-        close_ready: core_ready, finish_close: core_finish, timer: core_timer};
+        close_ready:   core_ready, finish_close: core_finish, timer: core_timer};
     val config: qt.Config = qt.Config{source: source, max_udp_payload: 1500,
         max_close_reason: 64};
     val storage: qt.Storage = qt.Storage{sends: ?endpoint.sends[0],
@@ -471,56 +472,56 @@ pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
     ret 0;
 }
 
-pub val NO_HOLD: u64 = (-1)::u64;
+pub val NO_HOLD:    u64   = (-1)::u64;
 pub val HOLD_SLOTS: usize = 4;
 
 pub rec Link {
-    client: *Endpoint;
-    server: *Endpoint;
-    buffer: [256]u8;
-    held: [4][256]u8;
-    held_length: [4]usize;
-    held_count: usize;
-    hold_id: u64;
-    now_ns: u64;
-    drop_next: usize;
-    dropped: usize;
-    transfers: usize;
-    reordered: usize;
-    errors: usize;
+    client:       *Endpoint;
+    server:       *Endpoint;
+    buffer:       [256]u8;
+    held:         [4][256]u8;
+    held_length:  [4]usize;
+    held_count:   usize;
+    hold_id:      u64;
+    now_ns:       u64;
+    drop_next:    usize;
+    dropped:      usize;
+    transfers:    usize;
+    reordered:    usize;
+    errors:       usize;
     close_rounds: usize;
 }
 
 pub fun init_link(link: *Link, client: *Endpoint, server: *Endpoint) {
-    link.client = client;
-    link.server = server;
-    link.now_ns = 1;
-    link.drop_next = 0;
-    link.dropped = 0;
-    link.transfers = 0;
-    link.reordered = 0;
-    link.errors = 0;
+    link.client       = client;
+    link.server       = server;
+    link.now_ns       = 1;
+    link.drop_next    = 0;
+    link.dropped      = 0;
+    link.transfers    = 0;
+    link.reordered    = 0;
+    link.errors       = 0;
     link.close_rounds = 0;
-    link.held_count = 0;
-    link.hold_id = NO_HOLD;
+    link.held_count   = 0;
+    link.hold_id      = NO_HOLD;
 }
 
 # reads back the stream id a generated datagram carries, so the harness can
 # delay one stream's frames while the rest of the connection keeps moving
 fun carried_stream(data: *u8, length: usize, out: *u64) bool {
     if (data == nil || length < 2 || data[0] != FRAME_STREAM) { ret false; }
-    var d: binary.Decoder = binary.decoder(data, length, binary.BIG);
-    var kind: u8 = 0;
+    var d:    binary.Decoder = binary.decoder(data, length, binary.BIG);
+    var kind: u8             = 0;
     if (!take_u8(?d, ?kind)) { ret false; }
     ret take_varint(?d, out);
 }
 
 fun deliver(link: *Link, to: *Endpoint, data: *u8, length: usize) bool {
     var datagram: qt.Datagram;
-    datagram.local = ip.endpoint(127, 0, 0, 1, 4434);
-    datagram.peer = ip.endpoint(127, 0, 0, 1, 4433);
-    datagram.data = data;
-    datagram.length = length;
+    datagram.local          = ip.endpoint(127, 0, 0, 1, 4434);
+    datagram.peer           = ip.endpoint(127, 0, 0, 1, 4433);
+    datagram.data           = data;
+    datagram.length         = length;
     datagram.received_at_ns = link.now_ns;
     if (qt.receive_datagram[Core](?to.driver, ?datagram).status != qt.STATUS_OK) {
         ret false;
@@ -554,34 +555,37 @@ fun carry(link: *Link, from: *Endpoint, to: *Endpoint) bool {
     var lost: bool = false;
     if (link.drop_next != 0) {
         link.drop_next = link.drop_next - 1;
-        link.dropped = link.dropped + 1;
-        lost = true;
+        link.dropped   = link.dropped + 1;
+        lost           = true;
     }
-    var parked: bool = false;
-    var carried: u64 = 0;
+    var parked:  bool = false;
+    var carried: u64  = 0;
     if (!lost && link.hold_id != NO_HOLD && link.held_count < HOLD_SLOTS
-     && carried_stream(generated.buffer, generated.count, ?carried)
-     && carried == link.hold_id) {
+        && carried_stream(generated.buffer, generated.count, ?carried)
+        && carried == link.hold_id) {
         var i: usize = 0;
         for (i < generated.count) {
             link.held[link.held_count][i] = generated.buffer[i];
-            i = i + 1;
+            i                             = i + 1;
         }
         link.held_length[link.held_count] = generated.count;
-        link.held_count = link.held_count + 1;
-        link.reordered = link.reordered + 1;
-        parked = true;
+        link.held_count                   = link.held_count + 1;
+        link.reordered                    = link.reordered + 1;
+        parked                            = true;
     }
     if (!lost && !parked
-     && !deliver(link, to, generated.buffer, generated.count)) {
+        && !deliver(link, to, generated.buffer, generated.count)) {
         link.errors = link.errors + 1;
         qt.complete_send[Core](?from.driver, generated.token, qt.SEND_FAILED, 0,
             link.now_ns);
         ret false;
     }
     var status: qt.SendStatus = qt.SEND_SENT;
-    var count: usize = generated.count;
-    if (lost) { status = qt.SEND_FAILED; count = 0; }
+    var count:  usize         = generated.count;
+    if (lost) {
+        status = qt.SEND_FAILED;
+        count  = 0;
+    }
     if (qt.complete_send[Core](?from.driver, generated.token, status, count,
         link.now_ns).status != qt.STATUS_OK) {
         link.errors = link.errors + 1;
@@ -593,14 +597,14 @@ fun carry(link: *Link, from: *Endpoint, to: *Endpoint) bool {
 # drains both directions until neither driver has anything left to send
 pub fun flush(link: *Link, budget: usize) usize {
     var moved: usize = 0;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (i < budget) {
         var progress: bool = false;
         if (carry(link, link.client, link.server)) { progress = true; }
         if (carry(link, link.server, link.client)) { progress = true; }
-        if (!progress) { ret moved; }
+        if (!progress)                             { ret moved; }
         moved = moved + 1;
-        i = i + 1;
+        i     = i + 1;
     }
     ret moved;
 }
@@ -610,7 +614,7 @@ pub fun flush(link: *Link, budget: usize) usize {
 # driver applies a cancelled scope on the owner's next call, so both arrive at
 # the core through the same begin_close callback.
 pub fun begin_close_endpoint(endpoint: *Endpoint, abortive: bool, code: u64,
-                             now_ns: u64) bool {
+    now_ns: u64) bool {
     val begun: qt.Status = qt.begin_close[Core](?endpoint.driver, code, nil, 0,
         now_ns).status;
     if (begun != qt.STATUS_OK && begun != qt.STATUS_CLOSED) { ret false; }
@@ -626,7 +630,7 @@ pub fun begin_close_endpoint(endpoint: *Endpoint, abortive: bool, code: u64,
 # retried after the link moves, so the caller distinguishes it from a failure.
 pub fun finish_close_endpoint(endpoint: *Endpoint) bool {
     val finished: qt.Status = qt.finish_close[Core](?endpoint.driver).status;
-    if (finished == qt.STATUS_OK) { ret true; }
+    if (finished == qt.STATUS_OK)      { ret true; }
     if (finished == qt.STATUS_BLOCKED) { ret false; }
     endpoint.close_failed = true;
     ret false;
@@ -638,12 +642,12 @@ pub fun finish_close_endpoint(endpoint: *Endpoint) bool {
 pub fun close_link(link: *Link, abortive: bool, code: u64, budget: usize) bool {
     link.now_ns = link.now_ns + 1;
     if (!begin_close_endpoint(link.client, abortive, code, link.now_ns)
-     || !begin_close_endpoint(link.server, abortive, code, link.now_ns)) {
+        || !begin_close_endpoint(link.server, abortive, code, link.now_ns)) {
         ret false;
     }
-    var client_closed: bool = false;
-    var server_closed: bool = false;
-    var i: usize = 0;
+    var client_closed: bool  = false;
+    var server_closed: bool  = false;
+    var i:             usize = 0;
     for (i < budget) {
         link.close_rounds = i + 1;
         if (!client_closed) {
@@ -652,7 +656,7 @@ pub fun close_link(link: *Link, abortive: bool, code: u64, budget: usize) bool {
         if (!server_closed) {
             server_closed = finish_close_endpoint(link.server);
         }
-        if (client_closed && server_closed) { brk; }
+        if (client_closed && server_closed)                       { brk; }
         if (link.client.close_failed || link.server.close_failed) { ret false; }
         flush(link, 16);
         i = i + 1;
@@ -665,9 +669,9 @@ pub fun close_link(link: *Link, abortive: bool, code: u64, budget: usize) bool {
 # queue as it settles, so a closed endpoint owns no stream storage at all
 pub fun endpoint_closed(endpoint: *Endpoint) bool {
     if (qt.snapshot[Core](?endpoint.driver).state != qt.CLOSED
-     || !endpoint.core.closed || endpoint.core.outstanding != 0
-     || endpoint.manager.valid || endpoint.manager.active_streams != 0
-     || endpoint.manager.active_attempts != 0 || endpoint.datagrams.valid) {
+        || !endpoint.core.closed || endpoint.core.outstanding != 0
+        || endpoint.manager.valid || endpoint.manager.active_streams != 0
+        || endpoint.manager.active_attempts != 0 || endpoint.datagrams.valid) {
         ret false;
     }
     var i: usize = 0;
