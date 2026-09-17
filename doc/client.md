@@ -150,6 +150,14 @@ cancellation wins over both following and publishing a redirect error.
 
 ## Cancellation and shutdown
 
+Every `now` the client, DNS cache and pool take, and every request deadline, is
+`std.chrono.time.monotonic()` time, the clock std enforces cancellation-scope and
+`io.runtime` deadlines against. The DNS cache turns `now` plus the resolve timeout
+into the deadline of the scope it hands out with each resolver query. Each request's
+child scope takes `request.metadata.deadline`, and `expire_request` expires it at
+the given `now`. `time.Time` doesn't record its clock, so a wall-clock value
+(`time.now()`) is accepted, but it yields deadlines that never fire.
+
 Every request owns a child of the supplied cancellation scope. An open request body
 must initially reference that supplied parent. After the child is created, the client
 rebinds the body to it so the selected engine can initialize the common
