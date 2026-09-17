@@ -4,6 +4,13 @@
 machine. It composes strict incremental parsing and serialization with the common
 ordered transport.
 
+## Time
+
+Every `now` the engine takes is `std.chrono.time.monotonic()` time. The header,
+request, write, idle and total deadlines are absolute instants computed from it, and
+an expired one times out the engine's cancellation scope. Pass the same clock on
+every call. A wall-clock value (`time.now()`) moves with clock adjustments.
+
 ## Slots and identity
 
 Every pipeline slot and all parser, field, trailer, and serializer storage are

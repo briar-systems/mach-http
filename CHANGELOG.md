@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- Documented that every `now` and deadline the client, DNS cache, pool and HTTP/1 engine take is `std.chrono.time.monotonic()` time. A wall-clock value is accepted but yields deadlines that never fire (#99).
+
 ## [0.10.0] - 2026-09-17
 
 ### Changed
