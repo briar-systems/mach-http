@@ -1,0 +1,208 @@
+# address-stable record chunks borrowed from a std.memory.buffers source
+#
+# chunk 0 holds `1 << shift` records and chunk k holds `1 << (shift + k - 1)`,
+# the same doubling as std.memory.table, so capacity doubles per chunk and a
+# record's address never changes once handed out. every chunk is one buffers
+# chunk charged to the owner's account. the directory is inline and never grows.
+
+use std.allocator;
+use std.allocator.page;
+use std.memory;
+use std.memory.buffers;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+
+pub val DIRECTORY: usize = 16;
+
+# every chunk is requested at this alignment, so a record may need at most this
+pub val RECORD_ALIGN: usize = 16;
+
+pub rec Records {
+    chunks:       [16]buffers.Chunk;
+    element_size: usize;
+    shift:        usize;
+    chunk_count:  usize;
+    capacity:     usize;
+}
+
+fun floor_log2(value: usize) usize {
+    var v: usize = value;
+    var k: usize = 0;
+    for (v > 1) {
+        v = v >> 1;
+        k = k + 1;
+    }
+    ret k;
+}
+
+fun chunk_elements(records: *Records, chunk: usize) usize {
+    if (chunk == 0) { ret 1::usize << records.shift; }
+    ret 1::usize << (records.shift + chunk - 1);
+}
+
+# the largest capacity a record set of this shape can reach
+pub fun limit(first: usize) usize {
+    var shift: usize = 0;
+    for ((1::usize << shift) < first) { shift = shift + 1; }
+    ret 1::usize << (shift + DIRECTORY - 1);
+}
+
+# an empty set of records, taking no memory until the first grow
+# ---
+# records:      the set to shape
+# element_size: bytes per record, whose alignment is at most RECORD_ALIGN
+# first:        records in chunk 0, rounded up to a power of two
+# ret:          whether the shape is valid
+pub fun make(records: *Records, element_size: usize, first: usize) bool {
+    if (records == nil || element_size == 0 || first == 0 || first > 0x10000) { ret false; }
+    var blank: Records;
+    @records = blank;
+    var shift: usize = 0;
+    for ((1::usize << shift) < first) { shift = shift + 1; }
+    records.element_size = element_size;
+    records.shift        = shift;
+    ret true;
+}
+
+# the request for the next chunk, zero bytes when the directory is full
+pub fun next_request(records: *Records, lane: u8) buffers.Request {
+    var request: buffers.Request = buffers.Request{bytes: 0, align: RECORD_ALIGN,
+        lane: lane, secret: false};
+    if (records.chunk_count >= DIRECTORY) { ret request; }
+    var bytes: usize = 0;
+    if (!memory.range_scaled(chunk_elements(records, records.chunk_count),
+        records.element_size, ?bytes)) { ret request; }
+    request.bytes = bytes;
+    ret request;
+}
+
+# append an acquired chunk made for `next_request`, whose records are
+# uninitialized and owned by the caller from here
+pub fun attach(records: *Records, chunk: buffers.Chunk) {
+    records.chunks[records.chunk_count] = chunk;
+    records.capacity                    = records.capacity
+        + chunk_elements(records, records.chunk_count);
+    records.chunk_count = records.chunk_count + 1;
+}
+
+# grow by one chunk through the source, all or nothing
+# ---
+# register: on exhausted or memory, register the account for one wake-up
+# ret:      the source's result, the new records starting at the old capacity
+pub fun grow(records: *Records, source: *buffers.Source, account: *buffers.Account,
+    lane: u8, register: bool) buffers.Acquired {
+    val request: buffers.Request = next_request(records, lane);
+    if (request.bytes == 0) {
+        var refused: buffers.Acquired;
+        refused.status = buffers.Status.blocked{};
+        refused.reason = buffers.Reason.budget{};
+        ret refused;
+    }
+    val got: buffers.Acquired = source.fn_acquire(source.ctx, account, request, register);
+    if (sel got.status.ok) { attach(records, got.chunk); }
+    ret got;
+}
+
+pub fun at(records: *Records, index: usize) ptr {
+    if (records == nil || index >= records.capacity) { ret nil; }
+    var chunk:  usize = 0;
+    var offset: usize = index;
+    if (index >= (1::usize << records.shift)) {
+        chunk  = floor_log2(index >> records.shift) + 1;
+        offset = index - (1::usize << (records.shift + chunk - 1));
+    }
+    ret (records.chunks[chunk].data::usize + offset * records.element_size)::ptr;
+}
+
+# return every chunk, newest first, leaving the set empty but shaped
+pub fun destroy(records: *Records, source: *buffers.Source, account: *buffers.Account) {
+    for (records.chunk_count != 0) {
+        records.chunk_count = records.chunk_count - 1;
+        source.fn_release(source.ctx, account, records.chunks[records.chunk_count]);
+    }
+    records.capacity = 0;
+}
+
+fun test_pool(pool: *buffers.Pool, backing: *allocator.Allocator, budget: usize) bool {
+    val made: err[allocator.Error] = page.make(backing);
+    if (sel made.err) { ret false; }
+    var config: buffers.Config;
+    config.classes       = nil;
+    config.class_count   = 0;
+    config.lanes         = 1;
+    config.global_budget = budget;
+    config.initial_slots = 8;
+    ret buffers.make(pool, config, backing);
+}
+
+fun opened(reason: buffers.Reason) bool {
+    ret sel reason.none;
+}
+
+fun granted(got: buffers.Acquired) bool {
+    ret sel got.status.ok;
+}
+
+test "http.core.records: growth leaves every live record where it was" {
+    var backing: allocator.Allocator;
+    var pool:    buffers.Pool;
+    if (!test_pool(?pool, ?backing, 1 << 20)) { ret 1; }
+    var budget:  [1]usize = [1]usize{1 << 20};
+    var account: buffers.Account;
+    if (!opened(buffers.open_account(?pool, ?account, 1, ?budget[0], 0))) { ret 2; }
+    var source:  buffers.Source = buffers.source(?pool);
+    var records: Records;
+    if (!make(?records, $size_of(usize), 3) || records.capacity != 0)                   { ret 3; }
+    if (!granted(grow(?records, ?source, ?account, 0, false)) || records.capacity != 4) { ret 4; }
+    var taken: [4]*usize;
+    var i:     usize = 0;
+    for (i < 4) {
+        taken[i]  = at(?records, i)::*usize;
+        @taken[i] = i + 10;
+        i         = i + 1;
+    }
+    var round: usize = 0;
+    for (round < 4) {
+        if (!granted(grow(?records, ?source, ?account, 0, false))) { ret 5; }
+        round = round + 1;
+    }
+    if (records.capacity != 64 || at(?records, 64) != nil) { ret 6; }
+    i = 0;
+    for (i < records.capacity) {
+        val cell: *usize = at(?records, i)::*usize;
+        if (i < 4 && (cell != taken[i] || @cell != i + 10)) { ret 7; }
+        if (i >= 4)                                         { @cell = i + 10; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < records.capacity) {
+        if (@(at(?records, i)::*usize) != i + 10) { ret 8; }
+        i = i + 1;
+    }
+    destroy(?records, ?source, ?account);
+    if (records.capacity != 0 || account.held != 0)                                 { ret 9; }
+    if (!opened(buffers.close_account(?pool, ?account)) || !buffers.destroy(?pool)) { ret 10; }
+    ret 0;
+}
+
+test "http.core.records: a refused chunk leaves the set unchanged" {
+    var backing: allocator.Allocator;
+    var pool:    buffers.Pool;
+    if (!test_pool(?pool, ?backing, 1 << 20)) { ret 1; }
+    var budget:  [1]usize = [1]usize{64};
+    var account: buffers.Account;
+    if (!opened(buffers.open_account(?pool, ?account, 1, ?budget[0], 0))) { ret 2; }
+    var source:  buffers.Source = buffers.source(?pool);
+    var records: Records;
+    if (!make(?records, 16, 4))                                { ret 3; }
+    if (!granted(grow(?records, ?source, ?account, 0, false))) { ret 4; }
+    val refused: buffers.Acquired = grow(?records, ?source, ?account, 0, false);
+    if (granted(refused) || !(sel refused.reason.budget)
+        || records.capacity != 4 || records.chunk_count != 1) { ret 5; }
+    destroy(?records, ?source, ?account);
+    if (account.held != 0) { ret 6; }
+    ret 0;
+}

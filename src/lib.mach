@@ -13,6 +13,7 @@ fwd http.core.body;
 fwd http.core.message;
 fwd http.core.exchange;
 fwd http.core.transport;
+fwd http.core.records;
 fwd http.h1.framing;
 fwd http.h1.parser;
 fwd http.h1.serializer;
