@@ -62,8 +62,12 @@ of continuing with a corrupt compression context.
 the state `init` accepts, so one set of caller-owned storage can carry a succession
 of connections. It refuses while the transport still
 owns a read, write, or close operation, while the application still borrows an
-event, and while any stream is live, because each of those is a reference into
-storage the caller is about to reuse. It clears every initialization guard the
+event, and while any stream is live before the connection has closed, because each
+of those is a reference into storage the caller is about to reuse. Once the close
+completes, streams the host never released no longer block it, including those it
+never heard of, and `destroy` releases their memory. A closed stream's header event
+can be released without binding an exchange, so a failed engine can always be
+destroyed. It clears every initialization guard the
 engine holds by value, including both HPACK dynamic tables, the frame parser, and
 the frame writer, so no consumer has to reach in and clear one. Both dynamic tables
 come back empty: a surviving table would decode the next connection against entries

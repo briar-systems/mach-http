@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Changed
+- **Behaviour change.** An HTTP/1 server connection with no live slot now closes at `header_timeout_ns` with `ERROR_HEADER_TIMEOUT` (`EVENT_TIMED_OUT`), where it used to wait for `idle_timeout_ns` (#110). This covers two states:
+  - A client that completes the handshake, for example TLS, and then sends nothing.
+  - A memory-blocked connection, whose read buffer or slot set was refused while its request waits unread. `memory_blocked` stays set when the deadline fires, so a host can count memory timeouts separately.
+
+  The wait starts at `init`, or when a quiet keep-alive connection becomes readable. Memory refusals never restart it, and a started slot takes it over. An idle keep-alive connection with nothing to read is still bounded by `idle_timeout_ns`.
+
+### Fixed
+- A failed HTTP/2 or HTTP/3 connection can always be destroyed. Before, `destroy` refused forever in three cases, and a failed h2 engine kept its stream records and buffers on the account (#110):
+  - streams the host never saw, such as one still decoding a header block
+  - releases the peer never acknowledged
+  - a header event held without an exchange
+
+  Now, once the close completes:
+  - live streams and owed releases no longer block `destroy`, and h2 releases their memory
+  - a closed stream's header event can be released without an exchange
+  - held HTTP/3 data can be consumed without granting the transport more credit
+
 ## [0.12.0] - 2026-09-17
 
 ### Added
