@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- The license is attributed to Briar Systems LLC (#108).
+
 ## [0.11.0] - 2026-09-17
 
 ### Added
