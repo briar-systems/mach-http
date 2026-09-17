@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Changed
-- **Breaking.** `h3.connection.Transport[T]` has a new `ready` callback that returns a `TransportReady` for the next stream whose readable, writable or reset state changed, or `TRANSPORT_EMPTY`. The engine only reads and writes streams it has work for, so every adapter must report each such change. Duplicate and spurious reports are harmless, and dropped ones are not. See doc/h3-connection.md (#103).
+- **Breaking.** `h3.connection.Transport[T]` has a new `ready` callback that returns a `TransportReady` for the next stream whose readable, writable or reset state changed, or `TRANSPORT_EMPTY`. The engine only reads and writes streams it has work for, so every adapter must report each such change. Duplicate and spurious reports are harmless, and dropped ones are not. `process` also returns the new `EVENT_PENDING` when progress was made but work remains, and the host must call it again rather than wait. `EVENT_NONE` now means the transport, the accept queue and the engine have nothing left. See doc/h3-connection.md (#103).
 - **Breaking.** `h3.connection.Storage` has new `stream_index` and `stream_index_capacity` fields. The index holds `StreamIndexEntry` records, and its capacity must be a power of two and at least twice `stream_capacity` (#103).
 - HTTP/3 `process` now costs O(streams with news) instead of three passes over the stream capacity. Stream lookup, allocation and release are O(1), and `tick` walks only the requests bound to an exchange. A host that cancels an exchange scope should call `cancel_stream`, with `tick` as the fallback. Queued streams are serviced round-robin, so events come out in readiness order rather than slot order (#103).
 

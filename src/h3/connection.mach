@@ -106,6 +106,7 @@ pub val EVENT_CLOSED:           EventKind = 12;
 pub val EVENT_CANCELLED:        EventKind = 13;
 pub val EVENT_STREAM_ERROR:     EventKind = 14;
 pub val EVENT_ERROR:            EventKind = 15;
+pub val EVENT_PENDING:          EventKind = 16;
 
 pub def OfferStatus: u8;
 pub val OFFER_OUTPUT:  OfferStatus = 1;
@@ -1878,6 +1879,7 @@ fun reject_request[T](engine: *Engine[T], opened: TransportOpen) Event {
     ret result;
 }
 
+# EVENT_PENDING when a stream was taken, since another may be waiting
 fun accept_peer[T](engine: *Engine[T]) Event {
     val opened: TransportOpen = engine.transport.accept(engine.transport.context);
     if (!transport_status(opened.status)) {
@@ -1914,7 +1916,7 @@ fun accept_peer[T](engine: *Engine[T]) Event {
             || opened.stream.id > engine.last_remote_request) {
             engine.last_remote_request = opened.stream.id;
         }
-        ret base_event[T](engine, EVENT_NONE);
+        ret base_event[T](engine, EVENT_PENDING);
     }
     if (engine.active_peer_unidirectional
         >= engine.configured.max_peer_unidirectional) {
@@ -1926,7 +1928,7 @@ fun accept_peer[T](engine: *Engine[T]) Event {
         ?engine.critical, engine.role == SERVER)) {
         ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
     }
-    ret base_event[T](engine, EVENT_NONE);
+    ret base_event[T](engine, EVENT_PENDING);
 }
 
 fun discard_opened[T](engine: *Engine[T], opened: StreamHandle, code: u64) u8 {
@@ -2078,17 +2080,16 @@ fun process_encoder_stream[T](engine: *Engine[T], stream: *Stream) Event {
     ret base_event[T](engine, EVENT_NONE);
 }
 
-fun decoder_stream_ready[T](engine: *Engine[T], stream: *Stream) bool {
-    if (stream.decoder_stream.initialized)                                 { ret true; }
-    if (!engine.peer_settings_received || !engine.outbound_sections.valid) { ret false; }
-    ret qpack.decoder_stream_decoder_init(?stream.decoder_stream,
+fun process_decoder_stream[T](engine: *Engine[T], stream: *Stream) Event {
+    if (!decoder_stream_usable[T](engine, stream)) { ret base_event[T](engine, EVENT_NONE); }
+    # a usable stream that cannot start would otherwise stay queued forever
+    if (!stream.decoder_stream.initialized
+        && !qpack.decoder_stream_decoder_init(?stream.decoder_stream,
         ?engine.outbound_table, ?engine.outbound_sections,
         stream.memory.encoded, stream.memory.encoded_capacity,
-        engine.outbound_limits);
-}
-
-fun process_decoder_stream[T](engine: *Engine[T], stream: *Stream) Event {
-    if (!decoder_stream_ready[T](engine, stream)) { ret base_event[T](engine, EVENT_NONE); }
+        engine.outbound_limits)) {
+        ret fail_connection[T](engine, ERROR_LIMIT, H3_INTERNAL_ERROR);
+    }
     var input: *u8 = nil;
     if (input_available(stream) != 0) { input = ?stream.memory.read[stream.input_offset]; }
     val instruction: qpack.Instruction = qpack.decoder_stream_feed(
@@ -2819,18 +2820,20 @@ fun note_ready[T](engine: *Engine[T], report: TransportReady) {
     wake_stream[T](engine, stream);
 }
 
+# EVENT_NONE once the transport answered EMPTY, EVENT_PENDING when the budget
+# ran out first
 fun drain_ready[T](engine: *Engine[T]) Event {
     var taken: usize = 0;
     for (taken < READY_BUDGET) {
         val report: TransportReady = engine.transport.ready(engine.transport.context);
-        if (report.status == TRANSPORT_EMPTY) { brk; }
+        if (report.status == TRANSPORT_EMPTY) { ret base_event[T](engine, EVENT_NONE); }
         if (report.status != TRANSPORT_OK) {
             ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
         }
         note_ready[T](engine, report);
         taken = taken + 1;
     }
-    ret base_event[T](engine, EVENT_NONE);
+    ret base_event[T](engine, EVENT_PENDING);
 }
 
 fun service_stream[T](engine: *Engine[T], stream: *Stream) Event {
@@ -2850,7 +2853,7 @@ fun service_stream[T](engine: *Engine[T], stream: *Stream) Event {
 
 # each queued stream is serviced at most once per call and requeued at the
 # tail while it still has work, which keeps the order round-robin
-fun service_ready[T](engine: *Engine[T], blocked: bool) Event {
+fun service_ready[T](engine: *Engine[T], blocked: bool, pending: bool) Event {
     var output_blocked: bool  = blocked;
     var budget:         usize = engine.ready_count;
     if (budget > SERVICE_BUDGET) { budget = SERVICE_BUDGET; }
@@ -2865,10 +2868,17 @@ fun service_ready[T](engine: *Engine[T], blocked: bool) Event {
         if (result.kind == EVENT_BLOCKED) { output_blocked = true; }
         or (result.kind != EVENT_NONE)    { ret result; }
     }
-    if (output_blocked) { ret base_event[T](engine, EVENT_BLOCKED); }
+    if (pending || engine.ready_count != 0) { ret base_event[T](engine, EVENT_PENDING); }
+    if (output_blocked)                     { ret base_event[T](engine, EVENT_BLOCKED); }
     ret base_event[T](engine, EVENT_NONE);
 }
 
+# advances the connection and returns at most one event. EVENT_PENDING means
+# work remains that this call's budget did not reach, so call again at once.
+# EVENT_NONE means the transport has no unreported news, no peer stream is
+# waiting to be accepted and no stream is queued, so the host may wait for
+# transport or application news. EVENT_BLOCKED means only output is stalled
+# on the transport. PENDING wins over BLOCKED, since work remains.
 pub fun process[T](engine: *Engine[T]) Event {
     if (engine == nil || !engine.initialized) {
         ret invalid_event();
@@ -2884,10 +2894,11 @@ pub fun process[T](engine: *Engine[T]) Event {
     val output: Event = progress_critical_output[T](engine);
     if (output.kind == EVENT_ERROR || output.kind == EVENT_CANCELLED) { ret output; }
     val accepted: Event = accept_peer[T](engine);
-    if (accepted.kind != EVENT_NONE) { ret accepted; }
+    if (accepted.kind != EVENT_NONE && accepted.kind != EVENT_PENDING) { ret accepted; }
     val reported: Event = drain_ready[T](engine);
-    if (reported.kind != EVENT_NONE) { ret reported; }
-    ret service_ready[T](engine, output.kind == EVENT_BLOCKED);
+    if (reported.kind != EVENT_NONE && reported.kind != EVENT_PENDING) { ret reported; }
+    ret service_ready[T](engine, output.kind == EVENT_BLOCKED,
+        accepted.kind == EVENT_PENDING || reported.kind == EVENT_PENDING);
 }
 
 pub fun consume_data[T](engine: *Engine[T], id: u64, count: usize) bool {
@@ -4530,6 +4541,18 @@ test "http.h3.connection: a transport the peer already closed satisfies the clos
     ret 0;
 }
 
+# calls process until it stops reporting pending work
+fun settle(fixture: *Fixture) bool {
+    var i: usize = 0;
+    for (i < 16) {
+        val kind: EventKind = process[TestTransport](?fixture.engine).kind;
+        if (kind == EVENT_NONE)    { ret true; }
+        if (kind != EVENT_PENDING) { ret false; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # one process call over idle client requests with no transport news
 fun idle_process_cost(requests: usize, calls: *usize, visits: *usize,
     reads: *usize) bool {
@@ -4544,6 +4567,7 @@ fun idle_process_cost(requests: usize, calls: *usize, visits: *usize,
         i = i + 1;
     }
     # each new stream reads once, finds nothing and parks
+    if (!settle(?fixture)) { ret false; }
     i = 0;
     for (i < 4) {
         if (process[TestTransport](?fixture.engine).kind != EVENT_NONE) { ret false; }
@@ -4667,6 +4691,7 @@ test "http.h3.connection: readiness reports gate reads and tolerate noise" {
     val data: Event = drive(?fixture, EVENT_DATA, 8);
     if (data.stream_id != 0 || data.data_length != 3
         || !consume_data[TestTransport](?fixture.engine, 0, 3)) { ret 7; }
+    if (!settle(?fixture)) { ret 10; }
     i = 0;
     for (i < 8) {
         if (process[TestTransport](?fixture.engine).kind != EVENT_NONE) { ret 8; }
@@ -4816,5 +4841,83 @@ test "http.h3.connection: streams with pending work are serviced round-robin" {
         i = i + 1;
     }
     if (order[0] + order[1] + order[2] != 12) { ret 6; }
+    ret 0;
+}
+
+# many client requests with partially written output, which services to NONE
+test "http.h3.connection: a budget-limited call reports pending until the queue drains" {
+    var configured: Config = test_config();
+    configured.max_requests = 96;
+    var fixture: Fixture;
+    if (!make_sized_fixture(?fixture, CLIENT, configured, 99)
+        || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var i: usize = 0;
+    for (i < 96) {
+        if (open_request[TestTransport](?fixture.engine, nil) == NO_STREAM) { ret 2; }
+        i = i + 1;
+    }
+    if (!settle(?fixture) || fixture.engine.ready_count != 0) { ret 3; }
+    var request: [4]field.Field;
+    request[0] = field.Field{name: view.view(":method", 7), value: view.view("GET", 3),
+        sensitive: false};
+    request[1] = field.Field{name: view.view(":scheme", 7), value: view.view("https", 5),
+        sensitive: false};
+    request[2] = field.Field{name: view.view(":authority", 10), value: view.view("x", 1),
+        sensitive: false};
+    request[3] = field.Field{name: view.view(":path", 5), value: view.view("/", 1),
+        sensitive: false};
+    i = 0;
+    for (i < 96) {
+        if (send_headers[TestTransport](?fixture.engine, i::u64 * 4, ?request[0], 4,
+            true, false).status != OFFER_OUTPUT) { ret 4; }
+        i = i + 1;
+    }
+    # a byte per write keeps every stream queued with work after its turn
+    fixture.io.write_limit = 1;
+    if (process[TestTransport](?fixture.engine).kind != EVENT_PENDING) { ret 5; }
+    fixture.io.write_limit = 0;
+    var calls: usize = 1;
+    var last:  Event = base_event[TestTransport](?fixture.engine, EVENT_PENDING);
+    for (calls < 16 && last.kind == EVENT_PENDING) {
+        last  = process[TestTransport](?fixture.engine);
+        calls = calls + 1;
+    }
+    if (last.kind != EVENT_NONE || fixture.engine.output_streams != 0) { ret 6; }
+    i = 0;
+    for (i < 96) {
+        val stream: *Stream = stream_for[TestTransport](?fixture.engine, i::u64 * 4);
+        if (stream == nil || stream.state != STREAM_HALF_CLOSED_LOCAL
+            || test_wire(?fixture.io, stream.transport_stream).finished == false) { ret 7; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "http.h3.connection: undrained readiness reports keep process pending" {
+    var configured: Config = test_config();
+    configured.max_requests = 3;
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, CLIENT, configured)
+        || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    val id: u64 = open_request[TestTransport](?fixture.engine, nil);
+    if (id == NO_STREAM || process[TestTransport](?fixture.engine).kind != EVENT_NONE) {
+        ret 2;
+    }
+    val stream: *Stream = stream_for[TestTransport](?fixture.engine, id);
+    # reports without news service to nothing, so only the transport backlog remains
+    var i: usize = 0;
+    for (i < 200) {
+        test_signal(?fixture.io, stream.transport_stream, false, false, false);
+        i = i + 1;
+    }
+    var kinds: [4]EventKind;
+    i = 0;
+    for (i < 4) {
+        kinds[i] = process[TestTransport](?fixture.engine).kind;
+        i        = i + 1;
+    }
+    if (kinds[0] != EVENT_PENDING || kinds[1] != EVENT_PENDING
+        || kinds[2] != EVENT_PENDING || kinds[3] != EVENT_NONE
+        || fixture.io.signal_count != 0 || fixture.io.signal_dropped) { ret 3; }
     ret 0;
 }

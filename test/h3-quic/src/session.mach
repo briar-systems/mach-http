@@ -28,7 +28,7 @@ fun operation_ok(outcome: cancel.Operation) bool {
 
 pub val STREAM_SLOTS: usize = 10;
 pub val INDEX_SLOTS:  usize = 32;
-pub val EVENT_KINDS:  usize = 16;
+pub val EVENT_KINDS:  usize = 17;
 
 pub def HandlerFun: fun(ptr, h3.Event) bool;
 
@@ -63,7 +63,7 @@ pub rec Session {
     engine:              h3.Engine[adapter.Adapter];
     handler:             HandlerFun;
     context:             ptr;
-    counts:              [16]usize;
+    counts:              [17]usize;
     rejected:            usize;
 }
 

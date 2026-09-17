@@ -169,6 +169,23 @@ Every per-event path costs O(streams with news), not O(stream capacity).
   one `accept` and one `ready` call and visits no stream.
 - `tick` walks only the request streams bound to an exchange.
 
+`process` returns one of four kinds of result, and the host loop follows them:
+
+- An event: handle it and call `process` again.
+- `EVENT_PENDING`: progress was made and work remains that this call's budgets did
+  not reach. Call `process` again at once. This covers a queue still holding
+  streams, a readiness backlog the 64-report budget did not drain, and a peer
+  stream just accepted when another may be waiting.
+- `EVENT_BLOCKED`: nothing remains but output the transport refused. Wait for
+  transport news.
+- `EVENT_NONE`: the last `ready` returned EMPTY, `accept` had nothing, and the
+  queue is empty. Wait for transport or application news.
+
+PENDING takes precedence over BLOCKED, since work remains. A queued stream always
+makes progress when serviced (its codecs consume at least one byte per call, and a
+blocked write or an EMPTY read parks it), so PENDING cannot repeat forever without
+new input.
+
 A host that cancels an exchange scope must call `cancel_stream` for that request.
 That is O(1) and resets the stream immediately. `tick` is the fallback for scopes
 cancelled elsewhere, such as a parent scope, and costs O(bound requests), so it
