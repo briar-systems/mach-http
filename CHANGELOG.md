@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-17
+
 ### Added
 - `http.core.records` holds address-stable record chunks borrowed from a `std.memory.buffers.Source`. Each chunk doubles the capacity, and a record never moves once handed out (#104).
 - `transport.readable` waits for readability without lending a buffer. Its completion has kind `READABLE` and count 0 (#104).
@@ -9,6 +11,7 @@
 ### Changed
 - The license is attributed to Briar Systems LLC (#108).
 - **Breaking.** Dependencies: mach-std v5.3.0 (was v4.0.1), and `mach.toml` now requires mach `^5.3`. A consumer must be on std 5.x as well. Error completions from std 5.3 carry the bytes transferred before a cancellation or timeout. Every engine treats such a completion as fatal to its connection, never as an empty success (#104).
+- **Breaking, and stops compilation.** Every transport adapter must implement the new `submit_readable`: `transport.Adapter` and `transport.RuntimeStream` have the callback. It maps to a runtime readiness wait such as `net.async.submit_readable`. A read and a readable wait are never pending together (#104).
 - Dependencies (tests only): the h3-quic tests use mach-quic v0.12.1, and their adapter reports readiness through `transport.ready_stream` (#104).
 - **Breaking.** Every caller-supplied `now` and every deadline is a `std.chrono.time.Instant`, read with `time.instant()`, instead of a `time.Time`. This covers:
   - `h1.connection`: `init`, `tick`, `process`, `complete_io`, `enqueue_request`, `prepare_informational`, `prepare_response`, `release`, `Deadline.at` and `next_deadline`.
@@ -18,7 +21,6 @@
 
   A wall-clock value no longer compiles where a deadline is expected. This replaces the 0.11.0 note that such a value was accepted but never fired.
 - **Breaking.** `message.Metadata` replaces `has_deadline` and `deadline` with one `deadline: opt[time.Instant]`. `received_at` stays a wall-clock `time.Time`, since it is a timestamp for records and nothing orders requests by it.
-- **Breaking.** `transport.Adapter` and `transport.RuntimeStream` have a new `submit_readable` callback, which maps to a runtime readiness wait such as `net.async.submit_readable`. A read and a readable wait are never pending together (#104).
 - **Breaking.** The engines borrow their memory from a `std.memory.buffers` account, and an idle connection holds only per-connection state (#104). Each `init` takes the source and the connection's open account, and both must outlive the engine. `destroy` returns everything to the account. A refusal never fails the connection. It refuses the step or the stream that needed the memory, and an exhausted or memory refusal registers the account for one wake-up. Sizes below are at each `config_default`, measured on x86_64.
   - HTTP/1: `init` no longer takes slot memory or read and write buffers. `Config` gains `read_bytes`, `write_bytes`, `slot_storage_bytes`, `slot_scratch_bytes`, `slot_lane` and `connection_lane`. An idle engine holds no buffer: it waits with `transport.readable`, and the 8,192-byte read buffer is held from readability until its input is consumed. A slot borrows its 70,816-byte set while it is live, and the 8,192-byte write buffer is held while output is staged. A refused slot leaves the request unread and returns `EVENT_MEMORY_BLOCKED`. A refused client slot fails `enqueue_request`, and a refused write buffer returns `OFFER_BLOCKED` with `ERROR_MEMORY`.
   - HTTP/2: `init` takes the source, the account, the read buffer and the connection tables, plus one caller `StreamMemory` that decodes a refused header block. The stream array, per-stream memory, the index, and the write, frame-payload, header-output and encoder-pending buffers are no longer parameters. `Config` gains `write_bytes`, `frame_payload_bytes`, `initial_streams`, `stream_lane` and `connection_lane`. An idle engine holds 2,880 bytes: its first four 656-byte stream records and their index. Records grow in place up to `max_streams`. A stream that decodes headers borrows a 139,872-byte set until `release_stream`. Transient buffers are held only while in use. A refused stream set is refused with `REFUSED_STREAM`, and the block is still decoded so HPACK stays in step. A refused local stream fails `open_local`. A refused transient buffer returns `EVENT_MEMORY_BLOCKED` or `OFFER_BLOCKED` with `ERROR_MEMORY`.
