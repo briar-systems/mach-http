@@ -5449,3 +5449,34 @@ test "http.h3.connection: a refused record rejects a request and parks a unidire
         || fixture.engine.active_peer_unidirectional != 2) { ret 7; }
     ret 0;
 }
+
+test "http.h3.connection: an exhausted pool registers a parked stream for a wake-up" {
+    var configured: Config = test_config();
+    configured.initial_streams = 1;
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, configured)
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var other:        buffers.Account;
+    var budgets:      [2]usize       = [2]usize{1 << 20, 1 << 20};
+    val other_opened: buffers.Reason = buffers.source_open_account(?fixture.source, ?other,
+        2, ?budgets[0], 0);
+    if (!(sel other_opened.none)) { ret 2; }
+    val parked: buffers.Acquired = buffers.source_acquire(?fixture.source, ?other,
+        buffers.Request{bytes: 4096, align: 0, lane: 0, secret: false}, false);
+    if (!(sel parked.status.ok)) { ret 3; }
+    # the shared remainder is gone, so the record is refused as exhausted
+    fixture.pool.global_budget = fixture.pool.overflow_used;
+    var encoder: [1]u8;
+    encoder[0] = frame.STREAM_QPACK_ENCODER::u8;
+    var woken: [4]u64;
+    if (peer_stream(?fixture, 6, ?encoder[0], 1, false) == nil
+        || !settle_blocked(?fixture) || !fixture.engine.accept_parked
+        || !fixture.account.waiting
+        || buffers.source_ready(?fixture.source, ?woken[0], 4) != 0) { ret 4; }
+    val returned: buffers.Reason = buffers.source_release(?fixture.source, ?other, parked.chunk);
+    if (!(sel returned.none) || buffers.source_ready(?fixture.source, ?woken[0], 4) != 1
+        || woken[0] != 1) { ret 5; }
+    if (!settle(?fixture) || fixture.engine.accept_parked
+        || stream_for[TestTransport](?fixture.engine, 6) == nil) { ret 6; }
+    ret 0;
+}
