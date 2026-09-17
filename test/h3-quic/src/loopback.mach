@@ -5,10 +5,12 @@
 # and flow-control work, frames it with rfc 9000 variable-length integers, and
 # lets the harness deliver, drop, or reorder each datagram between two drivers.
 
+use quic.clock;
 use quic.connection.ownership;
-use dq: quic.stream.datagram;
-use sm: quic.stream.stream;
-use qt: quic.transport;
+use supply: quic.storage.source;
+use dq:     quic.stream.datagram;
+use sm:     quic.stream.stream;
+use qt:     quic.transport;
 use quic.wire.varint;
 
 use std.chrono.time;
@@ -18,6 +20,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -31,8 +34,7 @@ fun operation_ok(outcome: cancel.Operation) bool {
 }
 
 pub val STREAM_CAPACITY:  usize = 16;
-pub val SEND_STRIDE:      usize = 512;
-pub val RECEIVE_STRIDE:   usize = 512;
+pub val WINDOW_LIMIT:     u64   = 4096;
 pub val ATTEMPT_CAPACITY: usize = 32;
 pub val SEND_SLOTS:       usize = 4;
 pub val OWNER_SLOTS:      usize = 8;
@@ -72,7 +74,7 @@ fun state_of(core: *Core) qt.ConnectionState {
 
 fun core_result(core: *Core, status: qt.Status, error: u64) qt.CoreResult {
     ret qt.CoreResult{status: status, error: error, provider_error: 0,
-        state: state_of(core)};
+        state: state_of(core), refusal: qt.ERROR_NONE};
 }
 
 fun wrote(value: res[usize, binary.EncodeError]) bool {
@@ -231,7 +233,7 @@ fun core_generate(core: *Core, output: *u8, capacity: usize,
     ret result_value;
 }
 
-fun core_receive(core: *Core, input: *qt.Datagram) qt.CoreResult {
+fun core_receive(core: *Core, input: *qt.CoreInput) qt.CoreResult {
     if (input == nil || input.data == nil || input.length == 0) {
         ret core_result(core, qt.STATUS_ERROR, 1);
     }
@@ -364,6 +366,9 @@ fun core_ready(core: *Core) bool {
     ret core.closing && core.outstanding == 0;
 }
 
+# every chunk this core takes is lent to the stream manager, which retries on its own
+fun core_storage_ready(core: *Core) {}
+
 # the core owns the stream manager and the datagram queue, so releasing them is
 # its half of the close: the driver checks both are invalid on return and fails
 # the close if either still is. finishing twice is what a retry loop does after
@@ -382,22 +387,24 @@ fun core_timer(core: *Core) qt.CoreTimer {
     ret value;
 }
 
+# one pool shared by every endpoint, each charging its own account
+var chunk_pool: supply.TestPool;
+
+pub val POOL_CHUNKS:    usize = 256;
+pub val ACCOUNT_CHUNKS: usize = 32;
+
 pub rec Endpoint {
-    stream_records:  [16]sm.Stream;
-    send_data:       [8192]u8;
-    send_pending:    [8192]bool;
-    send_acked:      [8192]bool;
-    send_inflight:   [8192]u8;
-    receive_data:    [8192]u8;
-    receive_present: [8192]bool;
-    attempts:        [32]sm.Attempt;
-    manager:         sm.Manager;
-    datagrams:       dq.Queue;
-    sends:           [4]qt.SendSlot;
-    core:            Core;
-    scope:           cancel.Scope;
-    driver:          qt.Driver[Core];
-    close_failed:    bool;
+    stream_records: [16]sm.Stream;
+    attempts:       [32]sm.Attempt;
+    account:        supply.Account;
+    account_open:   bool;
+    manager:        sm.Manager;
+    datagrams:      dq.Queue;
+    sends:          [4]qt.SendSlot;
+    core:           Core;
+    scope:          cancel.Scope;
+    driver:         qt.Driver[Core];
+    close_failed:   bool;
 }
 
 fun stream_config(source: u64, role: u8, window: u64) sm.Config {
@@ -424,38 +431,35 @@ fun stream_config(source: u64, role: u8, window: u64) sm.Config {
 pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
     window: u64) usize {
     var role: u8 = sm.ROLE_SERVER;
-    if (client) { role = sm.ROLE_CLIENT; }
+    if (client)                                                                        { role = sm.ROLE_CLIENT; }
+    if (window == 0 || window > WINDOW_LIMIT)                                          { ret 1; }
+    if (!supply.test_made(?chunk_pool) && !supply.make_test(?chunk_pool, POOL_CHUNKS)) { ret 6; }
+    if (!supply.open(?chunk_pool.provider, ?endpoint.account, source,
+        ACCOUNT_CHUNKS, ACCOUNT_CHUNKS, 0)) { ret 7; }
+    endpoint.account_open = true;
     val stream_storage: sm.Storage = sm.Storage{
-        streams:         ?endpoint.stream_records[0], stream_capacity: STREAM_CAPACITY,
-        send_data:       ?endpoint.send_data[0], send_data_length: 8192,
-        send_pending:    ?endpoint.send_pending[0],
-        send_acked:      ?endpoint.send_acked[0],
-        send_inflight:   ?endpoint.send_inflight[0], send_state_length: 8192,
-        send_stride:     SEND_STRIDE,
-        receive_data:    ?endpoint.receive_data[0], receive_data_length: 8192,
-        receive_present: ?endpoint.receive_present[0], receive_state_length: 8192,
-        receive_stride:  RECEIVE_STRIDE,
-        attempts:        ?endpoint.attempts[0], attempt_capacity: ATTEMPT_CAPACITY
+        streams:           ?endpoint.stream_records[0], stream_capacity: STREAM_CAPACITY,
+        attempts:          ?endpoint.attempts[0], attempt_capacity: ATTEMPT_CAPACITY,
+        chunks:            ?chunk_pool.provider, account: ?endpoint.account,
+        send_buffer_limit: window::usize
     };
-    if (window == 0 || window > SEND_STRIDE::u64
-        || !sm.initialize(?endpoint.manager, stream_config(source, role, window),
+    if (!sm.initialize(?endpoint.manager, stream_config(source, role, window),
         stream_storage)) { ret 1; }
     # the engine deliberately has no datagram surface, so the queue stays empty
-    var datagram_storage: dq.Storage;
     if (!dq.initialize(?endpoint.datagrams, dq.Config{source: source,
         peer_max_frame_size: 0, local_max_frame_size: 0, enabled: false},
-        datagram_storage)) { ret 2; }
+        dq.empty_storage())) { ret 2; }
     endpoint.core.manager    = ?endpoint.manager;
     endpoint.core.datagrams  = ?endpoint.datagrams;
     endpoint.core.next_owner = 1;
     endpoint.close_failed    = false;
-    if (!operation_ok(cancel.make_root(?endpoint.scope, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 3; }
+    if (!operation_ok(cancel.make_root(?endpoint.scope, opt[time.Instant].none{}))) { ret 3; }
     val protocol: qt.Protocol[Core] = qt.Protocol[Core]{context: ?endpoint.core,
         context_range: core_range, receive: core_receive,
         timeout:       core_timeout, generate: core_generate,
         complete_send: core_complete, begin_close: core_begin_close,
-        close_ready:   core_ready, finish_close: core_finish, timer: core_timer};
+        close_ready:   core_ready, finish_close: core_finish, timer: core_timer,
+        storage_ready: core_storage_ready};
     val config: qt.Config = qt.Config{source: source, max_udp_payload: 1500,
         max_close_reason: 64};
     val storage: qt.Storage = qt.Storage{sends: ?endpoint.sends[0],
@@ -518,11 +522,11 @@ fun carried_stream(data: *u8, length: usize, out: *u64) bool {
 
 fun deliver(link: *Link, to: *Endpoint, data: *u8, length: usize) bool {
     var datagram: qt.Datagram;
-    datagram.local          = ip.endpoint(127, 0, 0, 1, 4434);
-    datagram.peer           = ip.endpoint(127, 0, 0, 1, 4433);
-    datagram.data           = data;
-    datagram.length         = length;
-    datagram.received_at_ns = link.now_ns;
+    datagram.local       = ip.endpoint(127, 0, 0, 1, 4434);
+    datagram.peer        = ip.endpoint(127, 0, 0, 1, 4433);
+    datagram.data        = data;
+    datagram.length      = length;
+    datagram.received_at = clock.instant(link.now_ns);
     if (qt.receive_datagram[Core](?to.driver, ?datagram).status != qt.STATUS_OK) {
         ret false;
     }
@@ -550,7 +554,7 @@ pub fun release_held(link: *Link, to: *Endpoint) bool {
 fun carry(link: *Link, from: *Endpoint, to: *Endpoint) bool {
     link.now_ns = link.now_ns + 1;
     val generated: qt.Generated = qt.generate[Core](?from.driver, ?from.scope,
-        ?link.buffer[0], DATAGRAM_BYTES, link.now_ns, 0);
+        ?link.buffer[0], DATAGRAM_BYTES, clock.instant(link.now_ns), 0);
     if (generated.status != qt.STATUS_OK) { ret false; }
     var lost: bool = false;
     if (link.drop_next != 0) {
@@ -577,7 +581,7 @@ fun carry(link: *Link, from: *Endpoint, to: *Endpoint) bool {
         && !deliver(link, to, generated.buffer, generated.count)) {
         link.errors = link.errors + 1;
         qt.complete_send[Core](?from.driver, generated.token, qt.SEND_FAILED, 0,
-            link.now_ns);
+            clock.instant(link.now_ns));
         ret false;
     }
     var status: qt.SendStatus = qt.SEND_SENT;
@@ -587,7 +591,7 @@ fun carry(link: *Link, from: *Endpoint, to: *Endpoint) bool {
         count  = 0;
     }
     if (qt.complete_send[Core](?from.driver, generated.token, status, count,
-        link.now_ns).status != qt.STATUS_OK) {
+        clock.instant(link.now_ns)).status != qt.STATUS_OK) {
         link.errors = link.errors + 1;
         ret false;
     }
@@ -616,7 +620,7 @@ pub fun flush(link: *Link, budget: usize) usize {
 pub fun begin_close_endpoint(endpoint: *Endpoint, abortive: bool, code: u64,
     now_ns: u64) bool {
     val begun: qt.Status = qt.begin_close[Core](?endpoint.driver, code, nil, 0,
-        now_ns).status;
+        clock.instant(now_ns)).status;
     if (begun != qt.STATUS_OK && begun != qt.STATUS_CLOSED) { ret false; }
     # beginning the graceful close first carries the application error to the
     # core, then the cancellation escalates the mode the driver recorded
@@ -662,7 +666,16 @@ pub fun close_link(link: *Link, abortive: bool, code: u64, budget: usize) bool {
         i = i + 1;
     }
     if (!client_closed || !server_closed) { ret false; }
-    ret operation_ok(cancel.destroy(?link.client.scope)) && operation_ok(cancel.destroy(?link.server.scope));
+    ret operation_ok(cancel.destroy(?link.client.scope)) && operation_ok(cancel.destroy(?link.server.scope))
+        && close_account(link.client) && close_account(link.server);
+}
+
+# a settled endpoint returns its account, which must then hold nothing
+fun close_account(endpoint: *Endpoint) bool {
+    if (!endpoint.account_open)                                 { ret true; }
+    if (!supply.close(?chunk_pool.provider, ?endpoint.account)) { ret false; }
+    endpoint.account_open = false;
+    ret true;
 }
 
 # the driver deactivates every stream record and invalidates the manager and the

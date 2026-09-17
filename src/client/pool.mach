@@ -66,9 +66,9 @@ pub rec Connection {
     driver:           ptr;
     max_streams:      usize;
     active_streams:   usize;
-    created_at:       time.Time;
-    last_used_at:     time.Time;
-    idle_deadline:    time.Time;
+    created_at:       time.Instant;
+    last_used_at:     time.Instant;
+    idle_deadline:    time.Instant;
     close_published:  bool;
     cancel_published: bool;
 }
@@ -222,22 +222,22 @@ fun empty_connect_cancel() ConnectCancel {
         reservation: empty_reservation(RESERVE_INVALID)};
 }
 
-fun time_valid(value: time.Time) bool {
+fun time_valid(value: time.Instant) bool {
     ret value.sec >= 0 && value.nsec >= 0 && value.nsec < 1000000000;
 }
 
-fun time_before_or_equal(first: time.Time, second: time.Time) bool {
-    ret time.time_before(first, second) || time.time_equal(first, second);
+fun time_before_or_equal(first: time.Instant, second: time.Instant) bool {
+    ret time.instant_before(first, second) || time.instant_equal(first, second);
 }
 
-fun deadline(now: time.Time, duration_ns: u64) time.Time {
+fun deadline(now: time.Instant, duration_ns: u64) time.Instant {
     val seconds:     u64 = duration_ns / 1000000000;
     val nanoseconds: u64 = duration_ns % 1000000000;
     if (seconds > 0x7fffffffffffffff ||
         now.sec > 0x7fffffffffffffff - seconds::i64) {
-        ret time.Time{sec: 0x7fffffffffffffff, nsec: 999999999};
+        ret time.Instant{sec: 0x7fffffffffffffff, nsec: 999999999};
     }
-    var result: time.Time = time.Time{sec: now.sec + seconds::i64,
+    var result: time.Instant = time.Instant{sec: now.sec + seconds::i64,
         nsec: now.nsec + nanoseconds::i64};
     if (result.nsec >= 1000000000) {
         if (result.sec == 0x7fffffffffffffff) {
@@ -326,9 +326,9 @@ fun clear_connection(connection: *Connection) {
     connection.driver           = nil;
     connection.max_streams      = 0;
     connection.active_streams   = 0;
-    connection.created_at       = time.Time{sec: 0, nsec: 0};
-    connection.last_used_at     = time.Time{sec: 0, nsec: 0};
-    connection.idle_deadline    = time.Time{sec: 0, nsec: 0};
+    connection.created_at       = time.Instant{sec: 0, nsec: 0};
+    connection.last_used_at     = time.Instant{sec: 0, nsec: 0};
+    connection.idle_deadline    = time.Instant{sec: 0, nsec: 0};
     connection.close_published  = false;
     connection.cancel_published = false;
 }
@@ -494,7 +494,7 @@ fun wire_matches(configured: policy.ProtocolPolicy, wire: message.Wire) bool {
 }
 
 fun connection_usable(connection: *Connection, route: policy.Route,
-    configured: policy.ProtocolPolicy, now: time.Time) bool {
+    configured: policy.ProtocolPolicy, now: time.Instant) bool {
     if (connection.state != CONNECTION_OPEN || connection.driver == nil
         || connection.active_streams >= connection.max_streams
         || !route_same(?connection.route, route)
@@ -512,11 +512,11 @@ fun better(first: *Connection, second: *Connection) bool {
     if (first.active_streams != second.active_streams) {
         ret first.active_streams < second.active_streams;
     }
-    ret time.time_before(second.last_used_at, first.last_used_at);
+    ret time.instant_before(second.last_used_at, first.last_used_at);
 }
 
 pub fun acquire(pool: *Pool, route: policy.Route,
-    configured: policy.ProtocolPolicy, now: time.Time) Acquire {
+    configured: policy.ProtocolPolicy, now: time.Instant) Acquire {
     if (!pool_ready(pool) || !policy.route_valid(route, 253)
         || !policy.protocol_valid(configured) || !time_valid(now)
         || route_aliases_pool(pool, route)) {
@@ -635,7 +635,7 @@ fun claim_connection_locked(pool: *Pool, token: *ConnectionToken) *Connection {
 }
 
 pub fun reserve(pool: *Pool, route: policy.Route, endpoint: ip.Endpoint,
-    transport: policy.TransportKind, now: time.Time) Reservation {
+    transport: policy.TransportKind, now: time.Instant) Reservation {
     var expected_port: u16 = route.origin.port;
     if (route.proxy.kind != policy.PROXY_NONE) { expected_port = route.proxy.port; }
     if (!pool_ready(pool) || !policy.route_valid(route, 253)
@@ -704,7 +704,7 @@ pub fun driver_owned(pool: *Pool, driver: ptr) bool {
 
 pub fun activate(pool: *Pool, reservation: Reservation,
     wire: message.Wire, driver: ptr, max_streams: usize,
-    now: time.Time) Activated {
+    now: time.Instant) Activated {
     if (!pool_ready(pool) || reservation.status != RESERVE_OK
         || !memory.range(driver, 1) || !time_valid(now)
         || overlaps_pool(pool, driver, 1)
@@ -851,7 +851,7 @@ fun idle_route_count_locked(pool: *Pool, route: *StoredRoute) usize {
 }
 
 pub fun release(pool: *Pool, value: Lease, reuse: body.Reuse,
-    now: time.Time) ReleaseStatus {
+    now: time.Instant) ReleaseStatus {
     if (!pool_ready(pool) || !time_valid(now)
         || (reuse != body.REUSE_ALLOWED && reuse != body.REUSE_FORBIDDEN)) {
         ret RELEASE_INVALID;
@@ -931,12 +931,12 @@ pub fun update_max_streams(pool: *Pool, token: ConnectionToken,
     ret true;
 }
 
-fun expired_idle(connection: *Connection, now: time.Time) bool {
+fun expired_idle(connection: *Connection, now: time.Instant) bool {
     ret connection.state == CONNECTION_OPEN && connection.active_streams == 0
         && time_before_or_equal(connection.idle_deadline, now);
 }
 
-pub fun take_close(pool: *Pool, now: time.Time) Close {
+pub fun take_close(pool: *Pool, now: time.Instant) Close {
     if (!pool_ready(pool) || !time_valid(now)) {
         ret empty_close();
     }
@@ -1119,7 +1119,7 @@ test "http.client.pool: multiplexed leases release exactly once" {
     if (!init(?value, ?connections[0], 2, ?leases[0], 4,
         configured)) { ret 1; }
     val route:    policy.Route = test_route("example.com", 11);
-    val now:      time.Time    = time.Time{sec: 10, nsec: 0};
+    val now:      time.Instant = time.Instant{sec: 10, nsec: 0};
     val reserved: Reservation  = reserve(?value, route,
         ip.endpoint(192, 0, 2, 1, 443), policy.TRANSPORT_TCP, now);
     var driver_storage: u8        = 1;
@@ -1177,8 +1177,8 @@ test "http.client.pool: routes and proxy identities isolate retention" {
     second_route.proxy = policy.Proxy{kind: policy.PROXY_HTTP_TUNNEL,
         host:   view.view("proxy.example", 13), port: 8443,
         secure: true, identity: 9, transports: policy.PROXY_TCP};
-    val now:   time.Time   = time.Time{sec: 20, nsec: 0};
-    val first: Reservation = reserve(?value, first_route,
+    val now:   time.Instant = time.Instant{sec: 20, nsec: 0};
+    val first: Reservation  = reserve(?value, first_route,
         ip.endpoint(192, 0, 2, 1, 443), policy.TRANSPORT_TCP, now);
     var first_driver: u8        = 1;
     val first_active: Activated = activate(?value, first, message.WIRE_H1,
@@ -1218,7 +1218,7 @@ test "http.client.pool: idle limits timeout and drain publish close once" {
     if (!init(?value, ?connections[0], 2, ?leases[0], 2,
         configured)) { ret 1; }
     val route: policy.Route = test_route("example.com", 11);
-    val now:   time.Time    = time.Time{sec: 30, nsec: 0};
+    val now:   time.Instant = time.Instant{sec: 30, nsec: 0};
     val first: Reservation  = reserve(?value, route,
         ip.endpoint(192, 0, 2, 1, 443), policy.TRANSPORT_TCP, now);
     var first_driver: u8        = 1;
@@ -1227,8 +1227,8 @@ test "http.client.pool: idle limits timeout and drain publish close once" {
     if (activated.status != ACTIVATE_OK
         || release(?value, activated.lease, body.REUSE_ALLOWED, now)
         != RELEASE_OK) { ret 2; }
-    val later: time.Time = time.Time{sec: 30, nsec: 10};
-    val close: Close     = take_close(?value, later);
+    val later: time.Instant = time.Instant{sec: 30, nsec: 10};
+    val close: Close        = take_close(?value, later);
     if (!close.found)                    { ret 3; }
     if (!connections[0].close_published) { ret 4; }
     if (take_close(?value, later).found) { ret 5; }
@@ -1251,7 +1251,7 @@ test "http.client.pool: drain publishes connect cancellation and owns late drive
     if (!init(?value, ?connections[0], 1, ?leases[0], 1,
         configured)) { ret 1; }
     val route:    policy.Route = test_route("example.com", 11);
-    val now:      time.Time    = time.Time{sec: 40, nsec: 0};
+    val now:      time.Instant = time.Instant{sec: 40, nsec: 0};
     val reserved: Reservation  = reserve(?value, route,
         ip.endpoint(192, 0, 2, 4, 443), policy.TRANSPORT_TCP, now);
     if (reserved.status != RESERVE_OK || !drain(?value)) { ret 2; }
@@ -1288,7 +1288,7 @@ test "http.client.pool: proxy transport capabilities gate QUIC routes" {
     route.proxy = policy.Proxy{kind: policy.PROXY_HTTP_TUNNEL,
         host:     view.view("proxy.example", 13), port: 8443, secure: true,
         identity: 1, transports: policy.PROXY_TCP};
-    val now: time.Time = time.Time{sec: 50, nsec: 0};
+    val now: time.Instant = time.Instant{sec: 50, nsec: 0};
     if (reserve(?value, route, ip.endpoint(192, 0, 2, 5, 8443),
         policy.TRANSPORT_QUIC, now).status != RESERVE_INVALID) { ret 2; }
     route.proxy = policy.Proxy{kind: policy.PROXY_CONNECT_UDP,
