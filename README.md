@@ -71,9 +71,8 @@ selection, retries, redirects, cancellation, and graceful drain are implemented.
 - HTTP/2 connections validate the client preface and first SETTINGS boundary before
   admitting streams. Settings, ping, reset, GOAWAY, push, and window updates remain
   ordered with header-block continuations under partial transport completion.
-- HTTP/2 stream state is generation-bound and allocation-free. One physical stream
-  slot beyond `max_streams` is reserved to decode refused field blocks, preserving
-  the shared HPACK context under saturation.
+- HTTP/2 stream state is generation-bound. One inline reserve stream decodes refused
+  field blocks, preserving the shared HPACK context under saturation.
 - Connection and stream receive windows replenish only after application data is
   consumed. Outbound DATA is copied, flow-controlled, and selected by a bounded
   weighted scheduler before transport ownership begins.
@@ -190,9 +189,15 @@ keeps service cancellation, response construction, streaming bodies, and termina
 completion version-neutral. See [doc/h2-connection.md](doc/h2-connection.md) for the
 state, memory, flow-control, and graceful-drain contracts.
 
-The HTTP/1, HTTP/2, and HTTP/3 connection engines each expose `destroy`, which
-returns the engine to the state `init` accepts so one set of caller-owned storage
-can carry a succession of connections. It refuses while anything still references
+The HTTP/1, HTTP/2, and HTTP/3 connection engines never allocate. Each borrows its
+stream records and per-request buffers from a `std.memory.buffers` account only while
+they are in use, so an idle connection holds its per-connection state and little
+else. A memory refusal refuses the step or stream that needed it, never the
+connection. The engine docs give each engine's sizes and refusal rules.
+
+Each engine exposes `destroy`, which returns every borrowed buffer to the account and
+the engine to the state `init` accepts, so one set of caller-owned storage can carry a
+succession of connections. It refuses while anything still references
 that storage, and it clears every initialization guard the engine holds, so a pool
 never has to reach into these records to reset one. Only the storage is pooled: the
 next `init` takes a fresh transport.

@@ -1,34 +1,66 @@
 # HTTP/2 connection engine
 
-`http.h2.connection.Engine` is an allocation-free HTTP/2 client and server state
-machine. It composes the strict frame codec, transactional HPACK codec, common
-ordered transport, and version-neutral service exchange.
+`http.h2.connection.Engine` is an HTTP/2 client and server state machine. It
+composes the strict frame codec, transactional HPACK codec, common ordered
+transport, and version-neutral service exchange. It never allocates. Stream records
+and per-stream and transient buffers are borrowed from a `std.memory.buffers`
+account.
 
 ## Memory and initialization
 
-Every buffer and table is caller-owned. `init` receives:
+`init` receives caller storage for per-connection state:
 
-- connection read and write buffers
-- one complete inbound-frame payload buffer sized for the advertised maximum frame
-- one outbound HPACK field-block buffer
+- the connection read buffer
 - bounded inbound and outbound dynamic-table entry arrays and byte arenas
-- bounded encoder shadow entries and a control-frame queue
-- a `Stream` and `StreamMemory` array
-- a `StreamIndexEntry` array for the stream index
+- a control-frame queue
+- one `StreamMemory` that decodes a refused header block
+- a `std.memory.buffers.Source` and the connection's open account on it, both of
+  which must outlive the engine
 
-`index_capacity` must be a power of two and at least `2 * capacity`. The index
-maps a stream ID to its slot, so every frame and every application call that names
-a stream finds it in O(1) expected time instead of scanning the table.
+Everything else is borrowed from the account. `Config` sizes it:
 
-`capacity` must be greater than `Config.max_streams`. The extra physical slot is a
-protocol reserve. When the admitted-stream budget is full, the engine still decodes
-one refused header block transactionally before sending `REFUSED_STREAM`. This keeps
-the connection HPACK context synchronized under saturation. If even the reserve is
-unavailable because closed generations were not released, the connection fails with
-`ENHANCE_YOUR_CALM` instead of continuing with a corrupt compression context.
+| Memory | Size | Held | Lane |
+| --- | --- | --- | --- |
+| stream records and the index | `initial_streams` records at first, then doubling | from `init` until `destroy`, growing up to `max_streams` | `connection_lane` |
+| stream decoder set | encoded block, fields, strings, and pending entries from `Config.hpack` | from stream allocation until `release_stream` | `stream_lane` |
+| write buffer | `write_bytes` | while a frame is staged or in flight | `connection_lane` |
+| frame payload | `frame_payload_bytes` | while a frame's payload is copied, and until a DATA event it backs is consumed | `connection_lane` |
+| encoder output and pending entries | from `Config.hpack` | from `send_headers` or `send_push_promise` until the block's last frame is written | `connection_lane` |
 
-`destroy` returns the engine to the state `init` accepts, so one set of caller-owned
-storage can carry a succession of connections. It refuses while the transport still
+`init` takes the first record chunk and its index. A refusal there fails `init`. At
+`config_default` an idle engine holds 2,880 bytes on x86_64: four 656-byte records
+and a 16-entry index. Records live in `http.core.records` chunks, so a record never
+moves once handed out. When the table grows, the index is rebuilt at the new size.
+The table never shrinks while the connection lives.
+
+A refusal never fails the connection:
+
+- A refused decoder set or record for a peer stream refuses that stream with
+  `REFUSED_STREAM`. The reserve stream still decodes the block, so the HPACK context
+  stays in step. The refusal registers nothing, since the peer retries a refused
+  stream on its own.
+- A refused set or record for a local stream makes `open_local` or `reserve_push`
+  return 0.
+- A refused write buffer makes `submit_write` return false and `offer_data` return
+  `OFFER_BLOCKED` with `ERROR_MEMORY`. A refused encoder buffer makes `send_headers`
+  or `send_push_promise` return the same, and the dynamic table is left untouched.
+- A refused payload buffer makes `process` return `EVENT_MEMORY_BLOCKED`. The frame
+  header is already consumed, so the next `process` retries the buffer first.
+
+A transient refusal (write, payload, or encoder buffer) sets `memory_blocked`. If the
+pool was exhausted, or its backing refused, the account is also registered for one
+wake-up. After the source reports it ready, drive the connection again.
+
+The reserve is one inline stream. When the admitted-stream budget is full, or memory
+refuses a peer stream, the engine still decodes one refused header block
+transactionally before sending `REFUSED_STREAM`. This keeps the connection HPACK
+context synchronized under saturation. If the reserve is busy because its
+generation was not released, the connection fails with `ENHANCE_YOUR_CALM` instead
+of continuing with a corrupt compression context.
+
+`destroy` returns every borrowed record and buffer to the account and the engine to
+the state `init` accepts, so one set of caller-owned storage can carry a succession
+of connections. It refuses while the transport still
 owns a read, write, or close operation, while the application still borrows an
 event, and while any stream is live, because each of those is a reference into
 storage the caller is about to reuse. It clears every initialization guard the
@@ -45,8 +77,7 @@ the required table-size update.
 
 ## Stream table
 
-The table has fixed caller storage, and every per-event path costs O(changed
-streams), not O(capacity).
+Every per-event path costs O(changed streams), not O(capacity).
 
 - **Index.** The index is open-addressed with linear probing on a `fmix64` hash of
   the stream ID. Each stream records its index position, so removal is O(1) and
@@ -55,12 +86,12 @@ streams), not O(capacity).
   `index_capacity / 4` removals since the last one, so its cost is amortized O(1)
   per removal. Live entries fill at most half the index and tombstones at most a
   quarter, so every probe sequence reaches an empty entry.
-- **Free list.** Free slots form an intrusive list built at `init`. Allocation and
-  `release_stream` are O(1). A released slot is reused first. Generations work as
-  before: every allocation takes a fresh one.
-- **Stream memory.** A slot is bound to its `StreamMemory` only when it is
-  allocated, through one private function. Nothing else assumes that
-  `memories[i]` belongs to `streams[i]`.
+- **Free list.** Free slots form an intrusive list, extended whenever the table
+  grows. Allocation and `release_stream` are O(1), apart from a growth step. A
+  released slot is reused first. Every allocation takes a fresh generation.
+- **Stream memory.** A stream that decodes header blocks takes its decoder set when
+  it is allocated and returns it at `release_stream`. A pushed stream reserved
+  locally decodes nothing and takes none.
 
 Each stream also carries links for the engine's work sets. A stream is a member of
 a set exactly when its state says it has that kind of work. Every mutation that
@@ -134,6 +165,7 @@ These passes still cover the whole table. None of them runs on a routine path:
 - a peer SETTINGS change to `INITIAL_WINDOW_SIZE`, once per such frame
 - the acknowledgement of a local SETTINGS frame, once per `send_settings`
 - `init`, which also clears the index
+- table growth, which rebuilds the index once per doubling of the table
 
 ## Preface and settings
 

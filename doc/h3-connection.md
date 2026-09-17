@@ -1,8 +1,9 @@
 # HTTP/3 connection ownership
 
 `http.h3.connection.Engine[T]` binds the HTTP/3 frame and QPACK codecs to a
-bounded QUIC stream adapter. It allocates nothing and owns no packet, recovery,
-TLS, socket, or QUIC connection state.
+bounded QUIC stream adapter. It never allocates, and owns no packet, recovery,
+TLS, socket, or QUIC connection state. Stream records and request buffers are
+borrowed from a `std.memory.buffers` account.
 
 ## QUIC boundary
 
@@ -55,7 +56,8 @@ written against the hardest adapter, one whose readiness queue can repeat itself
   held or already released, and reports with a stale generation are all harmless.
   A spurious report with `readable` set costs at most one empty read.
 - A stream that `accept` has not yet returned needs no report. The engine reads
-  every stream once when it accepts or opens it.
+  every stream once when it accepts or opens it, and once when it places a parked
+  stream.
 - The peer's control and QPACK streams follow the same rule. Nothing is read
   unconditionally on each call.
 - The engine's own control, encoder, and decoder streams are written on every
@@ -74,10 +76,8 @@ closes the connection.
 `test/h3-quic` binds this adapter to the `mach-quic` connection driver and drives
 two real drivers against each other. Stream handle identity, delivery, and receive
 credit map one to one, and the driver's own uncredited total proves that `read`
-returns no window. mach-quic 0.10 has no readiness queue yet, so that adapter
-reports every stream it handed out once per sweep. The contract allows the
-spurious reports, and the adapter switches to `transport.ready_stream` when
-mach-quic 0.12.0 ships it. Two statuses need translating: the QUIC write status answers
+returns no window. `ready` maps one to one onto mach-quic's
+`transport.ready_stream`. Two statuses need translating: the QUIC write status answers
 whether the entire write was accepted rather than whether the call made progress,
 and QUIC names an unsettled release a stream state error rather than a blocked one.
 No packet, TLS, or recovery API crosses this boundary.
@@ -89,36 +89,84 @@ without changing stream delivery or credit ownership.
 
 ## Memory and limits
 
-The caller provides the stream slots, one `StreamMemory` per slot, the stream id
-index, and the pending-release array that holds handles whose release the transport
-has not yet completed. `Storage.stream_index` holds `stream_index_capacity`
-`StreamIndexEntry` records. The capacity must be a power of two and at least twice
-`stream_capacity`, which keeps every probe short and guarantees an empty entry. Each memory
-record independently bounds read fragments, SETTINGS entries, encoded field
-sections, decoded fields, decoded string storage, QPACK scratch, output bytes, and
-field references. Connection storage separately owns both QPACK tables, table
-arenas, table scratch, outstanding section and reference arrays, the pending-release
-array, and the three local critical-stream queues.
+`Storage` is caller storage for per-connection state:
 
-`destroy` returns the engine to the state `init` accepts, so one set of caller-owned
-storage can carry a succession of connections. It refuses while a request is live or
-while the transport still owes a release, because both are references into storage
-the caller is about to reuse; the peer's control and QPACK streams stay live for the
-whole connection and are reclaimed by the transport close, so they do not block
-teardown. It clears every initialization guard the engine holds by value, including
-both QPACK tables, the inbound and outbound section sets, and the critical-stream
-record, and both tables come back empty. The stream slots are reset by the next
-`init`. The QUIC connection is not pooled, only the storage.
+- both QPACK tables with their arenas and scratch, and the outstanding section and
+  reference arrays
+- the three local critical-stream queues
+- the pending-release array, which holds handles whose release the transport has not
+  yet completed
+- a `CriticalMemory`, which the peer's control, QPACK encoder, and QPACK decoder
+  streams read through
+- a `std.memory.buffers.Source` and the connection's open account on it, both of
+  which must outlive the engine
 
-The caller zero-initializes `Engine`, `Stream`, and codec records before their first
-initialization. `init` validates every configured table, section, queue, stream, and
-memory capacity before the engine becomes live. Closed stream slots retain their
-generation until `release_stream` succeeds, then reuse advances the generation.
+Each critical stream uses only the buffers its kind needs:
+
+| Stream | Buffers |
+| --- | --- |
+| control | `read`, and `settings` for at least `frames.max_settings` entries |
+| QPACK encoder | `read`, `encoded` for an inbound instruction, `scratch` for twice an inbound field |
+| QPACK decoder | `read`, and `encoded` for an outbound instruction |
+
+Everything else is borrowed from the account. `Config` sizes it:
+
+| Memory | Size | Held | Lane |
+| --- | --- | --- | --- |
+| stream records and the index | `initial_streams` records at first, then doubling | from `init` until `destroy`, growing up to `max_requests + max_peer_unidirectional` | `connection_lane` |
+| request set | `read_bytes`, `output_bytes`, and the encoded section, fields, strings, scratch, and references from the QPACK limits | from stream allocation until `release_stream`, or until `destroy` if it was never released | `stream_lane` |
+
+`init` takes the first record chunk and its index, and a refusal there fails `init`.
+At `config_default` an idle engine holds 12,544 bytes on x86_64: eight 1,536-byte
+records and a 16-entry index. A request set is 217,808 bytes. Records live in
+`http.core.records` chunks, so a record never moves once handed out. When the table
+grows, the index is rebuilt at the new size. The table never shrinks while the
+connection lives.
+
+A peer unidirectional stream borrows no buffer. Until its type is known it reads one
+byte at a time into its own record, so no frame byte arrives before the stream is
+classified. A critical stream then reads through its `CriticalMemory`. A stream of an
+unknown type is drained through a 64-byte buffer inside the engine, and its bytes
+are credited in the same call that reads them.
+
+A refusal never fails the connection:
+
+- A refused request set or record for a peer request rejects it with
+  `H3_REQUEST_REJECTED`, as the request budget does, and registers nothing.
+- A refused request set or record for a client request makes `open_request` return
+  `NO_STREAM` before any transport stream is opened.
+- A peer unidirectional stream may be critical, so a refused record does not refuse
+  it. The engine parks the accepted handle and accepts nothing else. The stream stays
+  unread in the transport. `process` returns `EVENT_MEMORY_BLOCKED` and places the
+  stream once a record is free. If the pool was exhausted, or its backing refused,
+  the account is registered for one wake-up. After the source reports it ready, call
+  `process`. A refusal against the account's own lane budget ends when this
+  connection releases a stream.
+
+A request holds its record and set until `release_stream`, closed or not. Request
+admission and `open_request` therefore also stop once `max_requests` sets are held.
+Peer unidirectional streams never hold more than `max_peer_unidirectional` records.
+Once the table reaches its cap, a record is always free for the admission checks.
+
+`destroy` returns every borrowed record and buffer to the account and the engine to
+the state `init` accepts, so one set of caller-owned storage can carry a succession of
+connections. It refuses while a request is live or while the transport still owes a
+release, because both are references into state the caller is about to reuse. The
+peer's control and QPACK streams stay live for the whole connection and are reclaimed
+by the transport close, so they do not block teardown. It clears every initialization
+guard the engine holds by value, including both QPACK tables, the inbound and
+outbound section sets, and the critical-stream record, and both tables come back
+empty. The QUIC connection is not pooled, only the storage.
+
+The caller zero-initializes `Engine` and codec records before their first
+initialization. `init` validates every configured table, section, queue, critical
+buffer, and request size before the engine becomes live. Closed streams keep their
+generation until `release_stream` succeeds, and reuse then advances the generation.
 
 `max_requests` and `max_peer_unidirectional` are enforced independently. A request
 beyond the request budget is rejected with `H3_REQUEST_REJECTED`, and a QPACK Stream
 Cancellation is queued without admitting the request. Rejecting a request never
-consumes a stream slot, so its handle is held in the pending-release array until the
+consumes a stream record, so its handle is held in the pending-release array until the
 transport settles it. Exhausting the peer unidirectional budget is a connection-level
 excessive-load failure because doing otherwise could discard a required critical
 stream.
@@ -145,13 +193,14 @@ and blocked-stream allowances smaller than local maxima narrow the outbound enco
 
 Every per-event path costs O(streams with news), not O(stream capacity).
 
-- Stream lookup by id is an open-addressed hash of the id into
-  `Storage.stream_index` with linear probing. Removal leaves a tombstone, found in
+- Stream lookup by id is an open-addressed hash of the id into the borrowed index
+  with linear probing. Removal leaves a tombstone, found in
   O(1) through the position each stream records. The index is rebuilt in place once
   tombstones pass a quarter of its capacity, so removal stays amortized O(1).
   `stream_for` and every call that names a stream id are O(1).
-- Free slots form an intrusive list built by `init`, so allocation and release are
-  O(1). Generations advance on every allocation as before.
+- Free records form an intrusive list, extended whenever the table grows, so
+  allocation and release are O(1) apart from a growth step. Growth rebuilds the index
+  once per doubling. Generations advance on every allocation.
 - Streams with engine-side work sit on an intrusive FIFO. A stream is queued when it
   holds an event to re-emit, has buffered unparsed input, has request output or a
   FIN to submit that is not parked on a blocked write, owes a retry after GOAWAY,
@@ -176,12 +225,14 @@ Every per-event path costs O(streams with news), not O(stream capacity).
   not reach. Call `process` again at once. This covers a queue still holding
   streams, a readiness backlog the 64-report budget did not drain, and a peer
   stream just accepted when another may be waiting.
+- `EVENT_MEMORY_BLOCKED`: a parked peer stream waits for a record. Wait for the
+  account's wake-up, a released stream, or transport news.
 - `EVENT_BLOCKED`: nothing remains but output the transport refused. Wait for
   transport news.
 - `EVENT_NONE`: the last `ready` returned EMPTY, `accept` had nothing, and the
   queue is empty. Wait for transport or application news.
 
-PENDING takes precedence over BLOCKED, since work remains. A queued stream always
+PENDING takes precedence over MEMORY_BLOCKED, and MEMORY_BLOCKED over BLOCKED. A queued stream always
 makes progress when serviced (its codecs consume at least one byte per call, and a
 blocked write or an EMPTY read parks it), so PENDING cannot repeat forever without
 new input.
@@ -202,8 +253,8 @@ unidirectional streams are classified incrementally, including split QUIC variab
 integers. Duplicate critical streams, client push streams, and closure or reset of a
 critical stream fail the connection.
 
-Unknown unidirectional stream types are drained within their configured stream-slot
-budget. Push is not negotiated by this engine. A received push stream, PUSH_PROMISE,
+Unknown unidirectional stream types are drained through the engine's discard buffer
+and count against `max_peer_unidirectional` until their FIN. Push is not negotiated by this engine. A received push stream, PUSH_PROMISE,
 CANCEL_PUSH, or MAX_PUSH_ID therefore fails with the applicable ID or creation error.
 
 Request streams enforce HEADERS before DATA, informational responses before the final
