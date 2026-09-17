@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-17
+
+### Added
+- `http.core.records` holds address-stable record chunks borrowed from a `std.memory.buffers.Source`. Each chunk doubles the capacity, and a record never moves once handed out (#104).
+- `transport.readable` waits for readability without lending a buffer. Its completion has kind `READABLE` and count 0 (#104).
+
+### Changed
+- The license is attributed to Briar Systems LLC (#108).
+- **Breaking.** Dependencies: mach-std v5.3.0 (was v4.0.1), and `mach.toml` now requires mach `^5.3`. A consumer must be on std 5.x as well. Error completions from std 5.3 carry the bytes transferred before a cancellation or timeout. Every engine treats such a completion as fatal to its connection, never as an empty success (#104).
+- **Breaking, and stops compilation.** Every transport adapter must implement the new `submit_readable`: `transport.Adapter` and `transport.RuntimeStream` have the callback. It maps to a runtime readiness wait such as `net.async.submit_readable`. A read and a readable wait are never pending together (#104).
+- Dependencies (tests only): the h3-quic tests use mach-quic v0.12.1, and their adapter reports readiness through `transport.ready_stream` (#104).
+- **Breaking.** Every caller-supplied `now` and every deadline is a `std.chrono.time.Instant`, read with `time.instant()`, instead of a `time.Time`. This covers:
+  - `h1.connection`: `init`, `tick`, `process`, `complete_io`, `enqueue_request`, `prepare_informational`, `prepare_response`, `release`, `Deadline.at` and `next_deadline`.
+  - The client: `next`, maintenance, `expire_request`, retry and readiness instants, and their timer actions.
+  - The DNS cache: lookups, TTL and retry instants, and resolver scope deadlines.
+  - The connection pool: `take_close`, idle deadlines and last-use ordering.
+
+  A wall-clock value no longer compiles where a deadline is expected. This replaces the 0.11.0 note that such a value was accepted but never fired.
+- **Breaking.** `message.Metadata` replaces `has_deadline` and `deadline` with one `deadline: opt[time.Instant]`. `received_at` stays a wall-clock `time.Time`, since it is a timestamp for records and nothing orders requests by it.
+- **Breaking.** The engines borrow their memory from a `std.memory.buffers` account, and an idle connection holds only per-connection state (#104). Each `init` takes the source and the connection's open account, and both must outlive the engine. `destroy` returns everything to the account. A refusal never fails the connection. It refuses the step or the stream that needed the memory, and an exhausted or memory refusal registers the account for one wake-up. Sizes below are at each `config_default`, measured on x86_64.
+  - HTTP/1: `init` no longer takes slot memory or read and write buffers. `Config` gains `read_bytes`, `write_bytes`, `slot_storage_bytes`, `slot_scratch_bytes`, `slot_lane` and `connection_lane`. An idle engine holds no buffer: it waits with `transport.readable`, and the 8,192-byte read buffer is held from readability until its input is consumed. A slot borrows its 70,816-byte set while it is live, and the 8,192-byte write buffer is held while output is staged. A refused slot leaves the request unread and returns `EVENT_MEMORY_BLOCKED`. A refused client slot fails `enqueue_request`, and a refused write buffer returns `OFFER_BLOCKED` with `ERROR_MEMORY`.
+  - HTTP/2: `init` takes the source, the account, the read buffer and the connection tables, plus one caller `StreamMemory` that decodes a refused header block. The stream array, per-stream memory, the index, and the write, frame-payload, header-output and encoder-pending buffers are no longer parameters. `Config` gains `write_bytes`, `frame_payload_bytes`, `initial_streams`, `stream_lane` and `connection_lane`. An idle engine holds 2,880 bytes: its first four 656-byte stream records and their index. Records grow in place up to `max_streams`. A stream that decodes headers borrows a 139,872-byte set until `release_stream`. Transient buffers are held only while in use. A refused stream set is refused with `REFUSED_STREAM`, and the block is still decoded so HPACK stays in step. A refused local stream fails `open_local`. A refused transient buffer returns `EVENT_MEMORY_BLOCKED` or `OFFER_BLOCKED` with `ERROR_MEMORY`.
+  - HTTP/3: `Storage` loses `streams`, `memories`, `stream_capacity`, `stream_index` and `stream_index_capacity`. It gains `source`, `account`, and a `CriticalMemory` that the peer's control, QPACK encoder and QPACK decoder streams read through. Each of those uses only the buffers its kind needs. `Config` gains `read_bytes`, `output_bytes`, `initial_streams`, `stream_lane` and `connection_lane`. An idle engine holds 12,544 bytes: its first eight 1,536-byte stream records and their index. A request stream borrows a 217,808-byte set until `release_stream`, or until `destroy` if it was never released. An unclassified peer stream reads its type one byte at a time into its own record, and an ignored one is drained through a 64-byte buffer inside the engine.
+  - HTTP/3 refusals: a refused request set rejects the request with `H3_REQUEST_REJECTED`. A refused client request fails `open_request` before any transport stream is opened. A refused record for a peer unidirectional stream, which may be critical, parks that stream unread in the transport. `process` then returns the new `EVENT_MEMORY_BLOCKED` until the account wakes or a stream is released. A live request holds its set until it is released, so `open_request` and request admission also stop at `max_requests` held sets.
+- **Breaking.** `h3.connection.Transport[T]` has a new `ready` callback that returns a `TransportReady` for the next stream whose readable, writable or reset state changed, or `TRANSPORT_EMPTY`. The engine only reads and writes streams it has work for, so every adapter must report each such change. Duplicate and spurious reports are harmless, and dropped ones are not. `process` also returns the new `EVENT_PENDING` when progress was made but work remains, and the host must call it again rather than wait. `EVENT_NONE` now means the transport, the accept queue and the engine have nothing left. See doc/h3-connection.md (#103).
+- HTTP/3 `process` now costs O(streams with news) instead of three passes over the stream capacity. Stream lookup, allocation and release are O(1), and `tick` walks only the requests bound to an exchange. A host that cancels an exchange scope should call `cancel_stream`, with `tick` as the fallback. Queued streams are serviced round-robin, so events come out in readiness order rather than slot order (#103).
+- **Breaking.** `h2.connection.process` (and `complete_io` for reads) can return the new `EVENT_PENDING`. It means the call used up its per-call budget of 64 units and work remains, so the host should call `process` again. It takes precedence over `EVENT_NEED_READ` (#103).
+- **Breaking.** `h2.connection.Stream` no longer has `dependency` or `exclusive`, and PRIORITY dependencies are ignored (RFC 9113). Only the weight is kept. `refused_pending` is replaced by `pending_reset`, which holds the code of a reset deferred until a header block is decoded (#103).
+- **Breaking.** A self-dependent PRIORITY frame or HEADERS priority block is now a stream error of type PROTOCOL_ERROR, as RFC 9113 requires. It was a connection error. `h2.frame` parses such a frame and leaves the error to the engine. The writer still refuses to encode one (#103).
+- Performance: HTTP/2 routine paths no longer scan the stream table, so their cost is O(changed streams) (#103).
+  - Stream lookup, allocation and release are O(1).
+  - GOAWAY retries, owed WINDOW_UPDATEs, writable streams and exchange-bound streams each have their own set.
+  - `tick` costs O(open exchange-bound streams). A host that cancels an exchange scope should call `cancel_stream`.
+  - Weighted scheduling keeps the same order over the writable set only.
+  - A PRIORITY signal costs O(1), exclusive or not.
+
 ## [0.11.0] - 2026-09-17
 
 ### Added

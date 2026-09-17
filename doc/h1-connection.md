@@ -1,15 +1,51 @@
 # HTTP/1 connection engine
 
-`http.h1.connection.Engine` is an allocation-free HTTP/1 client and server state
-machine. It composes strict incremental parsing and serialization with the common
-ordered transport.
+`http.h1.connection.Engine` is an HTTP/1 client and server state machine. It
+composes strict incremental parsing and serialization with the common ordered
+transport. It never allocates. Every buffer it uses is borrowed from a
+`std.memory.buffers` account.
+
+## Memory
+
+`init` takes the pipeline slot records, a `std.memory.buffers.Source`, and the
+connection's open account on that source. The source and the account must outlive
+the engine. An initialized engine holds no buffer. `Config` sizes what it borrows:
+
+| Buffer | Size | Held |
+| --- | --- | --- |
+| read buffer | `read_bytes` | from readability until its input is consumed |
+| write buffer | `write_bytes` | while output is staged or in flight |
+| slot set | line, `slot_storage_bytes`, header and trailer fields, `slot_scratch_bytes` | while the slot is live |
+
+Slot sets are charged to `slot_lane` and the read and write buffers to
+`connection_lane`. A slot set is taken all or nothing.
+
+An idle connection waits with `transport.readable`, which lends the transport no
+buffer. The read buffer is taken only when that wait completes, and `submit_read`
+then reads into it. Once every byte has been consumed, the next `submit_read` gives
+the buffer back and waits for readability again.
+
+A refusal never fails the connection:
+
+- A refused read buffer or server slot set returns `EVENT_MEMORY_BLOCKED`. The input
+  stays unread, `submit_read` refuses, and `process` retries the same step.
+- A refused client slot set makes `enqueue_request` return `NO_SLOT`.
+- A refused write buffer makes `offer` return `OFFER_BLOCKED` with `ERROR_MEMORY`.
+
+A refusal because the pool was exhausted, or because its backing refused, registers
+the account for one wake-up. After the source reports the account ready, call
+`process`. A refusal against the account's own lane budget is not registered. It ends
+when this connection releases memory, for example through `release`.
+
+`destroy` returns every buffer to the account.
 
 ## Time
 
-Every `now` the engine takes is `std.chrono.time.monotonic()` time. The header,
-request, write, idle and total deadlines are absolute instants computed from it, and
-an expired one times out the engine's cancellation scope. Pass the same clock on
-every call. A wall-clock value (`time.now()`) moves with clock adjustments.
+Every `now` the engine takes is a `std.chrono.time.Instant`, read with
+`time.instant()`. The header, request, write, idle and total deadlines are
+`Instant`s computed from it, and an expired one times out the engine's cancellation
+scope. The type is distinct from the wall-clock `time.Time`, so a calendar reading
+cannot be passed where a deadline is expected.
 
 `next_deadline` returns the earliest deadline `tick` would enforce, with `active` false
 when none applies: an uninitialized engine, or a tunnel, closing, closed or failed
@@ -21,8 +57,8 @@ timers. Their `tick` only settles cancelled scopes, so call it after cancelling 
 
 ## Slots and identity
 
-Every pipeline slot and all parser, field, trailer, and serializer storage are
-caller-owned. An admitted message receives a nonzero sequence. The pair
+The pipeline slot records are caller-owned. Their parser, field, trailer, and
+serializer storage is the slot set borrowed while the slot is live. An admitted message receives a nonzero sequence. The pair
 `(Event.slot, Event.sequence)` is its identity for that connection. A physical slot
 may be reused after release, so a saved slot index alone is never an ownership
 token.

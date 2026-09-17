@@ -9,6 +9,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
@@ -1159,15 +1160,16 @@ fun test_control(context: ptr, token: transport.Token,
 test "http.websocket: transport backpressure retains only connection buffers" {
     var operation_scope: cancel.Scope;
     var control_scope:   cancel.Scope;
-    val none:            time.Time = time.Time{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_root(?operation_scope, false, none))
-        || !operation_ok(cancel.make_root(?control_scope, false, none))) { ret 1; }
+    val none:            time.Instant = time.Instant{sec: 0, nsec: 0};
+    if (!operation_ok(cancel.make_root(?operation_scope, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_root(?control_scope, opt[time.Instant].none{}))) { ret 1; }
     var adapter_state: TestAdapter;
     var adapter:       transport.Adapter = transport.Adapter{
         runtime: 1::*io_runtime.Runtime,
         context: (?adapter_state)::ptr,
         security:              transport.PLAINTEXT,
         submit_read:           test_read,
+        submit_readable:       test_control,
         submit_write:          test_write,
         submit_shutdown_write: test_control,
         submit_close:          test_control,

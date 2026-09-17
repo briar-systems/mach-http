@@ -18,6 +18,7 @@ use cancellation: std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.view;
 
@@ -119,7 +120,7 @@ pub rec RequestSlot {
     pending_dns:        dns.Token;
     reservation:        pool.Reservation;
     lease:              pool.Lease;
-    retry_at:           time.Time;
+    retry_at:           time.Instant;
     retry_needs_replay: bool;
     last_retry_reason:  policy.RetryReason;
     completion:         Completion;
@@ -178,7 +179,7 @@ pub rec Action {
     dns_query:   dns.Query;
     reservation: pool.Reservation;
     lease:       pool.Lease;
-    ready_at:    time.Time;
+    ready_at:    time.Instant;
     completion:  Completion;
 }
 
@@ -292,7 +293,7 @@ fun empty_action() Action {
         protocols:    policy.ProtocolPolicy{allowed: 0, prior_knowledge: 0,
         require_alpn: false}, dns_query: empty_dns_query(),
         reservation:  empty_reservation(), lease: empty_lease(),
-        ready_at:     time.Time{sec: 0, nsec: 0},
+        ready_at:     time.Instant{sec: 0, nsec: 0},
         completion:   empty_completion()};
 }
 
@@ -314,22 +315,22 @@ fun empty_maintenance() Maintenance {
         connect_cancel: empty_connect_cancel(), close: empty_close()};
 }
 
-fun time_valid(value: time.Time) bool {
+fun time_valid(value: time.Instant) bool {
     ret value.sec >= 0 && value.nsec >= 0 && value.nsec < 1000000000;
 }
 
-fun time_before_or_equal(first: time.Time, second: time.Time) bool {
-    ret time.time_before(first, second) || time.time_equal(first, second);
+fun time_before_or_equal(first: time.Instant, second: time.Instant) bool {
+    ret time.instant_before(first, second) || time.instant_equal(first, second);
 }
 
-fun time_add(now: time.Time, duration_ns: u64) time.Time {
+fun time_add(now: time.Instant, duration_ns: u64) time.Instant {
     val seconds:     u64 = duration_ns / 1000000000;
     val nanoseconds: u64 = duration_ns % 1000000000;
     if (seconds > 0x7fffffffffffffff
         || now.sec > 0x7fffffffffffffff - seconds::i64) {
-        ret time.Time{sec: 0x7fffffffffffffff, nsec: 999999999};
+        ret time.Instant{sec: 0x7fffffffffffffff, nsec: 999999999};
     }
-    var result: time.Time = time.Time{sec: now.sec + seconds::i64,
+    var result: time.Instant = time.Instant{sec: now.sec + seconds::i64,
         nsec: now.nsec + nanoseconds::i64};
     if (result.nsec >= 1000000000) {
         if (result.sec == 0x7fffffffffffffff) {
@@ -342,7 +343,7 @@ fun time_add(now: time.Time, duration_ns: u64) time.Time {
     ret result;
 }
 
-fun time_until(now: time.Time, future: time.Time) u64 {
+fun time_until(now: time.Instant, future: time.Instant) u64 {
     if (time_before_or_equal(future, now)) { ret 0; }
     var seconds:     u64 = (future.sec - now.sec)::u64;
     var nanoseconds: i64 = future.nsec - now.nsec;
@@ -522,7 +523,7 @@ fun clear_slot(client: *Client, index: usize) {
     slot.pending_dns        = empty_dns_token();
     slot.reservation        = empty_reservation();
     slot.lease              = empty_lease();
-    slot.retry_at           = time.Time{sec: 0, nsec: 0};
+    slot.retry_at           = time.Instant{sec: 0, nsec: 0};
     slot.retry_needs_replay = false;
     slot.last_retry_reason  = 0;
     slot.completion         = empty_completion();
@@ -1036,7 +1037,7 @@ fun request_route_valid(request: *message.Request,
 }
 
 # the scope's effective deadline, or false when it has none or cannot be read
-fun scope_deadline(scope: *cancellation.Scope, deadline: *time.Time) bool {
+fun scope_deadline(scope: *cancellation.Scope, deadline: *time.Instant) bool {
     val query: cancellation.DeadlineQuery = cancellation.get_deadline(scope);
     if (sel query.err)     { ret false; }
     if (sel query.ok.none) { ret false; }
@@ -1046,23 +1047,23 @@ fun scope_deadline(scope: *cancellation.Scope, deadline: *time.Time) bool {
 
 fun deadline_matches(request: *message.Request,
     scope: *cancellation.Scope) bool {
-    var deadline:     time.Time;
-    val has_deadline: bool = scope_deadline(scope, ?deadline);
-    if (request.metadata.has_deadline != has_deadline) { ret false; }
-    ret !has_deadline || (request.metadata.deadline.sec == deadline.sec
-        && request.metadata.deadline.nsec == deadline.nsec);
+    var deadline:  time.Instant;
+    val has_scope: bool              = scope_deadline(scope, ?deadline);
+    val requested: opt[time.Instant] = request.metadata.deadline;
+    if (sel requested.none) { ret !has_scope; }
+    ret has_scope && time.instant_equal(requested.some, deadline);
 }
 
 fun submission_deadline_matches(request: *message.Request,
     parent: *cancellation.Scope) bool {
-    var parent_deadline: time.Time;
-    val inherited:       bool = scope_deadline(parent, ?parent_deadline);
-    if (!request.metadata.has_deadline) { ret !inherited; }
-    if (!inherited
-        || time.time_before(request.metadata.deadline, parent_deadline)) {
+    var parent_deadline: time.Instant;
+    val inherited:       bool              = scope_deadline(parent, ?parent_deadline);
+    val requested:       opt[time.Instant] = request.metadata.deadline;
+    if (sel requested.none) { ret !inherited; }
+    if (!inherited || time.instant_before(requested.some, parent_deadline)) {
         ret true;
     }
-    ret time.time_equal(request.metadata.deadline, parent_deadline);
+    ret time.instant_equal(requested.some, parent_deadline);
 }
 
 fun request_scope_matches(request: *message.Request,
@@ -1135,7 +1136,7 @@ pub fun submit(client: *Client, parent: *cancellation.Scope,
     slot.lease           = empty_lease();
     slot.completion      = empty_completion();
     val scope_made: bool = operation_ok(cancellation.make_child(?slot.scope, parent,
-        request.metadata.has_deadline, request.metadata.deadline));
+        request.metadata.deadline));
     if (!scope_made) {
         clear_slot(client, token.index::usize);
         client.live_requests = client.live_requests - 1;
@@ -1253,7 +1254,7 @@ fun version_for(wire: message.Wire) message.Version {
 }
 
 fun route_next(client: *Client, token: Token, slot: *RequestSlot,
-    now: time.Time) Action {
+    now: time.Instant) Action {
     val route:    policy.Route = route_value(?slot.route);
     val acquired: pool.Acquire = pool.acquire(client.connections, route,
         slot.protocols, now);
@@ -1360,7 +1361,7 @@ fun route_next(client: *Client, token: Token, slot: *RequestSlot,
     ret empty_action();
 }
 
-pub fun next(client: *Client, token: Token, now: time.Time) Action {
+pub fun next(client: *Client, token: Token, now: time.Instant) Action {
     if (!client_ready(client) || !time_valid(now)) {
         ret empty_action();
     }
@@ -1441,7 +1442,7 @@ pub fun resolution_submitted(client: *Client, token: Token,
 }
 
 pub fun resolution_submit_failed(client: *Client, token: Token,
-    failure: resolver.Error, now: time.Time) bool {
+    failure: resolver.Error, now: time.Instant) bool {
     if (!client_ready(client) || !time_valid(now)) { ret false; }
     val slot: *RequestSlot = slot_for(client, token);
     if (slot == nil || slot.state != STATE_DNS_PUBLISHED
@@ -1453,7 +1454,7 @@ pub fun resolution_submit_failed(client: *Client, token: Token,
 }
 
 pub fun complete_resolution(client: *Client,
-    completion: *resolver.Completion, now: time.Time) dns.CompleteStatus {
+    completion: *resolver.Completion, now: time.Instant) dns.CompleteStatus {
     if (!client_ready(client)
         || !memory.range(completion::ptr, $size_of(resolver.Completion))
         || overlaps_client(client, completion::ptr,
@@ -1470,7 +1471,7 @@ fun close_untransferred_driver(client: *Client, driver: ptr) bool {
 
 pub fun connected(client: *Client, token: Token,
     reservation: pool.Reservation, secure: bool, negotiated: view.View,
-    driver: ptr, max_streams: usize, now: time.Time) Connected {
+    driver: ptr, max_streams: usize, now: time.Instant) Connected {
     if (!client_ready(client)) {
         ret Connected{status: CONNECT_INVALID, close_driver: false};
     }
@@ -1540,7 +1541,7 @@ pub fun connected(client: *Client, token: Token,
 }
 
 fun schedule_retry(slot: *RequestSlot, failure: policy.Failure,
-    now: time.Time, needs_replay: bool) bool {
+    now: time.Instant, needs_replay: bool) bool {
     val decision: policy.RetryDecision = policy.retry(slot.retry_policy,
         slot.replay, failure, slot.attempts);
     if (decision.status != policy.RETRY_ALLOWED) { ret false; }
@@ -1555,7 +1556,7 @@ fun schedule_retry(slot: *RequestSlot, failure: policy.Failure,
 
 pub fun connect_failed(client: *Client, token: Token,
     reservation: pool.Reservation, failure: policy.Failure,
-    now: time.Time) ConnectStatus {
+    now: time.Instant) ConnectStatus {
     if (!client_ready(client) || !time_valid(now)
         || failure.reason != policy.RETRY_CONNECT
         || !failure.definitely_unprocessed || failure.response_started
@@ -1581,7 +1582,7 @@ pub fun connect_failed(client: *Client, token: Token,
 }
 
 fun release_exchange(client: *Client, slot: *RequestSlot,
-    reuse: body.Reuse, now: time.Time) bool {
+    reuse: body.Reuse, now: time.Instant) bool {
     val released: pool.ReleaseStatus = pool.release(client.connections,
         slot.lease, reuse, now);
     if (released != pool.RELEASE_OK && released != pool.RELEASE_CLOSE) {
@@ -1679,7 +1680,7 @@ fun exchange_failure_matches(wire: message.Wire,
 
 pub fun exchange_complete(client: *Client, token: Token, exchange: pool.Lease,
     response: *message.Response, reuse: body.Reuse,
-    now: time.Time) bool {
+    now: time.Instant) bool {
     if (!client_ready(client) || !response_storage_representable(response)
         || !time_valid(now)
         || (reuse != body.REUSE_ALLOWED && reuse != body.REUSE_FORBIDDEN)) {
@@ -1737,7 +1738,7 @@ fun response_failure_matches(response: *message.Response,
 
 pub fun exchange_response_retry(client: *Client, token: Token,
     exchange: pool.Lease, response: *message.Response, reuse: body.Reuse,
-    failure: policy.Failure, now: time.Time) ExchangeResponseStatus {
+    failure: policy.Failure, now: time.Instant) ExchangeResponseStatus {
     if (!client_ready(client) || !response_storage_representable(response)
         || !time_valid(now)
         || (reuse != body.REUSE_ALLOWED && reuse != body.REUSE_FORBIDDEN)
@@ -1792,7 +1793,7 @@ pub fun exchange_response_retry(client: *Client, token: Token,
 }
 
 pub fun exchange_failed(client: *Client, token: Token, exchange: pool.Lease,
-    failure: policy.Failure, now: time.Time) bool {
+    failure: policy.Failure, now: time.Instant) bool {
     if (!client_ready(client) || !time_valid(now)
         || !policy.failure_valid(failure)
         || policy.response_retry_reason(failure.reason)) { ret false; }
@@ -1888,7 +1889,7 @@ fun forbidden_redirect_fields(request: *message.Request,
 pub fun follow_redirect(client: *Client, token: Token, exchange: pool.Lease,
     response: *message.Response, reuse: body.Reuse,
     target_route: policy.Route, next_request: *message.Request,
-    now: time.Time) policy.RedirectStatus {
+    now: time.Instant) policy.RedirectStatus {
     if (!client_ready(client) || !response_storage_representable(response)
         || !request_storage_representable(next_request)
         || !route_representable(target_route) || !time_valid(now)
@@ -1977,7 +1978,7 @@ pub fun cancel_request(client: *Client, token: Token) bool {
     ret slot != nil && transition_ok(cancellation.cancel(?slot.scope));
 }
 
-pub fun expire_request(client: *Client, token: Token, now: time.Time) bool {
+pub fun expire_request(client: *Client, token: Token, now: time.Instant) bool {
     if (!client_ready(client) || !time_valid(now)) { ret false; }
     val slot: *RequestSlot = slot_for(client, token);
     ret slot != nil && transition_ok(cancellation.expire(?slot.scope, now));
@@ -2014,7 +2015,7 @@ pub fun drain_dependencies(client: *Client) bool {
     ret true;
 }
 
-pub fun maintenance(client: *Client, now: time.Time) Maintenance {
+pub fun maintenance(client: *Client, now: time.Instant) Maintenance {
     if (!client_ready(client) || !time_valid(now)) {
         ret empty_maintenance();
     }
@@ -2076,7 +2077,7 @@ fun test_route(host: *u8, host_len: usize) policy.Route {
 }
 
 fun test_request(request: *message.Request, reader: *body.Reader,
-    generation: u64, has_deadline: bool, deadline: time.Time,
+    generation: u64, deadline: opt[time.Instant],
     configured: message.Limits) bool {
     @reader = body.empty_reader(generation);
     val fields: field.Fields = field.init(nil, 0,
@@ -2090,7 +2091,7 @@ fun test_request(request: *message.Request, reader: *body.Reader,
         early_data:    false, peer: message.unspecified_endpoint(),
         local:         message.unspecified_endpoint(),
         received_at:   time.Time{sec: 1, nsec: 0},
-        has_deadline:  has_deadline, deadline: deadline,
+        deadline:      deadline,
         request_index: generation},
         fields, trailers, reader, generation, configured);
 }
@@ -2133,8 +2134,7 @@ test "http.client.client: authorities replay claims and redirect trailers are ex
     val configured: message.Limits = message.limits_default();
     var reader:     body.Reader;
     var request:    message.Request;
-    if (!test_request(?request, ?reader, 91, false,
-        time.Time{sec: 0, nsec: 0}, configured)) { ret 1; }
+    if (!test_request(?request, ?reader, 91, opt[time.Instant].none{}, configured)) { ret 1; }
     val route:     policy.Route = test_route("example.com", 11);
     var host_item: field.Field;
     request.fields = field.init(?host_item, 1, configured.request_fields);
@@ -2265,12 +2265,10 @@ test "http.client.client: hostile aliases and capacity overflow are transactiona
         || !init(?client, ?cache, ?connections, ?slots[0], 2,
         ?request_endpoints[0], 2, configured)) { ret 6; }
     var parent: cancellation.Scope;
-    if (!operation_ok(cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 7; }
+    if (!operation_ok(cancellation.make_root(?parent, opt[time.Instant].none{}))) { ret 7; }
     var reader:  body.Reader;
     var request: message.Request;
-    if (!test_request(?request, ?reader, 92, false,
-        time.Time{sec: 0, nsec: 0}, configured.message_limits)) { ret 8; }
+    if (!test_request(?request, ?reader, 92, opt[time.Instant].none{}, configured.message_limits)) { ret 8; }
     val alias_route: policy.Route  = test_route("alias.example", 13);
     val safe_replay: policy.Replay = policy.Replay{explicit: true,
         body: policy.BODY_EMPTY};
@@ -2288,11 +2286,11 @@ test "http.client.client: hostile aliases and capacity overflow are transactiona
         != SUBMIT_INVALID
         || dns.lookup(?cache, dns.Key{host: view.view("range.example", 13),
         port: 443, transport: policy.TRANSPORT_TCP},
-        time.Time{sec: 1, nsec: 0},
+        time.Instant{sec: 1, nsec: 0},
         (~(0::usize))::*ip.Endpoint, 1).status != dns.LOOKUP_INVALID
         || complete_resolution(?client,
         (~(0::usize))::*resolver.Completion,
-        time.Time{sec: 1, nsec: 0}) != dns.COMPLETE_INVALID) { ret 9; }
+        time.Instant{sec: 1, nsec: 0}) != dns.COMPLETE_INVALID) { ret 9; }
     reader.ctx = (?slots[0])::ptr;
     if (submit(?client, ?parent, ?request, alias_route,
         policy.protocols_default(), policy.Replay{explicit: true,
@@ -2327,13 +2325,13 @@ test "http.client.client: hostile aliases and capacity overflow are transactiona
         configured.message_limits) != message.RESPONSE_OK
         || !response_aliases(?client, ?external_response, nil)) { ret 14; }
     if (!test_shutdown(?client, ?cache, ?connections, ?parent,
-        time.Time{sec: 1, nsec: 0})) { ret 15; }
+        time.Instant{sec: 1, nsec: 0})) { ret 15; }
     ret 0;
 }
 
 fun test_publish_resolution(client: *Client, token: Token, action: Action,
     endpoint: ip.Endpoint, resolver_token: resolver.Token,
-    now: time.Time) bool {
+    now: time.Instant) bool {
     if (action.kind != ACTION_RESOLVE || !action.dns_query.valid
         || !resolution_submitted(client, token, resolver_token)) { ret false; }
     var resolved:   ip.Endpoint         = endpoint;
@@ -2349,7 +2347,7 @@ fun test_publish_resolution(client: *Client, token: Token, action: Action,
 
 fun test_shutdown(client: *Client, cache: *dns.Cache,
     connections: *pool.Pool, parent: *cancellation.Scope,
-    now: time.Time) bool {
+    now: time.Instant) bool {
     if (!drain(client) || !drain_dependencies(client)) { ret false; }
     var checked: usize = 0;
     for (checked <= connections.capacity + cache.capacity) {
@@ -2398,12 +2396,10 @@ test "http.client.client: dns alpn exchange and graceful drain preserve ownershi
         ?request_endpoints[0], 4, client_config)) { ret 3; }
 
     var parent: cancellation.Scope;
-    if (!operation_ok(cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, opt[time.Instant].none{}))) { ret 4; }
     var reader:  body.Reader;
     var request: message.Request;
-    if (!test_request(?request, ?reader, 1, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 5; }
+    if (!test_request(?request, ?reader, 1, opt[time.Instant].none{}, client_config.message_limits)) { ret 5; }
     val route:     policy.Route          = test_route("example.com", 11);
     val protocols: policy.ProtocolPolicy = policy.ProtocolPolicy{
         allowed:         policy.ALLOW_H1 | policy.ALLOW_H2,
@@ -2412,8 +2408,8 @@ test "http.client.client: dns alpn exchange and graceful drain preserve ownershi
     val submitted: Submission = submit(?client, ?parent, ?request, route,
         protocols, policy.Replay{explicit: true, body: policy.BODY_EMPTY},
         policy.retry_policy_default(), policy.redirect_policy_default());
-    val now:       time.Time = time.Time{sec: 2, nsec: 0};
-    val resolving: Action    = next(?client, submitted.token, now);
+    val now:       time.Instant = time.Instant{sec: 2, nsec: 0};
+    val resolving: Action       = next(?client, submitted.token, now);
     if (submitted.status != SUBMIT_OK
         || !test_publish_resolution(?client, submitted.token, resolving,
         ip.endpoint(192, 0, 2, 1, 443),
@@ -2532,8 +2528,8 @@ test "http.client.client: dns alpn exchange and graceful drain preserve ownershi
         || completed.completion.outcome != OUTCOME_OK
         || completed.completion.response != ?pending_response
         || !release_request(?client, submitted.token)) { ret 10; }
-    val idle:    time.Time   = time.Time{sec: 62, nsec: 0};
-    val routine: Maintenance = maintenance(?client, idle);
+    val idle:    time.Instant = time.Instant{sec: 62, nsec: 0};
+    val routine: Maintenance  = maintenance(?client, idle);
     if (routine.kind != MAINTENANCE_CLOSE
         || !pool.retire(?connections, routine.close)
         || maintenance(?client, idle).kind != MAINTENANCE_NONE) { ret 11; }
@@ -2572,12 +2568,11 @@ test "http.client.client: request deadlines settle before transport publication"
     if (!init(?client, ?cache, ?connections, ?slots[0], 1,
         ?request_endpoints[0], 1, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!operation_ok(cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 4; }
-    val deadline: time.Time = time.Time{sec: 5, nsec: 10};
+    if (!operation_ok(cancellation.make_root(?parent, opt[time.Instant].none{}))) { ret 4; }
+    val deadline: time.Instant = time.Instant{sec: 5, nsec: 10};
     var reader:   body.Reader;
     var request:  message.Request;
-    if (!test_request(?request, ?reader, 11, true, deadline,
+    if (!test_request(?request, ?reader, 11, opt[time.Instant].some{deadline},
         client_config.message_limits)) { ret 5; }
     val submitted: Submission = submit(?client, ?parent, ?request,
         test_route("deadline.example", 16), policy.protocols_default(),
@@ -2585,7 +2580,7 @@ test "http.client.client: request deadlines settle before transport publication"
         policy.retry_policy_default(), policy.redirect_policy_default());
     if (submitted.status != SUBMIT_OK
         || expire_request(?client, submitted.token,
-        time.Time{sec: 5, nsec: 9})
+        time.Instant{sec: 5, nsec: 9})
         || !expire_request(?client, submitted.token, deadline)) { ret 6; }
     val completed: Action = next(?client, submitted.token, deadline);
     if (completed.kind != ACTION_COMPLETE
@@ -2627,16 +2622,13 @@ test "http.client.client: multi-origin saturation resumes after exact lease rele
     if (!init(?client, ?cache, ?connections, ?slots[0], 2,
         ?request_endpoints[0], 2, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!operation_ok(cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, opt[time.Instant].none{}))) { ret 4; }
     var first_reader:   body.Reader;
     var second_reader:  body.Reader;
     var first_request:  message.Request;
     var second_request: message.Request;
-    if (!test_request(?first_request, ?first_reader, 21, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)
-        || !test_request(?second_request, ?second_reader, 22, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) {
+    if (!test_request(?first_request, ?first_reader, 21, opt[time.Instant].none{}, client_config.message_limits)
+        || !test_request(?second_request, ?second_reader, 22, opt[time.Instant].none{}, client_config.message_limits)) {
         ret 5;
     }
     val retry_once: policy.RetryPolicy = policy.RetryPolicy{
@@ -2653,8 +2645,8 @@ test "http.client.client: multi-origin saturation resumes after exact lease rele
     val second: Submission = submit(?client, ?parent, ?second_request,
         test_route("two.example", 11), policy.protocols_default(), replay,
         retry_once, policy.redirect_policy_default());
-    val now:       time.Time = time.Time{sec: 8, nsec: 0};
-    val first_dns: Action    = next(?client, first.token, now);
+    val now:       time.Instant = time.Instant{sec: 8, nsec: 0};
+    val first_dns: Action       = next(?client, first.token, now);
     if (first.status != SUBMIT_OK || second.status != SUBMIT_OK
         || !test_publish_resolution(?client, first.token, first_dns,
         ip.endpoint(192, 0, 2, 21, 443),
@@ -2719,12 +2711,10 @@ test "http.client.client: cross-origin redirects require rewritten safe requests
     if (!init(?client, ?cache, ?connections, ?slots[0], 1,
         ?request_endpoints[0], 1, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!operation_ok(cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, opt[time.Instant].none{}))) { ret 4; }
     var reader:  body.Reader;
     var request: message.Request;
-    if (!test_request(?request, ?reader, 31, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 5; }
+    if (!test_request(?request, ?reader, 31, opt[time.Instant].none{}, client_config.message_limits)) { ret 5; }
     val source:  policy.Route          = test_route("source.example", 14);
     val h3_only: policy.ProtocolPolicy = policy.ProtocolPolicy{
         allowed:      policy.ALLOW_H3, prior_knowledge: message.WIRE_H3,
@@ -2738,8 +2728,8 @@ test "http.client.client: cross-origin redirects require rewritten safe requests
         h3_only,
         policy.Replay{explicit: true, body: policy.BODY_STREAMING},
         policy.retry_policy_default(), redirects);
-    val now:       time.Time = time.Time{sec: 9, nsec: 0};
-    val resolving: Action    = next(?client, submitted.token, now);
+    val now:       time.Instant = time.Instant{sec: 9, nsec: 0};
+    val resolving: Action       = next(?client, submitted.token, now);
     if (submitted.status != SUBMIT_OK
         || !test_publish_resolution(?client, submitted.token, resolving,
         ip.endpoint(192, 0, 2, 31, 443),
@@ -2760,8 +2750,7 @@ test "http.client.client: cross-origin redirects require rewritten safe requests
         client_config.message_limits)) { ret 8; }
     var next_reader:  body.Reader;
     var next_request: message.Request;
-    if (!test_request(?next_request, ?next_reader, 32, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 9; }
+    if (!test_request(?next_request, ?next_reader, 32, opt[time.Instant].none{}, client_config.message_limits)) { ret 9; }
     val destination:  policy.Route = test_route("other.example", 13);
     val index:        usize        = submitted.token.index::usize;
     val saved_lease:  pool.Lease   = slots[index].lease;
@@ -2799,8 +2788,7 @@ test "http.client.client: cross-origin redirects require rewritten safe requests
     clear_route.origin.port   = 80;
     if (!test_response(?second_response, 32, status.SEE_OTHER,
         client_config.message_limits)
-        || !test_request(?clear_request, ?clear_reader, 33, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)
+        || !test_request(?clear_request, ?clear_reader, 33, opt[time.Instant].none{}, client_config.message_limits)
         || follow_redirect(?client, submitted.token, redirected_exchange.lease,
         ?second_response, body.REUSE_ALLOWED, clear_route, ?clear_request,
         now) != policy.REDIRECT_INVALID) { ret 14; }
@@ -2845,8 +2833,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
     if (!init(?client, ?cache, ?connections, ?slots[0], 1,
         ?request_endpoints[0], 1, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!operation_ok(cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, opt[time.Instant].none{}))) { ret 4; }
     val route:       policy.Route       = test_route("retry.example", 13);
     val retry_twice: policy.RetryPolicy = policy.RetryPolicy{
         max_attempts:    2, retry_request_timeout: false,
@@ -2855,8 +2842,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
     };
     var first_reader:  body.Reader;
     var first_request: message.Request;
-    if (!test_request(?first_request, ?first_reader, 41, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 5; }
+    if (!test_request(?first_request, ?first_reader, 41, opt[time.Instant].none{}, client_config.message_limits)) { ret 5; }
     var first_body_context: u8 = 0;
     first_reader = body.init_reader((?first_body_context)::ptr,
         test_retry_body_read, test_retry_body_finish,
@@ -2869,8 +2855,8 @@ test "http.client.client: retries publish replay and never buffer streams" {
         policy.protocols_default(), policy.Replay{explicit: true,
         body: policy.BODY_REWINDABLE}, retry_twice,
         policy.redirect_policy_default());
-    val now:       time.Time = time.Time{sec: 10, nsec: 0};
-    val resolving: Action    = next(?client, first.token, now);
+    val now:       time.Instant = time.Instant{sec: 10, nsec: 0};
+    val resolving: Action       = next(?client, first.token, now);
     if (first.status != SUBMIT_OK
         || !test_publish_resolution(?client, first.token, resolving,
         ip.endpoint(192, 0, 2, 41, 443),
@@ -2909,8 +2895,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
         || next(?client, first.token, now).kind != ACTION_NONE) { ret 9; }
     var replay_reader:  body.Reader;
     var replay_request: message.Request;
-    if (!test_request(?replay_request, ?replay_reader, 42, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 10; }
+    if (!test_request(?replay_request, ?replay_reader, 42, opt[time.Instant].none{}, client_config.message_limits)) { ret 10; }
     var replay_context: u8 = 0;
     replay_reader = body.init_reader((?replay_context)::ptr,
         test_retry_body_read, test_retry_body_finish,
@@ -2940,8 +2925,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
 
     var stream_reader:  body.Reader;
     var stream_request: message.Request;
-    if (!test_request(?stream_request, ?stream_reader, 43, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 13; }
+    if (!test_request(?stream_request, ?stream_reader, 43, opt[time.Instant].none{}, client_config.message_limits)) { ret 13; }
     val streaming: Submission = submit(?client, ?parent, ?stream_request,
         route, policy.protocols_default(), policy.Replay{explicit: true,
         body: policy.BODY_STREAMING}, policy.retry_policy_default(),
@@ -2979,8 +2963,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
 
     var response_reader:  body.Reader;
     var response_request: message.Request;
-    if (!test_request(?response_request, ?response_reader, 44, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 17; }
+    if (!test_request(?response_request, ?response_reader, 44, opt[time.Instant].none{}, client_config.message_limits)) { ret 17; }
     var server_policy: policy.RetryPolicy = policy.retry_policy_default();
     server_policy.max_attempts = 2;
     server_policy.retry_server = true;
@@ -3051,8 +3034,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
         != ACTION_REPLAY) { ret 20; }
     var final_reader:  body.Reader;
     var final_request: message.Request;
-    if (!test_request(?final_request, ?final_reader, 45, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)
+    if (!test_request(?final_request, ?final_reader, 45, opt[time.Instant].none{}, client_config.message_limits)
         || !replay_ready(?client, response_submission.token,
         ?final_request)) { ret 21; }
     val final_exchange: Action = next(?client,
@@ -3080,8 +3062,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
 
     var upgrade_reader:  body.Reader;
     var upgrade_request: message.Request;
-    if (!test_request(?upgrade_request, ?upgrade_reader, 46, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 24; }
+    if (!test_request(?upgrade_request, ?upgrade_reader, 46, opt[time.Instant].none{}, client_config.message_limits)) { ret 24; }
     val upgrade_submission: Submission = submit(?client, ?parent,
         ?upgrade_request, route, policy.protocols_default(),
         policy.Replay{explicit: true, body: policy.BODY_EMPTY},
@@ -3141,31 +3122,29 @@ test "http.client.client: temporary dns failures wait for cache retry time" {
     if (!init(?client, ?cache, ?connections, ?slots[0], 1,
         ?request_endpoints[0], 1, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!operation_ok(cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, opt[time.Instant].none{}))) { ret 4; }
     var reader:  body.Reader;
     var request: message.Request;
-    if (!test_request(?request, ?reader, 51, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 5; }
+    if (!test_request(?request, ?reader, 51, opt[time.Instant].none{}, client_config.message_limits)) { ret 5; }
     val submitted: Submission = submit(?client, ?parent, ?request,
         test_route("dns.example", 11), policy.protocols_default(),
         policy.Replay{explicit: true, body: policy.BODY_EMPTY},
         policy.RetryPolicy{max_attempts: 2, retry_request_timeout: false,
         retry_too_early: false, retry_rate_limit: false,
         retry_server:    false}, policy.redirect_policy_default());
-    val now:         time.Time = time.Time{sec: 11, nsec: 20};
-    val first_query: Action    = next(?client, submitted.token, now);
+    val now:         time.Instant = time.Instant{sec: 11, nsec: 20};
+    val first_query: Action       = next(?client, submitted.token, now);
     if (submitted.status != SUBMIT_OK || first_query.kind != ACTION_RESOLVE
         || !resolution_submit_failed(?client, submitted.token,
         resolver.Error{kind: resolver.TEMPORARY, native_code: 1}, now)) {
         ret 6;
     }
-    val waiting: Action    = next(?client, submitted.token, now);
-    val ready:   time.Time = time.Time{sec: 11, nsec: 30};
+    val waiting: Action       = next(?client, submitted.token, now);
+    val ready:   time.Instant = time.Instant{sec: 11, nsec: 30};
     if (waiting.kind != ACTION_WAIT_TIMER
-        || !time.time_equal(waiting.ready_at, ready)
+        || !time.instant_equal(waiting.ready_at, ready)
         || next(?client, submitted.token,
-        time.Time{sec: 11, nsec: 29}).kind != ACTION_WAIT_TIMER) { ret 7; }
+        time.Instant{sec: 11, nsec: 29}).kind != ACTION_WAIT_TIMER) { ret 7; }
     val second_query: Action = next(?client, submitted.token, ready);
     if (second_query.kind != ACTION_RESOLVE
         || !resolution_submit_failed(?client, submitted.token,
@@ -3213,14 +3192,12 @@ test "http.client.client: cancellation wins connect and exchange races" {
     if (!init(?client, ?cache, ?connections, ?slots[0], 2,
         ?request_endpoints[0], 2, client_config)) { ret 3; }
     var parent: cancellation.Scope;
-    if (!operation_ok(cancellation.make_root(?parent, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, opt[time.Instant].none{}))) { ret 4; }
     val route:         policy.Route = test_route("race.example", 12);
-    val now:           time.Time    = time.Time{sec: 12, nsec: 0};
+    val now:           time.Instant = time.Instant{sec: 12, nsec: 0};
     var first_reader:  body.Reader;
     var first_request: message.Request;
-    if (!test_request(?first_request, ?first_reader, 61, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 5; }
+    if (!test_request(?first_request, ?first_reader, 61, opt[time.Instant].none{}, client_config.message_limits)) { ret 5; }
     val first: Submission = submit(?client, ?parent, ?first_request, route,
         policy.protocols_default(),
         policy.Replay{explicit: true, body: policy.BODY_EMPTY},
@@ -3244,8 +3221,7 @@ test "http.client.client: cancellation wins connect and exchange races" {
 
     var second_reader:  body.Reader;
     var second_request: message.Request;
-    if (!test_request(?second_request, ?second_reader, 62, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 9; }
+    if (!test_request(?second_request, ?second_reader, 62, opt[time.Instant].none{}, client_config.message_limits)) { ret 9; }
     val second: Submission = submit(?client, ?parent, ?second_request, route,
         policy.protocols_default(),
         policy.Replay{explicit: true, body: policy.BODY_EMPTY},
@@ -3269,8 +3245,7 @@ test "http.client.client: cancellation wins connect and exchange races" {
 
     var duplicate_reader:  body.Reader;
     var duplicate_request: message.Request;
-    if (!test_request(?duplicate_request, ?duplicate_reader, 66, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 11; }
+    if (!test_request(?duplicate_request, ?duplicate_reader, 66, opt[time.Instant].none{}, client_config.message_limits)) { ret 11; }
     val duplicate_submission: Submission = submit(?client, ?parent,
         ?duplicate_request, route, policy.protocols_default(),
         policy.Replay{explicit: true, body: policy.BODY_EMPTY},
@@ -3301,8 +3276,7 @@ test "http.client.client: cancellation wins connect and exchange races" {
     if (!test_response(?response, 62, status.SEE_OTHER,
         client_config.message_limits)
         || !test_request(?cancelled_redirect_request,
-        ?cancelled_redirect_reader, 65, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)
+        ?cancelled_redirect_reader, 65, opt[time.Instant].none{}, client_config.message_limits)
         || follow_redirect(?client, second.token, second_exchange.lease,
         ?response, body.REUSE_ALLOWED, route,
         ?cancelled_redirect_request, now) != policy.REDIRECT_CANCELLED) {
@@ -3320,10 +3294,8 @@ test "http.client.client: cancellation wins connect and exchange races" {
     var owner_request:  message.Request;
     var waiter_reader:  body.Reader;
     var waiter_request: message.Request;
-    if (!test_request(?owner_request, ?owner_reader, 63, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)
-        || !test_request(?waiter_request, ?waiter_reader, 64, false,
-        time.Time{sec: 0, nsec: 0}, client_config.message_limits)) { ret 17; }
+    if (!test_request(?owner_request, ?owner_reader, 63, opt[time.Instant].none{}, client_config.message_limits)
+        || !test_request(?waiter_request, ?waiter_reader, 64, opt[time.Instant].none{}, client_config.message_limits)) { ret 17; }
     val shared_route: policy.Route = test_route("dns-race.example", 16);
     val owner:        Submission   = submit(?client, ?parent, ?owner_request,
         shared_route, policy.protocols_default(),
@@ -3412,17 +3384,17 @@ test "http.client.client: hostile ownership and lifecycle inputs stay transactio
         ?request_endpoints[0], 1, client_config)) { ret 2; }
     if (complete_resolution(?client,
         (?slots[0])::ptr::*resolver.Completion,
-        time.Time{sec: 1, nsec: 0}) != dns.COMPLETE_INVALID
+        time.Instant{sec: 1, nsec: 0}) != dns.COMPLETE_INVALID
         || complete_resolution(?client,
         (?request_endpoints[0])::ptr::*resolver.Completion,
-        time.Time{sec: 1, nsec: 0}) != dns.COMPLETE_INVALID) { ret 3; }
-    val parent_deadline: time.Time = time.Time{sec: 5, nsec: 0};
+        time.Instant{sec: 1, nsec: 0}) != dns.COMPLETE_INVALID) { ret 3; }
+    val parent_deadline: time.Instant = time.Instant{sec: 5, nsec: 0};
     var parent:          cancellation.Scope;
-    if (!operation_ok(cancellation.make_root(?parent, true, parent_deadline))) { ret 4; }
+    if (!operation_ok(cancellation.make_root(?parent, opt[time.Instant].some{parent_deadline}))) { ret 4; }
     var deadline_reader:  body.Reader;
     var deadline_request: message.Request;
-    if (!test_request(?deadline_request, ?deadline_reader, 71, true,
-        time.Time{sec: 10, nsec: 0}, client_config.message_limits)
+    if (!test_request(?deadline_request, ?deadline_reader, 71,
+        opt[time.Instant].some{time.Instant{sec: 10, nsec: 0}}, client_config.message_limits)
         || submit(?client, ?parent, ?deadline_request,
         test_route("hostile.example", 15), policy.protocols_default(),
         policy.Replay{explicit: true, body: policy.BODY_EMPTY},
@@ -3431,8 +3403,8 @@ test "http.client.client: hostile ownership and lifecycle inputs stay transactio
 
     var alias_reader:  body.Reader;
     var alias_request: message.Request;
-    if (!test_request(?alias_request, ?alias_reader, 72, true,
-        parent_deadline, client_config.message_limits)) { ret 6; }
+    if (!test_request(?alias_request, ?alias_reader, 72,
+        opt[time.Instant].some{parent_deadline}, client_config.message_limits)) { ret 6; }
     alias_request.trailers = field.init(
         (?request_endpoints[0])::ptr::*field.Field, 1,
         client_config.message_limits.request_trailers);

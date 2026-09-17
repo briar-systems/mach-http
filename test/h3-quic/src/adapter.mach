@@ -2,8 +2,8 @@
 
 use h3quic.loopback;
 use h3: http.h3.connection;
+use quic.clock;
 use qt: quic.transport;
-use std.types.bool.bool;
 use std.types.size.usize;
 
 # the engine's close hook carries no clock, so the adapter shares the link's
@@ -60,6 +60,13 @@ fun adapter_accept(self: *Adapter) h3.TransportOpen {
         stream:               to_h3(opened.stream),
         stream_limit_blocked: opened.stream_limit_blocked,
         storage_blocked:      opened.storage_blocked, error: opened.error::u64};
+}
+
+fun adapter_ready(self: *Adapter) h3.TransportReady {
+    val ready: qt.ReadyStream = qt.ready_stream[loopback.Core](self.driver);
+    ret h3.TransportReady{status: status(ready.status),
+        handle:   to_h3(ready.stream), readable: ready.readable,
+        writable: ready.writable, reset: ready.reset};
 }
 
 # delivery only; the driver accumulates the uncredited total for credit to release
@@ -133,7 +140,7 @@ fun adapter_close(self: *Adapter, code: u64) h3.TransportOperation {
     self.close_error = code;
     self.clock[0]    = self.clock[0] + 1;
     ret operation(qt.begin_close[loopback.Core](self.driver, code, nil, 0,
-        self.clock[0]));
+        clock.instant(self.clock[0])));
 }
 
 pub fun stream_snapshot(self: *Adapter, value: h3.StreamHandle) qt.StreamSnapshot {
@@ -151,7 +158,8 @@ pub fun bind(self: *Adapter, driver: *qt.Driver[loopback.Core],
     self.short_reads      = 0;
     self.blocked_releases = 0;
     ret h3.Transport[Adapter]{context: self, open: adapter_open,
-        accept:      adapter_accept, read: adapter_read, credit: adapter_credit,
+        accept:      adapter_accept, ready: adapter_ready, read: adapter_read,
+        credit:      adapter_credit,
         write:       adapter_write, finish: adapter_finish,
         cancel_send: adapter_cancel_send, cancel_receive: adapter_cancel_receive,
         release:     adapter_release, close: adapter_close};

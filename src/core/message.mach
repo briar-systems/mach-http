@@ -7,6 +7,7 @@ use std.chrono.time;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.view;
 
@@ -72,8 +73,7 @@ pub rec Metadata {
     peer:          Endpoint;
     local:         Endpoint;
     received_at:   time.Time;
-    has_deadline:  bool;
-    deadline:      time.Time;
+    deadline:      opt[time.Instant];
     request_index: u64;
 }
 
@@ -180,9 +180,14 @@ fun valid_time(value: time.Time) bool {
     ret value.sec >= 0 && value.nsec >= 0 && value.nsec < 1000000000;
 }
 
+fun valid_deadline(value: opt[time.Instant]) bool {
+    if (sel value.none) { ret true; }
+    ret value.some.sec >= 0 && value.some.nsec >= 0 && value.some.nsec < 1000000000;
+}
+
 pub fun valid_metadata(metadata: Metadata, max_endpoint_bytes: usize) bool {
     if (!valid_version(metadata.version) || !valid_time(metadata.received_at)
-        || (metadata.has_deadline && !valid_time(metadata.deadline))) { ret false; }
+        || !valid_deadline(metadata.deadline)) { ret false; }
     if (metadata.peer.kind > ENDPOINT_FORWARDED || metadata.local.kind > ENDPOINT_FORWARDED) { ret false; }
     if ((metadata.peer.address.len != 0 && metadata.peer.address.data == nil)
         || (metadata.local.address.len != 0 && metadata.local.address.data == nil)) { ret false; }
@@ -420,8 +425,7 @@ test "http.core.message: request initialization validates bounds metadata and ge
         peer:          endpoint(ENDPOINT_IP, view.view("192.0.2.1", 9), 443),
         local:         endpoint(ENDPOINT_IP, view.view("192.0.2.2", 9), 443),
         received_at:   time.Time{sec: 10, nsec: 1},
-        has_deadline:  true,
-        deadline:      time.Time{sec: 11, nsec: 1},
+        deadline:      opt[time.Instant].some{time.Instant{sec: 11, nsec: 1}},
         request_index: 4,
     };
     var request: Request;

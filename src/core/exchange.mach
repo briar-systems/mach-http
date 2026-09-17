@@ -9,6 +9,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
@@ -83,15 +84,12 @@ pub rec Service {
     serve: ServiceFun;
 }
 
-fun equal_time(a: time.Time, b: time.Time) bool {
-    ret a.sec == b.sec && a.nsec == b.nsec;
-}
-
 fun deadline_matches(request: *message.Request, scope: *cancel.Scope) bool {
-    val query: cancel.DeadlineQuery = cancel.get_deadline(scope);
-    if (sel query.err)     { ret !request.metadata.has_deadline; }
-    if (sel query.ok.none) { ret !request.metadata.has_deadline; }
-    ret request.metadata.has_deadline && equal_time(request.metadata.deadline, query.ok.some.at);
+    val query:    cancel.DeadlineQuery = cancel.get_deadline(scope);
+    val deadline: opt[time.Instant]    = request.metadata.deadline;
+    if (sel query.err)     { ret sel deadline.none; }
+    if (sel query.ok.none) { ret sel deadline.none; }
+    ret sel deadline.some && time.instant_equal(deadline.some, query.ok.some.at);
 }
 
 pub fun init(exchange: *Exchange, request: *message.Request, response: *message.Response,
@@ -352,8 +350,7 @@ fun metadata(version: message.Version) message.Metadata {
         peer:          message.unspecified_endpoint(),
         local:         message.unspecified_endpoint(),
         received_at:   time.Time{sec: 1, nsec: 0},
-        has_deadline:  false,
-        deadline:      time.Time{sec: 0, nsec: 0},
+        deadline:      opt[time.Instant].none{},
         request_index: 1,
     };
 }
@@ -361,7 +358,7 @@ fun metadata(version: message.Version) message.Metadata {
 test "http.core.exchange: informational and final responses share one bounded generation" {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
-    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    cancel.make_root(?scope, opt[time.Instant].none{});
     var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_body:     body.Reader  = body.empty_reader(41);
@@ -389,7 +386,7 @@ test "http.core.exchange: informational and final responses share one bounded ge
 test "http.core.exchange: protocol adapters decide reuse after body rejection" {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
-    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    cancel.make_root(?scope, opt[time.Instant].none{});
     var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var body_state:       TestBody     = test_body(body.REUSE_FORBIDDEN, false);
@@ -409,7 +406,7 @@ test "http.core.exchange: protocol adapters decide reuse after body rejection" {
     if (body.reject(?request_body).status != body.REJECTED || commit(?exchange, configured) != message.RESPONSE_OK
         || finish(?exchange) != FINISH_OK || exchange.completion.reuse != body.REUSE_FORBIDDEN || reusable(?exchange)) { ret 2; }
     if (!operation_ok(cancel.destroy(?scope))) { ret 3; }
-    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    cancel.make_root(?scope, opt[time.Instant].none{});
     body_state   = test_body(body.REUSE_ALLOWED, false);
     request_body = body.init_reader(?body_state, test_read, test_finish, test_complete, test_release,
         body.OWNER_ENGINE, 52, false, 0, configured.request_body, ?request_trailers, ?scope);
@@ -428,7 +425,7 @@ test "http.core.exchange: protocol adapters decide reuse after body rejection" {
 test "http.core.exchange: response streaming gates completion and accounts bytes" {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
-    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    cancel.make_root(?scope, opt[time.Instant].none{});
     var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_body:     body.Reader  = body.empty_reader(61);
@@ -460,7 +457,7 @@ test "http.core.exchange: response streaming gates completion and accounts bytes
 test "http.core.exchange: post-commit field mutation fails closed" {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
-    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    cancel.make_root(?scope, opt[time.Instant].none{});
     var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_body:     body.Reader  = body.empty_reader(62);
@@ -490,7 +487,7 @@ test "http.core.exchange: post-commit field mutation fails closed" {
 test "http.core.exchange: cancellation and timeout settle both body directions" {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
-    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    cancel.make_root(?scope, opt[time.Instant].none{});
     var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var state:            TestBody     = test_body(body.REUSE_ALLOWED, false);
@@ -516,7 +513,7 @@ test "http.core.exchange: cancellation and timeout settle both body directions" 
         || exchange.completion.outcome != OUTCOME_CANCELLED
         || exchange.completion.reuse != body.REUSE_FORBIDDEN || response_state.releases != 1) { ret 1; }
     if (!operation_ok(cancel.destroy(?scope))) { ret 2; }
-    cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    cancel.make_root(?scope, opt[time.Instant].none{});
     state        = test_body(body.REUSE_FORBIDDEN, false);
     request_body = body.init_reader(?state, test_read, test_finish, test_complete, test_release,
         body.OWNER_ENGINE, 72, false, 0, configured.request_body, ?request_trailers, ?scope);
@@ -534,9 +531,9 @@ test "http.core.exchange: cancellation and timeout settle both body directions" 
 
 test "http.core.exchange: effective scope deadlines are request metadata" {
     val configured: message.Limits = message.limits_default();
-    val deadline:   time.Time      = time.Time{sec: 5, nsec: 10};
+    val deadline:   time.Instant   = time.Instant{sec: 5, nsec: 10};
     var scope:      cancel.Scope;
-    cancel.make_root(?scope, true, deadline);
+    cancel.make_root(?scope, opt[time.Instant].some{deadline});
     var request_fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var request_body:     body.Reader  = body.empty_reader(81);
@@ -551,8 +548,7 @@ test "http.core.exchange: effective scope deadlines are request metadata" {
     var infos:    [8]message.Informational;
     var exchange: Exchange;
     if (init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 81, configured)) { ret 1; }
-    request.metadata.has_deadline = true;
-    request.metadata.deadline     = deadline;
+    request.metadata.deadline = opt[time.Instant].some{deadline};
     if (!init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 81, configured) || !begin(?exchange)) { ret 2; }
     cancel.expire(?scope, deadline);
     if (settle_cancellation(?exchange) != FINISH_OK || exchange.state != TIMED_OUT_STATE) { ret 3; }

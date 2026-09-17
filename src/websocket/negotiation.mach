@@ -10,6 +10,7 @@ use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
@@ -444,8 +445,7 @@ fun test_metadata(version: message.Version) message.Metadata {
         peer:          message.unspecified_endpoint(),
         local:         message.unspecified_endpoint(),
         received_at:   time.Time{sec: 1, nsec: 0},
-        has_deadline:  false,
-        deadline:      time.Time{sec: 0, nsec: 0},
+        deadline:      opt[time.Instant].none{},
         request_index: 1,
     };
 }
@@ -453,7 +453,7 @@ fun test_metadata(version: message.Version) message.Metadata {
 test "http.websocket.negotiation: h1 upgrade commits common exchange" {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     var request_items:  [8]field.Field;
     var request_fields: field.Fields = field.init(?request_items[0], 8,
         configured.request_fields);
@@ -498,7 +498,7 @@ test "http.websocket.negotiation: h1 upgrade commits common exchange" {
 fun extended_test(version: message.Version, generation: u64) i32 {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     var request_items:  [3]field.Field;
     var request_fields: field.Fields = field.init(?request_items[0], 3,
         configured.request_fields);

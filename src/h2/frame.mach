@@ -268,7 +268,10 @@ fun u31(bytes: *u8) u32 {
         | (bytes[2]::u32 << 8) | bytes[3]::u32) & 0x7fffffff;
 }
 
-fun finish_payload(header: Header, prefix: *u8, prefix_length: usize) Error {
+# a self dependency is a stream error for the receiving engine (RFC 9113 5.3.1),
+# so only the writer refuses it
+fun finish_payload(header: Header, prefix: *u8, prefix_length: usize,
+    reject_self_dependency: bool) Error {
     var offset: usize = 0;
     if ((header.flags & FLAG_PADDED) != 0
         && (header.typ == FRAME_DATA || header.typ == FRAME_HEADERS
@@ -278,12 +281,14 @@ fun finish_payload(header: Header, prefix: *u8, prefix_length: usize) Error {
         if (required > header.length::usize) { ret ERROR_PROTOCOL; }
     }
     if (header.typ == FRAME_PRIORITY) {
-        if (prefix_length < 5)               { ret ERROR_FRAME_SIZE; }
-        if (u31(prefix) == header.stream_id) { ret ERROR_PROTOCOL; }
+        if (prefix_length < 5)                                         { ret ERROR_FRAME_SIZE; }
+        if (reject_self_dependency && u31(prefix) == header.stream_id) { ret ERROR_PROTOCOL; }
     }
     if (header.typ == FRAME_HEADERS && (header.flags & FLAG_PRIORITY) != 0) {
-        if (prefix_length < offset + 5)               { ret ERROR_FRAME_SIZE; }
-        if (u31(?prefix[offset]) == header.stream_id) { ret ERROR_PROTOCOL; }
+        if (prefix_length < offset + 5) { ret ERROR_FRAME_SIZE; }
+        if (reject_self_dependency && u31(?prefix[offset]) == header.stream_id) {
+            ret ERROR_PROTOCOL;
+        }
     }
     if (header.typ == FRAME_PUSH_PROMISE) {
         if (prefix_length < offset + 4) { ret ERROR_FRAME_SIZE; }
@@ -308,7 +313,8 @@ fun update_continuation(stream: *u32, header: Header) {
 }
 
 fun end_frame(parser: *Parser, consumed: usize) Event {
-    val error: Error = finish_payload(parser.header, ?parser.prefix[0], parser.prefix_length);
+    val error: Error = finish_payload(parser.header, ?parser.prefix[0],
+        parser.prefix_length, false);
     if (error != ERROR_NONE) { ret fail(parser, consumed, error); }
     update_continuation(?parser.continuation_stream, parser.header);
     var event: Event = empty_event(EVENT_FRAME_END, consumed);
@@ -469,7 +475,7 @@ pub fun write(writer: *Writer, output: *u8, output_capacity: usize,
     writer.payload_offset = writer.payload_offset + take::u32;
     if (writer.remaining == 0) {
         val error: Error = finish_payload(writer.header, ?writer.prefix[0],
-            writer.prefix_length);
+            writer.prefix_length, true);
         writer.active = false;
         if (error != ERROR_NONE) {
             writer.error = error;
@@ -656,5 +662,27 @@ test "http.h2.frame: oversized and truncated frames are distinguished" {
     oversized[3] = 0xf0;
     if (feed(?extension, ?oversized[0], 9, false).kind != EVENT_HEADER
         || feed(?extension, nil, 0, false).kind != EVENT_FRAME_END) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.frame: self dependency is parsed for the engine and never written" {
+    var parser: Parser;
+    if (!parser_init(?parser, limits_default())) { ret 1; }
+    var priority: [14]u8;
+    priority[2]  = 5;
+    priority[3]  = FRAME_PRIORITY;
+    priority[8]  = 3;
+    priority[12] = 3;
+    priority[13] = 15;
+    if (feed(?parser, ?priority[0], 14, false).kind != EVENT_HEADER) { ret 2; }
+    val payload: Event = feed(?parser, ?priority[9], 5, false);
+    if (payload.kind != EVENT_PAYLOAD || !release(?parser)
+        || feed(?parser, nil, 0, false).kind != EVENT_FRAME_END) { ret 3; }
+    var writer: Writer;
+    if (!writer_init(?writer, limits_default())) { ret 4; }
+    var output: [14]u8;
+    if (begin(?writer, decode_header(?priority[0]), ?output[0], 14).written != 9) { ret 5; }
+    val written: Write = write(?writer, ?output[9], 5, ?priority[9], 5);
+    if (written.status != WRITE_ERROR || written.error != ERROR_PROTOCOL) { ret 6; }
     ret 0;
 }
