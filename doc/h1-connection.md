@@ -11,6 +11,14 @@ request, write, idle and total deadlines are absolute instants computed from it,
 an expired one times out the engine's cancellation scope. Pass the same clock on
 every call. A wall-clock value (`time.now()`) moves with clock adjustments.
 
+`next_deadline` returns the earliest deadline `tick` would enforce, with `active` false
+when none applies: an uninitialized engine, or a tunnel, closing, closed or failed
+one. The idle deadline counts only while no slot is live, as in `tick`. A host with a
+timer wheel arms one timer at that instant, calls `tick` when it fires, and queries
+again after every call that takes `now` or changes a slot. The engine scope's own
+std deadline is the host's and is not included. The HTTP/2 and HTTP/3 engines keep no
+timers. Their `tick` only settles cancelled scopes, so call it after cancelling one.
+
 ## Slots and identity
 
 Every pipeline slot and all parser, field, trailer, and serializer storage are
