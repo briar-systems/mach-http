@@ -1,6 +1,7 @@
 # bounded http/2 connection and stream engine
 
 use http.core.body;
+use http.core.deadline;
 use http.core.exchange;
 use http.core.field;
 use http.core.message;
@@ -80,17 +81,22 @@ pub val H2_INADEQUATE_SECURITY: u32 = 12;
 pub val H2_HTTP_1_1_REQUIRED:   u32 = 13;
 
 pub def Error: u8;
-pub val ERROR_NONE:         Error = 0;
-pub val ERROR_STATE:        Error = 1;
-pub val ERROR_LIMIT:        Error = 2;
-pub val ERROR_PROTOCOL:     Error = 3;
-pub val ERROR_FRAME:        Error = 4;
-pub val ERROR_COMPRESSION:  Error = 5;
-pub val ERROR_FLOW_CONTROL: Error = 6;
-pub val ERROR_TRANSPORT:    Error = 7;
-pub val ERROR_NO_PROGRESS:  Error = 8;
-pub val ERROR_CANCELLED:    Error = 9;
-pub val ERROR_MEMORY:       Error = 10;
+pub val ERROR_NONE:            Error = 0;
+pub val ERROR_STATE:           Error = 1;
+pub val ERROR_LIMIT:           Error = 2;
+pub val ERROR_PROTOCOL:        Error = 3;
+pub val ERROR_FRAME:           Error = 4;
+pub val ERROR_COMPRESSION:     Error = 5;
+pub val ERROR_FLOW_CONTROL:    Error = 6;
+pub val ERROR_TRANSPORT:       Error = 7;
+pub val ERROR_NO_PROGRESS:     Error = 8;
+pub val ERROR_CANCELLED:       Error = 9;
+pub val ERROR_MEMORY:          Error = 10;
+pub val ERROR_HEADER_TIMEOUT:  Error = 11;
+pub val ERROR_REQUEST_TIMEOUT: Error = 12;
+pub val ERROR_IDLE_TIMEOUT:    Error = 13;
+pub val ERROR_WRITE_TIMEOUT:   Error = 14;
+pub val ERROR_TOTAL_TIMEOUT:   Error = 15;
 
 pub def EventKind: u8;
 pub val EVENT_NONE:             EventKind = 0;
@@ -115,6 +121,7 @@ pub val EVENT_STREAM_ERROR:     EventKind = 18;
 pub val EVENT_ERROR:            EventKind = 19;
 pub val EVENT_PENDING:          EventKind = 20;
 pub val EVENT_MEMORY_BLOCKED:   EventKind = 21;
+pub val EVENT_TIMED_OUT:        EventKind = 22;
 
 pub def OfferStatus: u8;
 pub val OFFER_OUTPUT:  OfferStatus = 1;
@@ -152,7 +159,9 @@ val SERVICE_BUDGET: usize = 64;
 val LIST_WINDOW:   usize = 0;
 val LIST_WRITABLE: usize = 1;
 val LIST_EXCHANGE: usize = 2;
-val LIST_COUNT:    usize = 3;
+val LIST_REQUEST:  usize = 3;
+val LIST_STALL:    usize = 4;
+val LIST_COUNT:    usize = 5;
 
 pub rec Settings {
     header_table_size:       u32;
@@ -172,6 +181,11 @@ pub rec Settings {
 # initial_streams:     stream records in the first chunk, taken at init
 # stream_lane:         the budget lane of per-stream decoder sets
 # connection_lane:     the budget lane of records, the index and transient buffers
+# header_timeout_ns:   a server's wait for its first request, and any header block
+# request_timeout_ns:  a stream's wait for the peer's half to close
+# idle_timeout_ns:     a connection with no live stream
+# write_timeout_ns:    a transport write, and a stream or connection send stall
+# total_timeout_ns:    the connection's whole life
 pub rec Config {
     local:                   Settings;
     hpack:                   hpack.Limits;
@@ -184,6 +198,11 @@ pub rec Config {
     initial_streams:         usize;
     stream_lane:             u8;
     connection_lane:         u8;
+    header_timeout_ns:       u64;
+    request_timeout_ns:      u64;
+    idle_timeout_ns:         u64;
+    write_timeout_ns:        u64;
+    total_timeout_ns:        u64;
 }
 
 # the buffers a decoding stream holds. a borrowed set is acquired all or nothing
@@ -206,10 +225,12 @@ pub rec StreamIndexEntry {
     slot: usize;
 }
 
+# `due` is the member's deadline on a timed list and unused elsewhere
 pub rec StreamLink {
     prev:   usize;
     next:   usize;
     linked: bool;
+    due:    time.Instant;
 }
 
 pub rec StreamList {
@@ -411,6 +432,13 @@ pub rec Engine {
     close_token:               transport.Token;
     error:                     Error;
     h2_error:                  u32;
+    now:                       time.Instant;
+    total_deadline:            deadline.Deadline;
+    wait_deadline:             deadline.Deadline;
+    idle_deadline:             deadline.Deadline;
+    header_deadline:           deadline.Deadline;
+    write_deadline:            deadline.Deadline;
+    window_deadline:           deadline.Deadline;
     initialized:               bool;
 }
 
@@ -442,6 +470,11 @@ pub fun config_default() Config {
         initial_streams:         4,
         stream_lane:             0,
         connection_lane:         0,
+        header_timeout_ns:       10000000000,
+        request_timeout_ns:      30000000000,
+        idle_timeout_ns:         60000000000,
+        write_timeout_ns:        30000000000,
+        total_timeout_ns:        300000000000,
     };
 }
 
@@ -478,7 +511,12 @@ fun config_valid(configured: Config) bool {
         && configured.hpack.max_header_list_bytes != 0
         && configured.hpack.max_header_count != 0
         && configured.hpack.max_string_bytes != 0
-        && configured.hpack.max_encoded_block_bytes != 0;
+        && configured.hpack.max_encoded_block_bytes != 0
+        && deadline.duration_valid(configured.header_timeout_ns)
+        && deadline.duration_valid(configured.request_timeout_ns)
+        && deadline.duration_valid(configured.idle_timeout_ns)
+        && deadline.duration_valid(configured.write_timeout_ns)
+        && deadline.duration_valid(configured.total_timeout_ns);
 }
 
 fun memory_valid(memory_value: StreamMemory, configured: Config) bool {
@@ -734,8 +772,9 @@ fun prepare_slot(engine: *Engine, slot: usize) {
     stream.queued         = false;
     var kind: usize = 0;
     for (kind < LIST_COUNT) {
-        stream.links[kind] = StreamLink{prev: NO_SLOT, next: NO_SLOT, linked: false};
-        kind               = kind + 1;
+        stream.links[kind] = StreamLink{prev: NO_SLOT, next: NO_SLOT, linked: false,
+            due: time.Instant{sec: 0, nsec: 0}};
+        kind = kind + 1;
     }
 }
 
@@ -924,11 +963,74 @@ fun exchange_tracked(stream: *Stream) bool {
     ret stream.live && stream.state != STREAM_CLOSED && stream.exchange != nil;
 }
 
+# a timed list must stay ordered by `due`, so its head is its earliest deadline.
+# the insert walks back from the tail past every later member: O(1) while all
+# members share one duration from the engine's non-decreasing clock, and still
+# ordered when one does not
+fun timed_push(engine: *Engine, kind: usize, stream: *Stream, due: time.Instant) {
+    val link: *StreamLink = ?stream.links[kind];
+    if (link.linked) { ret; }
+    val list:  *StreamList = ?engine.lists[kind];
+    var after: usize       = list.tail;
+    for (after != NO_SLOT && time.instant_before(due, slot_stream(engine, after).links[kind].due)) {
+        after = slot_stream(engine, after).links[kind].prev;
+    }
+    link.due    = due;
+    link.linked = true;
+    link.prev   = after;
+    if (after == NO_SLOT)     { link.next = list.head; }
+    or                        { link.next = slot_stream(engine, after).links[kind].next; }
+    if (link.prev == NO_SLOT) { list.head = stream.slot; }
+    or                        { slot_stream(engine, link.prev).links[kind].next = stream.slot; }
+    if (link.next == NO_SLOT) { list.tail = stream.slot; }
+    or                        { slot_stream(engine, link.next).links[kind].prev = stream.slot; }
+    list.count = list.count + 1;
+}
+
+# a member keeps the deadline it joined with until it leaves
+fun timed_set(engine: *Engine, kind: usize, stream: *Stream, member: bool, duration: u64) {
+    if (!member)                    { list_remove(engine, kind, stream); }
+    or (!stream.links[kind].linked) { timed_push(engine, kind, stream, deadline.after(engine.now, duration).at); }
+}
+
+fun timed_head(engine: *Engine, kind: usize) deadline.Deadline {
+    val head: usize = engine.lists[kind].head;
+    if (head == NO_SLOT) { ret deadline.none(); }
+    ret deadline.Deadline{active: true, at: slot_stream(engine, head).links[kind].due};
+}
+
+# the peer owes this stream the rest of its half
+fun peer_owes(stream: *Stream) bool {
+    ret stream.live && (stream.state == STREAM_OPEN
+        || stream.state == STREAM_HALF_CLOSED_LOCAL || stream.state == STREAM_RESERVED_REMOTE)
+        && (!stream.initiated_local || stream.initial_headers_sent);
+}
+
+# the host has output the stream's own send window holds back
+fun send_stalled(stream: *Stream) bool {
+    ret stream.live && stream.writable && stream.initial_headers_sent
+        && stream.send_window <= 0 && stream_writable(stream);
+}
+
+# the connection window holds back streams that could otherwise send
+fun refresh_window_stall(engine: *Engine) {
+    val stalled: bool = engine.send_window <= 0 && engine.lists[LIST_WRITABLE].count != 0;
+    if (!stalled) { engine.window_deadline = deadline.none(); }
+    or (!engine.window_deadline.active) {
+        engine.window_deadline = deadline.after(engine.now, engine.configured.write_timeout_ns);
+    }
+}
+
 # every stream mutation that can change a set membership ends here
 fun refresh_stream(engine: *Engine, stream: *Stream) {
     list_set(engine, LIST_WINDOW, stream, window_owed(engine, stream));
     list_set(engine, LIST_WRITABLE, stream, schedulable(stream));
     list_set(engine, LIST_EXCHANGE, stream, exchange_tracked(stream));
+    timed_set(engine, LIST_REQUEST, stream, peer_owes(stream),
+        engine.configured.request_timeout_ns);
+    timed_set(engine, LIST_STALL, stream, send_stalled(stream),
+        engine.configured.write_timeout_ns);
+    refresh_window_stall(engine);
 }
 
 fun stream_has_work(stream: *Stream) bool {
@@ -1012,6 +1114,10 @@ fun start_stream(engine: *Engine, stream: *Stream, id: u32, initiated_local: boo
         or                   { engine.active_remote = engine.active_remote + 1; }
     }
     index_insert(engine, stream);
+    # a live stream hands the connection to its own deadlines
+    engine.wait_deadline = deadline.none();
+    engine.idle_deadline = deadline.none();
+    refresh_stream(engine, stream);
     ret stream;
 }
 
@@ -1171,8 +1277,9 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     inbound_storage: *u8, inbound_storage_capacity: usize,
     outbound_entries: *hpack.Entry, outbound_entry_capacity: usize,
     outbound_storage: *u8, outbound_storage_capacity: usize,
-    refused: StreamMemory, configured: Config) bool {
+    refused: StreamMemory, configured: Config, now: time.Instant) bool {
     if (engine == nil || engine.initialized || (role != SERVER && role != CLIENT)
+        || !deadline.valid_now(now)
         || connection_transport == nil || !connection_transport.initialized
         || scope == nil || scope.root != connection_transport.operation_root
         || !scope_active(scope) || source == nil || account == nil || !account.open
@@ -1318,7 +1425,17 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     engine.close_pending             = false;
     engine.error                     = ERROR_NONE;
     engine.h2_error                  = H2_NO_ERROR;
-    engine.initialized               = true;
+    engine.now                       = now;
+    engine.total_deadline            = deadline.after(now, configured.total_timeout_ns);
+    engine.wait_deadline             = deadline.none();
+    engine.idle_deadline             = deadline.none();
+    engine.header_deadline           = deadline.none();
+    engine.write_deadline            = deadline.none();
+    engine.window_deadline           = deadline.none();
+    # a server owes nothing until its peer does, and a peer owes its first request promptly
+    if (role == SERVER) { engine.wait_deadline = deadline.after(now, configured.header_timeout_ns); }
+    or                  { engine.idle_deadline = deadline.after(now, configured.idle_timeout_ns); }
+    engine.initialized = true;
     if (!queue_initial_settings(engine)
         || (configured.connection_window_size > 65535
         && !queue_window(engine, 0, configured.connection_window_size - 65535))) {
@@ -1434,9 +1551,10 @@ pub fun open_local(engine: *Engine, bound: *exchange.Exchange) u32 {
     ret id;
 }
 
-pub fun release_stream(engine: *Engine, id: u32, generation: u64) bool {
+pub fun release_stream(engine: *Engine, id: u32, generation: u64, now: time.Instant) bool {
     val stream: *Stream = stream_for(engine, id);
-    if (stream == nil || stream.generation != generation || stream.state != STREAM_CLOSED
+    if (stream == nil || !deadline.valid_now(now)
+        || stream.generation != generation || stream.state != STREAM_CLOSED
         || engine.held_stream == id || stream.retry_pending
         || (stream.exchange != nil && stream.exchange.state != exchange.COMPLETE_STATE
         && stream.exchange.state != exchange.CANCELLED_STATE
@@ -1449,6 +1567,10 @@ pub fun release_stream(engine: *Engine, id: u32, generation: u64) bool {
     index_remove(engine, stream);
     refresh_stream(engine, stream);
     if (stream.slot != RESERVE_SLOT) { release_slot(engine, stream); }
+    if (engine.active_streams == 0) {
+        engine.now           = deadline.latest(engine.now, now);
+        engine.idle_deadline = deadline.after(engine.now, engine.configured.idle_timeout_ns);
+    }
     ret true;
 }
 
@@ -1483,13 +1605,54 @@ pub fun abandon_exchange(engine: *Engine, id: u32,
     ret abandoned;
 }
 
+fun timeout_error(error: Error) bool {
+    ret error >= ERROR_HEADER_TIMEOUT && error <= ERROR_TOTAL_TIMEOUT;
+}
+
 fun close_cause(error: Error) lifecycle.Cause {
+    if (timeout_error(error))     { ret lifecycle.DEADLINE; }
     if (error == ERROR_CANCELLED) { ret lifecycle.CANCELLATION; }
     ret lifecycle.FAILURE;
 }
 
+# output that can never be written is dropped, so the close is not held for it.
+# a write still in flight keeps its buffer until its completion arrives
+fun drop_output(engine: *Engine) {
+    engine.control_count        = 0;
+    engine.header_output_active = false;
+    engine.header_output_length = 0;
+    engine.header_output_offset = 0;
+    release_encoder(engine);
+    if (!engine.write_pending) {
+        engine.write_length = 0;
+        engine.write_offset = 0;
+        release_write(engine);
+    }
+}
+
+# a failed connection whose output cannot drain closes at once, and the
+# transport cancels a write still in flight
+fun abort_output(engine: *Engine) {
+    drop_output(engine);
+    engine.write_deadline = deadline.none();
+    submit_close(engine);
+}
+
+fun failure_event(engine: *Engine) Event {
+    var result: Event = event(engine, EVENT_ERROR);
+    result.code           = engine.h2_error;
+    result.last_stream_id = engine.last_remote_stream;
+    if (timeout_error(engine.error))     { result.kind = EVENT_TIMED_OUT; }
+    if (engine.error == ERROR_CANCELLED) { result.kind = EVENT_CANCELLED; }
+    ret result;
+}
+
 fun submit_close(engine: *Engine) {
     if (engine.close_pending || engine.state == CLOSED) { ret; }
+    # the scope carries the goaway drain, so a timeout reaches it only at the close
+    if (timeout_error(engine.error) && scope_active(engine.scope)) {
+        cancel.timeout(engine.scope);
+    }
     val submitted: res[transport.Token, io_error.Error] = transport.close_with_cause(
         engine.transport, close_cause(engine.error), engine.next_generation::usize);
     if (sel submitted.ok) {
@@ -1509,26 +1672,33 @@ fun fail_connection(engine: *Engine, error: Error, h2_error: u32) Event {
         if (scope_active(engine.scope) && error == ERROR_CANCELLED) {
             cancel.cancel(engine.scope);
         }
+        engine.wait_deadline   = deadline.none();
+        engine.idle_deadline   = deadline.none();
+        engine.header_deadline = deadline.none();
+        engine.window_deadline = deadline.none();
         # linear once per connection
         var i: usize = 0;
         for (i < sweep_count(engine)) {
             val stream: *Stream = sweep_at(engine, i);
             if (stream.live && stream.state != STREAM_CLOSED) {
-                if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
+                if (stream.exchange != nil && timeout_error(error)) {
+                    exchange.timeout_exchange(stream.exchange);
+                }
+                or (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
                 mark_closed(engine, stream);
             }
             i = i + 1;
         }
-        if (engine.preface_received && !engine.goaway_sent) {
+        # a peer that stopped reading will not read a goaway either
+        if (error == ERROR_WRITE_TIMEOUT) { abort_output(engine); }
+        or (engine.preface_received && !engine.goaway_sent) {
             queue_goaway(engine, engine.last_remote_stream, h2_error);
         }
+        # a server writes nothing before the preface, and nothing is written once the scope ends
+        if (!engine.preface_received || !scope_active(engine.scope)) { drop_output(engine); }
         settle_payload(engine);
     }
-    var result: Event = event(engine, EVENT_ERROR);
-    result.code           = h2_error;
-    result.last_stream_id = engine.last_remote_stream;
-    if (error == ERROR_CANCELLED) { result.kind = EVENT_CANCELLED; }
-    ret result;
+    ret failure_event(engine);
 }
 
 fun stream_error(engine: *Engine, stream: *Stream, code: u32) Event {
@@ -1676,9 +1846,10 @@ pub fun submit_read(engine: *Engine) bool {
     ret true;
 }
 
-pub fun submit_write(engine: *Engine) bool {
-    if (engine == nil || !engine.initialized || engine.write_pending
-        || engine.state == CLOSED || engine.state == CLOSING) { ret false; }
+pub fun submit_write(engine: *Engine, now: time.Instant) bool {
+    if (engine == nil || !engine.initialized || engine.write_pending || !deadline.valid_now(now)
+        || engine.close_pending || engine.state == CLOSED || engine.state == CLOSING) { ret false; }
+    engine.now = deadline.latest(engine.now, now);
     if (engine.write_length == 0 && !prepare_output(engine)) { ret false; }
     val submitted: res[transport.Token, io_error.Error] = transport.write(
         engine.transport, engine.scope, ?engine.write_buffer[engine.write_offset],
@@ -1687,8 +1858,9 @@ pub fun submit_write(engine: *Engine) bool {
         fail_connection(engine, ERROR_TRANSPORT, H2_INTERNAL_ERROR);
         ret false;
     }
-    engine.write_token   = submitted.ok;
-    engine.write_pending = true;
+    engine.write_token    = submitted.ok;
+    engine.write_pending  = true;
+    engine.write_deadline = deadline.after(engine.now, engine.configured.write_timeout_ns);
     ret true;
 }
 
@@ -1867,6 +2039,7 @@ fun handle_window(engine: *Engine, header: frame.Header) Event {
             ret fail_connection(engine, ERROR_FLOW_CONTROL, H2_FLOW_CONTROL_ERROR);
         }
         engine.send_window = engine.send_window + increment::i64;
+        refresh_window_stall(engine);
         ret event(engine, EVENT_NONE);
     }
     val stream: *Stream = stream_for(engine, header.stream_id);
@@ -2566,15 +2739,16 @@ fun process_preface(engine: *Engine) Event {
     ret event(engine, EVENT_NONE);
 }
 
-pub fun process(engine: *Engine) Event {
-    if (engine == nil || !engine.initialized) {
+pub fun process(engine: *Engine, now: time.Instant) Event {
+    if (engine == nil || !engine.initialized || !deadline.valid_now(now)) {
         var invalid: Event;
         invalid.kind  = EVENT_ERROR;
         invalid.error = ERROR_STATE;
         ret invalid;
     }
+    engine.now = deadline.latest(engine.now, now);
     if (engine.state == CLOSED) { ret event(engine, EVENT_CLOSED); }
-    if (engine.state == FAILED) { ret event(engine, EVENT_ERROR); }
+    if (engine.state == FAILED) { ret failure_event(engine); }
     if (engine.held) {
         val stream:     *Stream = stream_for(engine, engine.held_stream);
         var held_event: Event   = stream_event(engine, engine.held_kind, stream);
@@ -2631,6 +2805,12 @@ pub fun process(engine: *Engine) Event {
         if (parsed.kind == frame.EVENT_HEADER) {
             engine.current_header       = parsed.header;
             engine.frame_payload_length = 0;
+            # the parser admits only continuations inside a block, so this starts one
+            if (parsed.header.typ == frame.FRAME_HEADERS
+                || parsed.header.typ == frame.FRAME_PUSH_PROMISE) {
+                engine.header_deadline = deadline.after(engine.now,
+                    engine.configured.header_timeout_ns);
+            }
             # the header is consumed, so a refused copy buffer is retried first next call
             if (parsed.header.length != 0 && !acquire_payload(engine)) {
                 engine.payload_wanted = true;
@@ -2650,6 +2830,7 @@ pub fun process(engine: *Engine) Event {
         }
         or (parsed.kind == frame.EVENT_FRAME_END) {
             val handled: Event = handle_frame(engine, parsed.header);
+            if (engine.header_slot == NO_SLOT) { engine.header_deadline = deadline.none(); }
             settle_payload(engine);
             if (handled.kind != EVENT_NONE) { ret handled; }
             budget = budget - 1;
@@ -2718,8 +2899,9 @@ fun flush_window_update(engine: *Engine) {
     }
 }
 
-pub fun complete_io(engine: *Engine, completion: *transport.Completion) Event {
-    if (engine == nil || !engine.initialized || completion == nil) {
+pub fun complete_io(engine: *Engine, completion: *transport.Completion,
+    now: time.Instant) Event {
+    if (engine == nil || !engine.initialized || completion == nil || !deadline.valid_now(now)) {
         var invalid: Event;
         invalid.kind  = EVENT_ERROR;
         invalid.error = ERROR_STATE;
@@ -2746,15 +2928,17 @@ pub fun complete_io(engine: *Engine, completion: *transport.Completion) Event {
             engine.input_length = completion.count;
             engine.input_offset = 0;
             engine.input_eof    = completion.status == transport.IO_END;
-            ret process(engine);
+            ret process(engine, now);
         }
         if (completion.status == transport.IO_CANCELLED) {
             ret fail_connection(engine, ERROR_CANCELLED, H2_CANCEL);
         }
         ret fail_connection(engine, ERROR_TRANSPORT, H2_INTERNAL_ERROR);
     }
+    engine.now = deadline.latest(engine.now, now);
     if (completion.kind == transport.WRITE) {
-        engine.write_pending = false;
+        engine.write_pending  = false;
+        engine.write_deadline = deadline.none();
         if (completion.status != transport.IO_COMPLETE || completion.count == 0) {
             if (completion.status == transport.IO_CANCELLED) {
                 ret fail_connection(engine, ERROR_CANCELLED, H2_CANCEL);
@@ -2955,9 +3139,10 @@ pub fun send_push_promise(engine: *Engine, parent_id: u32, promised_id: u32,
         stream_id: promised_id, error: ERROR_NONE};
 }
 
-pub fun set_writable(engine: *Engine, id: u32, ready: bool) bool {
+pub fun set_writable(engine: *Engine, id: u32, ready: bool, now: time.Instant) bool {
     val stream: *Stream = stream_for(engine, id);
-    if (stream == nil || !stream_writable(stream)) { ret false; }
+    if (stream == nil || !stream_writable(stream) || !deadline.valid_now(now)) { ret false; }
+    engine.now      = deadline.latest(engine.now, now);
     stream.writable = ready;
     refresh_stream(engine, stream);
     if (!ready && engine.scheduled_stream == id) { engine.scheduled_stream = 0; }
@@ -2996,14 +3181,16 @@ pub fun writable_stream(engine: *Engine) u32 {
 }
 
 pub fun offer_data(engine: *Engine, id: u32, input: *u8,
-    length: usize, end_stream: bool) Offer {
+    length: usize, end_stream: bool, now: time.Instant) Offer {
     if (engine == nil || !engine.initialized || (input == nil && length != 0)
+        || !deadline.valid_now(now)
         || (length == 0 && !end_stream)
         || engine.write_length != 0 || engine.write_pending || engine.header_output_active
         || engine.control_count != 0) {
         ret Offer{status: OFFER_BLOCKED, consumed: 0, produced: 0,
             stream_id: id, error: ERROR_STATE};
     }
+    engine.now = deadline.latest(engine.now, now);
     val stream:    *Stream = stream_for(engine, id);
     val scheduled: u32     = writable_stream(engine);
     if (stream == nil || !stream_writable(stream) || !stream.initial_headers_sent
@@ -3078,19 +3265,85 @@ pub fun cancel_stream(engine: *Engine, id: u32, code: u32) bool {
     ret true;
 }
 
-# fallback sweep of exchange-bound open streams for scopes cancelled elsewhere,
-# costing O(active exchanges). a host that cancels a scope it owns calls
-# `cancel_stream` instead
-pub fun tick(engine: *Engine) Event {
-    if (engine == nil || !engine.initialized) {
+# a stream the peer let stall past its deadline is reset alone
+fun time_out_stream(engine: *Engine, kind: usize, error: Error) Event {
+    val stream: *Stream = visit(engine, engine.lists[kind].head);
+    if (!queue_reset(engine, stream.id, H2_CANCEL)) {
+        ret fail_connection(engine, ERROR_LIMIT, H2_ENHANCE_YOUR_CALM);
+    }
+    if (stream.exchange != nil) { exchange.timeout_exchange(stream.exchange); }
+    mark_closed(engine, stream);
+    stream.reset_code = H2_CANCEL;
+    var result: Event = stream_event(engine, EVENT_STREAM_RESET, stream);
+    result.code  = H2_CANCEL;
+    result.error = error;
+    ret result;
+}
+
+# the earliest deadline tick would enforce, inactive when none applies. every call
+# that takes now can move it, so query it again after each one. the scope's own
+# deadline is the caller's and is not included
+pub fun next_deadline(engine: *Engine) deadline.Deadline {
+    if (engine == nil || !engine.initialized || engine.state == CLOSED
+        || engine.state == CLOSING || engine.close_pending) { ret deadline.none(); }
+    if (engine.state == FAILED) { ret engine.write_deadline; }
+    var result: deadline.Deadline = engine.total_deadline;
+    result = deadline.earlier(result, engine.wait_deadline);
+    result = deadline.earlier(result, engine.idle_deadline);
+    result = deadline.earlier(result, engine.header_deadline);
+    result = deadline.earlier(result, engine.write_deadline);
+    result = deadline.earlier(result, engine.window_deadline);
+    result = deadline.earlier(result, timed_head(engine, LIST_REQUEST));
+    result = deadline.earlier(result, timed_head(engine, LIST_STALL));
+    ret result;
+}
+
+# enforces the deadlines, one expiry per call, then sweeps exchange-bound open
+# streams for scopes cancelled elsewhere at O(active exchanges). a host that
+# cancels a scope it owns calls `cancel_stream` instead
+pub fun tick(engine: *Engine, now: time.Instant) Event {
+    if (engine == nil || !engine.initialized || !deadline.valid_now(now)) {
         var invalid: Event;
         invalid.kind  = EVENT_ERROR;
         invalid.error = ERROR_STATE;
         ret invalid;
     }
+    engine.now = deadline.latest(engine.now, now);
+    if (engine.state == CLOSED)  { ret event(engine, EVENT_CLOSED); }
+    if (engine.state == CLOSING) { ret event(engine, EVENT_NONE); }
+    if (engine.state == FAILED) {
+        # a drain the peer stopped reading is bounded like any write
+        if (deadline.expired(engine.write_deadline, engine.now)) { abort_output(engine); }
+        ret failure_event(engine);
+    }
     val reason: cancel.Reason = cancel.reason(engine.scope);
+    if ((sel reason.timed_out)) {
+        ret fail_connection(engine, ERROR_TOTAL_TIMEOUT, H2_NO_ERROR);
+    }
     if (!(sel reason.active)) {
         ret fail_connection(engine, ERROR_CANCELLED, H2_CANCEL);
+    }
+    val at: time.Instant = engine.now;
+    if (deadline.expired(engine.write_deadline, at)) {
+        ret fail_connection(engine, ERROR_WRITE_TIMEOUT, H2_NO_ERROR);
+    }
+    if (deadline.expired(engine.total_deadline, at)) {
+        ret fail_connection(engine, ERROR_TOTAL_TIMEOUT, H2_NO_ERROR);
+    }
+    if (deadline.expired(engine.wait_deadline, at) || deadline.expired(engine.header_deadline, at)) {
+        ret fail_connection(engine, ERROR_HEADER_TIMEOUT, H2_NO_ERROR);
+    }
+    if (deadline.expired(engine.idle_deadline, at)) {
+        ret fail_connection(engine, ERROR_IDLE_TIMEOUT, H2_NO_ERROR);
+    }
+    if (deadline.expired(engine.window_deadline, at)) {
+        ret fail_connection(engine, ERROR_WRITE_TIMEOUT, H2_NO_ERROR);
+    }
+    if (deadline.expired(timed_head(engine, LIST_REQUEST), at)) {
+        ret time_out_stream(engine, LIST_REQUEST, ERROR_REQUEST_TIMEOUT);
+    }
+    if (deadline.expired(timed_head(engine, LIST_STALL), at)) {
+        ret time_out_stream(engine, LIST_STALL, ERROR_WRITE_TIMEOUT);
     }
     var slot: usize = engine.lists[LIST_EXCHANGE].head;
     for (slot != NO_SLOT) {
@@ -3137,6 +3390,10 @@ pub fun progress_close(engine: *Engine) bool {
     engine.state = CLOSING;
     submit_close(engine);
     ret engine.close_pending || engine.state == CLOSED;
+}
+
+fun test_now(seconds: i64) time.Instant {
+    ret time.Instant{sec: seconds, nsec: 0};
 }
 
 rec TestIO {
@@ -3211,6 +3468,7 @@ rec Fixture {
     inbound_storage:       [4096]u8;
     outbound_entries:      [16]hpack.Entry;
     outbound_storage:      [4096]u8;
+    clock:                 time.Instant;
     engine:                Engine;
 }
 
@@ -3255,6 +3513,7 @@ fun test_config() Config {
 }
 
 fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
+    fixture.clock = test_now(100);
     if (!operation_ok(cancel.make_root(?fixture.operation_root, opt[time.Instant].none{}))
         || !operation_ok(cancel.make_root(?fixture.control_root, opt[time.Instant].none{}))) { ret false; }
     fixture.adapter.runtime               = ?fixture.runtime;
@@ -3289,7 +3548,7 @@ fun start_engine(fixture: *Fixture, connection: *transport.Transport,
         ?fixture.read_buffer[0], 2048, ?fixture.controls[0], 16,
         ?fixture.inbound_entries[0], 16, ?fixture.inbound_storage[0], 4096,
         ?fixture.outbound_entries[0], 16, ?fixture.outbound_storage[0], 4096,
-        refused, configured);
+        refused, configured, fixture.clock);
 }
 
 fun test_frame(output: *u8, capacity: usize, typ: u8, flags: u8,
@@ -3315,7 +3574,7 @@ fun receive_bytes(fixture: *Fixture, input: *u8,
     var completion: transport.Completion;
     if (eof) { completion = transport.end(fixture.io.read_token, length); }
     or       { completion = transport.completed(fixture.io.read_token, transport.READ, length); }
-    ret complete_io(?fixture.engine, ?completion);
+    ret complete_io(?fixture.engine, ?completion, fixture.clock);
 }
 
 fun receive_frame(fixture: *Fixture, typ: u8, flags: u8,
@@ -3328,28 +3587,28 @@ fun receive_frame(fixture: *Fixture, typ: u8, flags: u8,
 }
 
 fun finish_write(fixture: *Fixture, partial: bool) bool {
-    if (!submit_write(?fixture.engine)) { ret false; }
+    if (!submit_write(?fixture.engine, fixture.clock)) { ret false; }
     var count: usize = fixture.io.write_length;
     if (partial && count > 1) { count = count / 2; }
     var completion: transport.Completion = transport.completed(
         fixture.io.write_token, transport.WRITE, count);
-    if (complete_io(?fixture.engine, ?completion).kind == EVENT_ERROR) { ret false; }
+    if (complete_io(?fixture.engine, ?completion, fixture.clock).kind == EVENT_ERROR) { ret false; }
     if (partial && fixture.engine.write_length != 0) {
-        if (!submit_write(?fixture.engine)) { ret false; }
+        if (!submit_write(?fixture.engine, fixture.clock)) { ret false; }
         completion = transport.completed(fixture.io.write_token,
             transport.WRITE, fixture.io.write_length);
-        if (complete_io(?fixture.engine, ?completion).kind == EVENT_ERROR) { ret false; }
+        if (complete_io(?fixture.engine, ?completion, fixture.clock).kind == EVENT_ERROR) { ret false; }
     }
     ret true;
 }
 
 fun drain_output(fixture: *Fixture) bool {
     var count: usize = 0;
-    for (submit_write(?fixture.engine)) {
+    for (submit_write(?fixture.engine, fixture.clock)) {
         val length:     usize                = fixture.io.write_length;
         var completion: transport.Completion = transport.completed(
             fixture.io.write_token, transport.WRITE, length);
-        if (complete_io(?fixture.engine, ?completion).kind == EVENT_ERROR) { ret false; }
+        if (complete_io(?fixture.engine, ?completion, fixture.clock).kind == EVENT_ERROR) { ret false; }
         count = count + 1;
         if (count > 64) { ret false; }
     }
@@ -3491,7 +3750,7 @@ fun pooled_exchange(fixture: *Fixture, storage: *ExchangeMemory) bool {
     if (send_headers(?fixture.engine, 1, ?response[0], 1, true,
         true).status != OFFER_OUTPUT || !drain_output(fixture)
         || stream_for(?fixture.engine, 1).state != STREAM_CLOSED) { ret false; }
-    ret release_stream(?fixture.engine, 1, request.generation);
+    ret release_stream(?fixture.engine, 1, request.generation, fixture.clock);
 }
 
 test "http.h2.connection: destroy returns pooled storage for a second connection" {
@@ -3509,7 +3768,7 @@ test "http.h2.connection: destroy returns pooled storage for a second connection
     if (destroy(?fixture.engine)) { ret 5; }
     var closed: transport.Completion = transport.completed(
         fixture.io.close_token, transport.CLOSE, 0);
-    if (complete_io(?fixture.engine, ?closed).kind != EVENT_CLOSED
+    if (complete_io(?fixture.engine, ?closed, test_now(100)).kind != EVENT_CLOSED
         || fixture.engine.state != CLOSED) { ret 6; }
     if (!destroy(?fixture.engine)) { ret 7; }
     if (fixture.engine.initialized || fixture.engine.inbound_table.valid
@@ -3543,7 +3802,7 @@ test "http.h2.connection: destroy returns pooled storage for a second connection
 test "http.h2.connection: preface settings and ping interoperate incrementally" {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
-        || submit_write(?fixture.engine)) { ret 1; }
+        || submit_write(?fixture.engine, test_now(100))) { ret 1; }
     val accepted: Event = server_handshake(?fixture);
     if (accepted.kind != EVENT_SETTINGS || fixture.engine.state != OPEN
         || !fixture.engine.peer_settings_received || !drain_output(?fixture)) { ret 2; }
@@ -3555,11 +3814,11 @@ test "http.h2.connection: preface settings and ping interoperate incrementally" 
     }
     val ping: Event = receive_frame(?fixture, frame.FRAME_PING, 0, 0, ?opaque[0], 8);
     if (ping.kind != EVENT_PING || !memory.raw_equal(?ping.opaque[0], ?opaque[0], 8)
-        || !submit_write(?fixture.engine) || fixture.io.write_buffer[3] != frame.FRAME_PING
+        || !submit_write(?fixture.engine, test_now(100)) || fixture.io.write_buffer[3] != frame.FRAME_PING
         || (fixture.io.write_buffer[4] & frame.FLAG_ACK) == 0) { ret 3; }
     var completion: transport.Completion = transport.completed(
         fixture.io.write_token, transport.WRITE, fixture.io.write_length);
-    if (complete_io(?fixture.engine, ?completion).kind == EVENT_ERROR) { ret 4; }
+    if (complete_io(?fixture.engine, ?completion, test_now(100)).kind == EVENT_ERROR) { ret 4; }
     ret 0;
 }
 
@@ -3627,7 +3886,7 @@ test "http.h2.connection: request stream binds and dispatches one common exchang
         true, true);
     if (offered.status != OFFER_OUTPUT || !finish_write(?fixture, true)
         || stream_for(?fixture.engine, 1).state != STREAM_CLOSED
-        || !release_stream(?fixture.engine, 1, request.generation)) { ret 5; }
+        || !release_stream(?fixture.engine, 1, request.generation, test_now(100))) { ret 5; }
     ret 0;
 }
 
@@ -3662,7 +3921,7 @@ test "http.h2.connection: teardown abandonment initiates cancellation" {
         || !scope_cancelled(?storage.scope)
         || storage.exchange.state != exchange.CANCELLED_STATE
         || exchange_for(?fixture.engine, 1) != nil
-        || !release_stream(?fixture.engine, 1, request.generation)) { ret 4; }
+        || !release_stream(?fixture.engine, 1, request.generation, test_now(100))) { ret 4; }
     if (!operation_ok(cancel.destroy(?storage.scope))) { ret 5; }
     ret 0;
 }
@@ -3694,7 +3953,7 @@ test "http.h2.connection: teardown detaches pending exchange generation safely" 
         || first.exchange.state == exchange.CANCELLED_STATE
         || first.reader.pending_kind != body.OP_FINISH
         || first.reader.pending_token != 701 || pending.finish_calls != 1
-        || release_stream(?fixture.engine, 1, first_request.generation)) { ret 3; }
+        || release_stream(?fixture.engine, 1, first_request.generation, test_now(100))) { ret 3; }
     if (abandon_exchange(?fixture.engine, 1,
         first_request.generation + 1) != nil
         || exchange_for(?fixture.engine, 1) != ?first.exchange) { ret 4; }
@@ -3702,7 +3961,7 @@ test "http.h2.connection: teardown detaches pending exchange generation safely" 
         first_request.generation);
     if (detached != ?first.exchange || exchange_for(?fixture.engine, 1) != nil
         || pending.finish_calls != 1
-        || !release_stream(?fixture.engine, 1, first_request.generation)) { ret 5; }
+        || !release_stream(?fixture.engine, 1, first_request.generation, test_now(100))) { ret 5; }
 
     val second_request: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
         frame.FLAG_END_HEADERS, 3, ?block[0], 6);
@@ -3724,7 +3983,7 @@ test "http.h2.connection: teardown detaches pending exchange generation safely" 
         || exchange_for(?fixture.engine, 3) != ?second.exchange) { ret 8; }
     if (abandon_exchange(?fixture.engine, 3,
         second_request.generation) != ?second.exchange
-        || !release_stream(?fixture.engine, 3, second_request.generation)) { ret 9; }
+        || !release_stream(?fixture.engine, 3, second_request.generation, test_now(100))) { ret 9; }
     if (!operation_ok(cancel.destroy(?first.scope)) || !operation_ok(cancel.destroy(?second.scope))) { ret 10; }
     ret 0;
 }
@@ -3757,18 +4016,18 @@ test "http.h2.connection: data backpressure replenishes both windows without dea
     if (data_event.kind != EVENT_DATA || data_event.data_length != 6
         || stream_for(?fixture.engine, 1).recv_window != 2
         || !consume_data(?fixture.engine, 1, 2)
-        || process(?fixture.engine).data_length != 4
+        || process(?fixture.engine, test_now(100)).data_length != 4
         || !consume_data(?fixture.engine, 1, 4)) { ret 3; }
-    if (!submit_write(?fixture.engine) || fixture.io.write_buffer[3] != frame.FRAME_WINDOW_UPDATE
+    if (!submit_write(?fixture.engine, test_now(100)) || fixture.io.write_buffer[3] != frame.FRAME_WINDOW_UPDATE
         || read_u31(?fixture.io.write_buffer[9]) != 6) { ret 4; }
     var completion: transport.Completion = transport.completed(
         fixture.io.write_token, transport.WRITE, fixture.io.write_length);
-    complete_io(?fixture.engine, ?completion);
-    if (!submit_write(?fixture.engine) || fixture.io.write_buffer[3] != frame.FRAME_WINDOW_UPDATE
+    complete_io(?fixture.engine, ?completion, test_now(100));
+    if (!submit_write(?fixture.engine, test_now(100)) || fixture.io.write_buffer[3] != frame.FRAME_WINDOW_UPDATE
         || read_u31(?fixture.io.write_buffer[9]) != 6) { ret 5; }
     completion = transport.completed(fixture.io.write_token,
         transport.WRITE, fixture.io.write_length);
-    complete_io(?fixture.engine, ?completion);
+    complete_io(?fixture.engine, ?completion, test_now(100));
     if (fixture.engine.recv_window != 65535
         || stream_for(?fixture.engine, 1).recv_window != 8) { ret 6; }
     ret 0;
@@ -3812,13 +4071,13 @@ test "http.h2.connection: weighted scheduling is fair and priority signals only 
     var byte: [1]u8;
     var i:    usize = 0;
     for (i < 20) {
-        set_writable(?fixture.engine, first, true);
-        set_writable(?fixture.engine, second, true);
+        set_writable(?fixture.engine, first, true, test_now(100));
+        set_writable(?fixture.engine, second, true, test_now(100));
         val selected: u32 = writable_stream(?fixture.engine);
         if (selected == first)  { high = high + 1; }
         or (selected == second) { low = low + 1; }
         or                      { ret 4; }
-        if (offer_data(?fixture.engine, selected, ?byte[0], 1, false).consumed != 1
+        if (offer_data(?fixture.engine, selected, ?byte[0], 1, false, test_now(100)).consumed != 1
             || !finish_write(?fixture, i % 2 == 0)) { ret 5; }
         i = i + 1;
     }
@@ -3842,11 +4101,11 @@ test "http.h2.connection: goaway retry cancellation and graceful drain preserve 
         ?goaway[0], 8);
     if (first != 1 || second != 3 || draining.kind != EVENT_GOAWAY
         || draining.last_stream_id != 1 || client.engine.state != DRAINING) { ret 3; }
-    val retry:         Event   = process(?client.engine);
+    val retry:         Event   = process(?client.engine, test_now(100));
     val second_stream: *Stream = stream_for(?client.engine, second);
     if (retry.kind != EVENT_STREAM_RETRY || retry.stream_id != second
         || second_stream.state != STREAM_CLOSED
-        || !release_stream(?client.engine, second, second_stream.generation)) { ret 4; }
+        || !release_stream(?client.engine, second, second_stream.generation, test_now(100))) { ret 4; }
     if (!cancel_stream(?client.engine, first, H2_CANCEL)
         || !scope_cancelled(?first_exchange.scope)
         || stream_for(?client.engine, first).state != STREAM_CLOSED) { ret 5; }
@@ -3858,7 +4117,7 @@ test "http.h2.connection: goaway retry cancellation and graceful drain preserve 
         || !progress_close(?server.engine) || server.io.close_calls != 1) { ret 6; }
     var closed: transport.Completion = transport.completed(
         server.io.close_token, transport.CLOSE, 0);
-    if (complete_io(?server.engine, ?closed).kind != EVENT_CLOSED) { ret 7; }
+    if (complete_io(?server.engine, ?closed, test_now(100)).kind != EVENT_CLOSED) { ret 7; }
     ret 0;
 }
 
@@ -3952,7 +4211,7 @@ test "http.h2.connection: refused streams still advance shared compression state
     if (refused.kind != EVENT_STREAM_ERROR || refused.code != H2_REFUSED_STREAM
         || fixture.engine.inbound_table.count != 1 || !drain_output(?fixture)) { ret 3; }
     val refused_stream: *Stream = stream_for(?fixture.engine, 3);
-    if (!release_stream(?fixture.engine, 3, refused_stream.generation)) { ret 4; }
+    if (!release_stream(?fixture.engine, 3, refused_stream.generation, test_now(100))) { ret 4; }
     var indexed: [1]u8;
     indexed[0] = 0xbe;
     val second_refusal: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
@@ -4011,15 +4270,15 @@ test "http.h2.connection: outbound continuation is atomic across queued control 
         || !send_priority(?fixture.engine, id, 0, 16, false)) { ret 2; }
     var continuations: usize = 0;
     for (fixture.engine.header_output_active) {
-        if (!submit_write(?fixture.engine)
+        if (!submit_write(?fixture.engine, test_now(100))
             || fixture.io.write_buffer[3] != frame.FRAME_CONTINUATION) { ret 3; }
         var completion: transport.Completion = transport.completed(
             fixture.io.write_token, transport.WRITE, fixture.io.write_length);
-        if (complete_io(?fixture.engine, ?completion).kind == EVENT_ERROR) { ret 4; }
+        if (complete_io(?fixture.engine, ?completion, test_now(100)).kind == EVENT_ERROR) { ret 4; }
         continuations = continuations + 1;
         if (continuations > 16) { ret 5; }
     }
-    if (continuations == 0 || !submit_write(?fixture.engine)
+    if (continuations == 0 || !submit_write(?fixture.engine, test_now(100))
         || fixture.io.write_buffer[3] != frame.FRAME_PRIORITY) { ret 6; }
     ret 0;
 }
@@ -4111,7 +4370,7 @@ test "http.h2.connection: sustained multiplexing reuses bounded slots generation
         if (headers.kind != EVENT_RESPONSE_HEADERS
             || headers.generation <= prior_generation
             || !release_event(?fixture.engine, id, headers.generation)
-            || !release_stream(?fixture.engine, id, headers.generation)) { ret 3; }
+            || !release_stream(?fixture.engine, id, headers.generation, test_now(100))) { ret 3; }
         prior_generation = headers.generation;
         i                = i + 1;
     }
@@ -4128,7 +4387,7 @@ test "http.h2.connection: stale transport completion is terminal and closes once
     stale.generation = stale.generation + 1;
     var completion: transport.Completion = transport.completed(stale,
         transport.READ, 1);
-    val failed: Event = complete_io(?fixture.engine, ?completion);
+    val failed: Event = complete_io(?fixture.engine, ?completion, test_now(100));
     if (failed.kind != EVENT_ERROR || failed.error != ERROR_STATE
         || fixture.engine.state != FAILED) { ret 2; }
     if (progress_close(?fixture.engine) || fixture.io.close_calls != 0) { ret 3; }
@@ -4176,13 +4435,13 @@ fun idle_visits(fixture: *Fixture, count: usize) u64 {
         || fixture.engine.active_streams != count) { ret VISITS_FAILED; }
     val before: u64 = fixture.engine.slot_visits;
     var opaque: [8]u8;
-    if (process(?fixture.engine).kind != EVENT_NEED_READ
-        || tick(?fixture.engine).kind != EVENT_NONE
+    if (process(?fixture.engine, test_now(100)).kind != EVENT_NEED_READ
+        || tick(?fixture.engine, test_now(100)).kind != EVENT_NONE
         || writable_stream(?fixture.engine) != 0
         || receive_frame(fixture, frame.FRAME_PING, 0, 0, ?opaque[0], 8).kind != EVENT_PING
         || !drain_output(fixture)
-        || process(?fixture.engine).kind != EVENT_NEED_READ
-        || tick(?fixture.engine).kind != EVENT_NONE) { ret VISITS_FAILED; }
+        || process(?fixture.engine, test_now(100)).kind != EVENT_NEED_READ
+        || tick(?fixture.engine, test_now(100)).kind != EVENT_NONE) { ret VISITS_FAILED; }
     ret fixture.engine.slot_visits - before;
 }
 
@@ -4235,8 +4494,8 @@ test "http.h2.connection: stream index survives tombstone churn and rebuilds" {
         if (!cancel_stream(?fixture.engine, second, H2_CANCEL)
             || !cancel_stream(?fixture.engine, first, H2_CANCEL)
             || !drain_output(?fixture)
-            || !release_stream(?fixture.engine, first, first_generation)
-            || !release_stream(?fixture.engine, second, second_generation)) { ret 3; }
+            || !release_stream(?fixture.engine, first, first_generation, test_now(100))
+            || !release_stream(?fixture.engine, second, second_generation, test_now(100))) { ret 3; }
         removals = removals + 2;
         if (stream_for(?fixture.engine, first) != nil
             || stream_for(?fixture.engine, second) != nil
@@ -4279,7 +4538,7 @@ test "http.h2.connection: window updates visit only the streams that owe one" {
     val before:  u64   = fixture.engine.slot_visits;
     var updates: [3]u32;
     var count:   usize = 0;
-    for (submit_write(?fixture.engine)) {
+    for (submit_write(?fixture.engine, test_now(100))) {
         if (fixture.io.write_buffer[3] == frame.FRAME_WINDOW_UPDATE) {
             if (count == 3) { ret 5; }
             updates[count] = read_u31(?fixture.io.write_buffer[5]);
@@ -4287,7 +4546,7 @@ test "http.h2.connection: window updates visit only the streams that owe one" {
         }
         var completion: transport.Completion = transport.completed(
             fixture.io.write_token, transport.WRITE, fixture.io.write_length);
-        if (complete_io(?fixture.engine, ?completion).kind == EVENT_ERROR) { ret 6; }
+        if (complete_io(?fixture.engine, ?completion, test_now(100)).kind == EVENT_ERROR) { ret 6; }
     }
     if (fixture.engine.slot_visits - before != 2) { ret 7; }
     if (count != 3 || updates[0] != 0 || updates[1] != owing[0]
@@ -4318,7 +4577,7 @@ test "http.h2.connection: weighted scheduling visits only the writable set" {
         if (receive_window(?fixture, ids[i], 1000).kind != EVENT_NEED_READ)        { ret 3; }
         i = i + 1;
     }
-    if (!set_writable(?fixture.engine, ids[4], true)
+    if (!set_writable(?fixture.engine, ids[4], true, test_now(100))
         || fixture.engine.lists[LIST_WRITABLE].count != 0) { ret 4; }
     var counts: [3]usize;
     var byte:   [1]u8;
@@ -4326,7 +4585,7 @@ test "http.h2.connection: weighted scheduling visits only the writable set" {
     for (round < 70) {
         i = 0;
         for (i < 3) {
-            if (!set_writable(?fixture.engine, ids[i], true)) { ret 5; }
+            if (!set_writable(?fixture.engine, ids[i], true, test_now(100))) { ret 5; }
             i = i + 1;
         }
         val before:   u64 = fixture.engine.slot_visits;
@@ -4342,7 +4601,7 @@ test "http.h2.connection: weighted scheduling visits only the writable set" {
             i = i + 1;
         }
         if (!found
-            || offer_data(?fixture.engine, selected, ?byte[0], 1, false).consumed != 1
+            || offer_data(?fixture.engine, selected, ?byte[0], 1, false, test_now(100)).consumed != 1
             || !finish_write(?fixture, false)) { ret 7; }
         round = round + 1;
     }
@@ -4372,7 +4631,7 @@ test "http.h2.connection: pending reports budgeted work until it drains" {
     if (length != 910
         || receive_bytes(?fixture, ?wire[0], length, false).kind != EVENT_PENDING
         || submit_read(?fixture.engine)
-        || process(?fixture.engine).kind != EVENT_NEED_READ) { ret 2; }
+        || process(?fixture.engine, test_now(100)).kind != EVENT_NEED_READ) { ret 2; }
     i = 0;
     for (i < 70) {
         if (stream_for(?fixture.engine, ids[i]).send_window != 65536) { ret 3; }
@@ -4383,11 +4642,11 @@ test "http.h2.connection: pending reports budgeted work until it drains" {
         != EVENT_GOAWAY || fixture.engine.ready_count != 70) { ret 4; }
     i = 0;
     for (i < 70) {
-        val retry: Event = process(?fixture.engine);
+        val retry: Event = process(?fixture.engine, test_now(100));
         if (retry.kind != EVENT_STREAM_RETRY || retry.stream_id != ids[i]) { ret 5; }
         i = i + 1;
     }
-    if (process(?fixture.engine).kind != EVENT_NEED_READ
+    if (process(?fixture.engine, test_now(100)).kind != EVENT_NEED_READ
         || fixture.engine.ready_count != 0) { ret 6; }
     ret 0;
 }
@@ -4422,7 +4681,7 @@ test "http.h2.connection: exclusive priority visits only the named stream" {
     if (!send_priority(?fixture.engine, ids[20], ids[70], 200, true)
         || fixture.engine.slot_visits - sent != 1
         || stream_for(?fixture.engine, ids[20]).weight != 200
-        || !submit_write(?fixture.engine)
+        || !submit_write(?fixture.engine, test_now(100))
         || fixture.io.write_buffer[3] != frame.FRAME_PRIORITY
         || read_u32(?fixture.io.write_buffer[5]) != ids[20]
         || read_u32(?fixture.io.write_buffer[9]) != (ids[70] | 0x80000000)
@@ -4457,7 +4716,7 @@ test "http.h2.connection: self dependency is a stream error that keeps hpack in 
         || looped.stream_id != 1 || fixture.engine.state != OPEN
         || stream_for(?fixture.engine, 1).state != STREAM_CLOSED
         || !scope_cancelled(?storage.scope)
-        || !submit_write(?fixture.engine)
+        || !submit_write(?fixture.engine, test_now(100))
         || fixture.io.write_buffer[3] != frame.FRAME_RESET_STREAM
         || read_u32(?fixture.io.write_buffer[9]) != H2_PROTOCOL_ERROR
         || !drain_output(?fixture)) { ret 3; }
@@ -4537,7 +4796,7 @@ test "http.h2.connection: an idle engine holds only its first records and a stre
         frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, id, ?status_ok[0], 1);
     if (headers.kind != EVENT_RESPONSE_HEADERS || fixture.engine.payload_held
         || !release_event(?fixture.engine, id, headers.generation)) { ret 6; }
-    if (!release_stream(?fixture.engine, id, headers.generation)
+    if (!release_stream(?fixture.engine, id, headers.generation, test_now(100))
         || fixture.account.held != idle_bytes() || fixture.account.used[0] != 0) { ret 7; }
     if (!destroy(?fixture.engine) || fixture.account.held != 0
         || fixture.account.chunks != 0) { ret 8; }
@@ -4582,12 +4841,12 @@ test "http.h2.connection: a refused stream set refuses only that stream" {
     if (refused.kind != EVENT_STREAM_ERROR || refused.code != H2_REFUSED_STREAM
         || fixture.engine.state != OPEN || !fixture.engine.reserve.live
         || fixture.engine.inbound_table.count != 1 || fixture.account.used[0] != 0) { ret 2; }
-    if (!submit_write(?fixture.engine) || fixture.io.write_buffer[3] != frame.FRAME_RESET_STREAM
+    if (!submit_write(?fixture.engine, test_now(100)) || fixture.io.write_buffer[3] != frame.FRAME_RESET_STREAM
         || read_u32(?fixture.io.write_buffer[9]) != H2_REFUSED_STREAM) { ret 3; }
     var completion: transport.Completion = transport.completed(fixture.io.write_token,
         transport.WRITE, fixture.io.write_length);
-    if (complete_io(?fixture.engine, ?completion).kind != EVENT_NONE
-        || !release_stream(?fixture.engine, 1, refused.generation)
+    if (complete_io(?fixture.engine, ?completion, test_now(100)).kind != EVENT_NONE
+        || !release_stream(?fixture.engine, 1, refused.generation, test_now(100))
         || fixture.engine.reserve.live) { ret 4; }
     fixture.account.budgets[0] = 1 << 25;
     # the refused block's insertion is indexed by the next block
@@ -4624,11 +4883,11 @@ test "http.h2.connection: a refused local stream or transient buffer blocks only
     var opaque: [8]u8;
     if (receive_frame(?fixture, frame.FRAME_PING, 0, 0, ?opaque[0], 8).kind
         != EVENT_MEMORY_BLOCKED || fixture.engine.state != OPEN
-        || process(?fixture.engine).kind != EVENT_MEMORY_BLOCKED) { ret 5; }
+        || process(?fixture.engine, test_now(100)).kind != EVENT_MEMORY_BLOCKED) { ret 5; }
     fixture.account.budgets[1] = idle_bytes() + round16(16384);
-    if (process(?fixture.engine).kind != EVENT_PING || fixture.engine.payload_held) { ret 6; }
+    if (process(?fixture.engine, test_now(100)).kind != EVENT_PING || fixture.engine.payload_held) { ret 6; }
     fixture.account.budgets[1] = idle_bytes();
-    if (submit_write(?fixture.engine) || !fixture.engine.memory_blocked
+    if (submit_write(?fixture.engine, test_now(100)) || !fixture.engine.memory_blocked
         || fixture.engine.write_held) { ret 8; }
     fixture.account.budgets[1] = 1 << 25;
     if (!drain_output(?fixture)
@@ -4668,7 +4927,7 @@ test "http.h2.connection: stream records grow in place and the index follows the
             val generation: u64     = stream.generation;
             if (!cancel_stream(?fixture.engine, ids[i], H2_CANCEL)
                 || !drain_output(?fixture)
-                || !release_stream(?fixture.engine, ids[i], generation)) { ret 5; }
+                || !release_stream(?fixture.engine, ids[i], generation, test_now(100))) { ret 5; }
             i = i + 3;
         }
         i = round;
@@ -4728,10 +4987,448 @@ test "http.h2.connection: a failed connection destroys with streams the host nev
     if (!drain_output(?fixture) || !progress_close(?fixture.engine)) { ret 5; }
     var closed: transport.Completion = transport.completed(
         fixture.io.close_token, transport.CLOSE, 0);
-    if (complete_io(?fixture.engine, ?closed).kind != EVENT_CLOSED
+    if (complete_io(?fixture.engine, ?closed, test_now(100)).kind != EVENT_CLOSED
         || fixture.engine.active_streams != 2) { ret 6; }
     if (!destroy(?fixture.engine))   { ret 7; }
     if (fixture.account.held != 0)   { ret 8; }
     if (fixture.account.chunks != 0) { ret 9; }
+    ret 0;
+}
+
+fun just_before(seconds: i64) time.Instant {
+    ret time.Instant{sec: seconds - 1, nsec: 999999999};
+}
+
+fun due_at(value: deadline.Deadline, at: time.Instant) bool {
+    ret value.active && time.instant_equal(value.at, at);
+}
+
+# the reported deadline is quiet a nanosecond early and fails the connection at it
+fun times_out_at(fixture: *Fixture, seconds: i64, error: Error) bool {
+    if (!due_at(next_deadline(?fixture.engine), test_now(seconds))
+        || tick(?fixture.engine, just_before(seconds)).kind != EVENT_NONE
+        || fixture.engine.state == FAILED) { ret false; }
+    val expired: Event = tick(?fixture.engine, test_now(seconds));
+    fixture.clock = test_now(seconds);
+    ret expired.kind == EVENT_TIMED_OUT && expired.error == error
+        && fixture.engine.state == FAILED && fixture.engine.error == error;
+}
+
+# the reported deadline resets only its stream, and not a nanosecond early
+fun resets_at(fixture: *Fixture, seconds: i64, id: u32, error: Error) bool {
+    if (!due_at(next_deadline(?fixture.engine), test_now(seconds))
+        || tick(?fixture.engine, just_before(seconds)).kind != EVENT_NONE) { ret false; }
+    val expired: Event = tick(?fixture.engine, test_now(seconds));
+    fixture.clock = test_now(seconds);
+    val stream: *Stream = stream_for(?fixture.engine, id);
+    ret expired.kind == EVENT_STREAM_RESET && expired.stream_id == id
+        && expired.error == error && expired.code == H2_CANCEL
+        && stream != nil && stream.state == STREAM_CLOSED
+        && fixture.engine.state != FAILED && fixture.engine.error == ERROR_NONE;
+}
+
+fun ping_at(fixture: *Fixture, seconds: i64) bool {
+    fixture.clock = test_now(seconds);
+    var opaque: [8]u8;
+    ret receive_frame(fixture, frame.FRAME_PING, 0, 0, ?opaque[0], 8).kind == EVENT_PING
+        && drain_output(fixture);
+}
+
+# a request the host has bound and taken, at the fixture's clock
+fun open_request(fixture: *Fixture, id: u32, end_stream: bool,
+    storage: *ExchangeMemory) bool {
+    var block: [6]u8;
+    request_block(?block[0]);
+    var flags: u8 = frame.FLAG_END_HEADERS;
+    if (end_stream) { flags = flags | frame.FLAG_END_STREAM; }
+    val reported: Event = receive_frame(fixture, frame.FRAME_HEADERS, flags, id, ?block[0], 6);
+    ret reported.kind == EVENT_REQUEST_HEADERS && reported.stream_id == id
+        && make_exchange(storage, reported.generation, id)
+        && bind_exchange(?fixture.engine, id, ?storage.exchange)
+        && release_event(?fixture.engine, id, reported.generation);
+}
+
+fun served_handshake(fixture: *Fixture) bool {
+    ret make_fixture(fixture, SERVER, test_config())
+        && server_handshake(fixture).kind == EVENT_SETTINGS && drain_output(fixture);
+}
+
+fun respond(fixture: *Fixture, id: u32) bool {
+    var response: [1]field.Field;
+    response[0] = field.Field{name: view.view(":status", 7),
+        value: view.view("200", 3), sensitive: false};
+    ret send_headers(?fixture.engine, id, ?response[0], 1, false, true).status == OFFER_OUTPUT
+        && drain_output(fixture) && stream_for(?fixture.engine, id).initial_headers_sent;
+}
+
+fun goaway_written(fixture: *Fixture, code: u32) bool {
+    var count: usize = 0;
+    for (count < 8 && submit_write(?fixture.engine, fixture.clock)) {
+        val found: bool = fixture.io.write_buffer[3] == frame.FRAME_GOAWAY
+            && read_u32(?fixture.io.write_buffer[13]) == code;
+        var completion: transport.Completion = transport.completed(
+            fixture.io.write_token, transport.WRITE, fixture.io.write_length);
+        complete_io(?fixture.engine, ?completion, fixture.clock);
+        if (found) { ret true; }
+        count = count + 1;
+    }
+    ret false;
+}
+
+fun closes(fixture: *Fixture) bool {
+    if (!fixture.engine.close_pending && !progress_close(?fixture.engine)) { ret false; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    ret complete_io(?fixture.engine, ?closed, fixture.clock).kind == EVENT_CLOSED
+        && destroy(?fixture.engine) && fixture.account.held == 0;
+}
+
+test "http.h2.connection: a silent server connection times out at the header timeout" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config()))                  { ret 1; }
+    if (!times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT))              { ret 2; }
+    if (fixture.engine.goaway_sent || fixture.engine.control_count != 0) { ret 3; }
+    if (!closes(?fixture))                                               { ret 4; }
+    val reason: cancel.Reason = cancel.reason(?fixture.operation_root);
+    if (!(sel reason.timed_out)) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: a preface and settings alone owe a request within the header timeout" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture)) { ret 1; }
+    # pings are not a request, so they never extend the wait
+    if (!ping_at(?fixture, 105) || !ping_at(?fixture, 109))          { ret 2; }
+    if (!times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT))          { ret 3; }
+    if (!goaway_written(?fixture, H2_NO_ERROR) || !closes(?fixture)) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.connection: a truncated first headers frame times out with the request wait" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture)) { ret 1; }
+    var block: [6]u8;
+    request_block(?block[0]);
+    var wire:  [15]u8;
+    val total: usize = test_frame(?wire[0], 15, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS, 1, ?block[0], 6);
+    fixture.clock = test_now(105);
+    if (total != 15 || receive_bytes(?fixture, ?wire[0], 12, false).kind != EVENT_NEED_READ) { ret 2; }
+    if (!times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT))                                  { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a truncated headers frame beside a live stream times out at the header timeout" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
+    if (!due_at(next_deadline(?fixture.engine), test_now(400)))                  { ret 2; }
+    var block: [6]u8;
+    request_block(?block[0]);
+    var wire:  [15]u8;
+    val total: usize = test_frame(?wire[0], 15, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS, 3, ?block[0], 6);
+    fixture.clock = test_now(105);
+    if (total != 15 || receive_bytes(?fixture, ?wire[0], 12, false).kind != EVENT_NEED_READ) { ret 3; }
+    if (!times_out_at(?fixture, 115, ERROR_HEADER_TIMEOUT))                                  { ret 4; }
+    ret 0;
+}
+
+test "http.h2.connection: a header block without its end times out from its first frame" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
+    var block: [6]u8;
+    request_block(?block[0]);
+    fixture.clock = test_now(105);
+    if (receive_frame(?fixture, frame.FRAME_HEADERS, 0, 3, ?block[0], 3).kind != EVENT_NEED_READ) { ret 2; }
+    # a continuation is progress, and progress never moves the deadline
+    fixture.clock = test_now(112);
+    if (receive_frame(?fixture, frame.FRAME_CONTINUATION, 0, 3, ?block[3], 2).kind
+        != EVENT_NEED_READ) { ret 3; }
+    if (!times_out_at(?fixture, 115, ERROR_HEADER_TIMEOUT)) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.connection: a finished header block stops its deadline" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
+    var block: [6]u8;
+    request_block(?block[0]);
+    fixture.clock = test_now(105);
+    if (receive_frame(?fixture, frame.FRAME_HEADERS, 0, 3, ?block[0], 3).kind != EVENT_NEED_READ
+        || !due_at(next_deadline(?fixture.engine), test_now(115))) { ret 2; }
+    fixture.clock = test_now(107);
+    val reported: Event = receive_frame(?fixture, frame.FRAME_CONTINUATION,
+        frame.FLAG_END_HEADERS, 3, ?block[3], 3);
+    # the stream's own wait, armed when it opened, is all that is left
+    if (reported.kind != EVENT_REQUEST_HEADERS
+        || fixture.engine.header_deadline.active
+        || !due_at(next_deadline(?fixture.engine), test_now(135))) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: an idle connection closes at the idle timeout after a response" {
+    var fixture: Fixture;
+    var served:  ExchangeMemory;
+    if (!served_handshake(?fixture)) { ret 1; }
+    fixture.clock = test_now(105);
+    if (!pooled_exchange(?fixture, ?served) || fixture.engine.active_streams != 0) { ret 2; }
+    if (!ping_at(?fixture, 130) || !ping_at(?fixture, 164))                        { ret 3; }
+    if (!times_out_at(?fixture, 165, ERROR_IDLE_TIMEOUT))                          { ret 4; }
+    if (!goaway_written(?fixture, H2_NO_ERROR) || !closes(?fixture))               { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: a request just inside the wait takes over with one timer" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture)) { ret 1; }
+    fixture.clock = just_before(110);
+    if (!open_request(?fixture, 1, false, ?first)) { ret 2; }
+    val due: time.Instant = time.Instant{sec: 139, nsec: 999999999};
+    if (fixture.engine.wait_deadline.active || fixture.engine.idle_deadline.active
+        || fixture.engine.lists[LIST_REQUEST].count != 1
+        || !due_at(next_deadline(?fixture.engine), due)) { ret 3; }
+    if (tick(?fixture.engine, test_now(110)).kind != EVENT_NONE
+        || tick(?fixture.engine, time.Instant{sec: 139, nsec: 999999998}).kind != EVENT_NONE) { ret 4; }
+    val expired: Event = tick(?fixture.engine, due);
+    if (expired.kind != EVENT_STREAM_RESET || expired.stream_id != 1
+        || fixture.engine.state == FAILED) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: a request that stalls is reset alone" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    var second:  ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, false, ?first)) { ret 1; }
+    fixture.clock = test_now(105);
+    if (!open_request(?fixture, 3, false, ?second)) { ret 2; }
+    # body progress never moves a request's deadline
+    var chunk: [3]u8;
+    fixture.clock = test_now(120);
+    if (receive_frame(?fixture, frame.FRAME_DATA, 0, 1, ?chunk[0], 3).kind != EVENT_DATA
+        || !consume_data(?fixture.engine, 1, 3)
+        || !due_at(next_deadline(?fixture.engine), test_now(130))) { ret 8; }
+    if (!resets_at(?fixture, 130, 1, ERROR_REQUEST_TIMEOUT)
+        || first.exchange.state != exchange.TIMED_OUT_STATE
+        || !scope_active(?second.scope)) { ret 3; }
+    if (!submit_write(?fixture.engine, fixture.clock)
+        || fixture.io.write_buffer[3] != frame.FRAME_RESET_STREAM
+        || read_u32(?fixture.io.write_buffer[5]) != 1
+        || read_u32(?fixture.io.write_buffer[9]) != H2_CANCEL) { ret 4; }
+    var written: transport.Completion = transport.completed(
+        fixture.io.write_token, transport.WRITE, fixture.io.write_length);
+    complete_io(?fixture.engine, ?written, fixture.clock);
+    # the sibling finishes its half in time and leaves its timer
+    if (!due_at(next_deadline(?fixture.engine), test_now(135))) { ret 5; }
+    fixture.clock = test_now(134);
+    if (receive_frame(?fixture, frame.FRAME_DATA, frame.FLAG_END_STREAM, 3, nil, 0).kind
+        != EVENT_STREAM_END) { ret 6; }
+    if (!due_at(next_deadline(?fixture.engine), test_now(400))
+        || tick(?fixture.engine, just_before(400)).kind != EVENT_NONE) { ret 7; }
+    ret 0;
+}
+
+test "http.h2.connection: a stream the peer never grants window is reset at the write timeout" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture)) { ret 1; }
+    var zero: [6]u8;
+    zero[0] = 0;
+    zero[1] = frame.SETTINGS_INITIAL_WINDOW_SIZE::u8;
+    put_u32(?zero[2], 0);
+    if (receive_frame(?fixture, frame.FRAME_SETTINGS, 0, 0, ?zero[0], 6).kind != EVENT_SETTINGS
+        || !drain_output(?fixture) || !open_request(?fixture, 1, true, ?first)
+        || !respond(?fixture, 1)) { ret 2; }
+    if (!set_writable(?fixture.engine, 1, true, test_now(105))
+        || !due_at(next_deadline(?fixture.engine), test_now(135))) { ret 3; }
+    # window ends the stall, and a later stall is a new one
+    var increment: [4]u8;
+    put_u32(?increment[0], 5);
+    fixture.clock = test_now(120);
+    if (receive_frame(?fixture, frame.FRAME_WINDOW_UPDATE, 0, 1, ?increment[0], 4).kind
+        != EVENT_NEED_READ
+        || !due_at(next_deadline(?fixture.engine), test_now(400))) { ret 4; }
+    var body:    [10]u8;
+    val offered: Offer = offer_data(?fixture.engine, 1, ?body[0], 10, true, test_now(125));
+    if (offered.status != OFFER_PARTIAL || offered.consumed != 5
+        || !due_at(next_deadline(?fixture.engine), test_now(155))) { ret 5; }
+    fixture.clock = test_now(125);
+    if (!drain_output(?fixture))                           { ret 6; }
+    if (!resets_at(?fixture, 155, 1, ERROR_WRITE_TIMEOUT)) { ret 7; }
+    ret 0;
+}
+
+test "http.h2.connection: a withdrawn stall stops its timer" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture)) { ret 1; }
+    var zero: [6]u8;
+    zero[0] = 0;
+    zero[1] = frame.SETTINGS_INITIAL_WINDOW_SIZE::u8;
+    put_u32(?zero[2], 0);
+    if (receive_frame(?fixture, frame.FRAME_SETTINGS, 0, 0, ?zero[0], 6).kind != EVENT_SETTINGS
+        || !drain_output(?fixture) || !open_request(?fixture, 1, true, ?first)
+        || !respond(?fixture, 1)) { ret 2; }
+    if (!set_writable(?fixture.engine, 1, true, test_now(105))
+        || !set_writable(?fixture.engine, 1, false, test_now(110))
+        || !due_at(next_deadline(?fixture.engine), test_now(400))
+        || !set_writable(?fixture.engine, 1, true, test_now(112))) { ret 3; }
+    if (!resets_at(?fixture, 142, 1, ERROR_WRITE_TIMEOUT)) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.connection: a connection window that never reopens closes at the write timeout" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)
+        || !respond(?fixture, 1)) { ret 1; }
+    # the peer's connection window only shrinks through data, so start it spent
+    fixture.engine.send_window = 0;
+    if (!set_writable(?fixture.engine, 1, true, test_now(105))
+        || !due_at(next_deadline(?fixture.engine), test_now(135))) { ret 2; }
+    var increment: [4]u8;
+    put_u32(?increment[0], 10);
+    fixture.clock = test_now(110);
+    if (receive_frame(?fixture, frame.FRAME_WINDOW_UPDATE, 0, 0, ?increment[0], 4).kind
+        != EVENT_NEED_READ
+        || !due_at(next_deadline(?fixture.engine), test_now(400))) { ret 3; }
+    var body: [20]u8;
+    if (offer_data(?fixture.engine, 1, ?body[0], 20, true, test_now(115)).consumed != 10
+        || !due_at(next_deadline(?fixture.engine), test_now(145))) { ret 4; }
+    if (!times_out_at(?fixture, 145, ERROR_WRITE_TIMEOUT)
+        || fixture.io.close_calls != 1 || fixture.engine.goaway_sent) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: a write the peer never takes closes at the write timeout" {
+    var fixture:  Fixture;
+    var first:    ExchangeMemory;
+    var response: [1]field.Field;
+    response[0] = field.Field{name: view.view(":status", 7),
+        value: view.view("200", 3), sensitive: false};
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)
+        || send_headers(?fixture.engine, 1, ?response[0], 1, true, true).status != OFFER_OUTPUT
+        || !submit_write(?fixture.engine, test_now(100))) { ret 1; }
+    if (!times_out_at(?fixture, 130, ERROR_WRITE_TIMEOUT)) { ret 2; }
+    # nothing more is written, and the close does not wait for the stuck write
+    if (fixture.io.close_calls != 1 || !fixture.engine.close_pending
+        || fixture.engine.goaway_sent || fixture.engine.control_count != 0
+        || submit_write(?fixture.engine, test_now(130))) { ret 3; }
+    var cancelled: transport.Completion = transport.failed(fixture.io.write_token,
+        transport.WRITE, 0, io_error.make(io_error.CANCELLED, io_error.OP_WRITE));
+    val written: Event = complete_io(?fixture.engine, ?cancelled, test_now(131));
+    if (written.kind != EVENT_TIMED_OUT || fixture.engine.error != ERROR_WRITE_TIMEOUT) { ret 4; }
+    if (!closes(?fixture))                                                              { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: a goaway drain the peer never reads still closes" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture)) { ret 1; }
+    if (!times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)
+        || next_deadline(?fixture.engine).active) { ret 2; }
+    if (!submit_write(?fixture.engine, test_now(111))
+        || !due_at(next_deadline(?fixture.engine), test_now(141))) { ret 3; }
+    if (tick(?fixture.engine, just_before(141)).kind != EVENT_TIMED_OUT
+        || fixture.io.close_calls != 0) { ret 4; }
+    if (tick(?fixture.engine, test_now(141)).kind != EVENT_TIMED_OUT
+        || fixture.io.close_calls != 1 || !fixture.engine.close_pending
+        || next_deadline(?fixture.engine).active) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: stream deadlines fire in deadline order whatever their duration" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    var second:  ExchangeMemory;
+    var third:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, false, ?first)) { ret 1; }
+    fixture.clock = test_now(105);
+    if (!open_request(?fixture, 3, false, ?second)) { ret 2; }
+    fixture.clock = test_now(106);
+    if (!open_request(?fixture, 5, false, ?third)) { ret 3; }
+    # a shorter duration joins ahead of members armed earlier
+    val moved: *Stream = stream_for(?fixture.engine, 3);
+    list_remove(?fixture.engine, LIST_REQUEST, moved);
+    timed_push(?fixture.engine, LIST_REQUEST, moved, test_now(120));
+    val middle: *Stream = stream_for(?fixture.engine, 5);
+    list_remove(?fixture.engine, LIST_REQUEST, middle);
+    timed_push(?fixture.engine, LIST_REQUEST, middle, test_now(125));
+    if (fixture.engine.lists[LIST_REQUEST].count != 3)       { ret 4; }
+    if (!resets_at(?fixture, 120, 3, ERROR_REQUEST_TIMEOUT)) { ret 5; }
+    if (!resets_at(?fixture, 125, 5, ERROR_REQUEST_TIMEOUT)) { ret 6; }
+    if (!resets_at(?fixture, 130, 1, ERROR_REQUEST_TIMEOUT)) { ret 7; }
+    ret 0;
+}
+
+test "http.h2.connection: a live stream keeps the connection until the total timeout" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
+    # the peer owes nothing and the host still holds the stream, so idle never runs
+    if (!ping_at(?fixture, 200) || fixture.engine.idle_deadline.active) { ret 2; }
+    if (!times_out_at(?fixture, 400, ERROR_TOTAL_TIMEOUT)
+        || first.exchange.state != exchange.TIMED_OUT_STATE) { ret 3; }
+    if (!goaway_written(?fixture, H2_NO_ERROR)) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.connection: a client is idle from init until it opens a stream" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, CLIENT, test_config())
+        || fixture.engine.wait_deadline.active) { ret 1; }
+    if (!times_out_at(?fixture, 160, ERROR_IDLE_TIMEOUT)) { ret 2; }
+    var opened: Fixture;
+    if (!make_fixture(?opened, CLIENT, test_config())
+        || client_handshake(?opened).kind != EVENT_SETTINGS) { ret 3; }
+    opened.clock = test_now(105);
+    val id: u32 = open_local(?opened.engine, nil);
+    # the peer owes nothing until the request is on the wire
+    if (id != 1 || opened.engine.idle_deadline.active
+        || !due_at(next_deadline(?opened.engine), test_now(400))) { ret 4; }
+    var request: [4]field.Field;
+    request[0] = field.Field{name: view.view(":method", 7), value: view.view("GET", 3), sensitive: false};
+    request[1] = field.Field{name: view.view(":scheme", 7), value: view.view("http", 4), sensitive: false};
+    request[2] = field.Field{name: view.view(":path", 5), value: view.view("/", 1), sensitive: false};
+    request[3] = field.Field{name: view.view(":authority", 10), value: view.view("x", 1), sensitive: false};
+    if (!drain_output(?opened)
+        || send_headers(?opened.engine, 1, ?request[0], 4, true, true).status != OFFER_OUTPUT
+        || !drain_output(?opened)) { ret 5; }
+    if (!resets_at(?opened, 135, 1, ERROR_REQUEST_TIMEOUT)) { ret 6; }
+    ret 0;
+}
+
+test "http.h2.connection: a cancelled connection closes without waiting on output it cannot write" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
+    cancel.cancel(?fixture.operation_root);
+    val cancelled: Event = tick(?fixture.engine, test_now(101));
+    if (cancelled.kind != EVENT_CANCELLED || fixture.engine.control_count != 0
+        || process(?fixture.engine, test_now(101)).kind != EVENT_CANCELLED) { ret 2; }
+    if (!closes(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: timeouts need valid instants and a later clock never moves a deadline back" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture)) { ret 1; }
+    if (tick(?fixture.engine, time.Instant{sec: 1, nsec: 1000000000}).error != ERROR_STATE
+        || process(?fixture.engine, time.Instant{sec: -1, nsec: 0}).error != ERROR_STATE
+        || submit_write(?fixture.engine, time.Instant{sec: 0, nsec: -1})) { ret 2; }
+    # a step back in the caller's clock counts as the latest instant seen
+    var first: ExchangeMemory;
+    if (tick(?fixture.engine, test_now(105)).kind != EVENT_NONE) { ret 3; }
+    fixture.clock = test_now(50);
+    if (!open_request(?fixture, 1, false, ?first)
+        || !due_at(next_deadline(?fixture.engine), test_now(135))) { ret 4; }
+    var bad: Config = test_config();
+    bad.idle_timeout_ns = 0;
+    var refused: Fixture;
+    if (make_fixture(?refused, SERVER, bad)) { ret 5; }
     ret 0;
 }
