@@ -64,3 +64,8 @@ path = "../.."
 [dep.quic]
 git = "https://github.com/briar-systems/mach-quic"
 ref = "tag/v0.10.1"
+
+# removed once mach-quic 0.12.0 (on std >= 4.2.0) is pinned
+[dep.std]
+git = "https://github.com/briar-systems/mach-std"
+ref = "tag/v4.2.0"
