@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-17
+
 ### Added
 - `h1.connection.next_deadline` returns the earliest deadline `tick` would enforce, so a host can arm one timer per connection instead of polling `tick` (#101).
 
