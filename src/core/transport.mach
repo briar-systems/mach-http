@@ -4,6 +4,7 @@ use std.chrono.time;
 use io_error: std.io.error;
 use std.io.lifecycle;
 use io_runtime: std.io.runtime;
+use std.memory;
 use std.sync.cancel;
 use std.sync.mutex;
 use std.types.bool.bool;
@@ -39,6 +40,7 @@ pub val READ:           Kind = 1;
 pub val WRITE:          Kind = 2;
 pub val SHUTDOWN_WRITE: Kind = 3;
 pub val CLOSE:          Kind = 4;
+pub val READABLE:       Kind = 5;
 
 pub def Status: u8;
 pub val IO_COMPLETE:  Status = 1;
@@ -75,11 +77,20 @@ pub def SubmitControlFun: fun(ptr, Token, *cancel.Scope) res[bool, io_error.Erro
 
 # plaintext and secured adapters satisfy exactly the same logical byte-stream API
 # secured adapters drive handshake reads and writes before publishing completion
+#
+# submit_readable waits, holding no buffer, until a read would return at least
+# one byte or end of stream. it shares the read direction with submit_read, so at
+# most one of the two is pending. its completion has kind READABLE and count 0:
+# IO_COMPLETE means a read can return bytes now, IO_END means nothing is left.
+# an adapter that buffers bytes above the socket, such as TLS holding decrypted
+# plaintext the socket no longer shows, completes the wait at once while any such
+# byte is held, and only waits on the socket when its own buffer is empty
 pub rec Adapter {
     runtime:               *io_runtime.Runtime;
     context:               ptr;
     security:              Security;
     submit_read:           SubmitBufferFun;
+    submit_readable:       SubmitControlFun;
     submit_write:          SubmitBufferFun;
     submit_shutdown_write: SubmitControlFun;
     submit_close:          SubmitControlFun;
@@ -89,10 +100,12 @@ pub def RuntimeBufferFun:  fun(ptr, *cancel.Scope, *u8, usize, usize) res[io_run
 pub def RuntimeControlFun: fun(ptr, *cancel.Scope, usize) res[io_runtime.Token, io_error.Error];
 
 # this facade adapts runtime streams whose completion kind matches the logical operation
+# submit_readable maps to a runtime readiness wait such as net.async.submit_readable
 pub rec RuntimeStream {
     runtime:               *io_runtime.Runtime;
     context:               ptr;
     submit_read:           RuntimeBufferFun;
+    submit_readable:       RuntimeControlFun;
     submit_write:          RuntimeBufferFun;
     submit_shutdown_write: RuntimeControlFun;
     submit_close:          RuntimeControlFun;
@@ -153,9 +166,9 @@ pub rec Transport {
 }
 
 fun operation_for(kind: Kind) io_error.Operation {
-    if (kind == READ)           { ret io_error.OP_READ; }
-    if (kind == WRITE)          { ret io_error.OP_WRITE; }
-    if (kind == SHUTDOWN_WRITE) { ret io_error.OP_SHUTDOWN; }
+    if (kind == READ || kind == READABLE) { ret io_error.OP_READ; }
+    if (kind == WRITE)                    { ret io_error.OP_WRITE; }
+    if (kind == SHUTDOWN_WRITE)           { ret io_error.OP_SHUTDOWN; }
     ret io_error.OP_CLOSE;
 }
 
@@ -186,6 +199,7 @@ pub fun adapter_valid(adapter: *Adapter) bool {
     ret adapter != nil && adapter.runtime != nil
         && (adapter.security == PLAINTEXT || adapter.security == SECURED)
         && adapter.submit_read::usize != 0
+        && adapter.submit_readable::usize != 0
         && adapter.submit_write::usize != 0
         && adapter.submit_shutdown_write::usize != 0
         && adapter.submit_close::usize != 0;
@@ -253,7 +267,7 @@ fun slot_for_locked(transport: *Transport, token: Token) *Slot {
 
 fun allowed_locked(transport: *Transport, kind: Kind) bool {
     if (lifecycle.snapshot(?transport.lifecycle).state != lifecycle.OPEN) { ret false; }
-    if (kind == READ)                                                     { ret transport.read_state == ENDPOINT_OPEN && !transport.read_pending; }
+    if (kind == READ || kind == READABLE)                                 { ret transport.read_state == ENDPOINT_OPEN && !transport.read_pending; }
     if (kind == WRITE)                                                    { ret transport.write_state == ENDPOINT_OPEN && !transport.write_pending; }
     if (kind == SHUTDOWN_WRITE) {
         ret transport.write_state == ENDPOINT_OPEN && !transport.write_pending && !transport.shutdown_pending;
@@ -300,8 +314,8 @@ fun release_locked(transport: *Transport, slot: *Slot) {
 }
 
 fun mark_pending_locked(transport: *Transport, kind: Kind) {
-    if (kind == READ)  { transport.read_pending = true; }
-    or (kind == WRITE) { transport.write_pending = true; }
+    if (kind == READ || kind == READABLE) { transport.read_pending = true; }
+    or (kind == WRITE)                    { transport.write_pending = true; }
     or (kind == SHUTDOWN_WRITE) {
         transport.shutdown_pending = true;
         transport.write_state      = ENDPOINT_CLOSING;
@@ -313,7 +327,8 @@ fun submit_buffer(transport: *Transport, kind: Kind, scope: *cancel.Scope, buffe
     val operation: io_error.Operation = operation_for(kind);
     if (transport == nil || !transport.initialized || scope == nil
         || scope.root != transport.operation_root || (buffer == nil && length != 0)
-        || (kind != READ && kind != WRITE)) {
+        || (kind != READ && kind != WRITE && kind != READABLE)
+        || (kind == READABLE && length != 0)) {
         ret res[Token, io_error.Error].err{invalid(operation)};
     }
     val reason: cancel.Reason = cancel.reason(scope);
@@ -335,6 +350,9 @@ fun submit_buffer(transport: *Transport, kind: Kind, scope: *cancel.Scope, buffe
     var submitted: res[bool, io_error.Error];
     if (kind == READ) {
         submitted = transport.adapter.submit_read(transport.adapter.context, token, scope, buffer, length);
+    }
+    or (kind == READABLE) {
+        submitted = transport.adapter.submit_readable(transport.adapter.context, token, scope);
     }
     or {
         submitted = transport.adapter.submit_write(transport.adapter.context, token, scope, buffer, length);
@@ -358,6 +376,12 @@ fun submit_buffer(transport: *Transport, kind: Kind, scope: *cancel.Scope, buffe
 pub fun read(transport: *Transport, scope: *cancel.Scope, buffer: *u8, length: usize,
     context: usize) res[Token, io_error.Error] {
     ret submit_buffer(transport, READ, scope, buffer, length, context);
+}
+
+# wait for readability without a buffer, see Adapter
+pub fun readable(transport: *Transport, scope: *cancel.Scope,
+    context: usize) res[Token, io_error.Error] {
+    ret submit_buffer(transport, READABLE, scope, nil, 0, context);
 }
 
 pub fun write(transport: *Transport, scope: *cancel.Scope, buffer: *u8, length: usize,
@@ -447,9 +471,14 @@ pub fun completed(token: Token, kind: Kind, count: usize) Completion {
 }
 
 pub fun end(token: Token, count: usize) Completion {
+    ret end_of(token, READ, count);
+}
+
+# end of stream for a read or a readable wait
+pub fun end_of(token: Token, kind: Kind, count: usize) Completion {
     ret Completion{
         token:   token,
-        kind:    READ,
+        kind:    kind,
         status:  IO_END,
         count:   count,
         context: 0,
@@ -482,7 +511,7 @@ fun settle_kind_locked(transport: *Transport, kind: Kind, status: Status) {
         transport.read_state  = ENDPOINT_CLOSED;
         transport.write_state = ENDPOINT_CLOSED;
     }
-    if (kind == READ) {
+    if (kind == READ || kind == READABLE) {
         transport.read_pending = false;
         if (status == IO_END || status == IO_CLOSED) { transport.read_state = ENDPOINT_CLOSED; }
     }
@@ -506,7 +535,7 @@ pub fun complete(transport: *Transport, completion: *Completion) bool {
     mutex.lock(?transport.lock);
     val slot: *Slot = slot_for_locked(transport, completion.token);
     if (slot == nil || completion.kind != slot.kind || !status_valid(completion.status)
-        || (completion.status == IO_END && slot.kind != READ)) {
+        || (completion.status == IO_END && slot.kind != READ && slot.kind != READABLE)) {
         mutex.unlock(?transport.lock);
         ret false;
     }
@@ -537,6 +566,7 @@ pub fun complete(transport: *Transport, completion: *Completion) bool {
 
 fun logical_kind(kind: io_runtime.Kind) Kind {
     if (kind == io_runtime.READ)     { ret READ; }
+    if (kind == io_runtime.READABLE) { ret READABLE; }
     if (kind == io_runtime.WRITE)    { ret WRITE; }
     if (kind == io_runtime.SHUTDOWN) { ret SHUTDOWN_WRITE; }
     if (kind == io_runtime.CLOSE)    { ret CLOSE; }
@@ -555,8 +585,8 @@ pub fun complete_runtime(transport: *Transport, runtime_completion: *io_runtime.
         @completion = failed(token, kind, runtime_completion.bytes, runtime_completion.error);
     }
     or (runtime_completion.end_of_stream) {
-        if (kind == READ) {
-            @completion = end(token, runtime_completion.bytes);
+        if (kind == READ || kind == READABLE) {
+            @completion = end_of(token, kind, runtime_completion.bytes);
         }
         or {
             @completion = failed(token, kind, 0, adapter_failure(operation_for(kind)));
@@ -625,6 +655,12 @@ fun runtime_read(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
     ret runtime_submit_buffer(stream, token, scope, buffer, length, stream.submit_read);
 }
 
+fun runtime_readable(context: ptr, token: Token,
+    scope: *cancel.Scope) res[bool, io_error.Error] {
+    val stream: *RuntimeStream = context::*RuntimeStream;
+    ret runtime_submit_control(stream, token, scope, stream.submit_readable);
+}
+
 fun runtime_write(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
     length: usize) res[bool, io_error.Error] {
     val stream: *RuntimeStream = context::*RuntimeStream;
@@ -657,12 +693,14 @@ pub fun make_runtime_adapter(adapter: *Adapter, stream: *RuntimeStream,
     security: Security) bool {
     if (adapter == nil || stream == nil || stream.runtime == nil
         || (security != PLAINTEXT && security != SECURED)
-        || stream.submit_read::usize == 0 || stream.submit_write::usize == 0
+        || stream.submit_read::usize == 0 || stream.submit_readable::usize == 0
+        || stream.submit_write::usize == 0
         || stream.submit_shutdown_write::usize == 0 || stream.submit_close::usize == 0) { ret false; }
     adapter.runtime               = stream.runtime;
     adapter.context               = stream::ptr;
     adapter.security              = security;
     adapter.submit_read           = runtime_read;
+    adapter.submit_readable       = runtime_readable;
     adapter.submit_write          = runtime_write;
     adapter.submit_shutdown_write = runtime_shutdown_write;
     adapter.submit_close          = runtime_close;
@@ -680,10 +718,12 @@ test "http.core.transport: tokens retain full runtime context" {
 rec TestRuntime {
     runtime:       *io_runtime.Runtime;
     last_read:     io_runtime.Token;
+    last_readable: io_runtime.Token;
     last_write:    io_runtime.Token;
     last_shutdown: io_runtime.Token;
     last_close:    io_runtime.Token;
     reads:         usize;
+    readables:     usize;
     writes:        usize;
     shutdowns:     usize;
     closes:        usize;
@@ -700,6 +740,7 @@ fun test_runtime_submit(state: *TestRuntime, scope: *cancel.Scope, kind: io_runt
     if ((sel submitted.ok)) {
         val token: io_runtime.Token = submitted.ok;
         if (kind == io_runtime.READ)     { state.last_read = token; }
+        or (kind == io_runtime.READABLE) { state.last_readable = token; }
         or (kind == io_runtime.WRITE)    { state.last_write = token; }
         or (kind == io_runtime.SHUTDOWN) { state.last_shutdown = token; }
         or                               { state.last_close = token; }
@@ -712,6 +753,13 @@ fun test_runtime_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: u
     val state: *TestRuntime = context::*TestRuntime;
     state.reads = state.reads + 1;
     ret test_runtime_submit(state, scope, io_runtime.READ, buffer, length, token_context);
+}
+
+fun test_runtime_readable(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val state: *TestRuntime = context::*TestRuntime;
+    state.readables = state.readables + 1;
+    ret test_runtime_submit(state, scope, io_runtime.READABLE, nil, 0, token_context);
 }
 
 fun test_runtime_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
@@ -767,6 +815,7 @@ fun make_fixture(fixture: *Fixture, security: Security) bool {
     fixture.stream.runtime               = ?fixture.runtime;
     fixture.stream.context               = (?fixture.state)::ptr;
     fixture.stream.submit_read           = test_runtime_read;
+    fixture.stream.submit_readable       = test_runtime_readable;
     fixture.stream.submit_write          = test_runtime_write;
     fixture.stream.submit_shutdown_write = test_runtime_shutdown;
     fixture.stream.submit_close          = test_runtime_close;
@@ -919,6 +968,156 @@ test "http.core.transport: eof closes only the read half" {
     ret 0;
 }
 
+test "http.core.transport: a readable wait holds no buffer and shares the read direction" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
+    val waiting: res[Token, io_error.Error] = readable(
+        ?fixture.transport, ?fixture.operation_root, 31);
+    if ((sel waiting.err)) { ret 2; }
+    val pending: OperationSnapshot = operation_snapshot(?fixture.transport, waiting.ok);
+    if (!pending.active || pending.buffer != nil || pending.length != 0
+        || pending.kind != READABLE || fixture.state.readables != 1) { ret 3; }
+    var bytes: [4]u8;
+    if (!submit_refused(read(?fixture.transport, ?fixture.operation_root, ?bytes[0], 4, 0))
+        || !submit_refused(readable(?fixture.transport, ?fixture.operation_root, 0))) { ret 4; }
+    var completion: Completion;
+    if (!finish_runtime(?fixture, fixture.state.last_readable, 0, false, ?completion)
+        || completion.kind != READABLE || completion.status != IO_COMPLETE
+        || completion.count != 0 || completion.context != 31) { ret 5; }
+    val reading: res[Token, io_error.Error] = read(
+        ?fixture.transport, ?fixture.operation_root, ?bytes[0], 4, 32);
+    if ((sel reading.err)
+        || !finish_runtime(?fixture, fixture.state.last_read, 2, false, ?completion)
+        || completion.kind != READ || completion.count != 2) { ret 6; }
+    val ending: res[Token, io_error.Error] = readable(
+        ?fixture.transport, ?fixture.operation_root, 33);
+    if ((sel ending.err)
+        || !finish_runtime(?fixture, fixture.state.last_readable, 0, true, ?completion)
+        || completion.kind != READABLE || completion.status != IO_END) { ret 7; }
+    if (snapshot(?fixture.transport).read != ENDPOINT_CLOSED
+        || !submit_refused(readable(?fixture.transport, ?fixture.operation_root, 0))) { ret 8; }
+    if (!destroy_fixture(?fixture)) { ret 9; }
+    ret 0;
+}
+
+# a secured adapter that holds decrypted plaintext above the socket
+rec BufferedState {
+    runtime:      *io_runtime.Runtime;
+    plaintext:    [16]u8;
+    buffered:     usize;
+    socket_waits: usize;
+    socket_reads: usize;
+    immediate:    usize;
+    last_wait:    io_runtime.Token;
+}
+
+fun buffered_submit(state: *BufferedState, scope: *cancel.Scope, kind: io_runtime.Kind,
+    buffer: *u8, length: usize, token: Token) res[io_runtime.Token, io_error.Error] {
+    ret io_runtime.submit_scoped(state.runtime, scope, io_runtime.Operation{kind: kind,
+        resource: 1, buffer: buffer, length: length, offset: 0,
+        context:  token_context(token)});
+}
+
+fun buffered_read(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
+    length: usize) res[bool, io_error.Error] {
+    val state: *BufferedState = context::*BufferedState;
+    if (state.buffered != 0) {
+        var take: usize = state.buffered;
+        if (take > length) { take = length; }
+        val submitted: res[io_runtime.Token, io_error.Error] = buffered_submit(state,
+            scope, io_runtime.READ, buffer, length, token);
+        if (sel submitted.err) { ret res[bool, io_error.Error].err{submitted.err}; }
+        memory.raw_copy(buffer, ?state.plaintext[0], take);
+        state.buffered = state.buffered - take;
+        val done: err[io_error.Error] = io_runtime.complete(state.runtime, submitted.ok, take, 1, false);
+        if (sel done.err) { ret res[bool, io_error.Error].err{done.err}; }
+        ret res[bool, io_error.Error].ok{true};
+    }
+    state.socket_reads = state.socket_reads + 1;
+    val submitted: res[io_runtime.Token, io_error.Error] = buffered_submit(state,
+        scope, io_runtime.READ, buffer, length, token);
+    if (sel submitted.err) { ret res[bool, io_error.Error].err{submitted.err}; }
+    ret res[bool, io_error.Error].ok{true};
+}
+
+# completes at once while plaintext is held, otherwise waits on the socket
+fun buffered_readable(context: ptr, token: Token,
+    scope: *cancel.Scope) res[bool, io_error.Error] {
+    val state:     *BufferedState                        = context::*BufferedState;
+    val submitted: res[io_runtime.Token, io_error.Error] = buffered_submit(state,
+        scope, io_runtime.READABLE, nil, 0, token);
+    if (sel submitted.err) { ret res[bool, io_error.Error].err{submitted.err}; }
+    if (state.buffered != 0) {
+        state.immediate = state.immediate + 1;
+        val done: err[io_error.Error] = io_runtime.complete(state.runtime, submitted.ok, 0, 1, false);
+        if (sel done.err) { ret res[bool, io_error.Error].err{done.err}; }
+        ret res[bool, io_error.Error].ok{true};
+    }
+    state.socket_waits = state.socket_waits + 1;
+    state.last_wait    = submitted.ok;
+    ret res[bool, io_error.Error].ok{true};
+}
+
+fun buffered_write(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
+    length: usize) res[bool, io_error.Error] {
+    ret res[bool, io_error.Error].ok{false};
+}
+
+fun buffered_control(context: ptr, token: Token,
+    scope: *cancel.Scope) res[bool, io_error.Error] {
+    ret res[bool, io_error.Error].ok{false};
+}
+
+test "http.core.transport: a readable wait completes at once over buffered plaintext" {
+    var runtime: io_runtime.Runtime;
+    if (refused(io_runtime.make(?runtime, 4))) { ret 1; }
+    val none:       time.Time = time.Time{sec: 0, nsec: 0};
+    var operations: cancel.Scope;
+    var controls:   cancel.Scope;
+    if (!operation_ok(cancel.make_root(?operations, false, none))
+        || !operation_ok(cancel.make_root(?controls, false, none))) { ret 2; }
+    var state: BufferedState;
+    state.runtime      = ?runtime;
+    state.plaintext[0] = 'h';
+    state.plaintext[1] = 'i';
+    state.buffered     = 2;
+    val adapter: Adapter = Adapter{
+        runtime: ?runtime,
+        context: (?state)::ptr,
+        security:              SECURED,
+        submit_read:           buffered_read,
+        submit_readable:       buffered_readable,
+        submit_write:          buffered_write,
+        submit_shutdown_write: buffered_control,
+        submit_close:          buffered_control,
+    };
+    var slots:   [3]Slot;
+    var secured: Transport;
+    if (!init(?secured, adapter, ?operations, ?controls, ?slots[0], 3)) { ret 3; }
+    val waiting: res[Token, io_error.Error] = readable(?secured, ?operations, 51);
+    if ((sel waiting.err) || state.immediate != 1 || state.socket_waits != 0) { ret 4; }
+    var native:     io_runtime.Completion;
+    var completion: Completion;
+    if (!take_runtime(?runtime, ?native) || !complete_runtime(?secured, ?native, ?completion)
+        || completion.kind != READABLE || completion.status != IO_COMPLETE
+        || completion.context != 51) { ret 5; }
+    var bytes:   [8]u8;
+    val reading: res[Token, io_error.Error] = read(?secured, ?operations, ?bytes[0], 8, 52);
+    if ((sel reading.err) || state.socket_reads != 0
+        || !take_runtime(?runtime, ?native) || !complete_runtime(?secured, ?native, ?completion)
+        || completion.count != 2 || bytes[0] != 'h' || bytes[1] != 'i') { ret 6; }
+    val idle: res[Token, io_error.Error] = readable(?secured, ?operations, 53);
+    if ((sel idle.err) || state.immediate != 1 || state.socket_waits != 1
+        || take_runtime(?runtime, ?native)) { ret 7; }
+    if (refused(io_runtime.complete(?runtime, state.last_wait, 0, 1, false))
+        || !take_runtime(?runtime, ?native) || !complete_runtime(?secured, ?native, ?completion)
+        || completion.kind != READABLE || completion.context != 53) { ret 8; }
+    if (!operation_ok(cancel.destroy(?operations)) || !operation_ok(cancel.destroy(?controls))
+        || close_refused(io_runtime.close(?runtime))
+        || refused(io_runtime.destroy(?runtime))) { ret 9; }
+    ret 0;
+}
+
 rec SecureState {
     runtime:         *io_runtime.Runtime;
     token:           Token;
@@ -974,6 +1173,7 @@ test "http.core.transport: secured adapters hide internal read and write directi
         context: (?state)::ptr,
         security:              SECURED,
         submit_read:           secure_read,
+        submit_readable:       secure_control,
         submit_write:          secure_write,
         submit_shutdown_write: secure_control,
         submit_close:          secure_control,
@@ -1009,6 +1209,7 @@ test "http.core.transport: reused slots reject stale generations" {
     stream.runtime               = ?runtime;
     stream.context               = (?state)::ptr;
     stream.submit_read           = test_runtime_read;
+    stream.submit_readable       = test_runtime_readable;
     stream.submit_write          = test_runtime_write;
     stream.submit_shutdown_write = test_runtime_shutdown;
     stream.submit_close          = test_runtime_close;

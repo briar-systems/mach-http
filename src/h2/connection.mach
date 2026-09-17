@@ -2868,6 +2868,7 @@ fun make_sized_fixture(fixture: *Fixture, role: Role, configured: Config,
     fixture.adapter.security              = transport.PLAINTEXT;
     fixture.adapter.submit_read           = test_read;
     fixture.adapter.submit_write          = test_write;
+    fixture.adapter.submit_readable       = test_shutdown;
     fixture.adapter.submit_shutdown_write = test_shutdown;
     fixture.adapter.submit_close          = test_close;
     if (!transport.init(?fixture.wire, fixture.adapter, ?fixture.operation_root,

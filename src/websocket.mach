@@ -1168,6 +1168,7 @@ test "http.websocket: transport backpressure retains only connection buffers" {
         context: (?adapter_state)::ptr,
         security:              transport.PLAINTEXT,
         submit_read:           test_read,
+        submit_readable:       test_control,
         submit_write:          test_write,
         submit_shutdown_write: test_control,
         submit_close:          test_control,
