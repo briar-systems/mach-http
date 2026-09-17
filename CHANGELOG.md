@@ -6,6 +6,16 @@
 - **Breaking.** `h3.connection.Transport[T]` has a new `ready` callback that returns a `TransportReady` for the next stream whose readable, writable or reset state changed, or `TRANSPORT_EMPTY`. The engine only reads and writes streams it has work for, so every adapter must report each such change. Duplicate and spurious reports are harmless, and dropped ones are not. `process` also returns the new `EVENT_PENDING` when progress was made but work remains, and the host must call it again rather than wait. `EVENT_NONE` now means the transport, the accept queue and the engine have nothing left. See doc/h3-connection.md (#103).
 - **Breaking.** `h3.connection.Storage` has new `stream_index` and `stream_index_capacity` fields. The index holds `StreamIndexEntry` records, and its capacity must be a power of two and at least twice `stream_capacity` (#103).
 - HTTP/3 `process` now costs O(streams with news) instead of three passes over the stream capacity. Stream lookup, allocation and release are O(1), and `tick` walks only the requests bound to an exchange. A host that cancels an exchange scope should call `cancel_stream`, with `tick` as the fallback. Queued streams are serviced round-robin, so events come out in readiness order rather than slot order (#103).
+- **Breaking.** `h2.connection.init` takes a `StreamIndexEntry` array and its capacity after the stream capacity. The capacity must be a power of two and at least twice the stream capacity (#103).
+- **Breaking.** `h2.connection.process` (and `complete_io` for reads) can return the new `EVENT_PENDING`. It means the call used up its per-call budget of 64 units and work remains, so the host should call `process` again. It takes precedence over `EVENT_NEED_READ` (#103).
+- **Breaking.** `h2.connection.Stream` no longer has `dependency` or `exclusive`, and PRIORITY dependencies are ignored (RFC 9113). Only the weight is kept. `refused_pending` is replaced by `pending_reset`, which holds the code of a reset deferred until a header block is decoded (#103).
+- **Breaking.** A self-dependent PRIORITY frame or HEADERS priority block is now a stream error of type PROTOCOL_ERROR, as RFC 9113 requires. It was a connection error. `h2.frame` parses such a frame and leaves the error to the engine. The writer still refuses to encode one (#103).
+- Performance: HTTP/2 routine paths no longer scan the stream table, so their cost is O(changed streams) (#103).
+  - Stream lookup, allocation and release are O(1).
+  - GOAWAY retries, owed WINDOW_UPDATEs, writable streams and exchange-bound streams each have their own set.
+  - `tick` costs O(open exchange-bound streams). A host that cancels an exchange scope should call `cancel_stream`.
+  - Weighted scheduling keeps the same order over the writable set only.
+  - A PRIORITY signal costs O(1), exclusive or not.
 
 ## [0.11.0] - 2026-09-17
 

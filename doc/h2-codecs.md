@@ -16,8 +16,12 @@ The parser enforces:
 - connection-only and stream-only frame placement
 - uninterrupted HEADERS, PUSH_PROMISE, and CONTINUATION sequences
 - SETTINGS ACK length, six-byte records, known value domains, and duplicate values
-- valid padding, promised streams, priority dependencies, and window increments
+- valid padding, promised streams, and window increments
 - distinct frame-size, protocol, flow-control, and truncated-input outcomes
+
+A PRIORITY frame or HEADERS priority block whose stream depends on itself is
+passed through, because RFC 9113 makes that a stream error, which the connection
+engine raises. The writer refuses to encode one.
 
 Unknown frame types are surfaced without interpreting their payload, as HTTP/2
 requires. Unknown flags are ignored. The reserved stream bit is ignored on input and
