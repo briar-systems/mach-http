@@ -13,9 +13,9 @@ keys, which cannot be erased to an untyped `ptr`. The engine only passes the
 context to callbacks. It never inspects its bytes or claims its ownership, so the
 transport contract needs no context range.
 
-The adapter exposes local stream creation, peer stream acceptance, receive,
-explicit receive credit, copied writes, FIN, RESET_STREAM, STOP_SENDING, release,
-and application close. Stream handles carry source, slot, generation, and QUIC
+The adapter exposes local stream creation, peer stream acceptance, readiness,
+receive, explicit receive credit, copied writes, FIN, RESET_STREAM, STOP_SENDING,
+release, and application close. Stream handles carry source, slot, generation, and QUIC
 stream ID identity. A stale or structurally invalid result fails the connection.
 
 Receive is deliberately two phase. `Transport.read` advances delivery into the
@@ -37,6 +37,34 @@ status combinations, duplicate local stream IDs, and failed cancellation close t
 connection as transport failures. A blocked connection close is retried and is never
 reported complete early.
 
+## Readiness
+
+`Transport.ready` returns the next stream whose transport state changed, as a
+`TransportReady` carrying the stream handle and `readable`, `writable`, and `reset`
+bits, or `TRANSPORT_EMPTY` when nothing is waiting. Any other status fails the
+connection. The engine only reads and writes streams it has work for, so this is
+the only way it learns that a parked stream can make progress. The contract is
+written against the hardest adapter, one whose readiness queue can repeat itself:
+
+- Report every stream whose readable, writable, or reset state changed since that
+  stream's last `read` returned EMPTY or BLOCKED, or its last `write` or `finish`
+  returned BLOCKED. Set `readable` for new data or a FIN, `writable` for new send
+  capacity, and `reset` for RESET_STREAM or STOP_SENDING.
+- No report may be dropped. A lost report can strand a stream forever.
+- Duplicate reports, reports with no news, reports for streams the engine never
+  held or already released, and reports with a stale generation are all harmless.
+  A spurious report with `readable` set costs at most one empty read.
+- A stream that `accept` has not yet returned needs no report. The engine reads
+  every stream once when it accepts or opens it.
+- The peer's control and QPACK streams follow the same rule. Nothing is read
+  unconditionally on each call.
+- The engine's own control, encoder, and decoder streams are written on every
+  `process` while their queues hold bytes, so reports for them are ignored.
+
+A report with `readable` or `reset` set on a stream whose field section is blocked
+on QPACK makes the engine probe it with a zero-length read, which is how a reset of
+a blocked stream is noticed.
+
 `release` means the stream is settled, not merely finished with. A stream this side
 has just reset still owes the peer's acknowledgment of that reset, so `release`
 reports `TRANSPORT_BLOCKED` until the transport can free the handle. The engine
@@ -46,7 +74,10 @@ closes the connection.
 `test/h3-quic` binds this adapter to the `mach-quic` connection driver and drives
 two real drivers against each other. Stream handle identity, delivery, and receive
 credit map one to one, and the driver's own uncredited total proves that `read`
-returns no window. Two statuses need translating: the QUIC write status answers
+returns no window. mach-quic 0.10 has no readiness queue yet, so that adapter
+reports every stream it handed out once per sweep. The contract allows the
+spurious reports, and the adapter switches to `transport.ready_stream` when
+mach-quic 0.12.0 ships it. Two statuses need translating: the QUIC write status answers
 whether the entire write was accepted rather than whether the call made progress,
 and QUIC names an unsettled release a stream state error rather than a blocked one.
 No packet, TLS, or recovery API crosses this boundary.
@@ -58,9 +89,11 @@ without changing stream delivery or credit ownership.
 
 ## Memory and limits
 
-The caller provides the stream slots, one `StreamMemory` per slot, and the
-pending-release array that holds handles whose release the transport has not yet
-completed. Each memory
+The caller provides the stream slots, one `StreamMemory` per slot, the stream id
+index, and the pending-release array that holds handles whose release the transport
+has not yet completed. `Storage.stream_index` holds `stream_index_capacity`
+`StreamIndexEntry` records. The capacity must be a power of two and at least twice
+`stream_capacity`, which keeps every probe short and guarantees an empty entry. Each memory
 record independently bounds read fragments, SETTINGS entries, encoded field
 sections, decoded fields, decoded string storage, QPACK scratch, output bytes, and
 field references. Connection storage separately owns both QPACK tables, table
@@ -108,6 +141,42 @@ the outbound encoder after the control stream validates them. Peer allowances la
 than local storage are safely used at the local configured ceiling. Peer field-size
 and blocked-stream allowances smaller than local maxima narrow the outbound encoder.
 
+## Scheduling and cost
+
+Every per-event path costs O(streams with news), not O(stream capacity).
+
+- Stream lookup by id is an open-addressed hash of the id into
+  `Storage.stream_index` with linear probing. Removal leaves a tombstone, found in
+  O(1) through the position each stream records. The index is rebuilt in place once
+  tombstones pass a quarter of its capacity, so removal stays amortized O(1).
+  `stream_for` and every call that names a stream id are O(1).
+- Free slots form an intrusive list built by `init`, so allocation and release are
+  O(1). Generations advance on every allocation as before.
+- Streams with engine-side work sit on an intrusive FIFO. A stream is queued when it
+  holds an event to re-emit, has buffered unparsed input, has request output or a
+  FIN to submit that is not parked on a blocked write, owes a retry after GOAWAY,
+  has a completed frame to finish, has a FIN to handle, or needs a read that has not
+  returned EMPTY since the last `readable` report. Reports from `Transport.ready`
+  and application calls (`send_headers`, `offer_data`, `consume_data`,
+  `release_event`) queue a stream when they give it work.
+- A QPACK-blocked stream waits on a list ordered by Required Insert Count. An
+  encoder-stream insert queues exactly the prefix of that list the new insert count
+  satisfies.
+- `process` accepts at most one peer stream, drains at most 64 readiness reports,
+  and services at most 64 queued streams, each at most once. A stream that still
+  has work after its turn goes back to the tail, so work is shared round-robin and
+  a call returns the first event it produces. With no news, one `process` call makes
+  one `accept` and one `ready` call and visits no stream.
+- `tick` walks only the request streams bound to an exchange.
+
+A host that cancels an exchange scope must call `cancel_stream` for that request.
+That is O(1) and resets the stream immediately. `tick` is the fallback for scopes
+cancelled elsewhere, such as a parent scope, and costs O(bound requests), so it
+belongs on a timer rather than on every event.
+
+GOAWAY handling, connection failure, and `destroy` still walk the stream table.
+Each runs at most once per connection.
+
 ## Critical streams and frames
 
 The engine opens one local control, QPACK encoder, and QPACK decoder stream and writes
@@ -135,7 +204,8 @@ bytes are credited immediately. Field-section bytes accumulate as uncredited byt
 until decode completes. If Required Insert Count is unavailable, the section keeps
 its `Sections` slot and all of its QUIC credit while other streams continue.
 
-Encoder-stream insertions retry blocked streams. Successful decode queues Section
+Encoder-stream insertions wake exactly the blocked streams whose Required Insert
+Count they satisfy. Successful decode queues Section
 Acknowledgment, releases the held credit, and publishes the decoded header event.
 Reset or local cancellation of a blocked stream releases its QPACK slot and queues
 Stream Cancellation. Insert Count Increment feedback is aggregated when the decoder
