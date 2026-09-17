@@ -1,4 +1,5 @@
 use http.core.body;
+use http.core.deadline;
 use http.core.field;
 use http.core.message;
 use http.core.method;
@@ -157,10 +158,7 @@ pub rec SlotMemory {
     held:             bool;
 }
 
-pub rec Deadline {
-    active: bool;
-    at:     time.Instant;
-}
+pub def Deadline: deadline.Deadline;
 
 pub rec Slot {
     state:             SlotState;
@@ -282,31 +280,6 @@ pub fun config_default() Config {
     };
 }
 
-fun valid_now(now: time.Instant) bool {
-    ret now.sec >= 0 && now.nsec >= 0 && now.nsec < 1000000000;
-}
-
-fun duration_valid(value: u64) bool {
-    ret value != 0 && value <= 0x7fffffffffffffff;
-}
-
-fun deadline(now: time.Instant, duration: u64) Deadline {
-    var seconds:     u64 = duration / 1000000000;
-    var nanoseconds: i64 = now.nsec + (duration % 1000000000)::i64;
-    if (nanoseconds >= 1000000000) {
-        nanoseconds = nanoseconds - 1000000000;
-        seconds     = seconds + 1;
-    }
-    if (seconds > 0x7fffffffffffffff - now.sec::u64) {
-        ret Deadline{active: true, at: time.Instant{sec: 0x7fffffffffffffff, nsec: 999999999}};
-    }
-    ret Deadline{active: true, at: time.Instant{sec: now.sec + seconds::i64, nsec: nanoseconds}};
-}
-
-fun expired(value: Deadline, now: time.Instant) bool {
-    ret value.active && !time.instant_before(now, value.at);
-}
-
 fun line_bytes(configured: parser.Limits) usize {
     var bytes: usize = configured.max_start_line;
     if (bytes < configured.max_header_line) { bytes = configured.max_header_line; }
@@ -323,11 +296,11 @@ fun config_valid(configured: Config, capacity: usize) bool {
         && configured.parser.max_trailers <= (-1)::usize / $size_of(field.Field)
         && line_bytes(configured.parser) != 0
         && configured.max_drain_bytes != 0
-        && duration_valid(configured.header_timeout_ns)
-        && duration_valid(configured.request_timeout_ns)
-        && duration_valid(configured.idle_timeout_ns)
-        && duration_valid(configured.write_timeout_ns)
-        && duration_valid(configured.total_timeout_ns);
+        && deadline.duration_valid(configured.header_timeout_ns)
+        && deadline.duration_valid(configured.request_timeout_ns)
+        && deadline.duration_valid(configured.idle_timeout_ns)
+        && deadline.duration_valid(configured.write_timeout_ns)
+        && deadline.duration_valid(configured.total_timeout_ns);
 }
 
 fun empty_event(engine: *Engine, kind: EventKind) Event {
@@ -505,7 +478,7 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
         || scope.root != connection_transport.operation_root || !scope_active(scope)
         || slots == nil || capacity == 0 || !config_valid(configured, capacity)
         || source == nil || account == nil || !account.open
-        || !valid_now(now)) { ret false; }
+        || !deadline.valid_now(now)) { ret false; }
     engine.source  = source;
     engine.account = account;
     var i: usize = 0;
@@ -555,9 +528,9 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     engine.graceful_requested = false;
     engine.tunnel_slot        = NO_SLOT;
     engine.tunnel_reported    = false;
-    engine.idle_deadline      = deadline(now, configured.idle_timeout_ns);
+    engine.idle_deadline      = deadline.after(now, configured.idle_timeout_ns);
     engine.wait_deadline      = Deadline{active: false, at: now};
-    engine.total_deadline     = deadline(now, configured.total_timeout_ns);
+    engine.total_deadline     = deadline.after(now, configured.total_timeout_ns);
     engine.error              = ERROR_NONE;
     engine.initialized        = true;
     await_request(engine, now);
@@ -570,7 +543,7 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
 # it, and it only ends when a slot starts. the idle deadline keeps running beside it
 fun await_request(engine: *Engine, now: time.Instant) {
     if (engine.role != SERVER || engine.count != 0 || engine.wait_deadline.active) { ret; }
-    engine.wait_deadline = deadline(now, engine.configured.header_timeout_ns);
+    engine.wait_deadline = deadline.after(now, engine.configured.header_timeout_ns);
 }
 
 fun next_sequence(engine: *Engine) u64 {
@@ -594,8 +567,8 @@ fun start_slot(engine: *Engine, index: usize, now: time.Instant) *Slot {
     if (!acquire_slot_memory(engine, slot)) { ret nil; }
     slot.state                  = SLOT_LIVE;
     slot.sequence               = next_sequence(engine);
-    slot.header_deadline        = deadline(now, engine.configured.header_timeout_ns);
-    slot.request_deadline       = deadline(now, engine.configured.request_timeout_ns);
+    slot.header_deadline        = deadline.after(now, engine.configured.header_timeout_ns);
+    slot.request_deadline       = deadline.after(now, engine.configured.request_timeout_ns);
     engine.count                = engine.count + 1;
     engine.idle_deadline.active = false;
     engine.wait_deadline.active = false;
@@ -748,13 +721,6 @@ pub fun destroy(engine: *Engine) bool {
     ret true;
 }
 
-fun earlier(first: Deadline, second: Deadline) Deadline {
-    if (!second.active)                           { ret first; }
-    if (!first.active)                            { ret second; }
-    if (time.instant_before(second.at, first.at)) { ret second; }
-    ret first;
-}
-
 # the earliest deadline tick would enforce now, inactive when none applies.
 # any call that takes now or changes a slot can move it, so query it again after
 # each one. the scope's own deadline is the caller's and is not included
@@ -762,24 +728,24 @@ pub fun next_deadline(engine: *Engine) Deadline {
     var result: Deadline = Deadline{active: false, at: time.Instant{sec: 0, nsec: 0}};
     if (engine == nil || !engine.initialized || engine.state == CLOSED || engine.state == TUNNEL
         || engine.state == CLOSING || engine.state == FAILED) { ret result; }
-    result = earlier(result, engine.total_deadline);
+    result = deadline.earlier(result, engine.total_deadline);
     if (engine.count == 0) {
-        result = earlier(result, engine.idle_deadline);
-        result = earlier(result, engine.wait_deadline);
+        result = deadline.earlier(result, engine.idle_deadline);
+        result = deadline.earlier(result, engine.wait_deadline);
     }
     var offset: usize = 0;
     for (offset < engine.count) {
         val slot: *Slot = ?engine.slots[(engine.head + offset) % engine.capacity];
-        result = earlier(result, slot.header_deadline);
-        result = earlier(result, slot.request_deadline);
-        result = earlier(result, slot.write_deadline);
+        result = deadline.earlier(result, slot.header_deadline);
+        result = deadline.earlier(result, slot.request_deadline);
+        result = deadline.earlier(result, slot.write_deadline);
         offset = offset + 1;
     }
     ret result;
 }
 
 pub fun tick(engine: *Engine, now: time.Instant) Event {
-    if (engine == nil || !engine.initialized || !valid_now(now)) {
+    if (engine == nil || !engine.initialized || !deadline.valid_now(now)) {
         var invalid: Event;
         invalid.kind  = EVENT_ERROR;
         invalid.error = ERROR_STATE;
@@ -796,18 +762,18 @@ pub fun tick(engine: *Engine, now: time.Instant) Event {
         ret empty_event(engine, EVENT_ERROR);
     }
     val reason: cancel.Reason = cancel.reason(engine.scope);
-    if ((sel reason.timed_out))                                  { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
-    if (!(sel reason.active))                                    { ret fail(engine, ERROR_CANCELLED); }
-    if (expired(engine.total_deadline, now))                     { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
-    if (engine.count == 0 && expired(engine.idle_deadline, now)) { ret fail(engine, ERROR_IDLE_TIMEOUT); }
-    if (engine.count == 0 && expired(engine.wait_deadline, now)) { ret fail(engine, ERROR_HEADER_TIMEOUT); }
+    if ((sel reason.timed_out))                                           { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
+    if (!(sel reason.active))                                             { ret fail(engine, ERROR_CANCELLED); }
+    if (deadline.expired(engine.total_deadline, now))                     { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
+    if (engine.count == 0 && deadline.expired(engine.idle_deadline, now)) { ret fail(engine, ERROR_IDLE_TIMEOUT); }
+    if (engine.count == 0 && deadline.expired(engine.wait_deadline, now)) { ret fail(engine, ERROR_HEADER_TIMEOUT); }
     var offset: usize = 0;
     for (offset < engine.count) {
         val index: usize = (engine.head + offset) % engine.capacity;
         val slot:  *Slot = ?engine.slots[index];
-        if (expired(slot.header_deadline, now))  { ret fail(engine, ERROR_HEADER_TIMEOUT); }
-        if (expired(slot.request_deadline, now)) { ret fail(engine, ERROR_REQUEST_TIMEOUT); }
-        if (expired(slot.write_deadline, now))   { ret fail(engine, ERROR_WRITE_TIMEOUT); }
+        if (deadline.expired(slot.header_deadline, now))  { ret fail(engine, ERROR_HEADER_TIMEOUT); }
+        if (deadline.expired(slot.request_deadline, now)) { ret fail(engine, ERROR_REQUEST_TIMEOUT); }
+        if (deadline.expired(slot.write_deadline, now))   { ret fail(engine, ERROR_WRITE_TIMEOUT); }
         offset = offset + 1;
     }
     ret empty_event(engine, EVENT_NONE);
@@ -817,7 +783,7 @@ pub fun enqueue_request(engine: *Engine, version: message.Version,
     request_method: method.Method, request_target: target.Target, fields: *field.Fields,
     trailers: *field.Fields, now: time.Instant) usize {
     if (engine == nil || !engine.initialized || engine.role != CLIENT || engine.state != OPEN
-        || engine.count >= engine.capacity || !valid_now(now)) { ret NO_SLOT; }
+        || engine.count >= engine.capacity || !deadline.valid_now(now)) { ret NO_SLOT; }
     val index: usize = tail_index(engine);
     val slot:  *Slot = start_slot(engine, index, now);
     if (slot == nil) { ret NO_SLOT; }
@@ -836,7 +802,7 @@ pub fun enqueue_request(engine: *Engine, version: message.Version,
     slot.out_kind          = OUT_REQUEST;
     slot.upgrade_requested = upgrade_requested(fields);
     slot.close_after       = !slot.serializer.plan.keep_alive;
-    slot.write_deadline    = deadline(now, engine.configured.write_timeout_ns);
+    slot.write_deadline    = deadline.after(now, engine.configured.write_timeout_ns);
     ret index;
 }
 
@@ -845,7 +811,7 @@ pub fun prepare_informational(engine: *Engine, index: usize, code: status.Status
     if (!slot_live(engine, index) || engine.role != SERVER || engine.state == TUNNEL
         || code < 100 || code >= 200 || code == status.SWITCHING_PROTOCOLS
         || current_outbound(engine) != index || engine.slots[index].serializer_active
-        || engine.slots[index].final_prepared || !valid_now(now)) { ret false; }
+        || engine.slots[index].final_prepared || !deadline.valid_now(now)) { ret false; }
     val slot: *Slot = ?engine.slots[index];
     if (!serializer.init_response(?slot.serializer, slot.parser.parsed.version,
         slot.request_method.kind, code, reason, fields, nil,
@@ -853,7 +819,7 @@ pub fun prepare_informational(engine: *Engine, index: usize, code: status.Status
     slot.serializer_active = true;
     slot.out_kind          = OUT_INFORMATIONAL;
     if (!slot.write_deadline.active) {
-        slot.write_deadline = deadline(now, engine.configured.write_timeout_ns);
+        slot.write_deadline = deadline.after(now, engine.configured.write_timeout_ns);
     }
     ret true;
 }
@@ -864,7 +830,7 @@ pub fun prepare_response(engine: *Engine, index: usize, code: status.Status,
     if (!slot_live(engine, index) || engine.role != SERVER || engine.state == TUNNEL
         || (code < 200 && code != status.SWITCHING_PROTOCOLS)
         || engine.slots[index].serializer_active || engine.slots[index].final_prepared
-        || !valid_now(now)) { ret false; }
+        || !deadline.valid_now(now)) { ret false; }
     val slot: *Slot = ?engine.slots[index];
     if (code == status.SWITCHING_PROTOCOLS
         && (!slot.upgrade_requested || !upgrade_requested(fields))) { ret false; }
@@ -878,7 +844,7 @@ pub fun prepare_response(engine: *Engine, index: usize, code: status.Status,
         || code == status.SWITCHING_PROTOCOLS;
     if (!slot.serializer.plan.keep_alive && !slot.tunnel_ready) { slot.close_after = true; }
     if (!slot.write_deadline.active) {
-        slot.write_deadline = deadline(now, engine.configured.write_timeout_ns);
+        slot.write_deadline = deadline.after(now, engine.configured.write_timeout_ns);
     }
     ret true;
 }
@@ -1003,7 +969,7 @@ fun mark_outbound(engine: *Engine, index: usize, kind: OutKind) Event {
 
 pub fun complete_io(engine: *Engine, completion: *transport.Completion,
     now: time.Instant) Event {
-    if (engine == nil || !engine.initialized || completion == nil || !valid_now(now)) {
+    if (engine == nil || !engine.initialized || completion == nil || !deadline.valid_now(now)) {
         var invalid: Event;
         invalid.kind  = EVENT_ERROR;
         invalid.error = ERROR_STATE;
@@ -1154,7 +1120,7 @@ fun need_read(engine: *Engine) Event {
 }
 
 pub fun process(engine: *Engine, now: time.Instant) Event {
-    if (engine == nil || !engine.initialized || !valid_now(now)) {
+    if (engine == nil || !engine.initialized || !deadline.valid_now(now)) {
         var invalid: Event;
         invalid.kind  = EVENT_ERROR;
         invalid.error = ERROR_STATE;
@@ -1346,7 +1312,7 @@ fun sweep_done(engine: *Engine) {
 fun sweep(engine: *Engine, now: time.Instant) {
     sweep_done(engine);
     if (engine.count == 0 && engine.state == OPEN) {
-        engine.idle_deadline = deadline(now, engine.configured.idle_timeout_ns);
+        engine.idle_deadline = deadline.after(now, engine.configured.idle_timeout_ns);
     }
     # pipelined bytes or a readable wait already mean the next request is owed
     if (engine.count == 0 && (input_available(engine) != 0 || engine.readable)) {
@@ -1355,7 +1321,7 @@ fun sweep(engine: *Engine, now: time.Instant) {
 }
 
 pub fun release(engine: *Engine, index: usize, now: time.Instant) bool {
-    if (!slot_live(engine, index) || !valid_now(now)
+    if (!slot_live(engine, index) || !deadline.valid_now(now)
         || !engine.slots[index].inbound_complete || !engine.slots[index].outbound_complete) {
         ret false;
     }

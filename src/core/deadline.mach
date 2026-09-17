@@ -1,0 +1,67 @@
+# absolute monotonic deadlines shared by the connection engines
+
+use std.chrono.time;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+
+pub rec Deadline {
+    active: bool;
+    at:     time.Instant;
+}
+
+pub fun none() Deadline {
+    ret Deadline{active: false, at: time.Instant{sec: 0, nsec: 0}};
+}
+
+pub fun valid_now(now: time.Instant) bool {
+    ret now.sec >= 0 && now.nsec >= 0 && now.nsec < 1000000000;
+}
+
+pub fun duration_valid(value: u64) bool {
+    ret value != 0 && value <= 0x7fffffffffffffff;
+}
+
+# saturates at the latest representable instant
+pub fun after(now: time.Instant, duration: u64) Deadline {
+    var seconds:     u64 = duration / 1000000000;
+    var nanoseconds: i64 = now.nsec + (duration % 1000000000)::i64;
+    if (nanoseconds >= 1000000000) {
+        nanoseconds = nanoseconds - 1000000000;
+        seconds     = seconds + 1;
+    }
+    if (seconds > 0x7fffffffffffffff - now.sec::u64) {
+        ret Deadline{active: true, at: time.Instant{sec: 0x7fffffffffffffff, nsec: 999999999}};
+    }
+    ret Deadline{active: true, at: time.Instant{sec: now.sec + seconds::i64, nsec: nanoseconds}};
+}
+
+pub fun expired(value: Deadline, now: time.Instant) bool {
+    ret value.active && !time.instant_before(now, value.at);
+}
+
+pub fun earlier(first: Deadline, second: Deadline) Deadline {
+    if (!second.active)                           { ret first; }
+    if (!first.active)                            { ret second; }
+    if (time.instant_before(second.at, first.at)) { ret second; }
+    ret first;
+}
+
+# the later of two instants, so a caller clock that steps back never moves a deadline earlier
+pub fun latest(first: time.Instant, second: time.Instant) time.Instant {
+    if (time.instant_before(first, second)) { ret second; }
+    ret first;
+}
+
+test "http.core.deadline: expiry is inclusive and saturates" {
+    val start: time.Instant = time.Instant{sec: 10, nsec: 999999999};
+    val at:    Deadline     = after(start, 1);
+    if (!at.active || at.at.sec != 11 || at.at.nsec != 0) { ret 1; }
+    if (expired(at, start) || !expired(at, at.at))        { ret 2; }
+    val far: Deadline = after(time.Instant{sec: 0x7fffffffffffffff, nsec: 0}, 1000000000);
+    if (far.at.sec != 0x7fffffffffffffff || far.at.nsec != 999999999)         { ret 3; }
+    if (expired(none(), start))                                               { ret 4; }
+    if (earlier(none(), at).at.sec != 11 || earlier(at, none()).at.sec != 11) { ret 5; }
+    if (latest(start, at.at).sec != 11 || latest(at.at, start).sec != 11)     { ret 6; }
+    ret 0;
+}
