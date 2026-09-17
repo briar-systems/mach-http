@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+- **Breaking.** `h2.connection.init` takes a `StreamIndexEntry` array and its capacity after the stream capacity. The capacity must be a power of two and at least twice the stream capacity (#103).
+- **Breaking.** `h2.connection.process` (and `complete_io` for reads) can return the new `EVENT_PENDING`. It means the call used up its per-call budget of 64 units and work remains, so the host should call `process` again. It takes precedence over `EVENT_NEED_READ` (#103).
+- Performance: HTTP/2 routine paths no longer scan the stream table, so their cost is O(changed streams) (#103).
+  - Stream lookup, allocation and release are O(1).
+  - GOAWAY retries, owed WINDOW_UPDATEs, writable streams and exchange-bound streams each have their own set.
+  - `tick` costs O(open exchange-bound streams). A host that cancels an exchange scope should call `cancel_stream`.
+  - Weighted scheduling keeps the same order over the writable set only.
+  - The priority cycle check walks at most 32 ancestors.
+
 ## [0.11.0] - 2026-09-17
 
 ### Added
