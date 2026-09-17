@@ -150,8 +150,12 @@ Once the table reaches its cap, a record is always free for the admission checks
 
 `destroy` returns every borrowed record and buffer to the account and the engine to
 the state `init` accepts, so one set of caller-owned storage can carry a succession of
-connections. It refuses while a request is live or while the transport still owes a
-release, because both are references into state the caller is about to reuse. The
+connections. It refuses while a request is live, and while the transport still owes a
+release before the connection has closed, because both are references into state the
+caller is about to reuse. Releases the peer never acknowledged stop blocking once the
+engine is closed. After a failure or close, a terminal request's header event can be
+released without an exchange, and held data can still be consumed. The engine then
+grants the transport no more credit, so a failed engine can always be destroyed. The
 peer's control and QPACK streams stay live for the whole connection and are reclaimed
 by the transport close, so they do not block teardown. It clears every initialization
 guard the engine holds by value, including both QPACK tables, the inbound and
