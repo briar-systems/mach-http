@@ -296,6 +296,7 @@ pub rec Engine {
     ready_count:               usize;
     lists:                     [LIST_COUNT]StreamList;
     slot_visits:               u64;
+    index_rebuilds:            u64;
     active_streams:            usize;
     active_local:              usize;
     active_remote:             usize;
@@ -566,6 +567,7 @@ fun index_clear(engine: *Engine) {
 
 # runs after more than capacity / 4 removals, so its linear cost is amortized O(1)
 fun index_rebuild(engine: *Engine) {
+    engine.index_rebuilds = engine.index_rebuilds + 1;
     index_clear(engine);
     var i: usize = 0;
     for (i < engine.stream_capacity) {
@@ -947,6 +949,7 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
         list               = list + 1;
     }
     engine.slot_visits    = 0;
+    engine.index_rebuilds = 0;
     engine.active_streams = 0;
     engine.active_local   = 0;
     engine.active_remote  = 0;
@@ -1124,8 +1127,9 @@ pub fun release_stream(engine: *Engine, id: u32, generation: u64) bool {
         && stream.exchange.state != exchange.TIMED_OUT_STATE
         && stream.exchange.state != exchange.FAILED_STATE)) { ret false; }
     if (engine.active_streams != 0) { engine.active_streams = engine.active_streams - 1; }
-    index_remove(engine, stream);
+    # a rebuild triggered by the removal must not see this stream as live
     reset_stream(stream);
+    index_remove(engine, stream);
     refresh_stream(engine, stream);
     release_slot(engine, stream);
     ret true;
