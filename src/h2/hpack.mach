@@ -100,6 +100,7 @@ rec Shadow {
     original_count:   usize;
     bytes:            usize;
     max_bytes:        usize;
+    fold_names:       bool;
 }
 
 pub rec Decoder {
@@ -243,6 +244,25 @@ pub fun table_clear(table: *DynamicTable) bool {
 
 pub fun table_insert(table: *DynamicTable, name: view.View, value: view.View,
     sensitive: bool) bool {
+    ret table_store(table, name, value, sensitive, false);
+}
+
+# copies `length` bytes, lowercasing them when `fold` is set
+fun copy_name(output: *u8, input: *u8, length: usize, fold: bool) {
+    if (!fold) {
+        memory.raw_copy(output, input, length);
+        ret;
+    }
+    var i: usize = 0;
+    for (i < length) {
+        output[i] = field.lower(input[i]);
+        i         = i + 1;
+    }
+}
+
+# an encoder's table holds names as they went on the wire, so it stores them folded
+fun table_store(table: *DynamicTable, name: view.View, value: view.View,
+    sensitive: bool, fold: bool) bool {
     if (table == nil || !table.valid || !view_valid(name) || !view_valid(value)) {
         ret false;
     }
@@ -269,7 +289,7 @@ pub fun table_insert(table: *DynamicTable, name: view.View, value: view.View,
         };
         i = i - 1;
     }
-    memory.raw_copy(table.storage, name.data, name.len);
+    copy_name(table.storage, name.data, name.len, fold);
     memory.raw_copy(?table.storage[name.len], value.data, value.len);
     table.items[0] = Entry{
         name:      view.view(table.storage, name.len),
@@ -462,11 +482,21 @@ pub fun huffman_decode(input: *u8, input_length: usize, output: *u8,
 }
 
 pub fun huffman_encoded_size(input: *u8, input_length: usize) usize {
+    ret huffman_size(input, input_length, false);
+}
+
+fun symbol_at(input: *u8, i: usize, fold: bool) usize {
+    if (fold) { ret field.lower(input[i])::usize; }
+    ret input[i]::usize;
+}
+
+# `fold` sizes and writes the input's ascii lowercase instead of the input
+fun huffman_size(input: *u8, input_length: usize, fold: bool) usize {
     if (input == nil && input_length != 0) { ret (-1)::usize; }
     var bits: u64   = 0;
     var i:    usize = 0;
     for (i < input_length) {
-        bits = bits + huffman_length(input[i]::usize)::u64;
+        bits = bits + huffman_length(symbol_at(input, i, fold))::u64;
         if (bits > ((-1)::usize)::u64 * 8) { ret (-1)::usize; }
         i = i + 1;
     }
@@ -475,7 +505,21 @@ pub fun huffman_encoded_size(input: *u8, input_length: usize) usize {
 
 pub fun huffman_encode(input: *u8, input_length: usize,
     output: *u8, output_capacity: usize) usize {
-    val required: usize = huffman_encoded_size(input, input_length);
+    ret huffman_write(input, input_length, output, output_capacity, false);
+}
+
+pub fun huffman_encode_lower(input: *u8, input_length: usize,
+    output: *u8, output_capacity: usize) usize {
+    ret huffman_write(input, input_length, output, output_capacity, true);
+}
+
+pub fun huffman_encoded_size_lower(input: *u8, input_length: usize) usize {
+    ret huffman_size(input, input_length, true);
+}
+
+fun huffman_write(input: *u8, input_length: usize,
+    output: *u8, output_capacity: usize, fold: bool) usize {
+    val required: usize = huffman_size(input, input_length, fold);
     if (required == (-1)::usize || output == nil || output_capacity < required) {
         ret (-1)::usize;
     }
@@ -483,9 +527,10 @@ pub fun huffman_encode(input: *u8, input_length: usize,
     var bit_offset: usize = 0;
     var i:          usize = 0;
     for (i < input_length) {
-        val code:   u32 = huffman_code(input[i]::usize);
-        val length: u8  = huffman_length(input[i]::usize);
-        var bit:    u8  = length;
+        val symbol: usize = symbol_at(input, i, fold);
+        val code:   u32   = huffman_code(symbol);
+        val length: u8    = huffman_length(symbol);
+        var bit:    u8    = length;
         for (bit > 0) {
             bit = bit - 1;
             if (((code >> bit) & 1) != 0) {
@@ -573,6 +618,7 @@ fun shadow_init(shadow: *Shadow, table: *DynamicTable,
     shadow.original_count   = table.count;
     shadow.bytes            = table.bytes;
     shadow.max_bytes        = table.max_bytes;
+    shadow.fold_names       = false;
     ret true;
 }
 
@@ -636,19 +682,20 @@ fun shadow_lookup(shadow: *Shadow, index: usize) Entry {
     ret make_entry("", "");
 }
 
+# names match in any case, since the encoder writes them lowercase
 fun shadow_find(shadow: *Shadow, name: view.View, value: view.View,
     exact_value: bool) usize {
     var index: usize = 1;
     for (index <= 61) {
         val item: Entry = static_entry(index);
-        if (same(item.name, name) && (!exact_value || same(item.value, value))) { ret index; }
+        if (field.name_equal(item.name, name) && (!exact_value || same(item.value, value))) { ret index; }
         index = index + 1;
     }
     val pending_count: usize = shadow_active_pending(shadow);
     var dynamic_index: usize = 0;
     for (dynamic_index < pending_count) {
         val item: Entry = shadow.pending[shadow.pending_count - 1 - dynamic_index];
-        if (same(item.name, name) && (!exact_value || same(item.value, value))) {
+        if (field.name_equal(item.name, name) && (!exact_value || same(item.value, value))) {
             ret 62 + dynamic_index;
         }
         dynamic_index = dynamic_index + 1;
@@ -656,7 +703,7 @@ fun shadow_find(shadow: *Shadow, name: view.View, value: view.View,
     var original: usize = 0;
     for (original < shadow.original_count) {
         val item: Entry = shadow.table.items[original];
-        if (same(item.name, name) && (!exact_value || same(item.value, value))) {
+        if (field.name_equal(item.name, name) && (!exact_value || same(item.value, value))) {
             ret 62 + pending_count + original;
         }
         original = original + 1;
@@ -670,7 +717,8 @@ fun shadow_commit(shadow: *Shadow) bool {
     var i: usize = shadow.pending_start;
     for (i < shadow.pending_count) {
         val item: Entry = shadow.pending[i];
-        if (!table_insert(shadow.table, item.name, item.value, item.sensitive)) { ret false; }
+        if (!table_store(shadow.table, item.name, item.value, item.sensitive,
+            shadow.fold_names)) { ret false; }
         i = i + 1;
     }
     ret shadow.table.bytes == shadow.bytes;
@@ -919,6 +967,7 @@ pub fun encoder_init(encoder: *Encoder, table: *DynamicTable,
         || output_capacity > limits.max_encoded_block_bytes
         || pending_capacity < limits.max_header_count
         || !shadow_init(?encoder.shadow, table, pending, pending_capacity)) { ret false; }
+    encoder.shadow.fold_names  = true;
     encoder.limits             = limits;
     encoder.table              = table;
     encoder.output             = output;
@@ -941,12 +990,13 @@ fun encoder_error(encoder: *Encoder, error: Error) Encode {
     ret Encode{ok: false, written: 0, error: error};
 }
 
+# `fold` writes the string's ascii lowercase, for field names
 fun encode_string(output: *u8, capacity: usize, value: view.View,
-    use_huffman: bool) usize {
+    use_huffman: bool, fold: bool) usize {
     if (!view_valid(value) || output == nil || capacity == 0) { ret 0; }
     var encoded_length: usize = value.len;
     if (use_huffman) {
-        encoded_length = huffman_encoded_size(value.data, value.len);
+        encoded_length = huffman_size(value.data, value.len, fold);
         if (encoded_length == (-1)::usize) { ret 0; }
     }
     var pattern: u8 = 0;
@@ -955,11 +1005,11 @@ fun encode_string(output: *u8, capacity: usize, value: view.View,
         output, capacity);
     if (prefix == 0 || encoded_length > capacity - prefix) { ret 0; }
     if (use_huffman) {
-        if (huffman_encode(value.data, value.len, ?output[prefix],
-            capacity - prefix) != encoded_length) { ret 0; }
+        if (huffman_write(value.data, value.len, ?output[prefix],
+            capacity - prefix, fold) != encoded_length) { ret 0; }
     }
     or {
-        memory.raw_copy(?output[prefix], value.data, value.len);
+        copy_name(?output[prefix], value.data, value.len, fold);
     }
     ret prefix + encoded_length;
 }
@@ -1040,7 +1090,7 @@ pub fun encoder_field(encoder: *Encoder, item: field.Field,
     if (written == 0) { ret encoder_error(encoder, ERROR_OUTPUT); }
     if (name_index == 0) {
         val amount: usize = encode_string(?encoder.output[start + written],
-            encoder.output_capacity - start - written, item.name, use_huffman);
+            encoder.output_capacity - start - written, item.name, use_huffman, true);
         if (amount == 0) {
             encoder.output_length = start;
             ret encoder_error(encoder, ERROR_OUTPUT);
@@ -1048,7 +1098,7 @@ pub fun encoder_field(encoder: *Encoder, item: field.Field,
         written = written + amount;
     }
     val value_amount: usize = encode_string(?encoder.output[start + written],
-        encoder.output_capacity - start - written, item.value, use_huffman);
+        encoder.output_capacity - start - written, item.value, use_huffman, false);
     if (value_amount == 0) {
         encoder.output_length = start;
         ret encoder_error(encoder, ERROR_OUTPUT);
@@ -1566,5 +1616,48 @@ test "http.h2.hpack: sensitive literals never enter dynamic state" {
     val decoded: Decode = decoder_feed(?decoder, ?output[0], finished.written, true);
     if (decoded.status != DECODE_COMPLETE || decoded.count != 1
         || !fields[0].sensitive || decoder_table.count != 0) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.hpack: names go on the wire lowercase and match the tables in any case" {
+    val limits:        Limits = limits_default();
+    var entries:       [8]Entry;
+    var table_storage: [4096]u8;
+    var table:         DynamicTable;
+    table_init(?table, ?entries[0], 8, ?table_storage[0], 4096, 4096, 4096);
+    var output:  [64]u8;
+    var pending: [100]Entry;
+    var encoder: Encoder;
+    if (!encoder_init(?encoder, ?table, ?output[0], 64, ?pending[0], 100, limits)) { ret 1; }
+    var custom: [8]u8;
+    memory.raw_copy(?custom[0], "X-Custom", 8);
+    val name: view.View = view.view(?custom[0], 8);
+    # a mixed-case name still indexes the static content-type name
+    if (!encoder_field(?encoder, field.Field{name: text("Content-Type"),
+        value: text("text/plain"), sensitive: false}, REPRESENT_AUTO, false).ok
+        || output[0] != 0x0f || output[1] != 0x10 || output[2] != 0x0a) { ret 2; }
+    if (!encoder_field(?encoder, field.Field{name: name, value: text("v"),
+        sensitive: false}, REPRESENT_INCREMENTAL, false).ok
+        || output[13] != 0x40 || output[14] != 0x08
+        || !memory.raw_equal(?output[15], "x-custom", 8)) { ret 3; }
+    # the pending entry matches a later spelling exactly
+    if (!encoder_field(?encoder, field.Field{name: text("x-CUSTOM"), value: text("v"),
+        sensitive: false}, REPRESENT_AUTO, false).ok || output[25] != 0xbe) { ret 4; }
+    if (!encoder_finish(?encoder).ok || table.count != 1
+        || !same(table.items[0].name, text("x-custom"))
+        || !memory.raw_equal(?custom[0], "X-Custom", 8)) { ret 5; }
+    # a committed entry matches too, and huffman writes the lowercase name
+    var second:  Encoder;
+    var huffman: [64]u8;
+    if (!encoder_init(?second, ?table, ?huffman[0], 64, ?pending[0], 100, limits)
+        || !encoder_field(?second, field.Field{name: text("X-CUSTOM"), value: text("v"),
+        sensitive: false}, REPRESENT_AUTO, true).ok || huffman[0] != 0xbe) { ret 6; }
+    if (!encoder_field(?second, field.Field{name: text("X-Other"), value: text("w"),
+        sensitive: false}, REPRESENT_WITHOUT, true).ok) { ret 7; }
+    var expected: [8]u8;
+    val size:     usize = huffman_encode("x-other", 7, ?expected[0], 8);
+    if (size == (-1)::usize || huffman[1] != 0 || huffman[2] != (0x80 | size::u8)
+        || !memory.raw_equal(?huffman[3], ?expected[0], size)
+        || huffman_encoded_size_lower("X-Other", 7) != size) { ret 8; }
     ret 0;
 }

@@ -1466,6 +1466,12 @@ fun is_name(name: view.View, literal: *u8, length: usize) bool {
     ret same_view(name, view.view(literal, length));
 }
 
+# a received name must match exactly, while a caller's name may use any case
+fun name_is(name: view.View, inbound: bool, literal: *u8, length: usize) bool {
+    if (inbound) { ret is_name(name, literal, length); }
+    ret field.name_equal(name, view.view(literal, length));
+}
+
 fun lowercase(name: view.View) bool {
     if (name.data == nil || name.len == 0) { ret false; }
     var i: usize = 0;
@@ -1508,15 +1514,16 @@ fun authority_valid(value: view.View) bool {
     ret true;
 }
 
-fun regular_field_valid(item: field.Field) bool {
-    if (!lowercase(item.name) || !field.valid_name(item.name)
+fun regular_field_valid(item: field.Field, inbound: bool) bool {
+    # the block walk has already refused a received uppercase name
+    if (!field.valid_name(item.name)
         || !field.valid_value(item.value)) { ret false; }
-    if (is_name(item.name, "connection", 10)
-        || is_name(item.name, "proxy-connection", 16)
-        || is_name(item.name, "keep-alive", 10)
-        || is_name(item.name, "transfer-encoding", 17)
-        || is_name(item.name, "upgrade", 7)) { ret false; }
-    if (is_name(item.name, "te", 2) && !trailers_value(item.value)) { ret false; }
+    if (name_is(item.name, inbound, "connection", 10)
+        || name_is(item.name, inbound, "proxy-connection", 16)
+        || name_is(item.name, inbound, "keep-alive", 10)
+        || name_is(item.name, inbound, "transfer-encoding", 17)
+        || name_is(item.name, inbound, "upgrade", 7)) { ret false; }
+    if (name_is(item.name, inbound, "te", 2) && !trailers_value(item.value)) { ret false; }
     ret true;
 }
 
@@ -1547,7 +1554,7 @@ fun parse_length(value: view.View, length: *u64) bool {
 }
 
 fun validate_header_block(items: *field.Field, count: usize, kind: u8,
-    connect_enabled: bool, maximum_bytes: usize, block: *HeaderBlock) bool {
+    connect_enabled: bool, maximum_bytes: usize, inbound: bool, block: *HeaderBlock) bool {
     if (block == nil || (items == nil && count != 0)) { ret false; }
     @block               = empty_headers();
     block.fields         = items;
@@ -1566,7 +1573,7 @@ fun validate_header_block(items: *field.Field, count: usize, kind: u8,
     var i:             usize     = 0;
     for (i < count) {
         val item: field.Field = items[i];
-        if (item.name.data == nil || item.name.len == 0 || !lowercase(item.name)
+        if (item.name.data == nil || item.name.len == 0 || (inbound && !lowercase(item.name))
             || !field.valid_value(item.value) || item.name.len > maximum_bytes
             || item.value.len > maximum_bytes - item.name.len
             || item.name.len + item.value.len > maximum_bytes - bytes
@@ -1574,27 +1581,27 @@ fun validate_header_block(items: *field.Field, count: usize, kind: u8,
         bytes = bytes + item.name.len + item.value.len + 32;
         if (item.name.data[0] == ':') {
             if (saw_regular || kind == HEADER_TRAILERS) { ret false; }
-            if (is_name(item.name, ":method", 7) && !saw_method) {
+            if (name_is(item.name, inbound, ":method", 7) && !saw_method) {
                 block.method = item.value;
                 saw_method   = true;
             }
-            or (is_name(item.name, ":scheme", 7) && !saw_scheme) {
+            or (name_is(item.name, inbound, ":scheme", 7) && !saw_scheme) {
                 block.scheme = item.value;
                 saw_scheme   = true;
             }
-            or (is_name(item.name, ":path", 5) && !saw_path) {
+            or (name_is(item.name, inbound, ":path", 5) && !saw_path) {
                 block.path = item.value;
                 saw_path   = true;
             }
-            or (is_name(item.name, ":authority", 10) && !saw_authority) {
+            or (name_is(item.name, inbound, ":authority", 10) && !saw_authority) {
                 block.authority = item.value;
                 saw_authority   = true;
             }
-            or (is_name(item.name, ":protocol", 9) && !saw_protocol) {
+            or (name_is(item.name, inbound, ":protocol", 9) && !saw_protocol) {
                 block.protocol = item.value;
                 saw_protocol   = true;
             }
-            or (is_name(item.name, ":status", 7) && !saw_status) {
+            or (name_is(item.name, inbound, ":status", 7) && !saw_status) {
                 block.status = parse_status(item.value);
                 if (block.status == 0) { ret false; }
                 saw_status = true;
@@ -1606,15 +1613,15 @@ fun validate_header_block(items: *field.Field, count: usize, kind: u8,
                 block.regular_offset = i;
                 saw_regular          = true;
             }
-            if (!regular_field_valid(item)
+            if (!regular_field_valid(item, inbound)
                 || (kind == HEADER_TRAILERS
                 && !field.allowed_trailer_name(item.name))) { ret false; }
-            if (is_name(item.name, "host", 4)) {
+            if (name_is(item.name, inbound, "host", 4)) {
                 if (saw_host && !same_view(host, item.value)) { ret false; }
                 host     = item.value;
                 saw_host = true;
             }
-            if (is_name(item.name, "content-length", 14)) {
+            if (name_is(item.name, inbound, "content-length", 14)) {
                 var parsed: u64 = 0;
                 if (!parse_length(item.value, ?parsed)
                     || (block.has_content_length
@@ -2429,7 +2436,7 @@ fun finish_headers[T](engine: *Engine[T], stream: *Stream,
     var block: HeaderBlock;
     if (!validate_header_block(stream.memory.fields, decoded.count, kind,
         engine.configured.local.enable_connect_protocol,
-        engine.configured.inbound_qpack.max_field_section_bytes, ?block)) {
+        engine.configured.inbound_qpack.max_field_section_bytes, true, ?block)) {
         ret stream_failure[T](engine, stream, H3_MESSAGE_ERROR);
     }
     val inbound_limits: body.Limits = inbound_body_limits[T](engine);
@@ -2677,7 +2684,7 @@ fun outbound_header_kind[T](engine: *Engine[T], stream: *Stream,
     if (engine.role == SERVER && !stream.local) {
         var i: usize = 0;
         for (i < count) {
-            if (is_name(items[i].name, ":status", 7)) {
+            if (name_is(items[i].name, false, ":status", 7)) {
                 val code: u16 = parse_status(items[i].value);
                 if (code >= 100 && code < 200) { ret HEADER_INFORMATIONAL; }
             }
@@ -2705,7 +2712,7 @@ pub fun send_headers[T](engine: *Engine[T], id: u64, items: *field.Field,
         maximum = engine.peer.max_field_section_size;
     }
     if (kind == 0 || !validate_header_block(items, count, kind,
-        engine.peer.enable_connect_protocol, maximum, ?block)
+        engine.peer.enable_connect_protocol, maximum, false, ?block)
         || (kind == HEADER_INFORMATIONAL && end_stream)
         || (kind == HEADER_TRAILERS && !end_stream)
         || (end_stream && block.has_content_length && block.content_length != 0
@@ -5549,5 +5556,95 @@ test "http.h3.connection: a closed connection destroys with releases the transpo
     if (!destroy[TestTransport](?fixture.engine)) { ret 5; }
     if (fixture.account.held != 0)                { ret 6; }
     if (fixture.account.chunks != 0)              { ret 7; }
+    ret 0;
+}
+
+fun named(name: *u8, length: usize, value: *u8, value_length: usize) field.Field {
+    ret field.Field{name: view.view(name, length), value: view.view(value, value_length),
+        sensitive: false};
+}
+
+fun taken_request(fixture: *Fixture, storage: *ExchangeMemory) *TestWire {
+    var request_bytes:  [16]u8;
+    val request_length: usize     = static_request(?request_bytes[0], 16);
+    val wire:           *TestWire = peer_stream(fixture, 0, ?request_bytes[0], request_length, false);
+    if (wire == nil) { ret nil; }
+    val request: Event = drive(fixture, EVENT_REQUEST_HEADERS, 32);
+    if (request.kind != EVENT_REQUEST_HEADERS
+        || !make_exchange(storage, request.generation, 0)
+        || !bind_exchange[TestTransport](?fixture.engine, 0, ?storage.exchange)
+        || !release_event[TestTransport](?fixture.engine, 0, request.generation)) { ret nil; }
+    ret wire;
+}
+
+test "http.h3.connection: outgoing names in any case are sent lowercase" {
+    var fixture: Fixture;
+    var storage: ExchangeMemory;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    val wire: *TestWire = taken_request(?fixture, ?storage);
+    if (wire == nil) { ret 2; }
+    var response: [2]field.Field;
+    response[0] = named(":status", 7, "200", 3);
+    response[1] = named("Content-Type", 12, "text/x-demo", 11);
+    if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 2,
+        false, false).status != OFFER_OUTPUT) { ret 3; }
+    process[TestTransport](?fixture.engine);
+    # the static :status 200 entry, then the static content-type name with a literal value
+    if (wire.output_length < 8 || wire.output[0] != frame.FRAME_HEADERS::u8
+        || wire.output[2] != 0 || wire.output[3] != 0 || wire.output[4] != 0xd9
+        || wire.output[5] != 0x5f || wire.output[6] != 0x1d) { ret 4; }
+    ret 0;
+}
+
+test "http.h3.connection: outgoing connection-specific names are refused in any case" {
+    var fixture: Fixture;
+    var storage: ExchangeMemory;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS
+        || taken_request(?fixture, ?storage) == nil) { ret 1; }
+    var response: [2]field.Field;
+    response[0] = named(":status", 7, "200", 3);
+    response[1] = named("Connection", 10, "close", 5);
+    if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 2,
+        false, false).status != OFFER_ERROR) { ret 2; }
+    response[1] = named("TE", 2, "gzip", 4);
+    if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 2,
+        false, false).status != OFFER_ERROR) { ret 3; }
+    response[1] = named("Content-Length", 14, "x", 1);
+    if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 2,
+        false, false).status != OFFER_ERROR) { ret 4; }
+    # an informational status is recognised whatever the case of its name
+    response[0] = named(":Status", 7, "103", 3);
+    response[1] = named("Link", 4, "</a>", 4);
+    if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 2,
+        true, false).status != OFFER_ERROR) { ret 5; }
+    if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 2,
+        false, false).status != OFFER_OUTPUT) { ret 6; }
+    ret 0;
+}
+
+test "http.h3.connection: a received uppercase name is still malformed" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var block: [12]u8;
+    block[0]  = 0;
+    block[1]  = 0;
+    block[2]  = 0xd1;
+    block[3]  = 0xd7;
+    block[4]  = 0xc1;
+    block[5]  = 0x50;
+    block[6]  = 1;
+    block[7]  = 'x';
+    block[8]  = 0x22;
+    block[9]  = 'X';
+    block[10] = 'a';
+    block[11] = 0;
+    var bytes:  [24]u8;
+    val length: usize = append_frame(?bytes[0], 24, frame.FRAME_HEADERS, ?block[0], 12);
+    if (length == 0 || peer_stream(?fixture, 0, ?bytes[0], length, true) == nil) { ret 2; }
+    val failed: Event = drive(?fixture, EVENT_STREAM_ERROR, 64);
+    if (failed.kind != EVENT_STREAM_ERROR || failed.stream_id != 0) { ret 3; }
     ret 0;
 }

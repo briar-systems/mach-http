@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+- HTTP/2 and HTTP/3 `send_headers` and `send_push_promise` accept caller field names in any case, as HTTP field names are case-insensitive (RFC 9110). `Content-Type` used to be refused with `OFFER_ERROR`, so a version-neutral caller worked over HTTP/1 and failed over HTTP/2 and HTTP/3 (#112).
+  - The HPACK and QPACK encoders write every literal name lowercase, raw or Huffman, and never modify the caller's view.
+  - The encoders match static and dynamic table names in any case, so `Content-Type` still indexes.
+  - An inserted name is stored lowercase in the encoder's table.
+  - Outbound validation compares pseudo-field names and the connection-specific, `te`, `host` and `content-length` names without case.
+  - Received names stay strict, and an uppercase name is still a malformed message.
+- `h2.hpack` gains `huffman_encode_lower` and `huffman_encoded_size_lower`, and `core.field` gains `lower` (#112).
+
 ## [0.13.0] - 2026-09-17
 
 ### Added

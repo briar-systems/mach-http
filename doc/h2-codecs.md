@@ -69,7 +69,11 @@ entries own copies in the table arena.
 
 `encoder_field` supports automatic indexed representation, incremental indexing,
 literal without indexing, and literal never indexed. Sensitive fields always use
-never indexed. Callers choose raw or RFC Huffman strings per field. All output and
+never indexed. Callers choose raw or RFC Huffman strings per field. A field name is
+matched against the static and dynamic tables in any case and written lowercase, as
+RFC 9113 requires on the wire. Only the output and the encoder's own table hold the
+lowercase copy: the caller's view is never modified. `huffman_encode_lower` and
+`huffman_encoded_size_lower` are the lowercase forms of the Huffman helpers. All output and
 shadow table changes remain pending until `encoder_finish`. `encoder_abort` discards
 the block without changing compression state.
 

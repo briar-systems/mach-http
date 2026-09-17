@@ -2148,6 +2148,12 @@ fun is_name(name: view.View, literal: *u8, length: usize) bool {
     ret same_view(name, view.view(literal, length));
 }
 
+# a received name must match exactly, while a caller's name may use any case
+fun name_is(name: view.View, inbound: bool, literal: *u8, length: usize) bool {
+    if (inbound) { ret is_name(name, literal, length); }
+    ret field.name_equal(name, view.view(literal, length));
+}
+
 fun lowercase(name: view.View) bool {
     if (name.data == nil || name.len == 0) { ret false; }
     var i: usize = 0;
@@ -2190,15 +2196,16 @@ fun authority_valid(value: view.View) bool {
     ret true;
 }
 
-fun regular_field_valid(item: field.Field) bool {
-    if (!lowercase(item.name) || !field.valid_name(item.name)
+fun regular_field_valid(item: field.Field, inbound: bool) bool {
+    # the block walk has already refused a received uppercase name
+    if (!field.valid_name(item.name)
         || !field.valid_value(item.value)) { ret false; }
-    if (is_name(item.name, "connection", 10)
-        || is_name(item.name, "proxy-connection", 16)
-        || is_name(item.name, "keep-alive", 10)
-        || is_name(item.name, "transfer-encoding", 17)
-        || is_name(item.name, "upgrade", 7)) { ret false; }
-    if (is_name(item.name, "te", 2) && !trailers_value(item.value)) { ret false; }
+    if (name_is(item.name, inbound, "connection", 10)
+        || name_is(item.name, inbound, "proxy-connection", 16)
+        || name_is(item.name, inbound, "keep-alive", 10)
+        || name_is(item.name, inbound, "transfer-encoding", 17)
+        || name_is(item.name, inbound, "upgrade", 7)) { ret false; }
+    if (name_is(item.name, inbound, "te", 2) && !trailers_value(item.value)) { ret false; }
     ret true;
 }
 
@@ -2231,7 +2238,7 @@ fun parse_length(value: view.View, length: *u64) bool {
 }
 
 fun validate_header_block(items: *field.Field, count: usize, kind: u8,
-    connect_enabled: bool, maximum_bytes: usize, block: *HeaderBlock) bool {
+    connect_enabled: bool, maximum_bytes: usize, inbound: bool, block: *HeaderBlock) bool {
     if (block == nil || (items == nil && count != 0)) { ret false; }
     @block               = empty_headers();
     block.fields         = items;
@@ -2250,7 +2257,7 @@ fun validate_header_block(items: *field.Field, count: usize, kind: u8,
     var i:             usize     = 0;
     for (i < count) {
         val item: field.Field = items[i];
-        if (item.name.data == nil || item.name.len == 0 || !lowercase(item.name)
+        if (item.name.data == nil || item.name.len == 0 || (inbound && !lowercase(item.name))
             || !field.valid_value(item.value) || item.name.len > maximum_bytes
             || item.value.len > maximum_bytes - item.name.len
             || item.name.len + item.value.len > maximum_bytes - bytes
@@ -2258,27 +2265,27 @@ fun validate_header_block(items: *field.Field, count: usize, kind: u8,
         bytes = bytes + item.name.len + item.value.len + 32;
         if (item.name.data[0] == ':') {
             if (saw_regular || kind == HEADER_TRAILERS) { ret false; }
-            if (is_name(item.name, ":method", 7) && !saw_method) {
+            if (name_is(item.name, inbound, ":method", 7) && !saw_method) {
                 block.method = item.value;
                 saw_method   = true;
             }
-            or (is_name(item.name, ":scheme", 7) && !saw_scheme) {
+            or (name_is(item.name, inbound, ":scheme", 7) && !saw_scheme) {
                 block.scheme = item.value;
                 saw_scheme   = true;
             }
-            or (is_name(item.name, ":path", 5) && !saw_path) {
+            or (name_is(item.name, inbound, ":path", 5) && !saw_path) {
                 block.path = item.value;
                 saw_path   = true;
             }
-            or (is_name(item.name, ":authority", 10) && !saw_authority) {
+            or (name_is(item.name, inbound, ":authority", 10) && !saw_authority) {
                 block.authority = item.value;
                 saw_authority   = true;
             }
-            or (is_name(item.name, ":protocol", 9) && !saw_protocol) {
+            or (name_is(item.name, inbound, ":protocol", 9) && !saw_protocol) {
                 block.protocol = item.value;
                 saw_protocol   = true;
             }
-            or (is_name(item.name, ":status", 7) && !saw_status) {
+            or (name_is(item.name, inbound, ":status", 7) && !saw_status) {
                 block.status = parse_status(item.value);
                 if (block.status == 0) { ret false; }
                 saw_status = true;
@@ -2290,16 +2297,16 @@ fun validate_header_block(items: *field.Field, count: usize, kind: u8,
                 block.regular_offset = i;
                 saw_regular          = true;
             }
-            if (!regular_field_valid(item)
+            if (!regular_field_valid(item, inbound)
                 || (kind == HEADER_TRAILERS && !field.allowed_trailer_name(item.name))) {
                 ret false;
             }
-            if (is_name(item.name, "host", 4)) {
+            if (name_is(item.name, inbound, "host", 4)) {
                 if (saw_host && !same_view(host, item.value)) { ret false; }
                 host     = item.value;
                 saw_host = true;
             }
-            if (is_name(item.name, "content-length", 14)) {
+            if (name_is(item.name, inbound, "content-length", 14)) {
                 var parsed_length: u64 = 0;
                 if (!parse_length(item.value, ?parsed_length)
                     || (block.has_content_length
@@ -2456,7 +2463,7 @@ fun finish_headers(engine: *Engine, stream: *Stream, decoded: hpack.Decode) Even
     }
     val connect_enabled: bool = engine.configured.local.enable_connect_protocol == 1;
     if (!validate_header_block(stream.memory.fields, decoded.count, kind,
-        connect_enabled, engine.configured.hpack.max_header_list_bytes, ?block)) {
+        connect_enabled, engine.configured.hpack.max_header_list_bytes, true, ?block)) {
         ret stream_error(engine, stream, H2_PROTOCOL_ERROR);
     }
     var event_kind: EventKind = EVENT_TRAILERS;
@@ -3042,7 +3049,7 @@ pub fun send_headers(engine: *Engine, id: u32, items: *field.Field,
         maximum = engine.peer.max_header_list_size::usize;
     }
     if (!validate_header_block(items, count, kind,
-        engine.peer.enable_connect_protocol == 1, maximum, ?checked)
+        engine.peer.enable_connect_protocol == 1, maximum, false, ?checked)
         || (end_stream && checked.has_content_length && checked.content_length != 0
         && !(kind == HEADER_RESPONSE && stream.exchange != nil
         && stream.exchange.request.method.kind == method.HEAD)
@@ -3117,7 +3124,7 @@ pub fun send_push_promise(engine: *Engine, parent_id: u32, promised_id: u32,
         || engine.header_output_active || !stream_writable(parent)
         || !validate_header_block(items, count, HEADER_PUSH,
         engine.peer.enable_connect_protocol == 1,
-        maximum, ?checked)) {
+        maximum, false, ?checked)) {
         ret Offer{status: OFFER_ERROR, consumed: 0, produced: 0,
             stream_id: promised_id, error: ERROR_STATE};
     }
@@ -5430,5 +5437,60 @@ test "http.h2.connection: timeouts need valid instants and a later clock never m
     bad.idle_timeout_ns = 0;
     var refused: Fixture;
     if (make_fixture(?refused, SERVER, bad)) { ret 5; }
+    ret 0;
+}
+
+fun named(name: *u8, length: usize, value: *u8, value_length: usize) field.Field {
+    ret field.Field{name: view.view(name, length), value: view.view(value, value_length),
+        sensitive: false};
+}
+
+test "http.h2.connection: outgoing names in any case are sent lowercase" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, false, ?first)) { ret 1; }
+    var response: [2]field.Field;
+    response[0] = named(":status", 7, "200", 3);
+    response[1] = named("Content-Type", 12, "text/x-demo", 11);
+    if (send_headers(?fixture.engine, 1, ?response[0], 2, false, false).status != OFFER_OUTPUT
+        || !submit_write(?fixture.engine, test_now(100))) { ret 2; }
+    # the static :status 200 entry, then the static content-type name with a literal value
+    val wire: *u8 = fixture.io.write_buffer;
+    if (wire[3] != frame.FRAME_HEADERS || wire[9] != 0x88 || wire[10] != 0x0f
+        || wire[11] != 0x10 || wire[12] != 11) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: outgoing connection-specific names are refused in any case" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, false, ?first)) { ret 1; }
+    var response: [2]field.Field;
+    response[0] = named(":status", 7, "200", 3);
+    response[1] = named("Connection", 10, "close", 5);
+    if (send_headers(?fixture.engine, 1, ?response[0], 2, false, false).status != OFFER_ERROR) { ret 2; }
+    response[1] = named("TE", 2, "gzip", 4);
+    if (send_headers(?fixture.engine, 1, ?response[0], 2, false, false).status != OFFER_ERROR) { ret 3; }
+    response[1] = named("Content-Length", 14, "x", 1);
+    if (send_headers(?fixture.engine, 1, ?response[0], 2, false, false).status != OFFER_ERROR) { ret 4; }
+    response[0] = named(":Status", 7, "200", 3);
+    response[1] = named("X-Ok", 4, "y", 1);
+    if (send_headers(?fixture.engine, 1, ?response[0], 2, false, false).status != OFFER_OUTPUT) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: a received uppercase name is still malformed" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture)) { ret 1; }
+    var block: [11]u8;
+    request_block(?block[0]);
+    block[6]  = 0x00;
+    block[7]  = 0x02;
+    block[8]  = 'X';
+    block[9]  = 'a';
+    block[10] = 0x00;
+    val reported: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 1, ?block[0], 11);
+    if (reported.kind != EVENT_STREAM_ERROR || reported.code != H2_PROTOCOL_ERROR) { ret 2; }
     ret 0;
 }
