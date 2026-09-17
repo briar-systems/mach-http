@@ -79,8 +79,10 @@ selection, retries, redirects, cancellation, and graceful drain are implemented.
 - Request, response, informational, trailer, and push pseudo-fields are validated at
   the connection boundary. Forbidden fields, authority conflicts, content-length
   mismatches, and data on bodyless responses reset only the affected stream.
-- Header, request, idle, write, and total deadlines are absolute. Slow progress does
-  not refresh them. Graceful close finishes admitted work before write half-close.
+- HTTP/1 and HTTP/2 enforce header, request, idle, write, and total deadlines. They
+  are absolute, and slow progress does not refresh them. An HTTP/2 stream that
+  stalls is reset alone, and `next_deadline` is O(1). Graceful close finishes
+  admitted work before write half-close.
 - HTTP/3 frame headers, SETTINGS pairs, typed control payloads, and unidirectional
   stream headers accept arbitrary fragmentation and retain borrowed payload input
   only until explicit release.

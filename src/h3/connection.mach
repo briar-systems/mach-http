@@ -1886,6 +1886,11 @@ fun drain_releases[T](engine: *Engine[T]) Event {
 fun credit[T](engine: *Engine[T], stream: *Stream, count: usize) bool {
     if (count == 0)                                 { ret true; }
     if (stream == nil || count > stream.uncredited) { ret false; }
+    # a failed or closed connection grants no more credit, so a held borrow can still end
+    if (engine.state == FAILED || engine.state == CLOSED) {
+        stream.uncredited = stream.uncredited - count;
+        ret true;
+    }
     val result: TransportOperation = engine.transport.credit(
         engine.transport.context, stream.transport_stream, count);
     if (result.status != TRANSPORT_OK) { ret false; }
@@ -3193,7 +3198,8 @@ pub fun release_event[T](engine: *Engine[T], id: u64, generation: u64) bool {
     val stream: *Stream = stream_for[T](engine, id);
     if (stream == nil || !stream.held || stream.held_kind == EVENT_DATA
         || stream.generation != generation
-        || (stream.held_kind == EVENT_REQUEST_HEADERS && stream.exchange == nil)) {
+        || (stream.held_kind == EVENT_REQUEST_HEADERS && stream.exchange == nil
+        && !stream_terminal(stream))) {
         ret false;
     }
     stream.held            = false;
@@ -3252,7 +3258,9 @@ fun release_all[T](engine: *Engine[T]) {
 # streams the host never released give their buffers back here.
 pub fun destroy[T](engine: *Engine[T]) bool {
     if (engine == nil || !engine.initialized) { ret false; }
-    if (engine.active_requests != 0 || engine.pending_release_count != 0) {
+    # the transport close reclaims every handle whose release is still owed
+    if (engine.active_requests != 0
+        || (engine.state != CLOSED && engine.pending_release_count != 0)) {
         ret false;
     }
     var i: usize = 0;
@@ -3644,7 +3652,8 @@ fun test_credit(context: *TestTransport, value: StreamHandle,
     count: usize) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
     test_call(context);
-    if (wire == nil || count > wire.delivered - wire.credited) {
+    # a closed connection grants no more credit
+    if (wire == nil || context.close_calls != 0 || count > wire.delivered - wire.credited) {
         ret TransportOperation{status: TRANSPORT_ERROR, error: 1};
     }
     wire.credited = wire.credited + count;
@@ -5478,5 +5487,67 @@ test "http.h3.connection: an exhausted pool registers a parked stream for a wake
         || woken[0] != 1) { ret 5; }
     if (!settle(?fixture) || fixture.engine.accept_parked
         || stream_for[TestTransport](?fixture.engine, 6) == nil) { ret 6; }
+    ret 0;
+}
+
+test "http.h3.connection: held data is consumed after the connection closes" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var wire_bytes:     [32]u8;
+    val headers_length: usize = static_request(?wire_bytes[0], 32);
+    var data:           [3]u8;
+    data[0] = 'a';
+    data[1] = 'b';
+    data[2] = 'c';
+    val data_length: usize = append_frame(?wire_bytes[headers_length],
+        32 - headers_length, frame.FRAME_DATA, ?data[0], 3);
+    val wire: *TestWire = peer_stream(?fixture, 0, ?wire_bytes[0],
+        headers_length + data_length, false);
+    if (wire == nil) { ret 2; }
+    val headers: Event = drive(?fixture, EVENT_REQUEST_HEADERS, 128);
+    var storage: ExchangeMemory;
+    if (!make_exchange(?storage, headers.generation, 0)
+        || !bind_exchange[TestTransport](?fixture.engine, 0, ?storage.exchange)
+        || !release_event[TestTransport](?fixture.engine, 0, headers.generation)) { ret 3; }
+    val service: exchange.Service = exchange.Service{ctx: nil, serve: test_service};
+    if (dispatch[TestTransport](?fixture.engine, 0, ?service) != exchange.SERVICE_COMPLETE
+        || drive(?fixture, EVENT_DATA, 64).data_length != 3) { ret 4; }
+    val credited: usize = wire.credited;
+    if (!cancel_connection[TestTransport](?fixture.engine)
+        || fixture.io.close_calls == 0) { ret 5; }
+    if (!consume_data[TestTransport](?fixture.engine, 0, 3)
+        || wire.credited != credited) { ret 6; }
+    ret 0;
+}
+
+test "http.h3.connection: a closed connection destroys with releases the transport still owed" {
+    var configured: Config = test_config();
+    configured.max_requests = 1;
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, configured)
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var first_bytes:   [16]u8;
+    var second_bytes:  [16]u8;
+    val first_length:  usize = static_request(?first_bytes[0], 16);
+    val second_length: usize = static_request(?second_bytes[0], 16);
+    if (peer_stream(?fixture, 0, ?first_bytes[0], first_length, false) == nil
+        || drive(?fixture, EVENT_REQUEST_HEADERS, 16).kind != EVENT_REQUEST_HEADERS
+        || peer_stream(?fixture, 4, ?second_bytes[0], second_length, false) == nil
+        || drive(?fixture, EVENT_STREAM_ERROR, 16).kind != EVENT_STREAM_ERROR) { ret 2; }
+    # the peer never acknowledges the rejection, so its release stays owed
+    if (fixture.engine.pending_release_count != 1
+        || !cancel_connection[TestTransport](?fixture.engine)
+        || fixture.engine.active_requests != 0
+        || destroy[TestTransport](?fixture.engine)) { ret 3; }
+    # the unbound request's borrow still ends, since its stream can never be served
+    val held: *Stream = stream_for[TestTransport](?fixture.engine, 0);
+    if (held == nil || !held.held
+        || !release_event[TestTransport](?fixture.engine, 0, held.generation)) { ret 8; }
+    if (!progress_close[TestTransport](?fixture.engine)
+        || fixture.engine.state != CLOSED) { ret 4; }
+    if (!destroy[TestTransport](?fixture.engine)) { ret 5; }
+    if (fixture.account.held != 0)                { ret 6; }
+    if (fixture.account.chunks != 0)              { ret 7; }
     ret 0;
 }
