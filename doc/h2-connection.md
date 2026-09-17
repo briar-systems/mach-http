@@ -292,7 +292,10 @@ The semantic validator enforces:
 - required, unique, ordered request and response pseudo-fields
 - ordinary CONNECT and negotiated extended CONNECT shapes
 - valid methods, schemes, paths, authorities, and three-digit statuses
-- lowercase field names and valid field values
+- valid field names and values. A received name must be lowercase, since an uppercase
+  name is malformed on the wire. A caller's name may use any case, because field
+  names are case-insensitive: the HPACK encoder writes it lowercase, and the
+  pseudo-field and connection-specific checks below compare it without case
 - rejection of connection-specific fields and TE values other than `trailers`
 - matching Host and `:authority` values
 - trailer field restrictions

@@ -71,7 +71,8 @@ table. An increment must be nonzero and cannot advance beyond the table's actual
 Insert Count.
 
 The matching `encode_*` functions construct instructions without retaining output
-storage. Table-mutating encoder instructions update local state only after their
+storage. Insert With Literal Name writes the name lowercase and stores it lowercase
+in the table. Table-mutating encoder instructions update local state only after their
 complete wire representation fits.
 
 ## Field-section decode
@@ -104,6 +105,8 @@ and releases its blocked slot.
 `FieldEncoder` accepts one field at a time. It chooses an exact static or dynamic
 index, a static or safe dynamic name reference, or a literal representation. Sensitive
 fields always use the never-indexed form. Huffman coding is caller-selected per field.
+A field name matches the static and dynamic tables in any case and is written
+lowercase, as RFC 9114 requires. The caller's view is never modified.
 
 The encoder reserves prefix space until `field_encoder_finish` knows the largest
 dynamic reference. Finish writes Required Insert Count and Delta Base, then registers
