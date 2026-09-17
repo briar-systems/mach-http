@@ -5,6 +5,7 @@
 ### Changed
 - **Breaking.** Dependencies: mach-std v4.0.1 (was v3.2.0), which requires mach 5.2 or later (#93). A consumer must be on std 4.x as well.
 - **Breaking.** `transport` builds its own errors with `io.error.make` and an explicit kind, so their `code` is now 0 (#93). An adapter that breaks its contract (reports more bytes than it was given, or completes with a retryable error) is reported as `IO` instead of `OTHER`. Refused and closed work is still `INVALID`, `BUSY` or `CLOSED`, and a cancel reason is still `TIMEOUT`, `CANCELLED` or `CLOSED`.
+- Dependencies (tests only): the h3-quic tests use mach-quic v0.10.0, which brings mach-crypto v0.11.0 and mach-tls v0.5.0 (#93).
 
 ## [0.9.0] - 2026-09-16
 
