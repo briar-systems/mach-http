@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- `h1.connection.next_deadline` returns the earliest deadline `tick` would enforce, so a host can arm one timer per connection instead of polling `tick` (#101).
+
 ### Changed
 - Documented that every `now` and deadline the client, DNS cache, pool and HTTP/1 engine take is `std.chrono.time.monotonic()` time. A wall-clock value is accepted but yields deadlines that never fire (#99).
 
