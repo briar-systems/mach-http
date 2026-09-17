@@ -124,12 +124,14 @@ pub fun init(items: *Field, capacity: usize, configured: Limits) Fields {
     ret fields;
 }
 
+# the ascii lowercase of a name byte, for encoders that must write names lowercase
+pub fun lower(byte: u8) u8 {
+    if (byte >= 'A' && byte <= 'Z') { ret byte + 32; }
+    ret byte;
+}
+
 fun equal_char(a: u8, b: u8) bool {
-    var left:  u8 = a;
-    var right: u8 = b;
-    if (left >= 'A' && left <= 'Z')   { left = left + 32; }
-    if (right >= 'A' && right <= 'Z') { right = right + 32; }
-    ret left == right;
+    ret lower(a) == lower(b);
 }
 
 pub fun name_equal(a: view.View, b: view.View) bool {
