@@ -564,6 +564,33 @@ pub fun destroy(engine: *Engine) bool {
     ret true;
 }
 
+fun earlier(first: Deadline, second: Deadline) Deadline {
+    if (!second.active)                        { ret first; }
+    if (!first.active)                         { ret second; }
+    if (time.time_before(second.at, first.at)) { ret second; }
+    ret first;
+}
+
+# the earliest deadline tick would enforce now, inactive when none applies.
+# any call that takes now or changes a slot can move it, so query it again after
+# each one. the scope's own deadline is the caller's and is not included
+pub fun next_deadline(engine: *Engine) Deadline {
+    var result: Deadline = Deadline{active: false, at: time.Time{sec: 0, nsec: 0}};
+    if (engine == nil || !engine.initialized || engine.state == CLOSED || engine.state == TUNNEL
+        || engine.state == CLOSING || engine.state == FAILED) { ret result; }
+    result = earlier(result, engine.total_deadline);
+    if (engine.count == 0) { result = earlier(result, engine.idle_deadline); }
+    var offset: usize = 0;
+    for (offset < engine.count) {
+        val slot: *Slot = ?engine.slots[(engine.head + offset) % engine.capacity];
+        result = earlier(result, slot.header_deadline);
+        result = earlier(result, slot.request_deadline);
+        result = earlier(result, slot.write_deadline);
+        offset = offset + 1;
+    }
+    ret result;
+}
+
 pub fun tick(engine: *Engine, now: time.Time) Event {
     if (engine == nil || !engine.initialized || !valid_now(now)) {
         var invalid: Event;
@@ -1832,6 +1859,89 @@ test "http.h1.connection: each deadline is absolute and never refreshed by progr
     var total_fixture: Fixture;
     if (!make_fixture(?total_fixture, SERVER, 1)
         || tick(?total_fixture.engine, test_now(400)).error != ERROR_TOTAL_TIMEOUT) { ret 12; }
+    ret 0;
+}
+
+fun deadline_at(value: Deadline, seconds: i64) bool {
+    ret value.active && time.time_equal(value.at, test_now(seconds));
+}
+
+# ticking just before the reported deadline is quiet and ticking at it fails
+fun fires_at(fixture: *Fixture, seconds: i64, error: Error) bool {
+    if (!deadline_at(next_deadline(?fixture.engine), seconds)) { ret false; }
+    if (tick(?fixture.engine, time.Time{sec: seconds - 1, nsec: 999999999}).kind != EVENT_NONE) {
+        ret false;
+    }
+    ret tick(?fixture.engine, test_now(seconds)).error == error;
+}
+
+test "http.h1.connection: next deadline is the one tick enforces first" {
+    var idle_fixture: Fixture;
+    if (!make_fixture(?idle_fixture, SERVER, 1)
+        || !fires_at(?idle_fixture, 160, ERROR_IDLE_TIMEOUT)) { ret 1; }
+    var total_fixture: Fixture;
+    if (!make_fixture(?total_fixture, SERVER, 1)) { ret 2; }
+    total_fixture.engine.idle_deadline.active = false;
+    if (!fires_at(?total_fixture, 400, ERROR_TOTAL_TIMEOUT)) { ret 3; }
+    var header_fixture: Fixture;
+    if (!make_fixture(?header_fixture, SERVER, 1)
+        || complete_read(?header_fixture, "G", false, test_now(100)).kind != EVENT_NEED_READ) { ret 4; }
+    # a live slot suppresses the earlier idle deadline, as tick does
+    header_fixture.engine.idle_deadline = Deadline{active: true, at: test_now(101)};
+    if (!fires_at(?header_fixture, 110, ERROR_HEADER_TIMEOUT)) { ret 5; }
+    var request_fixture: Fixture;
+    if (!make_fixture(?request_fixture, SERVER, 1)) { ret 6; }
+    val request_headers: Event = complete_read(?request_fixture,
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n", false, test_now(100));
+    if (request_headers.kind != EVENT_REQUEST_HEADERS
+        || request_fixture.slots[request_headers.slot].header_deadline.active
+        || !fires_at(?request_fixture, 130, ERROR_REQUEST_TIMEOUT)) { ret 7; }
+    var write_fixture: Fixture;
+    if (!make_fixture(?write_fixture, SERVER, 1)) { ret 8; }
+    val write_headers: Event = complete_read(?write_fixture,
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n", false, test_now(100));
+    var no_fields: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    if (write_headers.kind != EVENT_REQUEST_HEADERS
+        || process(?write_fixture.engine, test_now(100)).kind != EVENT_REQUEST_COMPLETE
+        || !prepare_response(?write_fixture.engine, write_headers.slot, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, test_now(120))) { ret 9; }
+    if (!fires_at(?write_fixture, 130, ERROR_REQUEST_TIMEOUT)) { ret 10; }
+    var late_write: Fixture;
+    if (!make_fixture(?late_write, SERVER, 1)) { ret 11; }
+    val late_headers: Event = complete_read(?late_write,
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n", false, test_now(100));
+    if (late_headers.kind != EVENT_REQUEST_HEADERS
+        || process(?late_write.engine, test_now(100)).kind != EVENT_REQUEST_COMPLETE
+        || !prepare_response(?late_write.engine, late_headers.slot, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, test_now(100))) { ret 12; }
+    late_write.slots[late_headers.slot].request_deadline.at = test_now(200);
+    late_write.slots[late_headers.slot].write_deadline.at   = test_now(125);
+    if (!fires_at(?late_write, 125, ERROR_WRITE_TIMEOUT)) { ret 13; }
+    ret 0;
+}
+
+test "http.h1.connection: no next deadline outside an open engine" {
+    var uninitialized: Engine;
+    uninitialized.initialized = false;
+    if (next_deadline(nil).active || next_deadline(?uninitialized).active) { ret 1; }
+    var failed: Fixture;
+    if (!make_fixture(?failed, SERVER, 1)
+        || tick(?failed.engine, test_now(160)).error != ERROR_IDLE_TIMEOUT
+        || failed.engine.state != FAILED || next_deadline(?failed.engine).active) { ret 2; }
+    var draining: Fixture;
+    if (!make_fixture(?draining, SERVER, 1) || !begin_graceful(?draining.engine)
+        || !deadline_at(next_deadline(?draining.engine), 160)) { ret 3; }
+    # tick skips these states without looking at any deadline
+    var states: [3]State = [3]State{TUNNEL, CLOSING, CLOSED};
+    var i:      usize    = 0;
+    for (i < 3) {
+        var fixture: Fixture;
+        if (!make_fixture(?fixture, SERVER, 1)) { ret 4; }
+        fixture.engine.state = states[i];
+        if (next_deadline(?fixture.engine).active
+            || tick(?fixture.engine, test_now(1000)).error != ERROR_NONE) { ret 5; }
+        i = i + 1;
+    }
     ret 0;
 }
 

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-17
+
+### Added
+- `h1.connection.next_deadline` returns the earliest deadline `tick` would enforce, so a host can arm one timer per connection instead of polling `tick` (#101).
+
+### Changed
+- Documented that every `now` and deadline the client, DNS cache, pool and HTTP/1 engine take is `std.chrono.time.monotonic()` time. A wall-clock value is accepted but yields deadlines that never fire (#99).
+- Dependencies (tests only): the h3-quic tests use mach-quic v0.10.1, which brings mach-crypto v0.12.0 and mach-tls v0.5.1.
+
 ## [0.10.0] - 2026-09-17
 
 ### Changed
