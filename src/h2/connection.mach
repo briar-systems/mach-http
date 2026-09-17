@@ -136,13 +136,6 @@ val INDEX_TOMBSTONE: usize = (-2)::usize;
 # ready-queue entries serviced and inbound frames handled per `process` call
 val SERVICE_BUDGET: usize = 64;
 
-# ancestors `set_priority` walks before it installs the dependency on the root
-val PRIORITY_DEPTH_LIMIT: usize = 32;
-
-val PRIORITY_UNRELATED:  u8 = 0;
-val PRIORITY_DESCENDANT: u8 = 1;
-val PRIORITY_TOO_DEEP:   u8 = 2;
-
 val LIST_WINDOW:   usize = 0;
 val LIST_WRITABLE: usize = 1;
 val LIST_EXCHANGE: usize = 2;
@@ -216,16 +209,14 @@ pub rec Stream {
     send_window:              i64;
     recv_window:              i64;
     consumed_pending:         u32;
-    dependency:               u32;
     weight:                   u16;
-    exclusive:                bool;
     writable:                 bool;
     schedule_credit:          i64;
     exchange:                 *exchange.Exchange;
     decoder:                  hpack.Decoder;
     memory:                   StreamMemory;
     retry_pending:            bool;
-    refused_pending:          bool;
+    pending_reset:            u32;
     reset_code:               u32;
     live:                     bool;
     slot:                     usize;
@@ -487,16 +478,14 @@ fun reset_stream(stream: *Stream) {
     stream.send_window              = 0;
     stream.recv_window              = 0;
     stream.consumed_pending         = 0;
-    stream.dependency               = 0;
     stream.weight                   = 16;
-    stream.exclusive                = false;
     stream.writable                 = false;
     stream.schedule_credit          = 0;
     stream.exchange                 = nil;
     stream.decoder                  = decoder;
     stream.memory                   = unbound;
     stream.retry_pending            = false;
-    stream.refused_pending          = false;
+    stream.pending_reset            = H2_NO_ERROR;
     stream.reset_code               = H2_NO_ERROR;
     stream.live                     = false;
 }
@@ -1548,49 +1537,12 @@ fun handle_window(engine: *Engine, header: frame.Header) Event {
     ret event(engine, EVENT_NONE);
 }
 
-# walks at most PRIORITY_DEPTH_LIMIT ancestors of start looking for target
-fun ancestry(engine: *Engine, start: u32, target: u32) u8 {
-    var current: u32   = start;
-    var steps:   usize = 0;
-    for (current != 0) {
-        if (current == target)             { ret PRIORITY_DESCENDANT; }
-        if (steps == PRIORITY_DEPTH_LIMIT) { ret PRIORITY_TOO_DEEP; }
-        val stream: *Stream = stream_for(engine, current);
-        if (stream == nil) { ret PRIORITY_UNRELATED; }
-        current = stream.dependency;
-        steps   = steps + 1;
-    }
-    ret PRIORITY_UNRELATED;
-}
-
+# dependencies and exclusivity are validated and ignored, only the weight schedules
 pub fun set_priority(engine: *Engine, id: u32, dependency: u32,
     weight: u16, exclusive: bool) bool {
     val stream: *Stream = stream_for(engine, id);
     if (stream == nil || dependency == id || weight == 0 || weight > 256) { ret false; }
-    var parent_id: u32 = dependency;
-    val relation:  u8  = ancestry(engine, dependency, id);
-    if (relation == PRIORITY_DESCENDANT) {
-        val parent: *Stream = stream_for(engine, dependency);
-        if (parent != nil) { parent.dependency = stream.dependency; }
-    }
-    or (relation == PRIORITY_TOO_DEEP) {
-        # an unverifiable chain could close a cycle, so the stream joins the root
-        parent_id = 0;
-    }
-    if (exclusive) {
-        # linear once per exclusive priority change
-        var i: usize = 0;
-        for (i < engine.stream_capacity) {
-            val child: *Stream = visit(engine, i);
-            if (child.live && child.id != id && child.dependency == parent_id) {
-                child.dependency = id;
-            }
-            i = i + 1;
-        }
-    }
-    stream.dependency = parent_id;
-    stream.weight     = weight;
-    stream.exclusive  = exclusive;
+    stream.weight = weight;
     ret true;
 }
 
@@ -1600,7 +1552,7 @@ fun handle_priority(engine: *Engine, header: frame.Header) Event {
     val exclusive:  bool    = (engine.frame_payload[0] & 0x80) != 0;
     val stream:     *Stream = stream_for(engine, header.stream_id);
     if (stream != nil && !set_priority(engine, stream.id, dependency, weight, exclusive)) {
-        ret fail_connection(engine, ERROR_PROTOCOL, H2_PROTOCOL_ERROR);
+        ret stream_error(engine, stream, H2_PROTOCOL_ERROR);
     }
     var result: Event = stream_event(engine, EVENT_PRIORITY, stream);
     result.stream_id = header.stream_id;
@@ -1919,7 +1871,7 @@ fun start_headers(engine: *Engine, header: frame.Header) Event {
             stream = allocate_stream(engine, header.stream_id, false, STREAM_OPEN);
             if (stream != nil) {
                 engine.last_remote_stream = header.stream_id;
-                stream.refused_pending    = true;
+                stream.pending_reset      = H2_REFUSED_STREAM;
             }
         }
         or {
@@ -1957,9 +1909,10 @@ fun finish_headers(engine: *Engine, stream: *Stream, decoded: hpack.Decode) Even
     engine.header_wire_stream = 0;
     engine.header_kind        = 0;
     engine.header_end_stream  = false;
-    if (stream.refused_pending) {
-        stream.refused_pending = false;
-        ret stream_error(engine, stream, H2_REFUSED_STREAM);
+    if (stream.pending_reset != H2_NO_ERROR) {
+        val code: u32 = stream.pending_reset;
+        stream.pending_reset = H2_NO_ERROR;
+        ret stream_error(engine, stream, code);
     }
     var block: HeaderBlock;
     if (kind == HEADER_RESPONSE && decoded.count != 0) {
@@ -2045,8 +1998,10 @@ fun header_fragment(engine: *Engine, header: frame.Header,
             val dependency: u32  = read_u31(?input[offset]);
             val exclusive:  bool = (input[offset] & 0x80) != 0;
             val weight:     u16  = input[offset + 4]::u16 + 1;
-            if (!set_priority(engine, stream.id, dependency, weight, exclusive)) {
-                ret fail_connection(engine, ERROR_PROTOCOL, H2_PROTOCOL_ERROR);
+            # the block is still decoded so the shared hpack context stays in step
+            if (!set_priority(engine, stream.id, dependency, weight, exclusive)
+                && stream.pending_reset == H2_NO_ERROR) {
+                stream.pending_reset = H2_PROTOCOL_ERROR;
             }
             offset = offset + 5;
         }
@@ -2089,7 +2044,7 @@ fun start_push(engine: *Engine, header: frame.Header) Event {
         promised = allocate_stream(engine, promised_id, false, STREAM_RESERVED_REMOTE);
         if (promised != nil) {
             engine.last_remote_stream = promised_id;
-            promised.refused_pending  = true;
+            promised.pending_reset    = H2_REFUSED_STREAM;
         }
     }
     or {
@@ -3439,7 +3394,7 @@ fun request_fields(items: *field.Field) {
         value: view.view("x", 1), sensitive: false};
 }
 
-test "http.h2.connection: weighted scheduling is fair and priority cycles are repaired" {
+test "http.h2.connection: weighted scheduling is fair and priority signals only set weights" {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS
@@ -3458,8 +3413,9 @@ test "http.h2.connection: weighted scheduling is fair and priority cycles are re
     if (!set_priority(?fixture.engine, first, 0, 4, false)
         || !set_priority(?fixture.engine, second, first, 1, false)
         || !set_priority(?fixture.engine, first, second, 4, true)
-        || stream_for(?fixture.engine, second).dependency != 0
-        || stream_for(?fixture.engine, first).dependency != second) { ret 3; }
+        || set_priority(?fixture.engine, first, first, 8, false)
+        || stream_for(?fixture.engine, first).weight != 4
+        || stream_for(?fixture.engine, second).weight != 1) { ret 3; }
     var high: usize = 0;
     var low:  usize = 0;
     var byte: [1]u8;
@@ -4045,33 +4001,101 @@ test "http.h2.connection: pending reports budgeted work until it drains" {
     ret 0;
 }
 
-test "http.h2.connection: priority chains are bounded and never close a cycle" {
+fun priority_payload(output: *u8, dependency: u32, weight: u16, exclusive: bool) {
+    put_u32(output, dependency);
+    if (exclusive) { output[0] = output[0] | 0x80; }
+    output[4] = (weight - 1)::u8;
+}
+
+test "http.h2.connection: exclusive priority visits only the named stream" {
     var fixture: Fixture;
-    var ids:     [40]u32;
-    if (!make_sized_fixture(?fixture, CLIENT, sized_config(48), 64, 128)
+    var ids:     [100]u32;
+    if (!make_sized_fixture(?fixture, CLIENT, sized_config(120), 128, 256)
         || client_handshake(?fixture).kind != EVENT_SETTINGS
         || !drain_output(?fixture)) { ret 1; }
     var i: usize = 0;
-    for (i < 40) {
+    for (i < 100) {
         ids[i] = open_local(?fixture.engine, nil);
         if (ids[i] == 0) { ret 2; }
-        if (i != 0 && !set_priority(?fixture.engine, ids[i], ids[i - 1], 16, false)) {
-            ret 3;
-        }
         i = i + 1;
     }
-    if (stream_for(?fixture.engine, ids[PRIORITY_DEPTH_LIMIT]).dependency
-        != ids[PRIORITY_DEPTH_LIMIT - 1]
-        || stream_for(?fixture.engine, ids[PRIORITY_DEPTH_LIMIT + 1]).dependency != 0) {
-        ret 4;
-    }
-    val before: u64 = fixture.engine.slot_visits;
-    if (!set_priority(?fixture.engine, ids[0], ids[PRIORITY_DEPTH_LIMIT], 16, false)) {
+    var payload: [5]u8;
+    priority_payload(?payload[0], ids[10], 32, true);
+    val before:   u64   = fixture.engine.slot_visits;
+    val received: Event = receive_frame(?fixture, frame.FRAME_PRIORITY, 0, ids[50],
+        ?payload[0], 5);
+    if (received.kind != EVENT_PRIORITY || received.stream_id != ids[50]
+        || fixture.engine.slot_visits - before != 2
+        || stream_for(?fixture.engine, ids[50]).weight != 32) { ret 3; }
+    val sent: u64 = fixture.engine.slot_visits;
+    if (!send_priority(?fixture.engine, ids[20], ids[70], 200, true)
+        || fixture.engine.slot_visits - sent != 1
+        || stream_for(?fixture.engine, ids[20]).weight != 200
+        || !submit_write(?fixture.engine)
+        || fixture.io.write_buffer[3] != frame.FRAME_PRIORITY
+        || read_u32(?fixture.io.write_buffer[5]) != ids[20]
+        || read_u32(?fixture.io.write_buffer[9]) != (ids[70] | 0x80000000)
+        || fixture.io.write_buffer[13] != 199) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.connection: self dependency is a stream error that keeps hpack in step" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS
+        || !drain_output(?fixture)) { ret 1; }
+    var request: [6]u8;
+    request[0] = 0x82;
+    request[1] = 0x86;
+    request[2] = 0x84;
+    request[3] = 0x01;
+    request[4] = 0x01;
+    request[5] = 'x';
+    val first: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS, 1, ?request[0], 6);
+    var storage: ExchangeMemory;
+    if (first.kind != EVENT_REQUEST_HEADERS
+        || !make_exchange(?storage, first.generation, 1)
+        || !bind_exchange(?fixture.engine, 1, ?storage.exchange)
+        || !release_event(?fixture.engine, 1, first.generation)) { ret 2; }
+    var payload: [5]u8;
+    priority_payload(?payload[0], 1, 16, false);
+    val looped: Event = receive_frame(?fixture, frame.FRAME_PRIORITY, 0, 1,
+        ?payload[0], 5);
+    if (looped.kind != EVENT_STREAM_ERROR || looped.code != H2_PROTOCOL_ERROR
+        || looped.stream_id != 1 || fixture.engine.state != OPEN
+        || stream_for(?fixture.engine, 1).state != STREAM_CLOSED
+        || !scope_cancelled(?storage.scope)
+        || !submit_write(?fixture.engine)
+        || fixture.io.write_buffer[3] != frame.FRAME_RESET_STREAM
+        || read_u32(?fixture.io.write_buffer[9]) != H2_PROTOCOL_ERROR
+        || !drain_output(?fixture)) { ret 3; }
+    var prioritized: [11]u8;
+    priority_payload(?prioritized[0], 3, 16, true);
+    prioritized[5]  = 0x82;
+    prioritized[6]  = 0x86;
+    prioritized[7]  = 0x84;
+    prioritized[8]  = 0x41;
+    prioritized[9]  = 0x01;
+    prioritized[10] = 'y';
+    val headers: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS | frame.FLAG_PRIORITY, 3, ?prioritized[0], 11);
+    if (headers.kind != EVENT_STREAM_ERROR || headers.code != H2_PROTOCOL_ERROR
+        || headers.stream_id != 3 || fixture.engine.state != OPEN
+        || fixture.engine.inbound_table.count != 1
+        || stream_for(?fixture.engine, 3).state != STREAM_CLOSED
+        || !drain_output(?fixture)) { ret 4; }
+    var indexed: [4]u8;
+    indexed[0] = 0x82;
+    indexed[1] = 0x86;
+    indexed[2] = 0x84;
+    indexed[3] = 0xbe;
+    val next: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 5, ?indexed[0], 4);
+    if (next.kind != EVENT_REQUEST_HEADERS || next.headers.count != 4
+        || next.headers.authority.len != 1 || next.headers.authority.data[0] != 'y') {
         ret 5;
     }
-    if (fixture.engine.slot_visits - before > (PRIORITY_DEPTH_LIMIT + 3)::u64
-        || stream_for(?fixture.engine, ids[PRIORITY_DEPTH_LIMIT]).dependency != 0
-        || stream_for(?fixture.engine, ids[0]).dependency
-        != ids[PRIORITY_DEPTH_LIMIT]) { ret 6; }
+    if (!operation_ok(cancel.destroy(?storage.scope))) { ret 6; }
     ret 0;
 }

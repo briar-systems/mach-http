@@ -125,7 +125,7 @@ cancelled one. Call it from a timer, not once per event.
 | window flush, per output or completion | O(1) |
 | `writable_stream` | O(writable set) |
 | `tick` | O(open exchange-bound streams) |
-| priority cycle check | at most 32 ancestors |
+| PRIORITY frame or HEADERS priority block, exclusive or not | O(1) |
 
 These passes still cover the whole table. None of them runs on a routine path:
 
@@ -133,9 +133,6 @@ These passes still cover the whole table. None of them runs on a routine path:
 - a received GOAWAY, once per GOAWAY
 - a peer SETTINGS change to `INITIAL_WINDOW_SIZE`, once per such frame
 - the acknowledgement of a local SETTINGS frame, once per `send_settings`
-- `set_priority` with the exclusive flag, once per exclusive PRIORITY or HEADERS
-  priority block. A peer can send these at will, so the cost of this pass is
-  bounded only by the peer's frame rate.
 - `init`, which also clears the index
 
 ## Preface and settings
@@ -220,16 +217,19 @@ member waits more than one period.
 `offer_data` accepts only the selected stream, copies no more than all negotiated
 and configured frame and window limits, and reports partial consumption.
 
-Legacy PRIORITY dependencies, exclusivity, and weights are validated. A dependency
-that would create a cycle is reparented before the new relationship is installed.
-The cycle check walks at most 32 ancestors. If the chain is deeper than that, the
-engine cannot prove the new edge is safe, so the stream is placed under the root.
-This keeps the check bounded and still never creates a cycle. RFC 9113 deprecates
-this signalling, and the scheduler flattens the tree anyway, so dependencies deeper
-than 32 carry no scheduling meaning.
-Scheduling intentionally flattens the dependency tree to weights. HTTP/2 permits
-priority information to be ignored, while the weighted scheduler provides bounded
-fairness and no starvation without allocating idle priority nodes.
+RFC 9113 deprecates the PRIORITY dependency signal and lets an endpoint ignore it.
+The engine therefore keeps no dependency tree. PRIORITY frames and HEADERS priority
+blocks are parsed and validated, and their dependency and exclusive bits are then
+ignored. Only the weight is stored, and only weights affect scheduling. The
+weighted scheduler gives bounded fairness with no starvation and allocates no idle
+priority nodes. Handling a priority signal is O(1), exclusive or not.
+
+A stream that depends on itself is a stream error of type PROTOCOL_ERROR (RFC 9113
+section 5.3.1). When the signal arrives in a HEADERS frame, the engine still decodes
+the rest of the header block, so the shared HPACK context stays in step. The stream
+is reset after that. `set_priority` refuses a self dependency or a weight outside
+1..256. `send_priority` writes the caller's dependency and exclusive bits to the
+wire unchanged, as the caller's signal to the peer, and stores only the weight.
 
 ## Shutdown and ownership
 

@@ -5,12 +5,14 @@
 ### Changed
 - **Breaking.** `h2.connection.init` takes a `StreamIndexEntry` array and its capacity after the stream capacity. The capacity must be a power of two and at least twice the stream capacity (#103).
 - **Breaking.** `h2.connection.process` (and `complete_io` for reads) can return the new `EVENT_PENDING`. It means the call used up its per-call budget of 64 units and work remains, so the host should call `process` again. It takes precedence over `EVENT_NEED_READ` (#103).
+- **Breaking.** `h2.connection.Stream` no longer has `dependency` or `exclusive`, and PRIORITY dependencies are ignored (RFC 9113). Only the weight is kept. `refused_pending` is replaced by `pending_reset`, which holds the code of a reset deferred until a header block is decoded (#103).
+- **Breaking.** A self-dependent PRIORITY frame or HEADERS priority block is now a stream error of type PROTOCOL_ERROR, as RFC 9113 requires. It was a connection error. `h2.frame` parses such a frame and leaves the error to the engine. The writer still refuses to encode one (#103).
 - Performance: HTTP/2 routine paths no longer scan the stream table, so their cost is O(changed streams) (#103).
   - Stream lookup, allocation and release are O(1).
   - GOAWAY retries, owed WINDOW_UPDATEs, writable streams and exchange-bound streams each have their own set.
   - `tick` costs O(open exchange-bound streams). A host that cancels an exchange scope should call `cancel_stream`.
   - Weighted scheduling keeps the same order over the writable set only.
-  - The priority cycle check walks at most 32 ancestors.
+  - A PRIORITY signal costs O(1), exclusive or not.
 
 ## [0.11.0] - 2026-09-17
 
