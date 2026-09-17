@@ -27,6 +27,7 @@ fun operation_ok(outcome: cancel.Operation) bool {
 }
 
 pub val STREAM_SLOTS: usize = 10;
+pub val INDEX_SLOTS:  usize = 32;
 pub val EVENT_KINDS:  usize = 16;
 
 pub def HandlerFun: fun(ptr, h3.Event) bool;
@@ -36,6 +37,7 @@ pub rec Session {
     scope:               cancel.Scope;
     streams:             [10]h3.Stream;
     memories:            [10]h3.StreamMemory;
+    index:               [32]h3.StreamIndexEntry;
     pending:             [4]h3.StreamHandle;
     reads:               [10][192]u8;
     settings:            [10][5]frame.Setting;
@@ -119,6 +121,7 @@ pub fun start_session(session: *Session,
     val storage: h3.Storage = h3.Storage{
         streams:                     ?session.streams[0], memories: ?session.memories[0],
         stream_capacity:             STREAM_SLOTS,
+        stream_index:                ?session.index[0], stream_index_capacity: INDEX_SLOTS,
         pending_release:             ?session.pending[0], pending_release_capacity: 4,
         inbound_entries:             ?session.inbound_entries[0], inbound_entry_capacity: 8,
         inbound_storage:             ?session.inbound_storage[0], inbound_storage_capacity: 256,

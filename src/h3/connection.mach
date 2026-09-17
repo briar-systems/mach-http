@@ -162,10 +162,27 @@ pub rec TransportWrite {
 
 pub rec TransportOperation { status: TransportStatus; error: u64; }
 
+# the next stream whose transport state changed, or TRANSPORT_EMPTY when none is
+# waiting. a report may repeat or carry no news, but none may be dropped.
+# ---
+# status:   TRANSPORT_OK with a stream, or TRANSPORT_EMPTY
+# handle:   the stream whose state changed
+# readable: data or a FIN arrived since a read returned EMPTY or BLOCKED
+# writable: send capacity opened since a write or finish returned BLOCKED
+# reset:    the peer reset the stream or asked it to stop sending
+pub rec TransportReady {
+    status:   TransportStatus;
+    handle:   StreamHandle;
+    readable: bool;
+    writable: bool;
+    reset:    bool;
+}
+
 pub rec Transport[T] {
     context:        *T;
     open:           fun(*T, u8) TransportOpen;
     accept:         fun(*T) TransportOpen;
+    ready:          fun(*T) TransportReady;
     read:           fun(*T, StreamHandle, *u8, usize) TransportRead;
     credit:         fun(*T, StreamHandle, usize) TransportOperation;
     write:          fun(*T, StreamHandle, *u8, usize) TransportWrite;
@@ -216,10 +233,15 @@ pub rec StreamMemory {
 
 pub rec ByteQueue { data: *u8; capacity: usize; head: usize; count: usize; }
 
+# one open-addressed slot of the stream id index
+pub rec StreamIndexEntry { id: u64; slot: usize; }
+
 pub rec Storage {
     streams:                     *Stream;
     memories:                    *StreamMemory;
     stream_capacity:             usize;
+    stream_index:                *StreamIndexEntry;
+    stream_index_capacity:       usize;
     pending_release:             *StreamHandle;
     pending_release_capacity:    usize;
     inbound_entries:             *qpack.Entry;
@@ -340,6 +362,21 @@ pub rec Stream {
     output_end_stream:        bool;
     exchange:                 *exchange.Exchange;
     reset_code:               u64;
+    slot:                     usize;
+    next_free:                usize;
+    index_position:           usize;
+    ready_next:               usize;
+    queued:                   bool;
+    read_parked:              bool;
+    write_parked:             bool;
+    probe_pending:            bool;
+    blocked_listed:           bool;
+    blocked_required:         u64;
+    blocked_next:             usize;
+    blocked_prev:             usize;
+    exchange_listed:          bool;
+    exchange_next:            usize;
+    exchange_prev:            usize;
 }
 
 pub rec Engine[T] {
@@ -352,13 +389,25 @@ pub rec Engine[T] {
     streams:                     *Stream;
     memories:                    *StreamMemory;
     stream_capacity:             usize;
+    stream_index:                *StreamIndexEntry;
+    index_capacity:              usize;
+    index_tombstones:            usize;
+    index_rebuilds:              usize;
+    free_head:                   usize;
+    ready_head:                  usize;
+    ready_tail:                  usize;
+    ready_count:                 usize;
+    blocked_head:                usize;
+    exchange_head:               usize;
+    output_streams:              usize;
+    peer_decoder:                usize;
+    slot_visits:                 usize;
     pending_release:             *StreamHandle;
     pending_release_capacity:    usize;
     pending_release_count:       usize;
     active_requests:             usize;
     active_peer_unidirectional:  usize;
     next_generation:             u64;
-    next_process:                usize;
     critical:                    frame.CriticalStreams;
     local_control:               LocalStream;
     local_encoder:               LocalStream;
@@ -397,6 +446,13 @@ val HEADER_RESPONSE:      u8 = 2;
 val HEADER_INFORMATIONAL: u8 = 3;
 val HEADER_TRAILERS:      u8 = 4;
 
+val INDEX_EMPTY:     usize = (-1)::usize;
+val INDEX_TOMBSTONE: usize = (-2)::usize;
+
+# transport reports and queued stream services one process call may take
+val READY_BUDGET:   usize = 64;
+val SERVICE_BUDGET: usize = 64;
+
 pub fun settings_default() Settings {
     ret Settings{qpack_max_table_capacity: 4096,
         max_field_section_size:  32768, qpack_blocked_streams: 16,
@@ -419,7 +475,7 @@ pub fun config_default() Config {
 
 fun transport_valid[T](value: *Transport[T]) bool {
     ret value != nil && value.open != nil && value.accept != nil
-        && value.read != nil && value.credit != nil
+        && value.ready != nil && value.read != nil && value.credit != nil
         && value.write != nil && value.finish != nil
         && value.cancel_send != nil && value.cancel_receive != nil
         && value.release != nil && value.close != nil;
@@ -434,8 +490,17 @@ fun qpack_limits_valid(limits: qpack.Limits) bool {
         && limits.max_outstanding_sections != 0 && limits.max_references != 0;
 }
 
+# the index holds at most half its capacity live, so a probe always meets an
+# empty entry while tombstones stay under a quarter
+fun index_capacity_valid(streams: usize, index: *StreamIndexEntry, capacity: usize) bool {
+    ret index != nil && streams != 0 && streams <= (-1)::usize / 4
+        && capacity >= 2 * streams && (capacity & (capacity - 1)) == 0;
+}
+
 fun config_valid(configured: Config, storage: *Storage) bool {
     ret storage != nil && configured.max_requests != 0
+        && index_capacity_valid(storage.stream_capacity, storage.stream_index,
+        storage.stream_index_capacity)
         && configured.max_peer_unidirectional >= 3
         && configured.max_requests <= (-1)::usize - configured.max_peer_unidirectional
         && storage.stream_capacity >= configured.max_requests
@@ -600,6 +665,8 @@ fun stream_event[T](engine: *Engine[T], kind: EventKind, stream: *Stream) Event 
     ret result;
 }
 
+# the slot, free link and ready-queue link survive, so callers unlink every
+# other list first
 fun reset_stream(stream: *Stream, memory_value: StreamMemory) {
     var classifier:     frame.StreamParser;
     var parser:         frame.Parser;
@@ -658,6 +725,17 @@ fun reset_stream(stream: *Stream, memory_value: StreamMemory) {
     stream.output_end_stream        = false;
     stream.exchange                 = nil;
     stream.reset_code               = H3_NO_ERROR;
+    stream.index_position           = NO_SLOT;
+    stream.read_parked              = false;
+    stream.write_parked             = false;
+    stream.probe_pending            = false;
+    stream.blocked_listed           = false;
+    stream.blocked_required         = 0;
+    stream.blocked_next             = NO_SLOT;
+    stream.blocked_prev             = NO_SLOT;
+    stream.exchange_listed          = false;
+    stream.exchange_next            = NO_SLOT;
+    stream.exchange_prev            = NO_SLOT;
 }
 
 fun next_generation[T](engine: *Engine[T]) u64 {
@@ -680,49 +758,231 @@ fun request_id(id: u64) bool {
     ret (id & 3) == 0;
 }
 
-fun stream_index[T](engine: *Engine[T], id: u64) usize {
-    var i: usize = 0;
-    for (i < engine.stream_capacity) {
-        if (engine.streams[i].live && engine.streams[i].transport_stream.id == id) {
-            ret i;
-        }
-        i = i + 1;
+# fmix64, so sequential stream ids spread across the whole index
+fun index_hash(id: u64) u64 {
+    var x: u64 = id;
+    x = x ^ (x >> 33);
+    x = x * 0xff51afd7ed558ccd;
+    x = x ^ (x >> 33);
+    x = x * 0xc4ceb9fe1a85ec53;
+    ret x ^ (x >> 33);
+}
+
+fun index_find[T](engine: *Engine[T], id: u64) usize {
+    val mask:     usize = engine.index_capacity - 1;
+    var position: usize = index_hash(id)::usize & mask;
+    var probes:   usize = 0;
+    for (probes < engine.index_capacity) {
+        val entry: StreamIndexEntry = engine.stream_index[position];
+        if (entry.slot == INDEX_EMPTY)                       { ret NO_SLOT; }
+        if (entry.slot != INDEX_TOMBSTONE && entry.id == id) { ret entry.slot; }
+        position = (position + 1) & mask;
+        probes   = probes + 1;
     }
     ret NO_SLOT;
 }
 
+# the caller has checked the id is absent
+fun index_insert[T](engine: *Engine[T], stream: *Stream) {
+    val mask:      usize = engine.index_capacity - 1;
+    var position:  usize = index_hash(stream.transport_stream.id)::usize & mask;
+    var tombstone: usize = NO_SLOT;
+    var probes:    usize = 0;
+    for (probes < engine.index_capacity
+        && engine.stream_index[position].slot != INDEX_EMPTY) {
+        if (tombstone == NO_SLOT
+            && engine.stream_index[position].slot == INDEX_TOMBSTONE) { tombstone = position; }
+        position = (position + 1) & mask;
+        probes   = probes + 1;
+    }
+    if (tombstone != NO_SLOT) {
+        position                = tombstone;
+        engine.index_tombstones = engine.index_tombstones - 1;
+    }
+    engine.stream_index[position] = StreamIndexEntry{id: stream.transport_stream.id,
+        slot: stream.slot};
+    stream.index_position = position;
+}
+
+fun index_rebuild[T](engine: *Engine[T]) {
+    var i: usize = 0;
+    for (i < engine.index_capacity) {
+        engine.stream_index[i] = StreamIndexEntry{id: 0, slot: INDEX_EMPTY};
+        i                      = i + 1;
+    }
+    engine.index_tombstones = 0;
+    engine.index_rebuilds   = engine.index_rebuilds + 1;
+    i                       = 0;
+    for (i < engine.stream_capacity) {
+        val stream: *Stream = ?engine.streams[i];
+        if (stream.index_position != NO_SLOT) { index_insert[T](engine, stream); }
+        i = i + 1;
+    }
+}
+
+# a rebuild follows at least a quarter capacity of removals, so removal stays
+# amortized constant
+fun index_remove[T](engine: *Engine[T], stream: *Stream) {
+    if (stream.index_position == NO_SLOT) { ret; }
+    engine.stream_index[stream.index_position].slot = INDEX_TOMBSTONE;
+    stream.index_position                           = NO_SLOT;
+    engine.index_tombstones                         = engine.index_tombstones + 1;
+    if (engine.index_tombstones > engine.index_capacity / 4) { index_rebuild[T](engine); }
+}
+
 pub fun stream_for[T](engine: *Engine[T], id: u64) *Stream {
     if (engine == nil || !engine.initialized || id > MAX_STREAM_ID) { ret nil; }
-    val index: usize = stream_index[T](engine, id);
-    if (index == NO_SLOT) { ret nil; }
-    ret ?engine.streams[index];
+    val slot: usize = index_find[T](engine, id);
+    if (slot == NO_SLOT) { ret nil; }
+    ret ?engine.streams[slot];
+}
+
+fun ready_push[T](engine: *Engine[T], stream: *Stream) {
+    if (stream.queued) { ret; }
+    stream.queued     = true;
+    stream.ready_next = NO_SLOT;
+    if (engine.ready_tail == NO_SLOT) { engine.ready_head = stream.slot; }
+    or                                { engine.streams[engine.ready_tail].ready_next = stream.slot; }
+    engine.ready_tail  = stream.slot;
+    engine.ready_count = engine.ready_count + 1;
+}
+
+fun ready_pop[T](engine: *Engine[T]) *Stream {
+    if (engine.ready_head == NO_SLOT) { ret nil; }
+    val stream: *Stream = ?engine.streams[engine.ready_head];
+    engine.ready_head = stream.ready_next;
+    if (engine.ready_head == NO_SLOT) { engine.ready_tail = NO_SLOT; }
+    engine.ready_count = engine.ready_count - 1;
+    stream.queued      = false;
+    stream.ready_next  = NO_SLOT;
+    ret stream;
+}
+
+fun wake_stream[T](engine: *Engine[T], stream: *Stream) {
+    if (stream_has_work[T](engine, stream)) { ready_push[T](engine, stream); }
+}
+
+fun blocked_unlink[T](engine: *Engine[T], stream: *Stream) {
+    if (!stream.blocked_listed)         { ret; }
+    if (stream.blocked_prev == NO_SLOT) { engine.blocked_head = stream.blocked_next; }
+    or                                  { engine.streams[stream.blocked_prev].blocked_next = stream.blocked_next; }
+    if (stream.blocked_next != NO_SLOT) {
+        engine.streams[stream.blocked_next].blocked_prev = stream.blocked_prev;
+    }
+    stream.blocked_listed = false;
+    stream.blocked_next   = NO_SLOT;
+    stream.blocked_prev   = NO_SLOT;
+}
+
+# ordered by required insert count, so an insert wakes exactly a prefix
+fun blocked_link[T](engine: *Engine[T], stream: *Stream, required: u64) {
+    if (stream.blocked_listed) { ret; }
+    var previous: usize = NO_SLOT;
+    var next:     usize = engine.blocked_head;
+    for (next != NO_SLOT && engine.streams[next].blocked_required <= required) {
+        previous = next;
+        next     = engine.streams[next].blocked_next;
+    }
+    stream.blocked_required = required;
+    stream.blocked_prev     = previous;
+    stream.blocked_next     = next;
+    stream.blocked_listed   = true;
+    if (previous == NO_SLOT) { engine.blocked_head = stream.slot; }
+    or                       { engine.streams[previous].blocked_next = stream.slot; }
+    if (next != NO_SLOT)     { engine.streams[next].blocked_prev = stream.slot; }
+}
+
+fun set_blocked[T](engine: *Engine[T], stream: *Stream) {
+    stream.qpack_blocked = true;
+    blocked_link[T](engine, stream, stream.decoder.required_insert_count);
+}
+
+fun clear_blocked[T](engine: *Engine[T], stream: *Stream) {
+    stream.qpack_blocked = false;
+    stream.probe_pending = false;
+    blocked_unlink[T](engine, stream);
+}
+
+fun wake_unblocked[T](engine: *Engine[T]) {
+    for (engine.blocked_head != NO_SLOT) {
+        val stream: *Stream = ?engine.streams[engine.blocked_head];
+        if (stream.blocked_required > engine.inbound_table.insert_count) { brk; }
+        blocked_unlink[T](engine, stream);
+        ready_push[T](engine, stream);
+    }
+}
+
+fun exchange_link[T](engine: *Engine[T], stream: *Stream) {
+    if (stream.exchange_listed) { ret; }
+    stream.exchange_prev   = NO_SLOT;
+    stream.exchange_next   = engine.exchange_head;
+    stream.exchange_listed = true;
+    if (engine.exchange_head != NO_SLOT) {
+        engine.streams[engine.exchange_head].exchange_prev = stream.slot;
+    }
+    engine.exchange_head = stream.slot;
+}
+
+fun exchange_unlink[T](engine: *Engine[T], stream: *Stream) {
+    if (!stream.exchange_listed)         { ret; }
+    if (stream.exchange_prev == NO_SLOT) { engine.exchange_head = stream.exchange_next; }
+    or                                   { engine.streams[stream.exchange_prev].exchange_next = stream.exchange_next; }
+    if (stream.exchange_next != NO_SLOT) {
+        engine.streams[stream.exchange_next].exchange_prev = stream.exchange_prev;
+    }
+    stream.exchange_listed = false;
+    stream.exchange_next   = NO_SLOT;
+    stream.exchange_prev   = NO_SLOT;
+}
+
+fun output_pending(stream: *Stream) bool {
+    ret stream.output_length != 0 || stream.output_end_stream;
+}
+
+# the single point that binds a slot to its memory, so demand-acquired memory
+# replaces only this
+fun acquire_memory[T](engine: *Engine[T], slot: usize) StreamMemory {
+    ret engine.memories[slot];
 }
 
 fun allocate_stream[T](engine: *Engine[T], value: StreamHandle,
     local: bool, kind: StreamKind) *Stream {
     if (engine.next_generation == 0 || value.generation == 0
-        || value.id > MAX_STREAM_ID || stream_for[T](engine, value.id) != nil) { ret nil; }
-    var i: usize = 0;
-    for (i < engine.stream_capacity) {
-        val stream: *Stream = ?engine.streams[i];
-        if (!stream.live) {
-            val memory_value: StreamMemory = stream.memory;
-            reset_stream(stream, memory_value);
-            stream.transport_stream = value;
-            stream.generation       = next_generation[T](engine);
-            stream.state            = STREAM_OPEN;
-            stream.kind             = kind;
-            stream.local            = local;
-            stream.live             = true;
-            if (kind == STREAM_REQUEST) { engine.active_requests = engine.active_requests + 1; }
-            if (!local && unidirectional(value.id)) {
-                engine.active_peer_unidirectional = engine.active_peer_unidirectional + 1;
-            }
-            ret stream;
-        }
-        i = i + 1;
+        || value.id > MAX_STREAM_ID || engine.free_head == NO_SLOT
+        || index_find[T](engine, value.id) != NO_SLOT) { ret nil; }
+    val stream: *Stream = ?engine.streams[engine.free_head];
+    engine.free_head = stream.next_free;
+    stream.next_free = NO_SLOT;
+    reset_stream(stream, acquire_memory[T](engine, stream.slot));
+    stream.transport_stream = value;
+    stream.generation       = next_generation[T](engine);
+    stream.state            = STREAM_OPEN;
+    stream.kind             = kind;
+    stream.local            = local;
+    stream.live             = true;
+    if (kind == STREAM_REQUEST) { engine.active_requests = engine.active_requests + 1; }
+    if (!local && unidirectional(value.id)) {
+        engine.active_peer_unidirectional = engine.active_peer_unidirectional + 1;
     }
-    ret nil;
+    index_insert[T](engine, stream);
+    ready_push[T](engine, stream);
+    ret stream;
+}
+
+# returns a slot to the free list. a still-queued slot stays queued and is
+# skipped when popped, or serviced as its successor if reused first.
+fun free_stream[T](engine: *Engine[T], stream: *Stream) {
+    if (!stream.live) { ret; }
+    index_remove[T](engine, stream);
+    blocked_unlink[T](engine, stream);
+    exchange_unlink[T](engine, stream);
+    if (output_pending(stream) && engine.output_streams != 0) {
+        engine.output_streams = engine.output_streams - 1;
+    }
+    val memory_value: StreamMemory = stream.memory;
+    reset_stream(stream, memory_value);
+    stream.next_free = engine.free_head;
+    engine.free_head = stream.slot;
 }
 
 fun stream_terminal(stream: *Stream) bool {
@@ -839,9 +1099,19 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
     }
     i = 0;
     for (i < storage.stream_capacity) {
-        storage.streams[i].memory = storage.memories[i];
-        reset_stream(?storage.streams[i], storage.memories[i]);
-        i = i + 1;
+        val stream: *Stream = ?storage.streams[i];
+        reset_stream(stream, storage.memories[i]);
+        stream.slot       = i;
+        stream.next_free  = i + 1;
+        stream.ready_next = NO_SLOT;
+        stream.queued     = false;
+        i                 = i + 1;
+    }
+    storage.streams[storage.stream_capacity - 1].next_free = NO_SLOT;
+    i                                                      = 0;
+    for (i < storage.stream_index_capacity) {
+        storage.stream_index[i] = StreamIndexEntry{id: 0, slot: INDEX_EMPTY};
+        i                       = i + 1;
     }
     if (!queue_init(?engine.control, storage.control_queue,
         storage.control_queue_capacity)
@@ -862,13 +1132,25 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
     engine.streams                    = storage.streams;
     engine.memories                   = storage.memories;
     engine.stream_capacity            = storage.stream_capacity;
+    engine.stream_index               = storage.stream_index;
+    engine.index_capacity             = storage.stream_index_capacity;
+    engine.index_tombstones           = 0;
+    engine.index_rebuilds             = 0;
+    engine.free_head                  = 0;
+    engine.ready_head                 = NO_SLOT;
+    engine.ready_tail                 = NO_SLOT;
+    engine.ready_count                = 0;
+    engine.blocked_head               = NO_SLOT;
+    engine.exchange_head              = NO_SLOT;
+    engine.output_streams             = 0;
+    engine.peer_decoder               = NO_SLOT;
+    engine.slot_visits                = 0;
     engine.pending_release            = storage.pending_release;
     engine.pending_release_capacity   = configured.max_pending_release;
     engine.pending_release_count      = 0;
     engine.active_requests            = 0;
     engine.active_peer_unidirectional = 0;
     engine.next_generation            = 1;
-    engine.next_process               = 0;
     engine.local_control.kind         = STREAM_CONTROL;
     engine.local_encoder.kind         = STREAM_QPACK_ENCODER;
     engine.local_decoder.kind         = STREAM_QPACK_DECODER;
@@ -919,6 +1201,7 @@ pub fun bind_exchange[T](engine: *Engine[T], id: u64,
         || bound.request.metadata.request_index != id
         || bound.scope == nil || !scope_active(bound.scope)) { ret false; }
     stream.exchange = bound;
+    exchange_link[T](engine, stream);
     ret true;
 }
 
@@ -1291,6 +1574,7 @@ fun stream_failure[T](engine: *Engine[T], stream: *Stream, code: u64) Event {
         }
         if (stream.qpack_blocked) {
             qpack.field_decoder_cancel(?stream.decoder);
+            clear_blocked[T](engine, stream);
             if (!queue_cancel[T](engine, stream.transport_stream.id)) {
                 ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
             }
@@ -1408,6 +1692,7 @@ fun read_stream[T](engine: *Engine[T], stream: *Stream) Event {
         ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
     }
     if (result.status == TRANSPORT_EMPTY || result.status == TRANSPORT_BLOCKED) {
+        stream.read_parked = true;
         ret base_event[T](engine, EVENT_NONE);
     }
     if (result.status != TRANSPORT_OK
@@ -1483,6 +1768,10 @@ fun apply_peer_settings[T](engine: *Engine[T], stream: *Stream) Event {
     engine.peer                   = peer;
     engine.peer_settings_received = true;
     if (engine.local_settings_sent) { engine.state = OPEN; }
+    # decoder instructions that arrived before SETTINGS can now be applied
+    if (engine.peer_decoder != NO_SLOT) {
+        wake_stream[T](engine, ?engine.streams[engine.peer_decoder]);
+    }
     ret base_event[T](engine, EVENT_SETTINGS);
 }
 
@@ -1682,8 +1971,7 @@ pub fun open_request[T](engine: *Engine[T], bound: *exchange.Exchange) u64 {
         stream.memory.setting_capacity, engine.configured.frames)) {
         if (stream != nil) {
             mark_closed[T](engine, stream);
-            val memory_value: StreamMemory = stream.memory;
-            reset_stream(stream, memory_value);
+            free_stream[T](engine, stream);
         }
         release_outcome[T](engine,
             discard_opened[T](engine, opened.stream, H3_REQUEST_CANCELLED));
@@ -1691,8 +1979,7 @@ pub fun open_request[T](engine: *Engine[T], bound: *exchange.Exchange) u64 {
     }
     if (bound != nil && !bind_exchange[T](engine, opened.stream.id, bound)) {
         mark_closed[T](engine, stream);
-        val memory_value: StreamMemory = stream.memory;
-        reset_stream(stream, memory_value);
+        free_stream[T](engine, stream);
         release_outcome[T](engine,
             discard_opened[T](engine, opened.stream, H3_REQUEST_CANCELLED));
         ret NO_STREAM;
@@ -1742,8 +2029,9 @@ fun classify_stream[T](engine: *Engine[T], stream: *Stream) Event {
         }
     }
     or (parsed.stream_type == frame.STREAM_QPACK_DECODER) {
-        stream.kind     = STREAM_QPACK_DECODER;
-        stream.critical = true;
+        stream.kind         = STREAM_QPACK_DECODER;
+        stream.critical     = true;
+        engine.peer_decoder = stream.slot;
     }
     or { stream.kind = STREAM_IGNORED; }
     ret base_event[T](engine, EVENT_NONE);
@@ -1781,8 +2069,11 @@ fun process_encoder_stream[T](engine: *Engine[T], stream: *Stream) Event {
         ret fail_connection[T](engine, ERROR_QPACK,
             qpack_error_code(instruction.error, true));
     }
-    if (instruction.status == qpack.INSTRUCTION_COMPLETE && !note_inserts[T](engine)) {
-        ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
+    if (instruction.status == qpack.INSTRUCTION_COMPLETE) {
+        if (!note_inserts[T](engine)) {
+            ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
+        }
+        wake_unblocked[T](engine);
     }
     ret base_event[T](engine, EVENT_NONE);
 }
@@ -1856,8 +2147,8 @@ fun finish_headers[T](engine: *Engine[T], stream: *Stream,
     if (!credit[T](engine, stream, stream.qpack_credit)) {
         ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
     }
-    stream.qpack_credit  = 0;
-    stream.qpack_blocked = false;
+    stream.qpack_credit = 0;
+    clear_blocked[T](engine, stream);
     if (!queue_ack[T](engine, stream, decoded.required_insert_count)) {
         ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
     }
@@ -1918,7 +2209,7 @@ fun complete_field_section[T](engine: *Engine[T], stream: *Stream,
             qpack_error_code(decoded.error, false));
     }
     if (decoded.status == qpack.DECODE_BLOCKED) {
-        stream.qpack_blocked = true;
+        set_blocked[T](engine, stream);
         ret base_event[T](engine, EVENT_BLOCKED);
     }
     if (decoded.status != qpack.DECODE_COMPLETE) {
@@ -1956,6 +2247,7 @@ fun handle_goaway[T](engine: *Engine[T], value: u64) Event {
                 mark_closed[T](engine, stream);
                 stream.retry_pending = true;
                 stream.reset_code    = H3_REQUEST_REJECTED;
+                ready_push[T](engine, stream);
             }
             i = i + 1;
         }
@@ -2214,6 +2506,8 @@ pub fun send_headers[T](engine: *Engine[T], id: u64, items: *field.Field,
             || (stream.exchange != nil
             && stream.exchange.request.method.kind == method.HEAD));
     }
+    engine.output_streams = engine.output_streams + 1;
+    wake_stream[T](engine, stream);
     ret Offer{status: OFFER_OUTPUT, consumed: count,
         produced: stream.output_length, stream_id: id, error: ERROR_NONE};
 }
@@ -2276,6 +2570,8 @@ pub fun offer_data[T](engine: *Engine[T], id: u64, input: *u8,
     stream.output_end_stream    = final;
     stream.outbound_body_bytes  = stream.outbound_body_bytes + take::u64;
     stream.outbound_body_chunks = stream.outbound_body_chunks + 1;
+    engine.output_streams       = engine.output_streams + 1;
+    wake_stream[T](engine, stream);
     var status_value: OfferStatus = OFFER_PARTIAL;
     if (take == length && final) { status_value = OFFER_DONE; }
     or (take == length)          { status_value = OFFER_OUTPUT; }
@@ -2283,8 +2579,10 @@ pub fun offer_data[T](engine: *Engine[T], id: u64, input: *u8,
         produced: stream.output_length, stream_id: id, error: ERROR_NONE};
 }
 
+# a blocked write parks the output until the transport reports the stream writable
 fun flush_request_output[T](engine: *Engine[T], stream: *Stream) Event {
-    if (!stream.live || stream.kind != STREAM_REQUEST || stream_terminal(stream)) {
+    if (!stream.live || stream.kind != STREAM_REQUEST || stream_terminal(stream)
+        || stream.write_parked || !output_pending(stream)) {
         ret base_event[T](engine, EVENT_NONE);
     }
     if (stream.output_offset < stream.output_length) {
@@ -2298,6 +2596,7 @@ fun flush_request_output[T](engine: *Engine[T], stream: *Stream) Event {
             ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
         }
         if (written.status == TRANSPORT_BLOCKED || written.status == TRANSPORT_EMPTY) {
+            stream.write_parked = true;
             ret base_event[T](engine, EVENT_BLOCKED);
         }
         if (written.status != TRANSPORT_OK) {
@@ -2314,6 +2613,7 @@ fun flush_request_output[T](engine: *Engine[T], stream: *Stream) Event {
         val finished: TransportOperation = engine.transport.finish(
             engine.transport.context, stream.transport_stream);
         if (finished.status == TRANSPORT_BLOCKED) {
+            stream.write_parked = true;
             ret base_event[T](engine, EVENT_BLOCKED);
         }
         if (finished.status != TRANSPORT_OK) {
@@ -2322,6 +2622,7 @@ fun flush_request_output[T](engine: *Engine[T], stream: *Stream) Event {
         stream.output_end_stream = false;
         close_local_side[T](engine, stream);
     }
+    if (engine.output_streams != 0) { engine.output_streams = engine.output_streams - 1; }
     ret base_event[T](engine, EVENT_NONE);
 }
 
@@ -2356,7 +2657,7 @@ fun handle_fin[T](engine: *Engine[T], stream: *Stream) Event {
         val outcome: Event = release_outcome[T](engine,
             release_or_park[T](engine, stream.transport_stream));
         if (outcome.kind != EVENT_NONE) { ret outcome; }
-        stream.live = false;
+        free_stream[T](engine, stream);
         if (engine.active_peer_unidirectional != 0) {
             engine.active_peer_unidirectional = engine.active_peer_unidirectional - 1;
         }
@@ -2381,7 +2682,11 @@ fun retry_blocked[T](engine: *Engine[T], stream: *Stream) Event {
     ret complete_field_section[T](engine, stream, decoded);
 }
 
+# a blocked stream reads nothing, so it probes for a reset only when the
+# transport reported one and otherwise just retries after an insert
 fun poll_blocked_reset[T](engine: *Engine[T], stream: *Stream) Event {
+    if (!stream.probe_pending) { ret retry_blocked[T](engine, stream); }
+    stream.probe_pending = false;
     val result: TransportRead = engine.transport.read(engine.transport.context,
         stream.transport_stream, nil, 0);
     if (!transport_status(result.status) || result.count != 0) {
@@ -2402,9 +2707,9 @@ fun poll_blocked_reset[T](engine: *Engine[T], stream: *Stream) Event {
             ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
         }
         if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
-        stream.uncredited    = 0;
-        stream.qpack_credit  = 0;
-        stream.qpack_blocked = false;
+        stream.uncredited   = 0;
+        stream.qpack_credit = 0;
+        clear_blocked[T](engine, stream);
         mark_closed[T](engine, stream);
         stream.reset_code = result.application_error;
         var reset: Event = stream_event[T](engine, EVENT_STREAM_RESET, stream);
@@ -2445,7 +2750,8 @@ fun process_one_stream[T](engine: *Engine[T], stream: *Stream) Event {
         ret process_request_frame[T](engine, stream);
     }
     if (stream.input_offset == stream.input_length) {
-        if (stream.input_fin) { ret handle_fin[T](engine, stream); }
+        if (stream.input_fin)   { ret handle_fin[T](engine, stream); }
+        if (stream.read_parked) { ret base_event[T](engine, EVENT_NONE); }
         val read_event: Event = read_stream[T](engine, stream);
         if (read_event.kind != EVENT_NONE) { ret read_event; }
         if (stream.input_offset == stream.input_length) {
@@ -2470,18 +2776,96 @@ fun process_one_stream[T](engine: *Engine[T], stream: *Stream) Event {
     ret process_request_frame[T](engine, stream);
 }
 
-fun pending_retry[T](engine: *Engine[T]) Event {
-    var i: usize = 0;
-    for (i < engine.stream_capacity) {
-        val stream: *Stream = ?engine.streams[i];
-        if (stream.live && stream.retry_pending) {
-            stream.retry_pending = false;
-            var result: Event = stream_event[T](engine, EVENT_STREAM_RETRY, stream);
-            result.code = H3_REQUEST_REJECTED;
-            ret result;
+fun decoder_stream_usable[T](engine: *Engine[T], stream: *Stream) bool {
+    ret stream.decoder_stream.initialized
+        || (engine.peer_settings_received && engine.outbound_sections.valid);
+}
+
+# true exactly when servicing the stream can make progress without news from
+# the transport or the application
+fun stream_has_work[T](engine: *Engine[T], stream: *Stream) bool {
+    if (!stream.live)            { ret false; }
+    if (stream.retry_pending)    { ret true; }
+    if (stream_terminal(stream)) { ret false; }
+    if (stream.held)             { ret true; }
+    if (stream.kind == STREAM_REQUEST && !stream.write_parked
+        && output_pending(stream)) { ret true; }
+    if (stream.qpack_blocked) { ret !stream.blocked_listed || stream.probe_pending; }
+    if ((stream.kind == STREAM_REQUEST || stream.kind == STREAM_CONTROL)
+        && stream.frame_started && stream.parser.remaining == 0) { ret true; }
+    if (stream.input_offset != stream.input_length) {
+        if (stream.kind == STREAM_QPACK_DECODER) {
+            ret decoder_stream_usable[T](engine, stream);
         }
-        i = i + 1;
+        ret true;
     }
+    if (stream.input_fin) { ret !stream.remote_end_reported; }
+    ret stream_readable(stream) && !stream.read_parked;
+}
+
+fun note_ready[T](engine: *Engine[T], report: TransportReady) {
+    if (report.handle.id > MAX_STREAM_ID) { ret; }
+    val slot: usize = index_find[T](engine, report.handle.id);
+    if (slot == NO_SLOT) { ret; }
+    val stream: *Stream = ?engine.streams[slot];
+    if (stream.transport_stream.source != report.handle.source
+        || stream.transport_stream.index != report.handle.index
+        || stream.transport_stream.generation != report.handle.generation) { ret; }
+    if (report.readable || report.reset) {
+        stream.read_parked = false;
+        if (stream.qpack_blocked) { stream.probe_pending = true; }
+    }
+    if (report.writable || report.reset) { stream.write_parked = false; }
+    wake_stream[T](engine, stream);
+}
+
+fun drain_ready[T](engine: *Engine[T]) Event {
+    var taken: usize = 0;
+    for (taken < READY_BUDGET) {
+        val report: TransportReady = engine.transport.ready(engine.transport.context);
+        if (report.status == TRANSPORT_EMPTY) { brk; }
+        if (report.status != TRANSPORT_OK) {
+            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        }
+        note_ready[T](engine, report);
+        taken = taken + 1;
+    }
+    ret base_event[T](engine, EVENT_NONE);
+}
+
+fun service_stream[T](engine: *Engine[T], stream: *Stream) Event {
+    if (!stream.live) { ret base_event[T](engine, EVENT_NONE); }
+    if (stream.retry_pending) {
+        stream.retry_pending = false;
+        var retry: Event = stream_event[T](engine, EVENT_STREAM_RETRY, stream);
+        retry.code = H3_REQUEST_REJECTED;
+        ret retry;
+    }
+    val flushed: Event = flush_request_output[T](engine, stream);
+    if (flushed.kind != EVENT_NONE && flushed.kind != EVENT_BLOCKED) { ret flushed; }
+    val result: Event = process_one_stream[T](engine, stream);
+    if (result.kind == EVENT_NONE) { ret flushed; }
+    ret result;
+}
+
+# each queued stream is serviced at most once per call and requeued at the
+# tail while it still has work, which keeps the order round-robin
+fun service_ready[T](engine: *Engine[T], blocked: bool) Event {
+    var output_blocked: bool  = blocked;
+    var budget:         usize = engine.ready_count;
+    if (budget > SERVICE_BUDGET) { budget = SERVICE_BUDGET; }
+    for (budget != 0) {
+        budget = budget - 1;
+        val stream: *Stream = ready_pop[T](engine);
+        if (stream == nil) { brk; }
+        engine.slot_visits = engine.slot_visits + 1;
+        val result: Event = service_stream[T](engine, stream);
+        if (result.kind == EVENT_ERROR || result.kind == EVENT_CANCELLED) { ret result; }
+        wake_stream[T](engine, stream);
+        if (result.kind == EVENT_BLOCKED) { output_blocked = true; }
+        or (result.kind != EVENT_NONE)    { ret result; }
+    }
+    if (output_blocked) { ret base_event[T](engine, EVENT_BLOCKED); }
     ret base_event[T](engine, EVENT_NONE);
 }
 
@@ -2497,38 +2881,13 @@ pub fun process[T](engine: *Engine[T]) Event {
     queue_increment[T](engine);
     val drained: Event = drain_releases[T](engine);
     if (drained.kind != EVENT_NONE) { ret drained; }
-    val retry: Event = pending_retry[T](engine);
-    if (retry.kind != EVENT_NONE) { ret retry; }
-    var output_blocked: bool  = false;
-    val output:         Event = progress_critical_output[T](engine);
+    val output: Event = progress_critical_output[T](engine);
     if (output.kind == EVENT_ERROR || output.kind == EVENT_CANCELLED) { ret output; }
-    output_blocked = output.kind == EVENT_BLOCKED;
     val accepted: Event = accept_peer[T](engine);
     if (accepted.kind != EVENT_NONE) { ret accepted; }
-    var offset: usize = 0;
-    for (offset < engine.stream_capacity) {
-        val index: usize = ring_add(engine.next_process, offset,
-            engine.stream_capacity);
-        val flushed: Event = flush_request_output[T](engine, ?engine.streams[index]);
-        if (flushed.kind == EVENT_ERROR || flushed.kind == EVENT_CANCELLED) { ret flushed; }
-        if (flushed.kind == EVENT_BLOCKED)                                  { output_blocked = true; }
-        offset = offset + 1;
-    }
-    offset = 0;
-    for (offset < engine.stream_capacity) {
-        val index: usize = ring_add(engine.next_process, offset,
-            engine.stream_capacity);
-        val stream: *Stream = ?engine.streams[index];
-        val result: Event   = process_one_stream[T](engine, stream);
-        if (result.kind != EVENT_NONE && result.kind != EVENT_BLOCKED) {
-            engine.next_process = ring_add(index, 1, engine.stream_capacity);
-            ret result;
-        }
-        if (result.kind == EVENT_BLOCKED) { output_blocked = true; }
-        offset = offset + 1;
-    }
-    if (output_blocked) { ret base_event[T](engine, EVENT_BLOCKED); }
-    ret base_event[T](engine, EVENT_NONE);
+    val reported: Event = drain_ready[T](engine);
+    if (reported.kind != EVENT_NONE) { ret reported; }
+    ret service_ready[T](engine, output.kind == EVENT_BLOCKED);
 }
 
 pub fun consume_data[T](engine: *Engine[T], id: u64, count: usize) bool {
@@ -2545,6 +2904,7 @@ pub fun consume_data[T](engine: *Engine[T], id: u64, count: usize) bool {
         stream.held_data = nil;
         frame.release(?stream.parser);
     }
+    wake_stream[T](engine, stream);
     ret true;
 }
 
@@ -2559,6 +2919,7 @@ pub fun release_event[T](engine: *Engine[T], id: u64, generation: u64) bool {
     stream.held_kind       = EVENT_NONE;
     stream.held_headers    = empty_headers();
     stream.held_end_stream = false;
+    wake_stream[T](engine, stream);
     ret true;
 }
 
@@ -2577,8 +2938,7 @@ pub fun release_stream[T](engine: *Engine[T], id: u64, generation: u64) bool {
         && engine.active_peer_unidirectional != 0) {
         engine.active_peer_unidirectional = engine.active_peer_unidirectional - 1;
     }
-    val memory_value: StreamMemory = stream.memory;
-    reset_stream(stream, memory_value);
+    free_stream[T](engine, stream);
     ret true;
 }
 
@@ -2616,6 +2976,7 @@ pub fun detach_exchange[T](engine: *Engine[T], id: u64,
     }
     val detached: *exchange.Exchange = stream.exchange;
     stream.exchange = nil;
+    exchange_unlink[T](engine, stream);
     ret detached;
 }
 
@@ -2627,6 +2988,8 @@ pub fun cancel_stream[T](engine: *Engine[T], id: u64, code: u64) bool {
     ret result.kind == EVENT_STREAM_ERROR;
 }
 
+# the fallback for exchange scopes cancelled without `cancel_stream`. it walks
+# only the exchange-bound request streams, so it is not called per event.
 pub fun tick[T](engine: *Engine[T]) Event {
     if (engine == nil || !engine.initialized) {
         ret invalid_event();
@@ -2634,19 +2997,17 @@ pub fun tick[T](engine: *Engine[T]) Event {
     if (!scope_active(engine.scope)) {
         ret fail_connection[T](engine, ERROR_CANCELLED, H3_REQUEST_CANCELLED);
     }
-    var i: usize = 0;
-    for (i < engine.stream_capacity) {
-        val stream: *Stream = ?engine.streams[i];
-        if (stream.live && stream.kind == STREAM_REQUEST && !stream_terminal(stream)
-            && stream.exchange != nil
-            && !scope_active(stream.exchange.scope)) {
+    var slot: usize = engine.exchange_head;
+    for (slot != NO_SLOT) {
+        val stream: *Stream = ?engine.streams[slot];
+        slot = stream.exchange_next;
+        if (!stream_terminal(stream) && !scope_active(stream.exchange.scope)) {
             exchange.settle_cancellation(stream.exchange);
             val result: Event = stream_failure[T](engine, stream, H3_REQUEST_CANCELLED);
             var reset:  Event = result;
             reset.kind = EVENT_STREAM_RESET;
             ret reset;
         }
-        i = i + 1;
     }
     ret base_event[T](engine, EVENT_NONE);
 }
@@ -2721,15 +3082,7 @@ pub fun finish_graceful[T](engine: *Engine[T]) bool {
 }
 
 fun pending_request_output[T](engine: *Engine[T]) bool {
-    var i: usize = 0;
-    for (i < engine.stream_capacity) {
-        val stream: *Stream = ?engine.streams[i];
-        if (stream.live && (stream.output_length != 0 || stream.output_end_stream)) {
-            ret true;
-        }
-        i = i + 1;
-    }
-    ret false;
+    ret engine.output_streams != 0;
 }
 
 pub fun progress_close[T](engine: *Engine[T]) bool {
@@ -2791,7 +3144,10 @@ rec TestWire {
     reset_acked:       bool;
     stop_acked:        bool;
     released:          bool;
+    write_blocked:     bool;
 }
+
+val TEST_SIGNALS: usize = 256;
 
 rec TestTransport {
     secret:         ^u64;
@@ -2809,6 +3165,64 @@ rec TestTransport {
     close_code:     u64;
     close_override: bool;
     close_status:   TransportStatus;
+    calls:          usize;
+    reads:          usize;
+    signals:        [256]TransportReady;
+    signal_head:    usize;
+    signal_count:   usize;
+    signal_dropped: bool;
+}
+
+fun test_call(io: *TestTransport) {
+    io.calls = io.calls + 1;
+}
+
+# the fake's transport state changes only through the test, so every change is
+# reported here, exactly as a real adapter must
+fun test_signal(io: *TestTransport, value: StreamHandle, readable: bool,
+    writable: bool, reset: bool) {
+    if (io.signal_count == TEST_SIGNALS) {
+        io.signal_dropped = true;
+        ret;
+    }
+    io.signals[(io.signal_head + io.signal_count) % TEST_SIGNALS] = TransportReady{
+        status:   TRANSPORT_OK, handle: value, readable: readable,
+        writable: writable, reset: reset
+    };
+    io.signal_count = io.signal_count + 1;
+}
+
+fun test_ready(context: *TestTransport) TransportReady {
+    val io: *TestTransport = context;
+    test_call(io);
+    if (io.signal_count == 0) {
+        ret TransportReady{status: TRANSPORT_EMPTY, handle: no_handle(),
+            readable: false, writable: false, reset: false};
+    }
+    val report: TransportReady = io.signals[io.signal_head];
+    io.signal_head  = (io.signal_head + 1) % TEST_SIGNALS;
+    io.signal_count = io.signal_count - 1;
+    ret report;
+}
+
+fun wire_feed(io: *TestTransport, wire: *TestWire, input: *u8, length: usize,
+    fin: bool) {
+    wire.input        = input;
+    wire.input_length = length;
+    wire.input_offset = 0;
+    wire.fin          = fin;
+    test_signal(io, wire.handle, true, false, false);
+}
+
+fun wire_reset(io: *TestTransport, wire: *TestWire, code: u64) {
+    wire.reset             = true;
+    wire.application_error = code;
+    test_signal(io, wire.handle, false, false, true);
+}
+
+fun wire_unblock(io: *TestTransport, wire: *TestWire) {
+    wire.write_blocked = false;
+    test_signal(io, wire.handle, false, true, false);
 }
 
 fun no_handle() StreamHandle {
@@ -2850,6 +3264,7 @@ fun test_claim(io: *TestTransport, id: u64) *TestWire {
             wire.stop_acked        = false;
             wire.local             = false;
             wire.released          = false;
+            wire.write_blocked     = false;
             ret wire;
         }
         i = i + 1;
@@ -2859,7 +3274,8 @@ fun test_claim(io: *TestTransport, id: u64) *TestWire {
 
 fun test_open(context: *TestTransport, direction: u8) TransportOpen {
     val io: *TestTransport = context;
-    var id: u64            = io.next_bidi;
+    test_call(io);
+    var id: u64 = io.next_bidi;
     if (direction == UNIDIRECTIONAL) { id = io.next_uni; }
     val wire: *TestWire = test_claim(io, id);
     if (wire == nil) {
@@ -2876,7 +3292,8 @@ fun test_open(context: *TestTransport, direction: u8) TransportOpen {
 
 fun test_accept(context: *TestTransport) TransportOpen {
     val io: *TestTransport = context;
-    var i:  usize          = 0;
+    test_call(io);
+    var i: usize = 0;
     for (i < io.capacity) {
         if (io.wires[i].live && io.wires[i].pending_accept) {
             io.wires[i].pending_accept = false;
@@ -2894,6 +3311,8 @@ fun test_read(context: *TestTransport, value: StreamHandle,
     output: *u8, capacity: usize) TransportRead {
     val io:   *TestTransport = context;
     val wire: *TestWire      = test_wire(io, value);
+    test_call(io);
+    io.reads = io.reads + 1;
     if (wire == nil || (output == nil && capacity != 0)) {
         ret TransportRead{status: TRANSPORT_ERROR, count: 0, final_size: 0,
             application_error: 0, fin: false, error: 1};
@@ -2925,6 +3344,7 @@ fun test_read(context: *TestTransport, value: StreamHandle,
 fun test_credit(context: *TestTransport, value: StreamHandle,
     count: usize) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
+    test_call(context);
     if (wire == nil || count > wire.delivered - wire.credited) {
         ret TransportOperation{status: TRANSPORT_ERROR, error: 1};
     }
@@ -2936,12 +3356,18 @@ fun test_write(context: *TestTransport, value: StreamHandle,
     input: *u8, length: usize) TransportWrite {
     val io:   *TestTransport = context;
     val wire: *TestWire      = test_wire(io, value);
+    test_call(io);
     if (wire == nil || (input == nil && length != 0)
         || wire.output_length > wire.output_capacity
         || length > wire.output_capacity - wire.output_length) {
         ret TransportWrite{status: TRANSPORT_ERROR, count: 0,
             connection_blocked: false, stream_blocked: false,
             storage_blocked:    false, error: 1};
+    }
+    if (wire.write_blocked) {
+        ret TransportWrite{status: TRANSPORT_BLOCKED, count: 0,
+            connection_blocked: false, stream_blocked: true,
+            storage_blocked:    false, error: 0};
     }
     var count: usize = length;
     if (io.write_limit != 0 && count > io.write_limit) { count = io.write_limit; }
@@ -2956,6 +3382,10 @@ fun test_write(context: *TestTransport, value: StreamHandle,
 
 fun test_finish(context: *TestTransport, value: StreamHandle) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
+    test_call(context);
+    if (wire != nil && wire.write_blocked) {
+        ret TransportOperation{status: TRANSPORT_BLOCKED, error: 0};
+    }
     if (wire == nil) { ret TransportOperation{status: TRANSPORT_ERROR, error: 1}; }
     wire.finished = true;
     ret TransportOperation{status: TRANSPORT_OK, error: 0};
@@ -2964,6 +3394,7 @@ fun test_finish(context: *TestTransport, value: StreamHandle) TransportOperation
 fun test_cancel_send(context: *TestTransport, value: StreamHandle,
     code: u64) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
+    test_call(context);
     if (wire == nil) { ret TransportOperation{status: TRANSPORT_ERROR, error: 1}; }
     wire.send_cancelled    = true;
     wire.application_error = code;
@@ -2973,6 +3404,7 @@ fun test_cancel_send(context: *TestTransport, value: StreamHandle,
 fun test_cancel_receive(context: *TestTransport, value: StreamHandle,
     code: u64) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
+    test_call(context);
     if (wire == nil) { ret TransportOperation{status: TRANSPORT_ERROR, error: 1}; }
     wire.receive_cancelled = true;
     wire.application_error = code;
@@ -3001,6 +3433,7 @@ fun test_settled(wire: *TestWire) bool {
 
 fun test_release(context: *TestTransport, value: StreamHandle) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
+    test_call(context);
     if (wire == nil) { ret TransportOperation{status: TRANSPORT_ERROR, error: 1}; }
     if (!test_settled(wire)) {
         ret TransportOperation{status: TRANSPORT_BLOCKED, error: 0};
@@ -3011,6 +3444,7 @@ fun test_release(context: *TestTransport, value: StreamHandle) TransportOperatio
 
 fun test_close(context: *TestTransport, code: u64) TransportOperation {
     val io: *TestTransport = context;
+    test_call(io);
     io.close_calls = io.close_calls + 1;
     io.close_code  = code;
     if (io.close_override) { ret TransportOperation{status: io.close_status, error: 0}; }
@@ -3021,7 +3455,8 @@ test "http.h3.connection: typed transport accepts a secret-welded context" {
     var io: TestTransport;
     io.secret = 7;
     val transport: Transport[TestTransport] = Transport[TestTransport]{
-        context:     ?io, open: test_open, accept: test_accept, read: test_read,
+        context:     ?io, open: test_open, accept: test_accept, ready: test_ready,
+        read:        test_read,
         credit:      test_credit, write: test_write, finish: test_finish,
         cancel_send: test_cancel_send, cancel_receive: test_cancel_receive,
         release:     test_release, close: test_close
@@ -3032,22 +3467,27 @@ test "http.h3.connection: typed transport accepts a secret-welded context" {
     ret 0;
 }
 
+val FIXTURE_SLOTS: usize = 100;
+val FIXTURE_WIRES: usize = 112;
+
 rec Fixture {
     scope:               cancel.Scope;
     io:                  TestTransport;
-    wires:               [12]TestWire;
-    wire_output:         [12][1024]u8;
-    streams:             [6]Stream;
-    memories:            [6]StreamMemory;
+    slots:               usize;
+    wires:               [112]TestWire;
+    wire_output:         [112][1024]u8;
+    streams:             [100]Stream;
+    memories:            [100]StreamMemory;
+    index:               [256]StreamIndexEntry;
     pending:             [4]StreamHandle;
-    reads:               [6][128]u8;
-    settings:            [6][5]frame.Setting;
-    encoded:             [6][256]u8;
-    fields:              [6][16]field.Field;
-    strings:             [6][512]u8;
-    scratch:             [6][256]u8;
-    output:              [6][512]u8;
-    field_references:    [6][16]u64;
+    reads:               [100][128]u8;
+    settings:            [100][5]frame.Setting;
+    encoded:             [100][256]u8;
+    fields:              [100][16]field.Field;
+    strings:             [100][512]u8;
+    scratch:             [100][256]u8;
+    output:              [100][512]u8;
+    field_references:    [100][16]u64;
     inbound_entries:     [8]qpack.Entry;
     inbound_storage:     [256]u8;
     inbound_scratch:     [256]u8;
@@ -3090,7 +3530,7 @@ fun test_config() Config {
 # a fresh transport, as a pooled engine gets for its next connection
 fun reset_io(fixture: *Fixture, role: Role) {
     fixture.io.wires    = ?fixture.wires[0];
-    fixture.io.capacity = 12;
+    fixture.io.capacity = FIXTURE_WIRES;
     fixture.io.role     = role;
     fixture.io.source   = 77;
     if (role == CLIENT) {
@@ -3101,14 +3541,19 @@ fun reset_io(fixture: *Fixture, role: Role) {
         fixture.io.next_bidi = 1;
         fixture.io.next_uni  = 3;
     }
-    fixture.io.read_limit  = 0;
-    fixture.io.write_limit = 0;
-    fixture.io.opens       = 0;
-    fixture.io.accepts     = 0;
-    fixture.io.close_calls = 0;
-    fixture.io.close_code  = 0;
+    fixture.io.read_limit     = 0;
+    fixture.io.write_limit    = 0;
+    fixture.io.opens          = 0;
+    fixture.io.accepts        = 0;
+    fixture.io.close_calls    = 0;
+    fixture.io.close_code     = 0;
+    fixture.io.calls          = 0;
+    fixture.io.reads          = 0;
+    fixture.io.signal_head    = 0;
+    fixture.io.signal_count   = 0;
+    fixture.io.signal_dropped = false;
     var i: usize = 0;
-    for (i < 12) {
+    for (i < FIXTURE_WIRES) {
         fixture.wires[i].live              = false;
         fixture.wires[i].handle.generation = 0;
         fixture.wires[i].output            = ?fixture.wire_output[i][0];
@@ -3118,17 +3563,30 @@ fun reset_io(fixture: *Fixture, role: Role) {
 }
 
 fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
+    ret make_sized_fixture(fixture, role, configured, 6);
+}
+
+fun make_sized_fixture(fixture: *Fixture, role: Role, configured: Config,
+    slots: usize) bool {
+    if (slots > FIXTURE_SLOTS) { ret false; }
+    fixture.slots = slots;
     val none: time.Time = time.Time{sec: 0, nsec: 0};
     if (!operation_ok(cancel.make_root(?fixture.scope, false, none))) { ret false; }
     reset_io(fixture, role);
     ret start_engine(fixture, role, configured);
 }
 
+fun index_size(slots: usize) usize {
+    var size: usize = 1;
+    for (size < 2 * slots) { size = size * 2; }
+    ret size;
+}
+
 # every argument is the fixture's own storage, so calling this a second time is
 # exactly what a pool does with a recycled engine
 fun start_engine(fixture: *Fixture, role: Role, configured: Config) bool {
     var i: usize = 0;
-    for (i < 6) {
+    for (i < fixture.slots) {
         fixture.memories[i] = StreamMemory{
             read:       ?fixture.reads[i][0], read_capacity: 128,
             settings:   ?fixture.settings[i][0], setting_capacity: 5,
@@ -3143,14 +3601,16 @@ fun start_engine(fixture: *Fixture, role: Role, configured: Config) bool {
     }
     val transport: Transport[TestTransport] = Transport[TestTransport]{
         context:     ?fixture.io,
-        open:        test_open, accept: test_accept, read: test_read,
+        open:        test_open, accept: test_accept, ready: test_ready, read: test_read,
         credit:      test_credit, write: test_write, finish: test_finish,
         cancel_send: test_cancel_send, cancel_receive: test_cancel_receive,
         release:     test_release, close: test_close
     };
     val storage: Storage = Storage{
         streams:                     ?fixture.streams[0], memories: ?fixture.memories[0],
-        stream_capacity:             6,
+        stream_capacity:             fixture.slots,
+        stream_index:                ?fixture.index[0],
+        stream_index_capacity:       index_size(fixture.slots),
         pending_release:             ?fixture.pending[0], pending_release_capacity: 4,
         inbound_entries:             ?fixture.inbound_entries[0], inbound_entry_capacity: 8,
         inbound_storage:             ?fixture.inbound_storage[0], inbound_storage_capacity: 256,
@@ -3665,10 +4125,8 @@ test "http.h3.connection: informational response counts are bounded in both dire
     val second_length:  usize = informational_response(
         ?response_bytes[first_length], 16 - first_length);
     if (client_wire == nil || first_length == 0 || second_length == 0) { ret 3; }
-    client_wire.input        = ?response_bytes[0];
-    client_wire.input_length = first_length + second_length;
-    client_wire.input_offset = 0;
-    client_wire.fin          = false;
+    wire_feed(?client.io, client_wire, ?response_bytes[0],
+        first_length + second_length, false);
     val first: Event = drive(?client, EVENT_INFORMATIONAL, 32);
     if (first.stream_id != 0 || first.headers.status != 103
         || !release_event[TestTransport](?client.engine, 0, first.generation)) { ret 4; }
@@ -3862,13 +4320,10 @@ test "http.h3.connection: peer goaway retries only requests at or above its boun
     if (control_stream == nil) { ret 3; }
     val control: *TestWire = test_wire(?fixture.io, control_stream.transport_stream);
     var goaway:  [3]u8;
-    goaway[0]            = frame.FRAME_GOAWAY::u8;
-    goaway[1]            = 1;
-    goaway[2]            = 4;
-    control.input        = ?goaway[0];
-    control.input_length = 3;
-    control.input_offset = 0;
-    control.fin          = false;
+    goaway[0] = frame.FRAME_GOAWAY::u8;
+    goaway[1] = 1;
+    goaway[2] = 4;
+    wire_feed(?fixture.io, control, ?goaway[0], 3, false);
     val event: Event = drive(?fixture, EVENT_GOAWAY, 32);
     if (event.goaway_id != 4 || stream_for[TestTransport](?fixture.engine, 0) == nil
         || !stream_for[TestTransport](?fixture.engine, 4).retry_pending
@@ -4025,8 +4480,7 @@ test "http.h3.connection: blocked reset and application cancellation settle once
         ?blocked_bytes[0], blocked_length, false);
     if (blocked_wire == nil
         || drive(?blocked, EVENT_BLOCKED, 32).kind != EVENT_BLOCKED) { ret 2; }
-    blocked_wire.reset             = true;
-    blocked_wire.application_error = H3_REQUEST_CANCELLED;
+    wire_reset(?blocked.io, blocked_wire, H3_REQUEST_CANCELLED);
     val reset: Event = drive(?blocked, EVENT_STREAM_RESET, 16);
     if (reset.code != H3_REQUEST_CANCELLED
         || blocked.engine.inbound_sections.count != 0
