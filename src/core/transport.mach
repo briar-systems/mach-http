@@ -6,7 +6,6 @@ use std.io.lifecycle;
 use io_runtime: std.io.runtime;
 use std.sync.cancel;
 use std.sync.mutex;
-use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -161,25 +160,26 @@ fun operation_for(kind: Kind) io_error.Operation {
 }
 
 fun invalid(operation: io_error.Operation) io_error.Error {
-    ret io_error.from_code(os.EINVAL, operation);
+    ret io_error.make(io_error.INVALID, operation);
 }
 
 fun busy(operation: io_error.Operation) io_error.Error {
-    ret io_error.from_code(os.EBUSY, operation);
+    ret io_error.make(io_error.BUSY, operation);
 }
 
 fun closed(operation: io_error.Operation) io_error.Error {
-    ret io_error.from_code(os.EBADF, operation);
+    ret io_error.make(io_error.CLOSED, operation);
 }
 
+# the adapter broke its contract, so the i/o it stood for failed
 fun adapter_failure(operation: io_error.Operation) io_error.Error {
-    ret io_error.from_code(os.EIO, operation);
+    ret io_error.make(io_error.IO, operation);
 }
 
 fun reason_error(reason: cancel.Reason, operation: io_error.Operation) io_error.Error {
-    if ((sel reason.timed_out)) { ret io_error.from_code(os.ETIMEDOUT, operation); }
-    if ((sel reason.cancelled)) { ret io_error.from_code(os.ECANCELED, operation); }
-    ret io_error.from_code(os.EBADF, operation);
+    if ((sel reason.timed_out)) { ret io_error.make(io_error.TIMEOUT, operation); }
+    if ((sel reason.cancelled)) { ret io_error.make(io_error.CANCELLED, operation); }
+    ret io_error.make(io_error.CLOSED, operation);
 }
 
 pub fun adapter_valid(adapter: *Adapter) bool {
@@ -442,7 +442,7 @@ pub fun completed(token: Token, kind: Kind, count: usize) Completion {
         status:  IO_COMPLETE,
         count:   count,
         context: 0,
-        error:   io_error.from_code(0, io_error.OP_UNKNOWN),
+        error:   io_error.make(io_error.OTHER, io_error.OP_UNKNOWN),
     };
 }
 
@@ -453,7 +453,7 @@ pub fun end(token: Token, count: usize) Completion {
         status:  IO_END,
         count:   count,
         context: 0,
-        error:   io_error.from_code(0, io_error.OP_UNKNOWN),
+        error:   io_error.make(io_error.OTHER, io_error.OP_UNKNOWN),
     };
 }
 
@@ -1132,7 +1132,7 @@ test "http.core.transport: adapter violations become terminal I/O errors" {
     if (!take_runtime(?fixture.runtime, ?native)
         || !complete_runtime(?fixture.transport, ?native, ?completion)
         || completion.status != IO_ERROR || completion.count != 0
-        || completion.error.kind != io_error.OTHER) { ret 4; }
+        || completion.error.kind != io_error.IO) { ret 4; }
     if (snapshot(?fixture.transport).read != ENDPOINT_CLOSED
         || snapshot(?fixture.transport).write != ENDPOINT_CLOSED
         || !destroy_fixture(?fixture)) { ret 5; }
@@ -1141,10 +1141,10 @@ test "http.core.transport: adapter violations become terminal I/O errors" {
     if (submit_refused(read(
         ?retry_fixture.transport, ?retry_fixture.operation_root, ?bytes[0], 2, 0))) { ret 7; }
     if (refused(io_runtime.fail(?retry_fixture.runtime,
-        retry_fixture.state.last_read, io_error.from_code(os.EAGAIN, io_error.OP_READ)))) { ret 8; }
+        retry_fixture.state.last_read, io_error.make(io_error.WOULD_BLOCK, io_error.OP_READ)))) { ret 8; }
     if (!take_runtime(?retry_fixture.runtime, ?native)
         || !complete_runtime(?retry_fixture.transport, ?native, ?completion)
-        || completion.status != IO_ERROR || completion.error.kind != io_error.OTHER) { ret 9; }
+        || completion.status != IO_ERROR || completion.error.kind != io_error.IO) { ret 9; }
     if (!destroy_fixture(?retry_fixture)) { ret 10; }
     ret 0;
 }
