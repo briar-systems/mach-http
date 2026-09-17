@@ -7,6 +7,7 @@
 - `transport.readable` waits for readability without lending a buffer. Its completion has kind `READABLE` and count 0 (#104).
 
 ### Changed
+- The license is attributed to Briar Systems LLC (#108).
 - **Breaking.** Dependencies: mach-std v5.3.0 (was v4.0.1), and `mach.toml` now requires mach `^5.3`. A consumer must be on std 5.x as well. Error completions from std 5.3 carry the bytes transferred before a cancellation or timeout. Every engine treats such a completion as fatal to its connection, never as an empty success (#104).
 - Dependencies (tests only): the h3-quic tests use mach-quic v0.12.1, and their adapter reports readiness through `transport.ready_stream` (#104).
 - **Breaking.** Every caller-supplied `now` and every deadline is a `std.chrono.time.Instant`, read with `time.instant()`, instead of a `time.Time`. This covers:
