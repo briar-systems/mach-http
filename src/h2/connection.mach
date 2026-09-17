@@ -1330,6 +1330,12 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
 }
 
 fun release_all(engine: *Engine) {
+    # linear once per connection
+    var i: usize = 0;
+    for (i < engine.stream_capacity) {
+        release_stream_memory(engine, slot_stream(engine, i));
+        i = i + 1;
+    }
     settle_payload(engine);
     release_encoder(engine);
     release_write(engine);
@@ -1342,6 +1348,8 @@ fun release_all(engine: *Engine) {
 
 # returns every borrowed record and buffer to the account and the engine to the
 # state `init` accepts, so caller-owned storage can carry a second connection.
+# once the transport close has completed, streams the host never released, or
+# never learned of, are dropped here, since none of them can progress again.
 # zeroing is deliberate: the initialization guards on the two HPACK tables, the
 # parser, and the writer all live inside this record, as do the transport tokens
 # `init` does not otherwise rewrite, and a field added later must not silently
@@ -1349,7 +1357,7 @@ fun release_all(engine: *Engine) {
 pub fun destroy(engine: *Engine) bool {
     if (engine == nil || !engine.initialized) { ret false; }
     if (engine.read_pending || engine.write_pending || engine.close_pending
-        || engine.held || engine.active_streams != 0) { ret false; }
+        || engine.held || (engine.state != CLOSED && engine.active_streams != 0)) { ret false; }
     engine.header_output_active = false;
     engine.write_length         = 0;
     release_all(engine);
@@ -2674,8 +2682,10 @@ pub fun release_event(engine: *Engine, id: u32, generation: u64) bool {
     if (engine == nil || !engine.initialized || !engine.held
         || engine.held_kind == EVENT_DATA || engine.held_stream != id) { ret false; }
     val stream: *Stream = stream_for(engine, id);
+    # a closed stream is never served, so it needs no exchange to end the borrow
     if (stream == nil || stream.generation != generation
-        || (engine.held_kind == EVENT_REQUEST_HEADERS && stream.exchange == nil)) {
+        || (engine.held_kind == EVENT_REQUEST_HEADERS && stream.exchange == nil
+        && stream.state != STREAM_CLOSED)) {
         ret false;
     }
     engine.held            = false;
@@ -4675,5 +4685,53 @@ test "http.h2.connection: stream records grow in place and the index follows the
         if (first[i].live && stream_for(?fixture.engine, first[i].id) != first[i]) { ret 8; }
         i = i + 1;
     }
+    ret 0;
+}
+
+test "http.h2.connection: an unbound request borrow ends once its stream closes" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS
+        || !drain_output(?fixture)) { ret 1; }
+    var request: [6]u8;
+    request_block(?request[0]);
+    val reported: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS, 1, ?request[0], 6);
+    if (reported.kind != EVENT_REQUEST_HEADERS
+        || release_event(?fixture.engine, 1, reported.generation)) { ret 2; }
+    if (!cancel_stream(?fixture.engine, 1, H2_CANCEL)
+        || !release_event(?fixture.engine, 1, reported.generation)
+        || fixture.engine.held) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a failed connection destroys with streams the host never released" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS
+        || !drain_output(?fixture)) { ret 1; }
+    var request: [6]u8;
+    request_block(?request[0]);
+    val reported: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS, 1, ?request[0], 6);
+    var storage: ExchangeMemory;
+    if (reported.kind != EVENT_REQUEST_HEADERS
+        || !make_exchange(?storage, reported.generation, 1)
+        || !bind_exchange(?fixture.engine, 1, ?storage.exchange)
+        || !release_event(?fixture.engine, 1, reported.generation)) { ret 2; }
+    # a header block the host never hears of, then a frame that breaks it off
+    if (receive_frame(?fixture, frame.FRAME_HEADERS, 0, 3, ?request[0], 3).kind == EVENT_ERROR
+        || fixture.engine.active_streams != 2) { ret 3; }
+    var opaque: [8]u8;
+    if (receive_frame(?fixture, frame.FRAME_PING, 0, 0, ?opaque[0], 8).kind != EVENT_ERROR
+        || fixture.engine.state != FAILED || destroy(?fixture.engine)) { ret 4; }
+    if (!drain_output(?fixture) || !progress_close(?fixture.engine)) { ret 5; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed).kind != EVENT_CLOSED
+        || fixture.engine.active_streams != 2) { ret 6; }
+    if (!destroy(?fixture.engine))   { ret 7; }
+    if (fixture.account.held != 0)   { ret 8; }
+    if (fixture.account.chunks != 0) { ret 9; }
     ret 0;
 }
