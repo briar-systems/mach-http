@@ -3726,8 +3726,14 @@ fun informational_response(output: *u8, capacity: usize) usize {
 }
 
 fun blocked_request(output: *u8, capacity: usize) usize {
+    ret blocked_request_at(output, capacity, 2);
+}
+
+# the encoded required insert count 2 needs one insert, 3 needs two, and the
+# section references the newest entry it requires
+fun blocked_request_at(output: *u8, capacity: usize, encoded_required: u8) usize {
     var block: [6]u8;
-    block[0] = 2;
+    block[0] = encoded_required;
     block[1] = 0;
     block[2] = 0xd1;
     block[3] = 0xd7;
@@ -4521,5 +4527,294 @@ test "http.h3.connection: a transport the peer already closed satisfies the clos
     if (!cancel_connection[TestTransport](?failing.engine) || failing.engine.close_started) { ret 5; }
     if (progress_close[TestTransport](?failing.engine) || failing.engine.state != FAILED
         || failing.engine.close_started) { ret 6; }
+    ret 0;
+}
+
+# one process call over idle client requests with no transport news
+fun idle_process_cost(requests: usize, calls: *usize, visits: *usize,
+    reads: *usize) bool {
+    var configured: Config = test_config();
+    configured.max_requests = requests;
+    var fixture: Fixture;
+    if (!make_sized_fixture(?fixture, CLIENT, configured, requests + 3)
+        || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret false; }
+    var i: usize = 0;
+    for (i < requests) {
+        if (open_request[TestTransport](?fixture.engine, nil) == NO_STREAM) { ret false; }
+        i = i + 1;
+    }
+    # each new stream reads once, finds nothing and parks
+    i = 0;
+    for (i < 4) {
+        if (process[TestTransport](?fixture.engine).kind != EVENT_NONE) { ret false; }
+        i = i + 1;
+    }
+    if (fixture.engine.active_requests != requests || fixture.engine.state != OPEN) {
+        ret false;
+    }
+    val calls_before:  usize = fixture.io.calls;
+    val visits_before: usize = fixture.engine.slot_visits;
+    val reads_before:  usize = fixture.io.reads;
+    if (process[TestTransport](?fixture.engine).kind != EVENT_NONE) { ret false; }
+    @calls  = fixture.io.calls - calls_before;
+    @visits = fixture.engine.slot_visits - visits_before;
+    @reads  = fixture.io.reads - reads_before;
+    ret true;
+}
+
+test "http.h3.connection: an idle process call costs the same for few and many streams" {
+    var few_calls:   usize = 0;
+    var few_visits:  usize = 0;
+    var few_reads:   usize = 0;
+    var many_calls:  usize = 0;
+    var many_visits: usize = 0;
+    var many_reads:  usize = 0;
+    if (!idle_process_cost(3, ?few_calls, ?few_visits, ?few_reads))     { ret 1; }
+    if (!idle_process_cost(96, ?many_calls, ?many_visits, ?many_reads)) { ret 2; }
+    # one accept and one empty readiness poll, nothing per stream
+    if (few_calls != 2 || few_visits != 0 || few_reads != 0)                     { ret 3; }
+    if (many_calls != few_calls || many_visits != few_visits || many_reads != 0) { ret 4; }
+    ret 0;
+}
+
+test "http.h3.connection: the stream index survives tombstone churn and rebuilds" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, CLIENT, test_config())
+        || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    val anchor: u64 = open_request[TestTransport](?fixture.engine, nil);
+    if (anchor == NO_STREAM) { ret 2; }
+    var previous: u64   = NO_STREAM;
+    var round:    usize = 0;
+    for (round < 150) {
+        val id:     u64     = open_request[TestTransport](?fixture.engine, nil);
+        val stream: *Stream = stream_for[TestTransport](?fixture.engine, id);
+        if (id == NO_STREAM || stream == nil || stream.transport_stream.id != id) { ret 3; }
+        val generation: u64       = stream.generation;
+        val wire:       *TestWire = test_wire(?fixture.io, stream.transport_stream);
+        if (wire == nil || !cancel_stream[TestTransport](?fixture.engine, id,
+            H3_REQUEST_CANCELLED)) { ret 4; }
+        wire.reset_acked = true;
+        wire.stop_acked  = true;
+        if (!release_stream[TestTransport](?fixture.engine, id, generation)) { ret 5; }
+        # the fake recycles its wire as a real transport recycles its slot
+        wire.live = false;
+        if (stream_for[TestTransport](?fixture.engine, id) != nil
+            || (previous != NO_STREAM
+            && stream_for[TestTransport](?fixture.engine, previous) != nil)) { ret 6; }
+        val kept: *Stream = stream_for[TestTransport](?fixture.engine, anchor);
+        if (kept == nil || kept.transport_stream.id != anchor || stream_terminal(kept)) {
+            ret 7;
+        }
+        previous = id;
+        round    = round + 1;
+    }
+    if (fixture.engine.index_rebuilds == 0
+        || fixture.engine.index_tombstones > fixture.engine.index_capacity / 4) { ret 8; }
+    if (fixture.engine.active_requests != 1 || fixture.io.close_calls != 0) { ret 9; }
+    # the free list still hands out every remaining slot
+    if (open_request[TestTransport](?fixture.engine, nil) == NO_STREAM
+        || open_request[TestTransport](?fixture.engine, nil) == NO_STREAM
+        || fixture.engine.active_requests != 3) { ret 10; }
+    ret 0;
+}
+
+test "http.h3.connection: readiness reports gate reads and tolerate noise" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var input:          [32]u8;
+    val headers_length: usize = static_request(?input[0], 32);
+    var payload:        [3]u8;
+    payload[0] = 'a';
+    payload[1] = 'b';
+    payload[2] = 'c';
+    val data_length: usize = append_frame(?input[headers_length],
+        32 - headers_length, frame.FRAME_DATA, ?payload[0], 3);
+    val wire: *TestWire = peer_stream(?fixture, 0, ?input[0], headers_length, false);
+    if (wire == nil) { ret 2; }
+    val request: Event = drive(?fixture, EVENT_REQUEST_HEADERS, 32);
+    var storage: ExchangeMemory;
+    if (request.stream_id != 0 || !make_exchange(?storage, request.generation, 0)
+        || !bind_exchange[TestTransport](?fixture.engine, 0, ?storage.exchange)
+        || !release_event[TestTransport](?fixture.engine, 0, request.generation)) { ret 3; }
+    var i: usize = 0;
+    for (i < 4) {
+        process[TestTransport](?fixture.engine);
+        i = i + 1;
+    }
+    # data the transport never reported is never read
+    val reads: usize = fixture.io.reads;
+    wire.input_length = headers_length + data_length;
+    i                 = 0;
+    for (i < 8) {
+        if (process[TestTransport](?fixture.engine).kind != EVENT_NONE) { ret 4; }
+        i = i + 1;
+    }
+    if (fixture.io.reads != reads || wire.delivered != headers_length) { ret 5; }
+    # unknown ids, stale handles and reports without news change nothing
+    test_signal(?fixture.io, StreamHandle{source: 77, index: 0, generation: 1, id: 400},
+        true, true, true);
+    var stale: StreamHandle = wire.handle;
+    stale.generation = stale.generation + 1;
+    test_signal(?fixture.io, stale, true, true, true);
+    test_signal(?fixture.io, wire.handle, false, false, false);
+    if (process[TestTransport](?fixture.engine).kind != EVENT_NONE
+        || fixture.io.reads != reads) { ret 6; }
+    # a duplicated report yields the data once
+    test_signal(?fixture.io, wire.handle, true, false, false);
+    test_signal(?fixture.io, wire.handle, true, false, false);
+    test_signal(?fixture.io, wire.handle, true, false, false);
+    val data: Event = drive(?fixture, EVENT_DATA, 8);
+    if (data.stream_id != 0 || data.data_length != 3
+        || !consume_data[TestTransport](?fixture.engine, 0, 3)) { ret 7; }
+    i = 0;
+    for (i < 8) {
+        if (process[TestTransport](?fixture.engine).kind != EVENT_NONE) { ret 8; }
+        i = i + 1;
+    }
+    if (wire.delivered != headers_length + data_length
+        || fixture.io.signal_dropped || fixture.engine.state != OPEN
+        || fixture.io.close_calls != 0) { ret 9; }
+    ret 0;
+}
+
+test "http.h3.connection: blocked output waits for a writable report" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var request_bytes:  [16]u8;
+    val request_length: usize     = static_request(?request_bytes[0], 16);
+    val wire:           *TestWire = peer_stream(?fixture, 0, ?request_bytes[0],
+        request_length, true);
+    if (wire == nil) { ret 2; }
+    val request: Event            = drive(?fixture, EVENT_REQUEST_HEADERS, 32);
+    val service: exchange.Service = exchange.Service{ctx: nil, serve: test_service};
+    var storage: ExchangeMemory;
+    if (!make_exchange(?storage, request.generation, 0)
+        || !bind_exchange[TestTransport](?fixture.engine, 0, ?storage.exchange)
+        || !release_event[TestTransport](?fixture.engine, 0, request.generation)
+        || dispatch[TestTransport](?fixture.engine, 0, ?service) != exchange.SERVICE_COMPLETE
+        || drive(?fixture, EVENT_STREAM_END, 32).stream_id != 0) { ret 3; }
+    wire.write_blocked = true;
+    var response: [1]field.Field;
+    response[0] = field.Field{name: view.view(":status", 7),
+        value: view.view("204", 3), sensitive: false};
+    if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 1, true,
+        false).status != OFFER_OUTPUT
+        || process[TestTransport](?fixture.engine).kind != EVENT_BLOCKED) { ret 4; }
+    val calls: usize = fixture.io.calls;
+    var i:     usize = 0;
+    for (i < 8) {
+        if (process[TestTransport](?fixture.engine).kind != EVENT_NONE) { ret 5; }
+        i = i + 1;
+    }
+    # only the accept and readiness polls, never another write
+    if (fixture.io.calls != calls + 16 || wire.output_length != 0) { ret 6; }
+    wire_unblock(?fixture.io, wire);
+    i = 0;
+    for (i < 8 && !wire.finished) {
+        process[TestTransport](?fixture.engine);
+        i = i + 1;
+    }
+    if (!wire.finished || !release_stream[TestTransport](?fixture.engine, 0,
+        request.generation)) { ret 7; }
+    ret 0;
+}
+
+test "http.h3.connection: a qpack insert wakes only the streams it satisfies" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var one_bytes:  [16]u8;
+    var two_bytes:  [16]u8;
+    val one_length: usize = blocked_request_at(?one_bytes[0], 16, 2);
+    val two_length: usize = blocked_request_at(?two_bytes[0], 16, 3);
+    if (peer_stream(?fixture, 0, ?one_bytes[0], one_length, false) == nil
+        || drive(?fixture, EVENT_BLOCKED, 32).kind != EVENT_BLOCKED
+        || peer_stream(?fixture, 4, ?two_bytes[0], two_length, false) == nil
+        || drive(?fixture, EVENT_BLOCKED, 32).kind != EVENT_BLOCKED) { ret 2; }
+    val one: *Stream = stream_for[TestTransport](?fixture.engine, 0);
+    val two: *Stream = stream_for[TestTransport](?fixture.engine, 4);
+    if (one == nil || two == nil || !one.blocked_listed || !two.blocked_listed
+        || one.queued || two.queued || fixture.engine.blocked_head != one.slot) { ret 3; }
+    var instructions: [6]u8;
+    instructions[0] = frame.STREAM_QPACK_ENCODER::u8;
+    instructions[1] = 0x3f;
+    instructions[2] = 0x61;
+    instructions[3] = 0xc0;
+    instructions[4] = 1;
+    instructions[5] = 'x';
+    val encoder: *TestWire = peer_stream(?fixture, 6, ?instructions[0], 6, false);
+    if (encoder == nil) { ret 4; }
+    var i: usize = 0;
+    for (i < 32 && fixture.engine.inbound_table.insert_count == 0) {
+        process[TestTransport](?fixture.engine);
+        i = i + 1;
+    }
+    # the satisfied stream is queued, the other stays parked on the blocked list
+    if (fixture.engine.inbound_table.insert_count != 1
+        || !one.queued || one.blocked_listed
+        || two.queued || !two.blocked_listed
+        || fixture.engine.blocked_head != two.slot) { ret 5; }
+    val first: Event = drive(?fixture, EVENT_REQUEST_HEADERS, 16);
+    if (first.stream_id != 0 || first.headers.count != 4
+        || !two.qpack_blocked || two.queued) { ret 6; }
+    var second_insert: [3]u8;
+    second_insert[0] = 0xc0;
+    second_insert[1] = 1;
+    second_insert[2] = 'y';
+    wire_feed(?fixture.io, encoder, ?second_insert[0], 3, false);
+    i = 0;
+    var second: Event = base_event[TestTransport](?fixture.engine, EVENT_NONE);
+    for (i < 32 && second.stream_id != 4) {
+        second = process[TestTransport](?fixture.engine);
+        i      = i + 1;
+    }
+    if (second.kind != EVENT_REQUEST_HEADERS || second.headers.count != 4
+        || fixture.engine.inbound_table.insert_count != 2
+        || fixture.engine.blocked_head != NO_SLOT
+        || fixture.engine.inbound_sections.blocked_count != 0) { ret 7; }
+    ret 0;
+}
+
+test "http.h3.connection: streams with pending work are serviced round-robin" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var inputs:  [3][16]u8;
+    var lengths: [3]usize;
+    var i:       usize = 0;
+    for (i < 3) {
+        lengths[i] = static_request(?inputs[i][0], 16);
+        if (peer_stream(?fixture, i::u64 * 4, ?inputs[i][0], lengths[i], false) == nil) {
+            ret 2;
+        }
+        i = i + 1;
+    }
+    # every request holds its header event until released, so each stays queued
+    var seen: u64 = 0;
+    i = 0;
+    for (i < 64 && seen != 7) {
+        val event: Event = process[TestTransport](?fixture.engine);
+        if (event.kind == EVENT_REQUEST_HEADERS) { seen = seen | (1u64 << (event.stream_id / 4)); }
+        i = i + 1;
+    }
+    if (seen != 7) { ret 3; }
+    var order: [9]u64;
+    i = 0;
+    for (i < 9) {
+        val event: Event = process[TestTransport](?fixture.engine);
+        if (event.kind != EVENT_REQUEST_HEADERS) { ret 4; }
+        order[i] = event.stream_id;
+        i        = i + 1;
+    }
+    i = 0;
+    for (i < 9) {
+        if ((i != 0 && order[i] == order[i - 1])
+            || (i >= 3 && order[i] != order[i - 3])
+            || (i < 3 && i != 0 && order[i] == order[0])) { ret 5; }
+        i = i + 1;
+    }
+    if (order[0] + order[1] + order[2] != 12) { ret 6; }
     ret 0;
 }
