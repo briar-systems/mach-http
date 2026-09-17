@@ -11,6 +11,7 @@ use std.sync.mutex;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -57,10 +58,10 @@ pub rec Entry {
     transport:        policy.TransportKind;
     endpoint_len:     usize;
     has_value:        bool;
-    fresh_until:      time.Time;
-    stale_until:      time.Time;
-    retry_after:      time.Time;
-    last_used:        time.Time;
+    fresh_until:      time.Instant;
+    stale_until:      time.Instant;
+    retry_after:      time.Instant;
+    last_used:        time.Instant;
     failure_valid:    bool;
     last_error:       resolver.Error;
     resolving:        bool;
@@ -110,7 +111,7 @@ pub rec Lookup {
     status:   LookupStatus;
     written:  usize;
     error:    resolver.Error;
-    ready_at: time.Time;
+    ready_at: time.Instant;
     query:    Query;
 }
 
@@ -166,7 +167,7 @@ fun empty_query() Query {
 
 fun lookup_value(status: LookupStatus) Lookup {
     ret Lookup{status: status, written: 0, error: no_error(),
-        ready_at: time.Time{sec: 0, nsec: 0},
+        ready_at: time.Instant{sec: 0, nsec: 0},
         query:    empty_query()};
 }
 
@@ -174,22 +175,22 @@ fun empty_cancel() Cancel {
     ret Cancel{found: false, token: empty_token(), scope: nil};
 }
 
-fun time_valid(value: time.Time) bool {
+fun time_valid(value: time.Instant) bool {
     ret value.sec >= 0 && value.nsec >= 0 && value.nsec < 1000000000;
 }
 
-fun time_before_or_equal(first: time.Time, second: time.Time) bool {
-    ret time.time_before(first, second) || time.time_equal(first, second);
+fun time_before_or_equal(first: time.Instant, second: time.Instant) bool {
+    ret time.instant_before(first, second) || time.instant_equal(first, second);
 }
 
-fun time_add(now: time.Time, duration_ns: u64) time.Time {
+fun time_add(now: time.Instant, duration_ns: u64) time.Instant {
     val seconds:     u64 = duration_ns / 1000000000;
     val nanoseconds: u64 = duration_ns % 1000000000;
     if (seconds > 0x7fffffffffffffff
         || now.sec > 0x7fffffffffffffff - seconds::i64) {
-        ret time.Time{sec: 0x7fffffffffffffff, nsec: 999999999};
+        ret time.Instant{sec: 0x7fffffffffffffff, nsec: 999999999};
     }
-    var result: time.Time = time.Time{sec: now.sec + seconds::i64,
+    var result: time.Instant = time.Instant{sec: now.sec + seconds::i64,
         nsec: now.nsec + nanoseconds::i64};
     if (result.nsec >= 1000000000) {
         if (result.sec == 0x7fffffffffffffff) {
@@ -270,10 +271,10 @@ fun clear_entry(cache: *Cache, index: usize) {
     entry.transport        = 0;
     entry.endpoint_len     = 0;
     entry.has_value        = false;
-    entry.fresh_until      = time.Time{sec: 0, nsec: 0};
-    entry.stale_until      = time.Time{sec: 0, nsec: 0};
-    entry.retry_after      = time.Time{sec: 0, nsec: 0};
-    entry.last_used        = time.Time{sec: 0, nsec: 0};
+    entry.fresh_until      = time.Instant{sec: 0, nsec: 0};
+    entry.stale_until      = time.Instant{sec: 0, nsec: 0};
+    entry.retry_after      = time.Instant{sec: 0, nsec: 0};
+    entry.last_used        = time.Instant{sec: 0, nsec: 0};
     entry.failure_valid    = false;
     entry.last_error       = no_error();
     entry.resolving        = false;
@@ -385,7 +386,7 @@ fun entry_for_locked(cache: *Cache, token: Token) *Entry {
     ret entry;
 }
 
-fun claim_locked(cache: *Cache, now: time.Time) usize {
+fun claim_locked(cache: *Cache, now: time.Instant) usize {
     var checked: usize = 0;
     for (checked < cache.capacity) {
         val index: usize = cache.next_entry;
@@ -406,7 +407,7 @@ fun claim_locked(cache: *Cache, now: time.Time) usize {
         if (entry.state == ENTRY_PRESENT && !entry.resolving
             && !entry.completing
             && (selected == cache.capacity
-            || time.time_before(entry.last_used,
+            || time.instant_before(entry.last_used,
             cache.entries[selected].last_used))) {
             selected = i;
         }
@@ -473,11 +474,10 @@ fun query_for(index: usize, entry: *Entry) Query {
         protocol: 0, flags: flags}, scope: ?entry.scope, context: index};
 }
 
-fun begin_locked(cache: *Cache, index: usize, now: time.Time) Query {
+fun begin_locked(cache: *Cache, index: usize, now: time.Instant) Query {
     val entry: *Entry = ?cache.entries[index];
     if (entry.resolving || entry.completing
-        || !operation_ok(cancellation.make_root(?entry.scope, true,
-        time_add(now, cache.configured.resolve_timeout_ns)))) {
+        || !operation_ok(cancellation.make_root(?entry.scope, opt[time.Instant].some{time_add(now, cache.configured.resolve_timeout_ns)}))) {
         ret empty_query();
     }
     entry.resolving        = true;
@@ -507,7 +507,7 @@ fun copy_value_locked(cache: *Cache, index: usize, output: *ip.Endpoint,
     ret LOOKUP_HIT;
 }
 
-pub fun lookup(cache: *Cache, key: Key, now: time.Time,
+pub fun lookup(cache: *Cache, key: Key, now: time.Instant,
     output: *ip.Endpoint, output_capacity: usize) Lookup {
     if (!cache_ready(cache) || !key_valid(key) || !time_valid(now)
         || !memory.count(output::ptr, output_capacity,
@@ -583,7 +583,7 @@ pub fun lookup(cache: *Cache, key: Key, now: time.Time,
         mutex.unlock(?cache.lock);
         ret lookup_value(LOOKUP_PENDING);
     }
-    if (entry.failure_valid && time.time_before(now, entry.retry_after)) {
+    if (entry.failure_valid && time.instant_before(now, entry.retry_after)) {
         var result: Lookup = lookup_value(LOOKUP_FAILED);
         result.error    = entry.last_error;
         result.ready_at = entry.retry_after;
@@ -683,7 +683,7 @@ fun success_valid(cache: *Cache, entry: *Entry,
 }
 
 fun publish_success_locked(cache: *Cache, index: usize,
-    resolution: *resolver.Resolution, now: time.Time) {
+    resolution: *resolver.Resolution, now: time.Instant) {
     val entry:   *Entry = ?cache.entries[index];
     val base:    usize  = index * cache.configured.max_endpoints_per_entry;
     var written: usize  = 0;
@@ -711,7 +711,7 @@ fun publish_success_locked(cache: *Cache, index: usize,
     entry.has_value     = true;
     entry.fresh_until   = time_add(now, cache.configured.fresh_ns);
     entry.stale_until   = time_add(now, cache.configured.stale_ns);
-    entry.retry_after   = time.Time{sec: 0, nsec: 0};
+    entry.retry_after   = time.Instant{sec: 0, nsec: 0};
     entry.failure_valid = false;
     entry.last_error    = no_error();
 }
@@ -725,7 +725,7 @@ pub fun error_temporary(failure: resolver.Error) bool {
 }
 
 fun publish_failure_locked(cache: *Cache, index: usize,
-    failure: resolver.Error, now: time.Time) {
+    failure: resolver.Error, now: time.Instant) {
     val entry: *Entry = ?cache.entries[index];
     if (!error_temporary(failure)) {
         entry.has_value    = false;
@@ -747,7 +747,7 @@ fun finish_locked(cache: *Cache, entry: *Entry) {
 }
 
 pub fun complete(cache: *Cache, token: Token,
-    completion: *resolver.Completion, now: time.Time) CompleteStatus {
+    completion: *resolver.Completion, now: time.Instant) CompleteStatus {
     if (!cache_ready(cache)
         || !completion_descriptor_valid(cache, completion)
         || !time_valid(now)) { ret COMPLETE_INVALID; }
@@ -795,7 +795,7 @@ pub fun complete(cache: *Cache, token: Token,
 }
 
 pub fun complete_bound(cache: *Cache, completion: *resolver.Completion,
-    now: time.Time) CompleteStatus {
+    now: time.Instant) CompleteStatus {
     if (!cache_ready(cache)
         || !completion_descriptor_valid(cache, completion)
         || completion.context >= cache.capacity) { ret COMPLETE_INVALID; }
@@ -812,7 +812,7 @@ pub fun complete_bound(cache: *Cache, completion: *resolver.Completion,
 }
 
 pub fun abandon(cache: *Cache, token: Token, failure: resolver.Error,
-    now: time.Time) CompleteStatus {
+    now: time.Instant) CompleteStatus {
     if (!cache_ready(cache) || !time_valid(now)
         || failure.kind == resolver.NO_ERROR) { ret COMPLETE_INVALID; }
     mutex.lock(?cache.lock);
@@ -955,9 +955,9 @@ test "http.client.dns: refresh copies ordered results and retains temporary stal
     configured.resolve_timeout_ns      = 20;
     if (!init(?cache, ?entries[0], 1, ?storage[0], 4,
         configured)) { ret 1; }
-    val key:     Key       = test_key("Example.COM", 11, 443);
-    val now:     time.Time = time.Time{sec: 1, nsec: 0};
-    val initial: Lookup    = lookup(?cache, key, now, nil, 0);
+    val key:     Key          = test_key("Example.COM", 11, 443);
+    val now:     time.Instant = time.Instant{sec: 1, nsec: 0};
+    val initial: Lookup       = lookup(?cache, key, now, nil, 0);
     if (initial.status != LOOKUP_QUERY || !initial.query.valid
         || initial.query.query.host[0] != 'e'
         || initial.query.query.service[0] != '4'
@@ -974,12 +974,12 @@ test "http.client.dns: refresh copies ordered results and retains temporary stal
     }
     var output: [4]ip.Endpoint;
     val hit:    Lookup = lookup(?cache, key,
-        time.Time{sec: 1, nsec: 5}, ?output[0], 4);
+        time.Instant{sec: 1, nsec: 5}, ?output[0], 4);
     if (hit.status != LOOKUP_HIT || hit.written != 2
         || output[0].addr.v4.octets[3] != 1
         || output[1].addr.v4.octets[3] != 2) { ret 4; }
     val stale: Lookup = lookup(?cache, key,
-        time.Time{sec: 1, nsec: 11}, ?output[0], 4);
+        time.Instant{sec: 1, nsec: 11}, ?output[0], 4);
     if (stale.status != LOOKUP_STALE_QUERY
         || !bind(?cache, stale.query.token,
         resolver.Token{index: 8, generation: 4})) { ret 5; }
@@ -990,8 +990,8 @@ test "http.client.dns: refresh copies ordered results and retains temporary stal
         canonical_capacity: 0, allocator: nil}, has_error: true,
         error:              resolver.Error{kind: resolver.TEMPORARY, native_code: 9}};
     if (complete(?cache, stale.query.token, ?completion,
-        time.Time{sec: 1, nsec: 12}) != COMPLETE_FAILURE
-        || lookup(?cache, key, time.Time{sec: 1, nsec: 13},
+        time.Instant{sec: 1, nsec: 12}) != COMPLETE_FAILURE
+        || lookup(?cache, key, time.Instant{sec: 1, nsec: 13},
         ?output[0], 4).status != LOOKUP_STALE) { ret 6; }
     if (!drain(?cache) || !destroy(?cache)) { ret 7; }
     ret 0;
@@ -1006,8 +1006,8 @@ test "http.client.dns: capacity output and cancellation stay bounded" {
     configured.max_endpoints_per_entry = 2;
     if (!init(?cache, ?entries[0], 1, ?storage[0], 2,
         configured)) { ret 1; }
-    val now:   time.Time = time.Time{sec: 2, nsec: 0};
-    val first: Lookup    = lookup(?cache, test_key("one.example", 11, 80),
+    val now:   time.Instant = time.Instant{sec: 2, nsec: 0};
+    val first: Lookup       = lookup(?cache, test_key("one.example", 11, 80),
         now, nil, 0);
     if (first.status != LOOKUP_QUERY
         || lookup(?cache, test_key("two.example", 11, 80), now,
@@ -1041,8 +1041,8 @@ test "http.client.dns: completion descriptors cannot alias cache storage" {
     configured.max_endpoints_per_entry = 1;
     if (!init(?cache, ?entries[0], 1,
         (?aliased)::ptr::*ip.Endpoint, 1, configured)) { ret 1; }
-    val now:   time.Time = time.Time{sec: 3, nsec: 0};
-    val query: Lookup    = lookup(?cache,
+    val now:   time.Instant = time.Instant{sec: 3, nsec: 0};
+    val query: Lookup       = lookup(?cache,
         test_key("alias.example", 13, 443), now, nil, 0);
     val resolver_token: resolver.Token = resolver.Token{
         index: 7, generation: 3

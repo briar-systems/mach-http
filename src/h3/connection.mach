@@ -15,6 +15,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.view;
 
@@ -3581,8 +3582,8 @@ fun make_sized_fixture(fixture: *Fixture, role: Role, configured: Config,
     slots: usize) bool {
     if (slots > FIXTURE_SLOTS) { ret false; }
     fixture.slots = slots;
-    val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_root(?fixture.scope, false, none))) { ret false; }
+    val none: time.Instant = time.Instant{sec: 0, nsec: 0};
+    if (!operation_ok(cancel.make_root(?fixture.scope, opt[time.Instant].none{}))) { ret false; }
     reset_io(fixture, role);
     ret start_engine(fixture, role, configured);
 }
@@ -3766,16 +3767,16 @@ rec ExchangeMemory {
 
 fun make_exchange(storage: *ExchangeMemory, generation: u64, id: u64) bool {
     val configured: message.Limits = message.limits_default();
-    val none:       time.Time      = time.Time{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_root(?storage.scope, false, none))) { ret false; }
+    val none:       time.Instant   = time.Instant{sec: 0, nsec: 0};
+    if (!operation_ok(cancel.make_root(?storage.scope, opt[time.Instant].none{}))) { ret false; }
     var fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     storage.reader = body.empty_reader(generation);
     val metadata: message.Metadata = message.Metadata{
         version:     message.version_h3(), secure: true, early_data: false,
         peer:        message.unspecified_endpoint(), local: message.unspecified_endpoint(),
-        received_at: time.Time{sec: 1, nsec: 0}, has_deadline: false,
-        deadline:    none, request_index: id
+        received_at: time.Time{sec: 1, nsec: 0},
+        deadline:    opt[time.Instant].none{}, request_index: id
     };
     if (!message.init_request(?storage.request, method.from_kind(method.GET),
         target.origin(view.view("/", 1), view.view("/", 1),

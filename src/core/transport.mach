@@ -11,6 +11,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
@@ -808,9 +809,9 @@ fun submit_refused(outcome: res[Token, io_error.Error]) bool {
 
 fun make_fixture(fixture: *Fixture, security: Security) bool {
     if (refused(io_runtime.make(?fixture.runtime, 16))) { ret false; }
-    val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_root(?fixture.operation_root, false, none))
-        || !operation_ok(cancel.make_root(?fixture.control_root, false, none))) { ret false; }
+    val none: time.Instant = time.Instant{sec: 0, nsec: 0};
+    if (!operation_ok(cancel.make_root(?fixture.operation_root, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_root(?fixture.control_root, opt[time.Instant].none{}))) { ret false; }
     fixture.state.runtime                = ?fixture.runtime;
     fixture.stream.runtime               = ?fixture.runtime;
     fixture.stream.context               = (?fixture.state)::ptr;
@@ -890,8 +891,8 @@ test "http.core.transport: child deadline becomes one timed out completion" {
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     var scope: cancel.Scope;
-    val none:  time.Time = time.Time{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_child(?scope, ?fixture.operation_root, false, none))) { ret 2; }
+    val none:  time.Instant = time.Instant{sec: 0, nsec: 0};
+    if (!operation_ok(cancel.make_child(?scope, ?fixture.operation_root, opt[time.Instant].none{}))) { ret 2; }
     var bytes:     [1]u8;
     val submitted: res[Token, io_error.Error] = read(?fixture.transport, ?scope, ?bytes[0], 1, 8);
     if ((sel submitted.err) || !transition_ok(cancel.timeout(?scope))) { ret 3; }
@@ -909,8 +910,8 @@ test "http.core.transport: cancellation retains the buffer until completion dequ
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     var scope: cancel.Scope;
-    val none:  time.Time = time.Time{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_child(?scope, ?fixture.operation_root, false, none))) { ret 2; }
+    val none:  time.Instant = time.Instant{sec: 0, nsec: 0};
+    if (!operation_ok(cancel.make_child(?scope, ?fixture.operation_root, opt[time.Instant].none{}))) { ret 2; }
     var bytes:     [4]u8;
     val submitted: res[Token, io_error.Error] = write(?fixture.transport, ?scope, ?bytes[0], 4, 5);
     if ((sel submitted.err)) { ret 3; }
@@ -1071,11 +1072,11 @@ fun buffered_control(context: ptr, token: Token,
 test "http.core.transport: a readable wait completes at once over buffered plaintext" {
     var runtime: io_runtime.Runtime;
     if (refused(io_runtime.make(?runtime, 4))) { ret 1; }
-    val none:       time.Time = time.Time{sec: 0, nsec: 0};
+    val none:       time.Instant = time.Instant{sec: 0, nsec: 0};
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
-    if (!operation_ok(cancel.make_root(?operations, false, none))
-        || !operation_ok(cancel.make_root(?controls, false, none))) { ret 2; }
+    if (!operation_ok(cancel.make_root(?operations, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_root(?controls, opt[time.Instant].none{}))) { ret 2; }
     var state: BufferedState;
     state.runtime      = ?runtime;
     state.plaintext[0] = 'h';
@@ -1162,10 +1163,10 @@ fun secure_control(context: ptr, token: Token,
 test "http.core.transport: secured adapters hide internal read and write direction" {
     var runtime: io_runtime.Runtime;
     if (refused(io_runtime.make(?runtime, 2))) { ret 1; }
-    val none:       time.Time = time.Time{sec: 0, nsec: 0};
+    val none:       time.Instant = time.Instant{sec: 0, nsec: 0};
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
-    if (!operation_ok(cancel.make_root(?operations, false, none)) || !operation_ok(cancel.make_root(?controls, false, none))) { ret 2; }
+    if (!operation_ok(cancel.make_root(?operations, opt[time.Instant].none{})) || !operation_ok(cancel.make_root(?controls, opt[time.Instant].none{}))) { ret 2; }
     var state: SecureState;
     state.runtime = ?runtime;
     val adapter: Adapter = Adapter{
@@ -1199,10 +1200,10 @@ test "http.core.transport: secured adapters hide internal read and write directi
 test "http.core.transport: reused slots reject stale generations" {
     var runtime: io_runtime.Runtime;
     if (refused(io_runtime.make(?runtime, 4))) { ret 1; }
-    val none:       time.Time = time.Time{sec: 0, nsec: 0};
+    val none:       time.Instant = time.Instant{sec: 0, nsec: 0};
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
-    if (!operation_ok(cancel.make_root(?operations, false, none)) || !operation_ok(cancel.make_root(?controls, false, none))) { ret 2; }
+    if (!operation_ok(cancel.make_root(?operations, opt[time.Instant].none{})) || !operation_ok(cancel.make_root(?controls, opt[time.Instant].none{}))) { ret 2; }
     var state: TestRuntime;
     state.runtime = ?runtime;
     var stream: RuntimeStream;

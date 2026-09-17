@@ -18,6 +18,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -449,8 +450,7 @@ pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
     endpoint.core.datagrams  = ?endpoint.datagrams;
     endpoint.core.next_owner = 1;
     endpoint.close_failed    = false;
-    if (!operation_ok(cancel.make_root(?endpoint.scope, false,
-        time.Time{sec: 0, nsec: 0}))) { ret 3; }
+    if (!operation_ok(cancel.make_root(?endpoint.scope, opt[time.Instant].none{}))) { ret 3; }
     val protocol: qt.Protocol[Core] = qt.Protocol[Core]{context: ?endpoint.core,
         context_range: core_range, receive: core_receive,
         timeout:       core_timeout, generate: core_generate,

@@ -19,6 +19,7 @@ use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.view;
@@ -2860,9 +2861,9 @@ fun make_sized_fixture(fixture: *Fixture, role: Role, configured: Config,
     if (capacity > FIXTURE_SLOTS || index_capacity > FIXTURE_INDEX) { ret false; }
     fixture.capacity       = capacity;
     fixture.index_capacity = index_capacity;
-    val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_root(?fixture.operation_root, false, none))
-        || !operation_ok(cancel.make_root(?fixture.control_root, false, none))) { ret false; }
+    val none: time.Instant = time.Instant{sec: 0, nsec: 0};
+    if (!operation_ok(cancel.make_root(?fixture.operation_root, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_root(?fixture.control_root, opt[time.Instant].none{}))) { ret false; }
     fixture.adapter.runtime               = ?fixture.runtime;
     fixture.adapter.context               = (?fixture.io)::ptr;
     fixture.adapter.security              = transport.PLAINTEXT;
@@ -3028,16 +3029,16 @@ fun pending_body_release(context: ptr) {
 fun make_exchange(storage: *ExchangeMemory, generation: u64,
     stream_id: u32) bool {
     val configured: message.Limits = message.limits_default();
-    val none:       time.Time      = time.Time{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_root(?storage.scope, false, none))) { ret false; }
+    val none:       time.Instant   = time.Instant{sec: 0, nsec: 0};
+    if (!operation_ok(cancel.make_root(?storage.scope, opt[time.Instant].none{}))) { ret false; }
     var fields:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var trailers: field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     storage.reader = body.empty_reader(generation);
     val metadata: message.Metadata = message.Metadata{
         version:     message.version_h2(), secure: true, early_data: false,
         peer:        message.unspecified_endpoint(), local: message.unspecified_endpoint(),
-        received_at: time.Time{sec: 1, nsec: 0}, has_deadline: false,
-        deadline:    none, request_index: stream_id::u64,
+        received_at: time.Time{sec: 1, nsec: 0},
+        deadline:    opt[time.Instant].none{}, request_index: stream_id::u64,
     };
     if (!message.init_request(?storage.request, method.from_kind(method.GET),
         target.origin(view.view("/", 1), view.view("/", 1), view.view(nil, 0)),
@@ -3129,9 +3130,9 @@ test "http.h2.connection: destroy returns pooled storage for a second connection
         || fixture.engine.inbound_table.bytes != 0
         || fixture.engine.outbound_table.count != 0) { ret 8; }
     if (destroy(?fixture.engine)) { ret 9; }
-    val none: time.Time = time.Time{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_root(?fixture.pooled_operation_root, false, none))
-        || !operation_ok(cancel.make_root(?fixture.pooled_control_root, false, none))
+    val none: time.Instant = time.Instant{sec: 0, nsec: 0};
+    if (!operation_ok(cancel.make_root(?fixture.pooled_operation_root, opt[time.Instant].none{}))
+        || !operation_ok(cancel.make_root(?fixture.pooled_control_root, opt[time.Instant].none{}))
         || !transport.init(?fixture.pooled_wire, fixture.adapter,
         ?fixture.pooled_operation_root, ?fixture.pooled_control_root,
         ?fixture.pooled_slots[0], 3)) { ret 10; }

@@ -6,10 +6,11 @@ ordered transport.
 
 ## Time
 
-Every `now` the engine takes is `std.chrono.time.monotonic()` time. The header,
-request, write, idle and total deadlines are absolute instants computed from it, and
-an expired one times out the engine's cancellation scope. Pass the same clock on
-every call. A wall-clock value (`time.now()`) moves with clock adjustments.
+Every `now` the engine takes is a `std.chrono.time.Instant`, read with
+`time.instant()`. The header, request, write, idle and total deadlines are
+`Instant`s computed from it, and an expired one times out the engine's cancellation
+scope. The type is distinct from the wall-clock `time.Time`, so a calendar reading
+cannot be passed where a deadline is expected.
 
 `next_deadline` returns the earliest deadline `tick` would enforce, with `active` false
 when none applies: an uninitialized engine, or a tunnel, closing, closed or failed
