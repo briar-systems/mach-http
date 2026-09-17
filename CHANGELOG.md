@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-09-17
+
 ### Fixed
 - HTTP/2 and HTTP/3 `send_headers` and `send_push_promise` accept caller field names in any case, as HTTP field names are case-insensitive (RFC 9110). `Content-Type` used to be refused with `OFFER_ERROR`, so a version-neutral caller worked over HTTP/1 and failed over HTTP/2 and HTTP/3 (#112).
   - The HPACK and QPACK encoders write every literal name lowercase, raw or Huffman, and never modify the caller's view.
