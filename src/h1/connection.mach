@@ -255,6 +255,7 @@ pub rec Engine {
     tunnel_slot:        usize;
     tunnel_reported:    bool;
     idle_deadline:      Deadline;
+    wait_deadline:      Deadline;
     total_deadline:     Deadline;
     error:              Error;
     initialized:        bool;
@@ -555,10 +556,21 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     engine.tunnel_slot        = NO_SLOT;
     engine.tunnel_reported    = false;
     engine.idle_deadline      = deadline(now, configured.idle_timeout_ns);
+    engine.wait_deadline      = Deadline{active: false, at: now};
     engine.total_deadline     = deadline(now, configured.total_timeout_ns);
     engine.error              = ERROR_NONE;
     engine.initialized        = true;
+    await_request(engine, now);
     ret true;
+}
+
+# a server with no live slot owes its peer a request within the header timeout:
+# from init for the first one, and from the peer's next bytes or readability
+# after that. a running wait is never rearmed, so a memory refusal cannot extend
+# it, and it only ends when a slot starts. the idle deadline keeps running beside it
+fun await_request(engine: *Engine, now: time.Instant) {
+    if (engine.role != SERVER || engine.count != 0 || engine.wait_deadline.active) { ret; }
+    engine.wait_deadline = deadline(now, engine.configured.header_timeout_ns);
 }
 
 fun next_sequence(engine: *Engine) u64 {
@@ -586,6 +598,7 @@ fun start_slot(engine: *Engine, index: usize, now: time.Instant) *Slot {
     slot.request_deadline       = deadline(now, engine.configured.request_timeout_ns);
     engine.count                = engine.count + 1;
     engine.idle_deadline.active = false;
+    engine.wait_deadline.active = false;
     ret slot;
 }
 
@@ -750,7 +763,10 @@ pub fun next_deadline(engine: *Engine) Deadline {
     if (engine == nil || !engine.initialized || engine.state == CLOSED || engine.state == TUNNEL
         || engine.state == CLOSING || engine.state == FAILED) { ret result; }
     result = earlier(result, engine.total_deadline);
-    if (engine.count == 0) { result = earlier(result, engine.idle_deadline); }
+    if (engine.count == 0) {
+        result = earlier(result, engine.idle_deadline);
+        result = earlier(result, engine.wait_deadline);
+    }
     var offset: usize = 0;
     for (offset < engine.count) {
         val slot: *Slot = ?engine.slots[(engine.head + offset) % engine.capacity];
@@ -784,6 +800,7 @@ pub fun tick(engine: *Engine, now: time.Instant) Event {
     if (!(sel reason.active))                                    { ret fail(engine, ERROR_CANCELLED); }
     if (expired(engine.total_deadline, now))                     { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
     if (engine.count == 0 && expired(engine.idle_deadline, now)) { ret fail(engine, ERROR_IDLE_TIMEOUT); }
+    if (engine.count == 0 && expired(engine.wait_deadline, now)) { ret fail(engine, ERROR_HEADER_TIMEOUT); }
     var offset: usize = 0;
     for (offset < engine.count) {
         val index: usize = (engine.head + offset) % engine.capacity;
@@ -1022,6 +1039,7 @@ pub fun complete_io(engine: *Engine, completion: *transport.Completion,
     if (completion.kind == transport.READABLE) {
         if (completion.status == transport.IO_COMPLETE) {
             engine.readable = true;
+            await_request(engine, now);
             ret process(engine, now);
         }
         if (completion.status == transport.IO_END) {
@@ -1329,6 +1347,10 @@ fun sweep(engine: *Engine, now: time.Instant) {
     sweep_done(engine);
     if (engine.count == 0 && engine.state == OPEN) {
         engine.idle_deadline = deadline(now, engine.configured.idle_timeout_ns);
+    }
+    # pipelined bytes or a readable wait already mean the next request is owed
+    if (engine.count == 0 && (input_available(engine) != 0 || engine.readable)) {
+        await_request(engine, now);
     }
 }
 
@@ -2104,12 +2126,24 @@ test "http.h1.connection: each deadline is absolute and never refreshed by progr
     write_fixture.slots[write_headers.slot].write_deadline.at   = test_now(105);
     if (tick(?write_fixture.engine, test_now(105)).error != ERROR_WRITE_TIMEOUT) { ret 10; }
     var idle_fixture: Fixture;
-    if (!make_fixture(?idle_fixture, SERVER, 1)
+    if (!served_once(?idle_fixture, test_now(100))
         || tick(?idle_fixture.engine, test_now(160)).error != ERROR_IDLE_TIMEOUT) { ret 11; }
     var total_fixture: Fixture;
-    if (!make_fixture(?total_fixture, SERVER, 1)
-        || tick(?total_fixture.engine, test_now(400)).error != ERROR_TOTAL_TIMEOUT) { ret 12; }
+    if (!make_fixture(?total_fixture, SERVER, 1)) { ret 12; }
+    total_fixture.engine.wait_deadline.active = false;
+    if (tick(?total_fixture.engine, test_now(400)).error != ERROR_TOTAL_TIMEOUT) { ret 13; }
     ret 0;
+}
+
+# a server connection that has completed one request and waits idle
+fun served_once(fixture: *Fixture, now: time.Instant) bool {
+    if (!make_fixture(fixture, SERVER, 1)) { ret false; }
+    val headers: Event = complete_read(fixture, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", false, now);
+    ret headers.kind == EVENT_REQUEST_HEADERS
+        && process(?fixture.engine, now).kind == EVENT_REQUEST_COMPLETE
+        && serve_no_content(fixture, headers.slot, now)
+        && release(?fixture.engine, headers.slot, now)
+        && fixture.engine.count == 0 && !fixture.engine.wait_deadline.active;
 }
 
 fun deadline_at(value: Deadline, seconds: i64) bool {
@@ -2127,11 +2161,15 @@ fun fires_at(fixture: *Fixture, seconds: i64, error: Error) bool {
 
 test "http.h1.connection: next deadline is the one tick enforces first" {
     var idle_fixture: Fixture;
-    if (!make_fixture(?idle_fixture, SERVER, 1)
+    if (!served_once(?idle_fixture, test_now(100))
         || !fires_at(?idle_fixture, 160, ERROR_IDLE_TIMEOUT)) { ret 1; }
+    var first_fixture: Fixture;
+    if (!make_fixture(?first_fixture, SERVER, 1)
+        || !fires_at(?first_fixture, 110, ERROR_HEADER_TIMEOUT)) { ret 14; }
     var total_fixture: Fixture;
     if (!make_fixture(?total_fixture, SERVER, 1)) { ret 2; }
     total_fixture.engine.idle_deadline.active = false;
+    total_fixture.engine.wait_deadline.active = false;
     if (!fires_at(?total_fixture, 400, ERROR_TOTAL_TIMEOUT)) { ret 3; }
     var header_fixture: Fixture;
     if (!make_fixture(?header_fixture, SERVER, 1)
@@ -2180,7 +2218,7 @@ test "http.h1.connection: no next deadline outside an open engine" {
         || failed.engine.state != FAILED || next_deadline(?failed.engine).active) { ret 2; }
     var draining: Fixture;
     if (!make_fixture(?draining, SERVER, 1) || !begin_graceful(?draining.engine)
-        || !deadline_at(next_deadline(?draining.engine), 160)) { ret 3; }
+        || !deadline_at(next_deadline(?draining.engine), 110)) { ret 3; }
     # tick skips these states without looking at any deadline
     var states: [3]State = [3]State{TUNNEL, CLOSING, CLOSED};
     var i:      usize    = 0;
@@ -2420,5 +2458,85 @@ test "http.h1.connection: a refused client slot or write buffer refuses only tha
     fixture.account.budgets[1] = 1 << 20;
     if (!flush_offer(?fixture, index, nil, 0, true, now, false)
         || fixture.account.used[1] != 0) { ret 5; }
+    ret 0;
+}
+
+fun at_time(seconds: i64, nsec: i64) time.Instant {
+    ret time.Instant{sec: seconds, nsec: nsec};
+}
+
+test "http.h1.connection: a memory refusal never extends the request wait" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    fixture.account.budgets[0] = slot_set_bytes() - 1;
+    # the whole request is buffered, yet no slot can parse it
+    if (complete_read(?fixture, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", false, test_now(101)).kind
+        != EVENT_MEMORY_BLOCKED) { ret 2; }
+    var second: i64 = 102;
+    for (second < 110) {
+        if (process(?fixture.engine, test_now(second)).kind != EVENT_MEMORY_BLOCKED
+            || !deadline_at(next_deadline(?fixture.engine), 110)
+            || tick(?fixture.engine, test_now(second)).kind != EVENT_NONE) { ret 3; }
+        second = second + 1;
+    }
+    if (tick(?fixture.engine, at_time(109, 999999999)).kind != EVENT_NONE) { ret 4; }
+    val expired: Event = tick(?fixture.engine, test_now(110));
+    if (expired.kind != EVENT_TIMED_OUT || expired.error != ERROR_HEADER_TIMEOUT
+        || !fixture.engine.memory_blocked || fixture.engine.count != 0) { ret 5; }
+    ret 0;
+}
+
+test "http.h1.connection: a refused read buffer after keep-alive waits only the header timeout" {
+    var fixture: Fixture;
+    if (!served_once(?fixture, test_now(100)) || !submit_read(?fixture.engine)) { ret 1; }
+    fixture.account.budgets[1] = fixture.account.used[1];
+    var ready: transport.Completion = transport.completed(
+        fixture.io.readable_token, transport.READABLE, 0);
+    if (complete_io(?fixture.engine, ?ready, test_now(130)).kind != EVENT_MEMORY_BLOCKED
+        || !deadline_at(next_deadline(?fixture.engine), 140)) { ret 2; }
+    var second: i64 = 131;
+    for (second < 140) {
+        if (process(?fixture.engine, test_now(second)).kind != EVENT_MEMORY_BLOCKED
+            || tick(?fixture.engine, test_now(second)).kind != EVENT_NONE) { ret 3; }
+        second = second + 1;
+    }
+    val expired: Event = tick(?fixture.engine, test_now(140));
+    if (expired.error != ERROR_HEADER_TIMEOUT || !fixture.engine.memory_blocked) { ret 4; }
+    ret 0;
+}
+
+test "http.h1.connection: a slot that starts just before the wait expires owns the deadline" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    fixture.account.budgets[0] = slot_set_bytes() - 1;
+    if (complete_read(?fixture, "GE", false, test_now(105)).kind != EVENT_MEMORY_BLOCKED) { ret 2; }
+    fixture.account.budgets[0] = 1 << 20;
+    val started: Event = process(?fixture.engine, test_now(109));
+    if (started.kind != EVENT_NEED_READ || fixture.engine.count != 1
+        || fixture.engine.wait_deadline.active) { ret 3; }
+    # the slot's own header deadline runs from its start, and nothing else fires at 110
+    if (!deadline_at(fixture.slots[fixture.engine.head].header_deadline, 119)
+        || tick(?fixture.engine, test_now(110)).kind != EVENT_NONE
+        || !fires_at(?fixture, 119, ERROR_HEADER_TIMEOUT)) { ret 4; }
+    ret 0;
+}
+
+test "http.h1.connection: a keep-alive connection lives its full idle timeout" {
+    var fixture: Fixture;
+    if (!served_once(?fixture, test_now(100))) { ret 1; }
+    # the host's readable wait is pending, but no byte and no readiness has arrived
+    if (!submit_read(?fixture.engine) || fixture.engine.wait_deadline.active
+        || tick(?fixture.engine, test_now(150)).kind != EVENT_NONE
+        || !fires_at(?fixture, 160, ERROR_IDLE_TIMEOUT)) { ret 2; }
+    ret 0;
+}
+
+test "http.h1.connection: a silent new connection owes its first request within the header timeout" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, 1) || !submit_read(?fixture.engine)
+        || !fires_at(?fixture, 110, ERROR_HEADER_TIMEOUT)) { ret 1; }
+    var client: Fixture;
+    if (!make_fixture(?client, CLIENT, 1) || client.engine.wait_deadline.active
+        || !deadline_at(next_deadline(?client.engine), 160)) { ret 2; }
     ret 0;
 }
