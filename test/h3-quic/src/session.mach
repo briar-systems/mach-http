@@ -14,11 +14,15 @@ use http.h3.frame;
 use http.h3.qpack;
 use qt: quic.transport;
 
+use std.allocator;
+use std.allocator.page;
 use std.chrono.time;
+use std.memory.buffers;
 use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.size.usize;
 use std.types.view;
@@ -27,27 +31,25 @@ fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
 }
 
-pub val STREAM_SLOTS: usize = 10;
-pub val INDEX_SLOTS:  usize = 32;
-pub val EVENT_KINDS:  usize = 17;
+pub val EVENT_KINDS: usize = 18;
 
 pub def HandlerFun: fun(ptr, h3.Event) bool;
 
 pub rec Session {
     io:                  adapter.Adapter;
     scope:               cancel.Scope;
-    streams:             [10]h3.Stream;
-    memories:            [10]h3.StreamMemory;
-    index:               [32]h3.StreamIndexEntry;
+    backing:             allocator.Allocator;
+    pool:                buffers.Pool;
+    source:              buffers.Source;
+    account:             buffers.Account;
     pending:             [4]h3.StreamHandle;
-    reads:               [10][192]u8;
-    settings:            [10][5]frame.Setting;
-    encoded:             [10][256]u8;
-    fields:              [10][16]field.Field;
-    strings:             [10][512]u8;
-    scratch:             [10][256]u8;
-    output:              [10][384]u8;
-    references:          [10][16]u64;
+    control_read:        [192]u8;
+    control_settings:    [5]frame.Setting;
+    encoder_read:        [192]u8;
+    encoder_encoded:     [128]u8;
+    encoder_scratch:     [256]u8;
+    decoder_read:        [192]u8;
+    decoder_encoded:     [128]u8;
     inbound_entries:     [8]qpack.Entry;
     inbound_storage:     [256]u8;
     inbound_scratch:     [256]u8;
@@ -64,7 +66,7 @@ pub rec Session {
     engine:              h3.Engine[adapter.Adapter];
     handler:             HandlerFun;
     context:             ptr;
-    counts:              [17]usize;
+    counts:              [18]usize;
     rejected:            usize;
 }
 
@@ -89,13 +91,61 @@ pub fun session_config() h3.Config {
     configured.inbound_qpack.max_references            = 64;
     configured.outbound_qpack                          = configured.inbound_qpack;
     configured.messages.max_informational              = 2;
+    configured.read_bytes                              = 192;
+    configured.output_bytes                            = 384;
+    configured.initial_streams                         = 4;
     ret configured;
+}
+
+# a pool of exact-size chunks the session's engine borrows from, made once per
+# session and kept across recycled engines
+fun make_buffers(session: *Session) bool {
+    val backed: err[allocator.Error] = page.make(?session.backing);
+    if (sel backed.err) { ret false; }
+    var config: buffers.Config;
+    config.class_count   = 0;
+    config.lanes         = 1;
+    config.global_budget = 1 << 22;
+    config.initial_slots = 16;
+    if (!buffers.make(?session.pool, config, ?session.backing)) { ret false; }
+    session.source = buffers.source(?session.pool);
+    var budgets: [1]usize       = [1]usize{1 << 22};
+    val opened:  buffers.Reason = buffers.source_open_account(?session.source,
+        ?session.account, 1, ?budgets[0], 0);
+    ret sel opened.none;
+}
+
+# the account holds nothing once the engine is destroyed
+pub fun session_clean(session: *Session) bool {
+    ret session.account.used[0] == 0;
+}
+
+fun critical_memory(session: *Session) h3.CriticalMemory {
+    var control: h3.StreamMemory;
+    control.read             = ?session.control_read[0];
+    control.read_capacity    = 192;
+    control.settings         = ?session.control_settings[0];
+    control.setting_capacity = 5;
+    var encoder: h3.StreamMemory;
+    encoder.read             = ?session.encoder_read[0];
+    encoder.read_capacity    = 192;
+    encoder.encoded          = ?session.encoder_encoded[0];
+    encoder.encoded_capacity = 128;
+    encoder.scratch          = ?session.encoder_scratch[0];
+    encoder.scratch_capacity = 256;
+    var decoder: h3.StreamMemory;
+    decoder.read             = ?session.decoder_read[0];
+    decoder.read_capacity    = 192;
+    decoder.encoded          = ?session.decoder_encoded[0];
+    decoder.encoded_capacity = 128;
+    ret h3.CriticalMemory{control: control, encoder: encoder, decoder: decoder};
 }
 
 pub fun make_session(session: *Session,
     driver: *qt.Driver[loopback.Core], clock: *u64,
     role: h3.Role, configured: h3.Config) bool {
-    if (!operation_ok(cancel.make_root(?session.scope, opt[time.Instant].none{}))) { ret false; }
+    if (!operation_ok(cancel.make_root(?session.scope, opt[time.Instant].none{}))
+        || !make_buffers(session)) { ret false; }
     ret start_session(session, driver, clock, role, configured);
 }
 
@@ -104,24 +154,9 @@ pub fun make_session(session: *Session,
 pub fun start_session(session: *Session,
     driver: *qt.Driver[loopback.Core], clock: *u64,
     role: h3.Role, configured: h3.Config) bool {
-    var i: usize = 0;
-    for (i < STREAM_SLOTS) {
-        session.memories[i] = h3.StreamMemory{
-            read:       ?session.reads[i][0], read_capacity: 192,
-            settings:   ?session.settings[i][0], setting_capacity: 5,
-            encoded:    ?session.encoded[i][0], encoded_capacity: 256,
-            fields:     ?session.fields[i][0], field_capacity: 16,
-            strings:    ?session.strings[i][0], string_capacity: 512,
-            scratch:    ?session.scratch[i][0], scratch_capacity: 256,
-            output:     ?session.output[i][0], output_capacity: 384,
-            references: ?session.references[i][0], reference_capacity: 16
-        };
-        i = i + 1;
-    }
     val storage: h3.Storage = h3.Storage{
-        streams:                     ?session.streams[0], memories: ?session.memories[0],
-        stream_capacity:             STREAM_SLOTS,
-        stream_index:                ?session.index[0], stream_index_capacity: INDEX_SLOTS,
+        source:                      ?session.source, account: ?session.account,
+        critical:                    critical_memory(session),
         pending_release:             ?session.pending[0], pending_release_capacity: 4,
         inbound_entries:             ?session.inbound_entries[0], inbound_entry_capacity: 8,
         inbound_storage:             ?session.inbound_storage[0], inbound_storage_capacity: 256,
@@ -223,10 +258,11 @@ pub fun fabric_closed(fabric: *Fabric) bool {
 # hands to the next connection. the outgoing pair is closed rather than
 # abandoned, so a recycled engine only ever follows a completed close.
 pub fun recycle(fabric: *Fabric, configured: h3.Config, window: u64) usize {
-    if (!h3.destroy[adapter.Adapter](?fabric.client.engine)) { ret 30; }
-    if (!h3.destroy[adapter.Adapter](?fabric.server.engine)) { ret 31; }
-    if (!close_fabric(fabric, false, h3.H3_NO_ERROR))        { ret 32; }
-    if (!fabric_closed(fabric))                              { ret 33; }
+    if (!h3.destroy[adapter.Adapter](?fabric.client.engine))              { ret 30; }
+    if (!h3.destroy[adapter.Adapter](?fabric.server.engine))              { ret 31; }
+    if (!session_clean(?fabric.client) || !session_clean(?fabric.server)) { ret 34; }
+    if (!close_fabric(fabric, false, h3.H3_NO_ERROR))                     { ret 32; }
+    if (!fabric_closed(fabric))                                           { ret 33; }
     val client_ready: usize = loopback.init_endpoint(?fabric.pooled_client_wire,
         401, true, window);
     if (client_ready != 0) { ret 40 + client_ready; }

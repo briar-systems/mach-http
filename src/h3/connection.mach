@@ -5,16 +5,21 @@ use http.core.exchange;
 use http.core.field;
 use http.core.message;
 use http.core.method;
+use http.core.records;
 use http.core.status;
 use http.core.target;
 use http.h3.frame;
 use http.h3.qpack;
+use std.allocator;
+use std.allocator.page;
 use std.chrono.time;
 use std.memory;
+use std.memory.buffers;
 use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.size.usize;
 use std.types.view;
@@ -89,6 +94,7 @@ pub val ERROR_QPACK:       Error = 5;
 pub val ERROR_TRANSPORT:   Error = 6;
 pub val ERROR_CANCELLED:   Error = 7;
 pub val ERROR_NO_PROGRESS: Error = 8;
+pub val ERROR_MEMORY:      Error = 9;
 
 pub def EventKind: u8;
 pub val EVENT_NONE:             EventKind = 0;
@@ -108,6 +114,7 @@ pub val EVENT_CANCELLED:        EventKind = 13;
 pub val EVENT_STREAM_ERROR:     EventKind = 14;
 pub val EVENT_ERROR:            EventKind = 15;
 pub val EVENT_PENDING:          EventKind = 16;
+pub val EVENT_MEMORY_BLOCKED:   EventKind = 17;
 
 pub def OfferStatus: u8;
 pub val OFFER_OUTPUT:  OfferStatus = 1;
@@ -203,6 +210,14 @@ pub rec Settings {
     h3_datagram:              bool;
 }
 
+# stream records and request buffers are borrowed from the connection's
+# std.memory.buffers account
+# ---
+# read_bytes:      a request stream's read buffer
+# output_bytes:    a request stream's output buffer, at least the outbound encoded section plus 16
+# initial_streams: stream records in the first chunk, taken at init
+# stream_lane:     the budget lane of request buffers
+# connection_lane: the budget lane of stream records and the index
 pub rec Config {
     local:                   Settings;
     frames:                  frame.Limits;
@@ -212,8 +227,15 @@ pub rec Config {
     max_requests:            usize;
     max_peer_unidirectional: usize;
     max_pending_release:     usize;
+    read_bytes:              usize;
+    output_bytes:            usize;
+    initial_streams:         usize;
+    stream_lane:             u8;
+    connection_lane:         u8;
 }
 
+# the buffers a stream reads, decodes and writes through. a request stream
+# borrows every one; a critical stream uses only the ones its kind needs
 pub rec StreamMemory {
     read:               *u8;
     read_capacity:      usize;
@@ -233,17 +255,29 @@ pub rec StreamMemory {
     reference_capacity: usize;
 }
 
+# caller storage for the peer's three critical streams, which live for the whole
+# connection and are never borrowed
+# ---
+# control: read, and settings for at least frames.max_settings
+# encoder: read, encoded for an inbound instruction, scratch for twice an inbound field
+# decoder: read, and encoded for an outbound instruction
+pub rec CriticalMemory {
+    control: StreamMemory;
+    encoder: StreamMemory;
+    decoder: StreamMemory;
+}
+
 pub rec ByteQueue { data: *u8; capacity: usize; head: usize; count: usize; }
 
 # one open-addressed slot of the stream id index
 pub rec StreamIndexEntry { id: u64; slot: usize; }
 
+# source:  the buffer source, which must outlive the engine
+# account: the connection's open account on `source`, which must outlive the engine
 pub rec Storage {
-    streams:                     *Stream;
-    memories:                    *StreamMemory;
-    stream_capacity:             usize;
-    stream_index:                *StreamIndexEntry;
-    stream_index_capacity:       usize;
+    source:                      *buffers.Source;
+    account:                     *buffers.Account;
+    critical:                    CriticalMemory;
     pending_release:             *StreamHandle;
     pending_release_capacity:    usize;
     inbound_entries:             *qpack.Entry;
@@ -379,6 +413,9 @@ pub rec Stream {
     exchange_listed:          bool;
     exchange_next:            usize;
     exchange_prev:            usize;
+    probe:                    u8;
+    chunks:                   [7]buffers.Chunk;
+    memory_held:              bool;
 }
 
 pub rec Engine[T] {
@@ -388,11 +425,19 @@ pub rec Engine[T] {
     peer:                        Settings;
     transport:                   Transport[T];
     scope:                       *cancel.Scope;
-    streams:                     *Stream;
-    memories:                    *StreamMemory;
+    source:                      *buffers.Source;
+    account:                     *buffers.Account;
+    records:                     records.Records;
     stream_capacity:             usize;
     stream_index:                *StreamIndexEntry;
     index_capacity:              usize;
+    index_chunk:                 buffers.Chunk;
+    critical_memory:             CriticalMemory;
+    discard:                     [64]u8;
+    request_sets:                usize;
+    parked_stream:               StreamHandle;
+    accept_parked:               bool;
+    accept_blocked:              bool;
     index_tombstones:            usize;
     index_rebuilds:              usize;
     free_head:                   usize;
@@ -451,6 +496,9 @@ val HEADER_TRAILERS:      u8 = 4;
 val INDEX_EMPTY:     usize = (-1)::usize;
 val INDEX_TOMBSTONE: usize = (-2)::usize;
 
+# the buffers a request stream borrows, all or nothing
+val REQUEST_BUFFERS: usize = 7;
+
 # transport reports and queued stream services one process call may take
 val READY_BUDGET:   usize = 64;
 val SERVICE_BUDGET: usize = 64;
@@ -472,7 +520,10 @@ pub fun config_default() Config {
     ret Config{local: local, frames: frame.limits_default(),
         inbound_qpack:           inbound, outbound_qpack: outbound,
         messages:                message.limits_default(), max_requests: 100,
-        max_peer_unidirectional: 32, max_pending_release: 32};
+        max_peer_unidirectional: 32, max_pending_release: 32,
+        read_bytes:              16384,
+        output_bytes:            outbound.max_encoded_section_bytes + 16,
+        initial_streams:         8, stream_lane: 0, connection_lane: 0};
 }
 
 fun transport_valid[T](value: *Transport[T]) bool {
@@ -492,21 +543,29 @@ fun qpack_limits_valid(limits: qpack.Limits) bool {
         && limits.max_outstanding_sections != 0 && limits.max_references != 0;
 }
 
-# the index holds at most half its capacity live, so a probe always meets an
-# empty entry while tombstones stay under a quarter
-fun index_capacity_valid(streams: usize, index: *StreamIndexEntry, capacity: usize) bool {
-    ret index != nil && streams != 0 && streams <= (-1)::usize / 4
-        && capacity >= 2 * streams && (capacity & (capacity - 1)) == 0;
+# every request and peer unidirectional stream the configuration admits
+fun max_streams(configured: Config) usize {
+    ret configured.max_requests + configured.max_peer_unidirectional;
+}
+
+# the first chunk never holds more records than the configuration admits
+fun first_streams(configured: Config) usize {
+    if (configured.initial_streams > max_streams(configured)) { ret max_streams(configured); }
+    ret configured.initial_streams;
 }
 
 fun config_valid(configured: Config, storage: *Storage) bool {
     ret storage != nil && configured.max_requests != 0
-        && index_capacity_valid(storage.stream_capacity, storage.stream_index,
-        storage.stream_index_capacity)
         && configured.max_peer_unidirectional >= 3
-        && configured.max_requests <= (-1)::usize - configured.max_peer_unidirectional
-        && storage.stream_capacity >= configured.max_requests
-        + configured.max_peer_unidirectional
+        && configured.max_requests <= (-1)::usize / 4 - configured.max_peer_unidirectional
+        && configured.initial_streams != 0
+        && max_streams(configured) <= records.limit(first_streams(configured))
+        && configured.read_bytes != 0
+        && configured.output_bytes >= 16
+        && configured.output_bytes - 16 >= configured.outbound_qpack.max_encoded_section_bytes
+        && configured.inbound_qpack.max_field_count <= (-1)::usize / $size_of(field.Field)
+        && configured.outbound_qpack.max_field_count <= (-1)::usize / $size_of(u64)
+        && storage.source != nil && storage.account != nil && storage.account.open
         && configured.max_pending_release != 0
         && storage.pending_release != nil
         && storage.pending_release_capacity >= configured.max_pending_release
@@ -557,38 +616,34 @@ fun config_valid(configured: Config, storage: *Storage) bool {
         && storage.outbound_scratch != nil));
 }
 
-fun memory_error(value: StreamMemory, configured: Config) usize {
-    var encoded_limit: usize = configured.inbound_qpack.max_encoded_section_bytes;
-    if (encoded_limit < configured.outbound_qpack.max_encoded_section_bytes) {
-        encoded_limit = configured.outbound_qpack.max_encoded_section_bytes;
-    }
-    var field_limit: usize = configured.inbound_qpack.max_field_count;
-    if (field_limit < configured.outbound_qpack.max_field_count) {
-        field_limit = configured.outbound_qpack.max_field_count;
-    }
-    var string_limit: usize = configured.inbound_qpack.max_field_section_bytes;
-    if (string_limit < configured.outbound_qpack.max_field_section_bytes) {
-        string_limit = configured.outbound_qpack.max_field_section_bytes;
-    }
-    var scratch_limit: usize = configured.inbound_qpack.max_field_bytes;
-    if (scratch_limit < configured.outbound_qpack.max_field_bytes) {
-        scratch_limit = configured.outbound_qpack.max_field_bytes;
-    }
-    if (value.read == nil || value.read_capacity == 0) { ret 1; }
-    if (value.settings == nil
-        || value.setting_capacity < configured.frames.max_settings) { ret 2; }
-    if (value.encoded == nil || value.encoded_capacity < encoded_limit)     { ret 3; }
-    if (value.fields == nil || value.field_capacity < field_limit)          { ret 4; }
-    if (value.strings == nil || value.string_capacity < string_limit)       { ret 5; }
-    if (value.scratch == nil || value.scratch_capacity / 2 < scratch_limit) { ret 6; }
-    if (value.output == nil || value.output_capacity
-        < configured.outbound_qpack.max_encoded_section_bytes + 16) { ret 7; }
-    if (value.references == nil || value.reference_capacity < field_limit) { ret 8; }
-    ret 0;
+# the size of each request buffer, in StreamMemory order: read, encoded,
+# fields, strings, scratch, output, references
+fun request_bytes(configured: Config, index: usize) usize {
+    val inbound:  qpack.Limits = configured.inbound_qpack;
+    val outbound: qpack.Limits = configured.outbound_qpack;
+    if (index == 0) { ret configured.read_bytes; }
+    if (index == 1) { ret inbound.max_encoded_section_bytes; }
+    if (index == 2) { ret inbound.max_field_count * $size_of(field.Field); }
+    if (index == 3) { ret inbound.max_field_section_bytes; }
+    if (index == 4) { ret inbound.max_field_bytes * 2; }
+    if (index == 5) { ret configured.output_bytes; }
+    ret outbound.max_field_count * $size_of(u64);
 }
 
-fun memory_valid(value: StreamMemory, configured: Config) bool {
-    ret memory_error(value, configured) == 0;
+fun critical_valid(value: CriticalMemory, configured: Config) bool {
+    val inbound:  qpack.Limits = configured.inbound_qpack;
+    val outbound: qpack.Limits = configured.outbound_qpack;
+    ret value.control.read != nil && value.control.read_capacity != 0
+        && value.control.settings != nil
+        && value.control.setting_capacity >= configured.frames.max_settings
+        && value.encoder.read != nil && value.encoder.read_capacity != 0
+        && value.encoder.encoded != nil
+        && value.encoder.encoded_capacity >= inbound.max_instruction_bytes
+        && value.encoder.scratch != nil
+        && value.encoder.scratch_capacity / 2 >= inbound.max_field_bytes
+        && value.decoder.read != nil && value.decoder.read_capacity != 0
+        && value.decoder.encoded != nil
+        && value.decoder.encoded_capacity >= outbound.max_instruction_bytes;
 }
 
 fun queue_init(queue: *ByteQueue, data: *u8, capacity: usize) bool {
@@ -760,6 +815,10 @@ fun request_id(id: u64) bool {
     ret (id & 3) == 0;
 }
 
+fun slot_stream[T](engine: *Engine[T], slot: usize) *Stream {
+    ret records.at(?engine.records, slot)::*Stream;
+}
+
 # fmix64, so sequential stream ids spread across the whole index
 fun index_hash(id: u64) u64 {
     var x: u64 = id;
@@ -816,7 +875,7 @@ fun index_rebuild[T](engine: *Engine[T]) {
     engine.index_rebuilds   = engine.index_rebuilds + 1;
     i                       = 0;
     for (i < engine.stream_capacity) {
-        val stream: *Stream = ?engine.streams[i];
+        val stream: *Stream = slot_stream[T](engine, i);
         if (stream.index_position != NO_SLOT) { index_insert[T](engine, stream); }
         i = i + 1;
     }
@@ -836,7 +895,7 @@ pub fun stream_for[T](engine: *Engine[T], id: u64) *Stream {
     if (engine == nil || !engine.initialized || id > MAX_STREAM_ID) { ret nil; }
     val slot: usize = index_find[T](engine, id);
     if (slot == NO_SLOT) { ret nil; }
-    ret ?engine.streams[slot];
+    ret slot_stream[T](engine, slot);
 }
 
 fun ready_push[T](engine: *Engine[T], stream: *Stream) {
@@ -844,14 +903,14 @@ fun ready_push[T](engine: *Engine[T], stream: *Stream) {
     stream.queued     = true;
     stream.ready_next = NO_SLOT;
     if (engine.ready_tail == NO_SLOT) { engine.ready_head = stream.slot; }
-    or                                { engine.streams[engine.ready_tail].ready_next = stream.slot; }
+    or                                { slot_stream[T](engine, engine.ready_tail).ready_next = stream.slot; }
     engine.ready_tail  = stream.slot;
     engine.ready_count = engine.ready_count + 1;
 }
 
 fun ready_pop[T](engine: *Engine[T]) *Stream {
     if (engine.ready_head == NO_SLOT) { ret nil; }
-    val stream: *Stream = ?engine.streams[engine.ready_head];
+    val stream: *Stream = slot_stream[T](engine, engine.ready_head);
     engine.ready_head = stream.ready_next;
     if (engine.ready_head == NO_SLOT) { engine.ready_tail = NO_SLOT; }
     engine.ready_count = engine.ready_count - 1;
@@ -867,9 +926,9 @@ fun wake_stream[T](engine: *Engine[T], stream: *Stream) {
 fun blocked_unlink[T](engine: *Engine[T], stream: *Stream) {
     if (!stream.blocked_listed)         { ret; }
     if (stream.blocked_prev == NO_SLOT) { engine.blocked_head = stream.blocked_next; }
-    or                                  { engine.streams[stream.blocked_prev].blocked_next = stream.blocked_next; }
+    or                                  { slot_stream[T](engine, stream.blocked_prev).blocked_next = stream.blocked_next; }
     if (stream.blocked_next != NO_SLOT) {
-        engine.streams[stream.blocked_next].blocked_prev = stream.blocked_prev;
+        slot_stream[T](engine, stream.blocked_next).blocked_prev = stream.blocked_prev;
     }
     stream.blocked_listed = false;
     stream.blocked_next   = NO_SLOT;
@@ -881,17 +940,17 @@ fun blocked_link[T](engine: *Engine[T], stream: *Stream, required: u64) {
     if (stream.blocked_listed) { ret; }
     var previous: usize = NO_SLOT;
     var next:     usize = engine.blocked_head;
-    for (next != NO_SLOT && engine.streams[next].blocked_required <= required) {
+    for (next != NO_SLOT && slot_stream[T](engine, next).blocked_required <= required) {
         previous = next;
-        next     = engine.streams[next].blocked_next;
+        next     = slot_stream[T](engine, next).blocked_next;
     }
     stream.blocked_required = required;
     stream.blocked_prev     = previous;
     stream.blocked_next     = next;
     stream.blocked_listed   = true;
     if (previous == NO_SLOT) { engine.blocked_head = stream.slot; }
-    or                       { engine.streams[previous].blocked_next = stream.slot; }
-    if (next != NO_SLOT)     { engine.streams[next].blocked_prev = stream.slot; }
+    or                       { slot_stream[T](engine, previous).blocked_next = stream.slot; }
+    if (next != NO_SLOT)     { slot_stream[T](engine, next).blocked_prev = stream.slot; }
 }
 
 fun set_blocked[T](engine: *Engine[T], stream: *Stream) {
@@ -907,7 +966,7 @@ fun clear_blocked[T](engine: *Engine[T], stream: *Stream) {
 
 fun wake_unblocked[T](engine: *Engine[T]) {
     for (engine.blocked_head != NO_SLOT) {
-        val stream: *Stream = ?engine.streams[engine.blocked_head];
+        val stream: *Stream = slot_stream[T](engine, engine.blocked_head);
         if (stream.blocked_required > engine.inbound_table.insert_count) { brk; }
         blocked_unlink[T](engine, stream);
         ready_push[T](engine, stream);
@@ -920,7 +979,7 @@ fun exchange_link[T](engine: *Engine[T], stream: *Stream) {
     stream.exchange_next   = engine.exchange_head;
     stream.exchange_listed = true;
     if (engine.exchange_head != NO_SLOT) {
-        engine.streams[engine.exchange_head].exchange_prev = stream.slot;
+        slot_stream[T](engine, engine.exchange_head).exchange_prev = stream.slot;
     }
     engine.exchange_head = stream.slot;
 }
@@ -928,9 +987,9 @@ fun exchange_link[T](engine: *Engine[T], stream: *Stream) {
 fun exchange_unlink[T](engine: *Engine[T], stream: *Stream) {
     if (!stream.exchange_listed)         { ret; }
     if (stream.exchange_prev == NO_SLOT) { engine.exchange_head = stream.exchange_next; }
-    or                                   { engine.streams[stream.exchange_prev].exchange_next = stream.exchange_next; }
+    or                                   { slot_stream[T](engine, stream.exchange_prev).exchange_next = stream.exchange_next; }
     if (stream.exchange_next != NO_SLOT) {
-        engine.streams[stream.exchange_next].exchange_prev = stream.exchange_prev;
+        slot_stream[T](engine, stream.exchange_next).exchange_prev = stream.exchange_prev;
     }
     stream.exchange_listed = false;
     stream.exchange_next   = NO_SLOT;
@@ -941,21 +1000,193 @@ fun output_pending(stream: *Stream) bool {
     ret stream.output_length != 0 || stream.output_end_stream;
 }
 
-# the single point that binds a slot to its memory, so demand-acquired memory
-# replaces only this
-fun acquire_memory[T](engine: *Engine[T], slot: usize) StreamMemory {
-    ret engine.memories[slot];
+fun unbound_memory() StreamMemory {
+    ret StreamMemory{read: nil, read_capacity: 0, settings: nil, setting_capacity: 0,
+        encoded: nil, encoded_capacity: 0, fields: nil, field_capacity: 0,
+        strings: nil, string_capacity: 0, scratch: nil, scratch_capacity: 0,
+        output:  nil, output_capacity: 0, references: nil, reference_capacity: 0};
 }
 
-fun allocate_stream[T](engine: *Engine[T], value: StreamHandle,
-    local: bool, kind: StreamKind) *Stream {
-    if (engine.next_generation == 0 || value.generation == 0
-        || value.id > MAX_STREAM_ID || engine.free_head == NO_SLOT
-        || index_find[T](engine, value.id) != NO_SLOT) { ret nil; }
-    val stream: *Stream = ?engine.streams[engine.free_head];
+# an unclassified peer stream reads one byte at a time into its own record, so
+# the type is known before a byte of the stream's frames arrives
+fun probe_memory(stream: *Stream) StreamMemory {
+    var value: StreamMemory = unbound_memory();
+    value.read          = ?stream.probe;
+    value.read_capacity = 1;
+    ret value;
+}
+
+# an ignored stream's bytes are credited in the call that reads them
+fun discard_memory[T](engine: *Engine[T]) StreamMemory {
+    var value: StreamMemory = unbound_memory();
+    value.read          = ?engine.discard[0];
+    value.read_capacity = 64;
+    ret value;
+}
+
+fun granted(got: buffers.Acquired) bool {
+    ret sel got.status.ok;
+}
+
+fun buffer_request(bytes: usize, align: usize, lane: u8) buffers.Request {
+    ret buffers.Request{bytes: bytes, align: align, lane: lane, secret: false};
+}
+
+fun release_chunk[T](engine: *Engine[T], chunk: buffers.Chunk) {
+    buffers.source_release(engine.source, engine.account, chunk);
+}
+
+fun index_bytes(capacity: usize) usize {
+    ret capacity * $size_of(StreamIndexEntry);
+}
+
+# the index holds every slot at most half full
+fun index_size(slots: usize) usize {
+    var size: usize = 8;
+    for (size < 2 * slots) { size = size * 2; }
+    ret size;
+}
+
+# a record fresh from a chunk, unbound and on no list
+fun prepare_slot[T](engine: *Engine[T], slot: usize) {
+    val stream: *Stream = slot_stream[T](engine, slot);
+    reset_stream(stream, unbound_memory());
+    stream.slot        = slot;
+    stream.next_free   = NO_SLOT;
+    stream.ready_next  = NO_SLOT;
+    stream.queued      = false;
+    stream.probe       = 0;
+    stream.memory_held = false;
+}
+
+# the new records go on the free list lowest slot first
+fun attach_records[T](engine: *Engine[T], records_chunk: buffers.Chunk) {
+    val previous: usize = engine.stream_capacity;
+    records.attach(?engine.records, records_chunk);
+    engine.stream_capacity = engine.records.capacity;
+    var slot: usize = engine.stream_capacity;
+    for (slot > previous) {
+        slot = slot - 1;
+        prepare_slot[T](engine, slot);
+        slot_stream[T](engine, slot).next_free = engine.free_head;
+        engine.free_head                       = slot;
+    }
+}
+
+# one more record chunk and an index sized for it, all or nothing. the table
+# never shrinks while the connection lives and stops growing at max_streams
+fun grow_streams[T](engine: *Engine[T], register: bool) bool {
+    if (engine.stream_capacity >= max_streams(engine.configured)) { ret false; }
+    val lane:    u8              = engine.configured.connection_lane;
+    val request: buffers.Request = records.next_request(?engine.records, lane);
+    if (request.bytes == 0) { ret false; }
+    val size: usize = index_size(engine.stream_capacity
+        + request.bytes / engine.records.element_size);
+    var requests: [2]buffers.Request = [2]buffers.Request{
+        request, buffer_request(index_bytes(size), 0, lane),
+    };
+    var chunks: [2]buffers.Chunk;
+    val got:    buffers.Acquired = buffers.source_acquire_n(engine.source, engine.account,
+        ?requests[0], 2, ?chunks[0], register);
+    if (!granted(got)) { ret false; }
+    attach_records[T](engine, chunks[0]);
+    val old: buffers.Chunk = engine.index_chunk;
+    engine.index_chunk    = chunks[1];
+    engine.stream_index   = chunks[1].data::*StreamIndexEntry;
+    engine.index_capacity = size;
+    index_rebuild[T](engine);
+    release_chunk[T](engine, old);
+    ret true;
+}
+
+fun take_slot[T](engine: *Engine[T], register: bool) usize {
+    if (engine.free_head == NO_SLOT && !grow_streams[T](engine, register)) { ret NO_SLOT; }
+    val slot:   usize   = engine.free_head;
+    val stream: *Stream = slot_stream[T](engine, slot);
     engine.free_head = stream.next_free;
     stream.next_free = NO_SLOT;
-    reset_stream(stream, acquire_memory[T](engine, stream.slot));
+    ret slot;
+}
+
+fun give_slot[T](engine: *Engine[T], stream: *Stream) {
+    stream.next_free = engine.free_head;
+    engine.free_head = stream.slot;
+}
+
+# a request stream's buffers, all or nothing. a refusal refuses only the stream
+# and registers nothing, since a refused stream gets no wake-up
+fun acquire_request_memory[T](engine: *Engine[T], stream: *Stream) bool {
+    var requests: [7]buffers.Request;
+    var i:        usize = 0;
+    for (i < REQUEST_BUFFERS) {
+        requests[i] = buffer_request(request_bytes(engine.configured, i), 0,
+            engine.configured.stream_lane);
+        i = i + 1;
+    }
+    val got: buffers.Acquired = buffers.source_acquire_n(engine.source, engine.account,
+        ?requests[0], REQUEST_BUFFERS, ?stream.chunks[0], false);
+    if (!granted(got)) { ret false; }
+    val inbound:  qpack.Limits = engine.configured.inbound_qpack;
+    val outbound: qpack.Limits = engine.configured.outbound_qpack;
+    var value:    StreamMemory = unbound_memory();
+    value.read               = stream.chunks[0].data;
+    value.read_capacity      = engine.configured.read_bytes;
+    value.encoded            = stream.chunks[1].data;
+    value.encoded_capacity   = inbound.max_encoded_section_bytes;
+    value.fields             = stream.chunks[2].data::*field.Field;
+    value.field_capacity     = inbound.max_field_count;
+    value.strings            = stream.chunks[3].data;
+    value.string_capacity    = inbound.max_field_section_bytes;
+    value.scratch            = stream.chunks[4].data;
+    value.scratch_capacity   = inbound.max_field_bytes * 2;
+    value.output             = stream.chunks[5].data;
+    value.output_capacity    = engine.configured.output_bytes;
+    value.references         = stream.chunks[6].data::*u64;
+    value.reference_capacity = outbound.max_field_count;
+    stream.memory            = value;
+    stream.memory_held       = true;
+    engine.request_sets      = engine.request_sets + 1;
+    ret true;
+}
+
+fun release_request_memory[T](engine: *Engine[T], stream: *Stream) {
+    if (!stream.memory_held) { ret; }
+    var i: usize = REQUEST_BUFFERS;
+    for (i != 0) {
+        i = i - 1;
+        release_chunk[T](engine, stream.chunks[i]);
+    }
+    stream.memory_held  = false;
+    stream.memory       = unbound_memory();
+    engine.request_sets = engine.request_sets - 1;
+}
+
+# a record and, for a request, its buffers, not yet bound to a transport stream.
+# a request holds its record until released, closed or not, so at most
+# max_requests of them keep max_peer_unidirectional records under the cap
+fun prepare_stream[T](engine: *Engine[T], kind: StreamKind) *Stream {
+    if (engine.next_generation == 0 || (kind == STREAM_REQUEST
+        && engine.request_sets >= engine.configured.max_requests)) { ret nil; }
+    val slot: usize = take_slot[T](engine, false);
+    if (slot == NO_SLOT) { ret nil; }
+    val stream: *Stream = slot_stream[T](engine, slot);
+    reset_stream(stream, probe_memory(stream));
+    if (kind == STREAM_REQUEST && !acquire_request_memory[T](engine, stream)) {
+        reset_stream(stream, unbound_memory());
+        give_slot[T](engine, stream);
+        ret nil;
+    }
+    ret stream;
+}
+
+fun unprepare_stream[T](engine: *Engine[T], stream: *Stream) {
+    release_request_memory[T](engine, stream);
+    reset_stream(stream, unbound_memory());
+    give_slot[T](engine, stream);
+}
+
+fun start_stream[T](engine: *Engine[T], stream: *Stream, value: StreamHandle,
+    local: bool, kind: StreamKind) *Stream {
     stream.transport_stream = value;
     stream.generation       = next_generation[T](engine);
     stream.state            = STREAM_OPEN;
@@ -971,7 +1202,20 @@ fun allocate_stream[T](engine: *Engine[T], value: StreamHandle,
     ret stream;
 }
 
-# returns a slot to the free list. a still-queued slot stays queued and is
+fun stream_admissible[T](engine: *Engine[T], value: StreamHandle) bool {
+    ret engine.next_generation != 0 && value.generation != 0
+        && value.id <= MAX_STREAM_ID && index_find[T](engine, value.id) == NO_SLOT;
+}
+
+fun allocate_stream[T](engine: *Engine[T], value: StreamHandle,
+    local: bool, kind: StreamKind) *Stream {
+    if (!stream_admissible[T](engine, value)) { ret nil; }
+    val stream: *Stream = prepare_stream[T](engine, kind);
+    if (stream == nil) { ret nil; }
+    ret start_stream[T](engine, stream, value, local, kind);
+}
+
+# returns a slot and its buffers. a still-queued slot stays queued and is
 # skipped when popped, or serviced as its successor if reused first.
 fun free_stream[T](engine: *Engine[T], stream: *Stream) {
     if (!stream.live) { ret; }
@@ -981,10 +1225,9 @@ fun free_stream[T](engine: *Engine[T], stream: *Stream) {
     if (output_pending(stream) && engine.output_streams != 0) {
         engine.output_streams = engine.output_streams - 1;
     }
-    val memory_value: StreamMemory = stream.memory;
-    reset_stream(stream, memory_value);
-    stream.next_free = engine.free_head;
-    engine.free_head = stream.slot;
+    release_request_memory[T](engine, stream);
+    reset_stream(stream, unbound_memory());
+    give_slot[T](engine, stream);
 }
 
 fun stream_terminal(stream: *Stream) bool {
@@ -1083,7 +1326,7 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
     if (engine == nil || engine.initialized || (role != SERVER && role != CLIENT)
         || !transport_valid[T](?transport) || scope == nil
         || !scope_active(scope) || !config_valid(configured, ?storage)
-        || storage.streams == nil || storage.memories == nil
+        || !critical_valid(storage.critical, configured)
         || storage.control_queue == nil || storage.encoder_queue == nil
         || storage.decoder_queue == nil
         || storage.control_queue_capacity < 64
@@ -1094,27 +1337,6 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
         ?settings_bytes[0], 96);
     if (settings_length == 0
         || settings_length >= storage.control_queue_capacity) { ret false; }
-    var i: usize = 0;
-    for (i < storage.stream_capacity) {
-        if (!memory_valid(storage.memories[i], configured)) { ret false; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < storage.stream_capacity) {
-        val stream: *Stream = ?storage.streams[i];
-        reset_stream(stream, storage.memories[i]);
-        stream.slot       = i;
-        stream.next_free  = i + 1;
-        stream.ready_next = NO_SLOT;
-        stream.queued     = false;
-        i                 = i + 1;
-    }
-    storage.streams[storage.stream_capacity - 1].next_free = NO_SLOT;
-    i                                                      = 0;
-    for (i < storage.stream_index_capacity) {
-        storage.stream_index[i] = StreamIndexEntry{id: 0, slot: INDEX_EMPTY};
-        i                       = i + 1;
-    }
     if (!queue_init(?engine.control, storage.control_queue,
         storage.control_queue_capacity)
         || !queue_init(?engine.encoder, storage.encoder_queue,
@@ -1122,23 +1344,44 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
         || !queue_init(?engine.decoder, storage.decoder_queue,
         storage.decoder_queue_capacity)
         || !frame.critical_init(?engine.critical)) { ret false; }
-    if (!init_tables[T](engine, ?storage, configured)) { ret false; }
-    engine.role       = role;
-    engine.state      = STARTING;
-    engine.configured = configured;
-    engine.peer       = Settings{qpack_max_table_capacity: 0,
+    if (!init_tables[T](engine, ?storage, configured)
+        || !records.make(?engine.records, $size_of(Stream), first_streams(configured))) {
+        ret false;
+    }
+    # the first record chunk and its index are taken here, and a refusal fails init
+    val lane:     u8                 = configured.connection_lane;
+    val first:    buffers.Request    = records.next_request(?engine.records, lane);
+    val size:     usize              = index_size(first.bytes / engine.records.element_size);
+    var requests: [2]buffers.Request = [2]buffers.Request{
+        first, buffer_request(index_bytes(size), 0, lane),
+    };
+    var chunks: [2]buffers.Chunk;
+    if (!granted(buffers.source_acquire_n(storage.source, storage.account,
+        ?requests[0], 2, ?chunks[0], false))) { ret false; }
+    engine.source          = storage.source;
+    engine.account         = storage.account;
+    engine.stream_capacity = 0;
+    engine.free_head       = NO_SLOT;
+    attach_records[T](engine, chunks[0]);
+    engine.index_chunk    = chunks[1];
+    engine.stream_index   = chunks[1].data::*StreamIndexEntry;
+    engine.index_capacity = size;
+    engine.index_rebuilds = 0;
+    index_rebuild[T](engine);
+    engine.critical_memory = storage.critical;
+    engine.request_sets    = 0;
+    engine.accept_parked   = false;
+    engine.accept_blocked  = false;
+    engine.role            = role;
+    engine.state           = STARTING;
+    engine.configured      = configured;
+    engine.peer            = Settings{qpack_max_table_capacity: 0,
         max_field_section_size: (-1)::usize, qpack_blocked_streams: 0,
         enable_connect_protocol:                                    false, h3_datagram: false};
     engine.transport                  = transport;
     engine.scope                      = scope;
-    engine.streams                    = storage.streams;
-    engine.memories                   = storage.memories;
-    engine.stream_capacity            = storage.stream_capacity;
-    engine.stream_index               = storage.stream_index;
-    engine.index_capacity             = storage.stream_index_capacity;
     engine.index_tombstones           = 0;
     engine.index_rebuilds             = 0;
-    engine.free_head                  = 0;
     engine.ready_head                 = NO_SLOT;
     engine.ready_tail                 = NO_SLOT;
     engine.ready_count                = 0;
@@ -1177,11 +1420,9 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
     engine.initialized                = true;
     if (!queue_stream_prefix(?engine.control, frame.STREAM_CONTROL)
         || !queue_stream_prefix(?engine.encoder, frame.STREAM_QPACK_ENCODER)
-        || !queue_stream_prefix(?engine.decoder, frame.STREAM_QPACK_DECODER)) {
-        engine.initialized = false;
-        ret false;
-    }
-    if (!queue_push(?engine.control, ?settings_bytes[0], settings_length)) {
+        || !queue_stream_prefix(?engine.decoder, frame.STREAM_QPACK_DECODER)
+        || !queue_push(?engine.control, ?settings_bytes[0], settings_length)) {
+        release_all[T](engine);
         engine.initialized = false;
         ret false;
     }
@@ -1519,7 +1760,7 @@ fun frame_error_code(error: frame.Error) u64 {
 fun cancel_all_streams[T](engine: *Engine[T], code: u64) {
     var i: usize = 0;
     for (i < engine.stream_capacity) {
-        val stream: *Stream = ?engine.streams[i];
+        val stream: *Stream = slot_stream[T](engine, i);
         if (stream.live && !stream_terminal(stream)) {
             if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
             if (stream_readable(stream)) {
@@ -1772,7 +2013,7 @@ fun apply_peer_settings[T](engine: *Engine[T], stream: *Stream) Event {
     if (engine.local_settings_sent) { engine.state = OPEN; }
     # decoder instructions that arrived before SETTINGS can now be applied
     if (engine.peer_decoder != NO_SLOT) {
-        wake_stream[T](engine, ?engine.streams[engine.peer_decoder]);
+        wake_stream[T](engine, slot_stream[T](engine, engine.peer_decoder));
     }
     ret base_event[T](engine, EVENT_SETTINGS);
 }
@@ -1880,8 +2121,31 @@ fun reject_request[T](engine: *Engine[T], opened: TransportOpen) Event {
     ret result;
 }
 
-# EVENT_PENDING when a stream was taken, since another may be waiting
+# a peer unidirectional stream may be critical, so a refused record parks it
+# unread in the transport rather than refusing it. the account is registered for
+# a wake-up and a released stream frees a record too. at the cap a record is
+# always free, since requests never hold more than max_requests of them
+fun place_unidirectional[T](engine: *Engine[T], value: StreamHandle) Event {
+    if (engine.free_head == NO_SLOT && !grow_streams[T](engine, true)) {
+        engine.parked_stream  = value;
+        engine.accept_parked  = true;
+        engine.accept_blocked = true;
+        ret base_event[T](engine, EVENT_NONE);
+    }
+    engine.accept_parked = false;
+    val incoming: *Stream = allocate_stream[T](engine, value, false, STREAM_UNKNOWN);
+    if (incoming == nil || !frame.stream_parser_init(?incoming.classifier,
+        ?engine.critical, engine.role == SERVER)) {
+        ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
+    }
+    ret base_event[T](engine, EVENT_PENDING);
+}
+
+# EVENT_PENDING when a stream was taken, since another may be waiting. nothing
+# more is accepted while a parked stream waits for its record
 fun accept_peer[T](engine: *Engine[T]) Event {
+    engine.accept_blocked = false;
+    if (engine.accept_parked) { ret place_unidirectional[T](engine, engine.parked_stream); }
     val opened: TransportOpen = engine.transport.accept(engine.transport.context);
     if (!transport_status(opened.status)) {
         ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
@@ -1906,12 +2170,13 @@ fun accept_peer[T](engine: *Engine[T]) Event {
         if (engine.active_requests >= engine.configured.max_requests) {
             ret reject_request[T](engine, opened);
         }
+        # a request whose buffers the source refused is rejected like one over budget
         val request: *Stream = allocate_stream[T](engine, opened.stream,
             false, STREAM_REQUEST);
-        if (request == nil || !frame.parser_init(?request.parser,
-            frame.KIND_REQUEST, request.memory.settings,
-            request.memory.setting_capacity, engine.configured.frames)) {
-            ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
+        if (request == nil) { ret reject_request[T](engine, opened); }
+        if (!frame.parser_init(?request.parser, frame.KIND_REQUEST, nil, 0,
+            engine.configured.frames)) {
+            ret fail_connection[T](engine, ERROR_LIMIT, H3_INTERNAL_ERROR);
         }
         if (engine.last_remote_request == NO_STREAM
             || opened.stream.id > engine.last_remote_request) {
@@ -1923,13 +2188,7 @@ fun accept_peer[T](engine: *Engine[T]) Event {
         >= engine.configured.max_peer_unidirectional) {
         ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
     }
-    val incoming: *Stream = allocate_stream[T](engine, opened.stream,
-        false, STREAM_UNKNOWN);
-    if (incoming == nil || !frame.stream_parser_init(?incoming.classifier,
-        ?engine.critical, engine.role == SERVER)) {
-        ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
-    }
-    ret base_event[T](engine, EVENT_PENDING);
+    ret place_unidirectional[T](engine, opened.stream);
 }
 
 fun discard_opened[T](engine: *Engine[T], opened: StreamHandle, code: u64) u8 {
@@ -1948,34 +2207,35 @@ pub fun open_request[T](engine: *Engine[T], bound: *exchange.Exchange) u64 {
         || (engine.state != STARTING && engine.state != OPEN)
         || engine.graceful || engine.goaway_received
         || engine.active_requests >= engine.configured.max_requests) { ret NO_STREAM; }
+    # the record and buffers come first, so a refusal never opens a transport stream
+    val prepared: *Stream = prepare_stream[T](engine, STREAM_REQUEST);
+    if (prepared == nil) { ret NO_STREAM; }
     val opened: TransportOpen = engine.transport.open(
         engine.transport.context, BIDIRECTIONAL);
-    if (!transport_status(opened.status)) {
-        fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
-        ret NO_STREAM;
-    }
     if (opened.status == TRANSPORT_EMPTY || opened.status == TRANSPORT_BLOCKED) {
+        unprepare_stream[T](engine, prepared);
         ret NO_STREAM;
     }
-    if (opened.status != TRANSPORT_OK) {
-        fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
-        ret NO_STREAM;
-    }
-    if (!local_stream_valid[T](engine, opened.stream, BIDIRECTIONAL)
+    if (opened.status != TRANSPORT_OK
+        || !local_stream_valid[T](engine, opened.stream, BIDIRECTIONAL)
         || !request_id(opened.stream.id)
         || (engine.goaway_received && opened.stream.id >= engine.remote_goaway)) {
+        unprepare_stream[T](engine, prepared);
         fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
         ret NO_STREAM;
     }
-    val stream: *Stream = allocate_stream[T](engine, opened.stream,
+    if (!stream_admissible[T](engine, opened.stream)) {
+        unprepare_stream[T](engine, prepared);
+        release_outcome[T](engine,
+            discard_opened[T](engine, opened.stream, H3_REQUEST_CANCELLED));
+        ret NO_STREAM;
+    }
+    val stream: *Stream = start_stream[T](engine, prepared, opened.stream,
         true, STREAM_REQUEST);
-    if (stream == nil || !frame.parser_init(?stream.parser,
-        frame.KIND_REQUEST, stream.memory.settings,
-        stream.memory.setting_capacity, engine.configured.frames)) {
-        if (stream != nil) {
-            mark_closed[T](engine, stream);
-            free_stream[T](engine, stream);
-        }
+    if (!frame.parser_init(?stream.parser, frame.KIND_REQUEST, nil, 0,
+        engine.configured.frames)) {
+        mark_closed[T](engine, stream);
+        free_stream[T](engine, stream);
         release_outcome[T](engine,
             discard_opened[T](engine, opened.stream, H3_REQUEST_CANCELLED));
         ret NO_STREAM;
@@ -2015,6 +2275,7 @@ fun classify_stream[T](engine: *Engine[T], stream: *Stream) Event {
     if (parsed.stream_type == frame.STREAM_CONTROL) {
         stream.kind     = STREAM_CONTROL;
         stream.critical = true;
+        stream.memory   = engine.critical_memory.control;
         if (!frame.parser_init(?stream.parser, frame.KIND_CONTROL,
             stream.memory.settings, stream.memory.setting_capacity,
             engine.configured.frames)) {
@@ -2024,6 +2285,7 @@ fun classify_stream[T](engine: *Engine[T], stream: *Stream) Event {
     or (parsed.stream_type == frame.STREAM_QPACK_ENCODER) {
         stream.kind     = STREAM_QPACK_ENCODER;
         stream.critical = true;
+        stream.memory   = engine.critical_memory.encoder;
         if (!qpack.encoder_stream_decoder_init(?stream.encoder_stream,
             ?engine.inbound_table, stream.memory.encoded,
             stream.memory.encoded_capacity, stream.memory.scratch,
@@ -2034,9 +2296,13 @@ fun classify_stream[T](engine: *Engine[T], stream: *Stream) Event {
     or (parsed.stream_type == frame.STREAM_QPACK_DECODER) {
         stream.kind         = STREAM_QPACK_DECODER;
         stream.critical     = true;
+        stream.memory       = engine.critical_memory.decoder;
         engine.peer_decoder = stream.slot;
     }
-    or { stream.kind = STREAM_IGNORED; }
+    or {
+        stream.kind   = STREAM_IGNORED;
+        stream.memory = discard_memory[T](engine);
+    }
     ret base_event[T](engine, EVENT_NONE);
 }
 
@@ -2233,7 +2499,7 @@ fun handle_goaway[T](engine: *Engine[T], value: u64) Event {
     if (engine.role == CLIENT) {
         var i: usize = 0;
         for (i < engine.stream_capacity) {
-            val stream: *Stream = ?engine.streams[i];
+            val stream: *Stream = slot_stream[T](engine, i);
             if (stream.live && stream.kind == STREAM_REQUEST && stream.local
                 && stream.transport_stream.id >= value && !stream_terminal(stream)) {
                 val send: TransportOperation = engine.transport.cancel_send(
@@ -2809,7 +3075,7 @@ fun note_ready[T](engine: *Engine[T], report: TransportReady) {
     if (report.handle.id > MAX_STREAM_ID) { ret; }
     val slot: usize = index_find[T](engine, report.handle.id);
     if (slot == NO_SLOT) { ret; }
-    val stream: *Stream = ?engine.streams[slot];
+    val stream: *Stream = slot_stream[T](engine, slot);
     if (stream.transport_stream.source != report.handle.source
         || stream.transport_stream.index != report.handle.index
         || stream.transport_stream.generation != report.handle.generation) { ret; }
@@ -2870,6 +3136,7 @@ fun service_ready[T](engine: *Engine[T], blocked: bool, pending: bool) Event {
         or (result.kind != EVENT_NONE)    { ret result; }
     }
     if (pending || engine.ready_count != 0) { ret base_event[T](engine, EVENT_PENDING); }
+    if (engine.accept_blocked)              { ret base_event[T](engine, EVENT_MEMORY_BLOCKED); }
     if (output_blocked)                     { ret base_event[T](engine, EVENT_BLOCKED); }
     ret base_event[T](engine, EVENT_NONE);
 }
@@ -2878,8 +3145,10 @@ fun service_ready[T](engine: *Engine[T], blocked: bool, pending: bool) Event {
 # work remains that this call's budget did not reach, so call again at once.
 # EVENT_NONE means the transport has no unreported news, no peer stream is
 # waiting to be accepted and no stream is queued, so the host may wait for
-# transport or application news. EVENT_BLOCKED means only output is stalled
-# on the transport. PENDING wins over BLOCKED, since work remains.
+# transport or application news. EVENT_MEMORY_BLOCKED means a peer stream
+# waits for a stream record the source refused, which the account's wake-up or
+# a released stream provides. EVENT_BLOCKED means only output is stalled on
+# the transport. PENDING wins over both, since work remains.
 pub fun process[T](engine: *Engine[T]) Event {
     if (engine == nil || !engine.initialized) {
         ret invalid_event();
@@ -2954,16 +3223,33 @@ pub fun release_stream[T](engine: *Engine[T], id: u64, generation: u64) bool {
     ret true;
 }
 
-# returns the engine to the state `init` accepts so caller-owned storage can
-# carry a second connection. zeroing is deliberate: the guards on both QPACK
-# tables, the inbound and outbound section sets, and the critical-stream record
-# all live inside this record, as does the pending-release count, and a field
-# added later must not silently survive a reuse. the caller's stream slots are
-# reset by `init` itself.
+# every borrowed buffer, record and the index go back to the account. linear
+# once per connection
+fun release_all[T](engine: *Engine[T]) {
+    var i: usize = 0;
+    for (i < engine.stream_capacity) {
+        release_request_memory[T](engine, slot_stream[T](engine, i));
+        i = i + 1;
+    }
+    records.destroy(?engine.records, engine.source, engine.account);
+    release_chunk[T](engine, engine.index_chunk);
+    engine.stream_capacity = 0;
+    engine.stream_index    = nil;
+    engine.index_capacity  = 0;
+    engine.free_head       = NO_SLOT;
+}
+
+# returns every borrowed record and buffer to the account and the engine to the
+# state `init` accepts, so caller-owned storage can carry a second connection.
+# zeroing is deliberate: the guards on both QPACK tables, the inbound and
+# outbound section sets, and the critical-stream record all live inside this
+# record, as does the pending-release count, and a field added later must not
+# silently survive a reuse.
 #
 # the peer's control and QPACK streams stay live for the whole connection and
 # are reclaimed by the transport close, so they do not block teardown; an
-# application borrow or a release the transport still owes does.
+# application borrow or a release the transport still owes does. closed request
+# streams the host never released give their buffers back here.
 pub fun destroy[T](engine: *Engine[T]) bool {
     if (engine == nil || !engine.initialized) { ret false; }
     if (engine.active_requests != 0 || engine.pending_release_count != 0) {
@@ -2971,9 +3257,10 @@ pub fun destroy[T](engine: *Engine[T]) bool {
     }
     var i: usize = 0;
     for (i < engine.stream_capacity) {
-        if (engine.streams[i].live && engine.streams[i].held) { ret false; }
+        if (slot_stream[T](engine, i).live && slot_stream[T](engine, i).held) { ret false; }
         i = i + 1;
     }
+    release_all[T](engine);
     var cleared: Engine[T];
     @engine = cleared;
     ret true;
@@ -3011,7 +3298,7 @@ pub fun tick[T](engine: *Engine[T]) Event {
     }
     var slot: usize = engine.exchange_head;
     for (slot != NO_SLOT) {
-        val stream: *Stream = ?engine.streams[slot];
+        val stream: *Stream = slot_stream[T](engine, slot);
         slot = stream.exchange_next;
         if (!stream_terminal(stream) && !scope_active(stream.exchange.scope)) {
             exchange.settle_cancellation(stream.exchange);
@@ -3479,27 +3766,25 @@ test "http.h3.connection: typed transport accepts a secret-welded context" {
     ret 0;
 }
 
-val FIXTURE_SLOTS: usize = 100;
 val FIXTURE_WIRES: usize = 112;
 
 rec Fixture {
     scope:               cancel.Scope;
     io:                  TestTransport;
-    slots:               usize;
     wires:               [112]TestWire;
     wire_output:         [112][1024]u8;
-    streams:             [100]Stream;
-    memories:            [100]StreamMemory;
-    index:               [256]StreamIndexEntry;
+    backing:             allocator.Allocator;
+    pool:                buffers.Pool;
+    source:              buffers.Source;
+    account:             buffers.Account;
     pending:             [4]StreamHandle;
-    reads:               [100][128]u8;
-    settings:            [100][5]frame.Setting;
-    encoded:             [100][256]u8;
-    fields:              [100][16]field.Field;
-    strings:             [100][512]u8;
-    scratch:             [100][256]u8;
-    output:              [100][512]u8;
-    field_references:    [100][16]u64;
+    control_read:        [128]u8;
+    control_settings:    [5]frame.Setting;
+    encoder_read:        [128]u8;
+    encoder_encoded:     [128]u8;
+    encoder_scratch:     [256]u8;
+    decoder_read:        [128]u8;
+    decoder_encoded:     [128]u8;
     inbound_entries:     [8]qpack.Entry;
     inbound_storage:     [256]u8;
     inbound_scratch:     [256]u8;
@@ -3536,7 +3821,30 @@ fun test_config() Config {
     configured.inbound_qpack.max_outstanding_sections  = 8;
     configured.inbound_qpack.max_references            = 64;
     configured.outbound_qpack                          = configured.inbound_qpack;
+    configured.read_bytes                              = 128;
+    configured.output_bytes                            = 512;
+    configured.initial_streams                         = 6;
+    configured.stream_lane                             = 0;
+    configured.connection_lane                         = 1;
     ret configured;
+}
+
+# a std pool with no size classes, so every chunk is exactly its request rounded
+# to 16 bytes and the account's `used` counts bytes exactly
+fun make_buffers(fixture: *Fixture) bool {
+    val backed: err[allocator.Error] = page.make(?fixture.backing);
+    if (sel backed.err) { ret false; }
+    var config: buffers.Config;
+    config.class_count   = 0;
+    config.lanes         = 2;
+    config.global_budget = 1 << 26;
+    config.initial_slots = 16;
+    if (!buffers.make(?fixture.pool, config, ?fixture.backing)) { ret false; }
+    fixture.source = buffers.source(?fixture.pool);
+    var budgets: [2]usize       = [2]usize{1 << 25, 1 << 25};
+    val opened:  buffers.Reason = buffers.source_open_account(?fixture.source,
+        ?fixture.account, 1, ?budgets[0], 0);
+    ret sel opened.none;
 }
 
 # a fresh transport, as a pooled engine gets for its next connection
@@ -3575,42 +3883,36 @@ fun reset_io(fixture: *Fixture, role: Role) {
 }
 
 fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
-    ret make_sized_fixture(fixture, role, configured, 6);
-}
-
-fun make_sized_fixture(fixture: *Fixture, role: Role, configured: Config,
-    slots: usize) bool {
-    if (slots > FIXTURE_SLOTS) { ret false; }
-    fixture.slots = slots;
-    val none: time.Instant = time.Instant{sec: 0, nsec: 0};
-    if (!operation_ok(cancel.make_root(?fixture.scope, opt[time.Instant].none{}))) { ret false; }
+    if (!operation_ok(cancel.make_root(?fixture.scope, opt[time.Instant].none{}))
+        || !make_buffers(fixture)) { ret false; }
     reset_io(fixture, role);
     ret start_engine(fixture, role, configured);
 }
 
-fun index_size(slots: usize) usize {
-    var size: usize = 1;
-    for (size < 2 * slots) { size = size * 2; }
-    ret size;
+fun fixture_critical(fixture: *Fixture) CriticalMemory {
+    var control: StreamMemory = unbound_memory();
+    control.read             = ?fixture.control_read[0];
+    control.read_capacity    = 128;
+    control.settings         = ?fixture.control_settings[0];
+    control.setting_capacity = 5;
+    var encoder: StreamMemory = unbound_memory();
+    encoder.read             = ?fixture.encoder_read[0];
+    encoder.read_capacity    = 128;
+    encoder.encoded          = ?fixture.encoder_encoded[0];
+    encoder.encoded_capacity = 128;
+    encoder.scratch          = ?fixture.encoder_scratch[0];
+    encoder.scratch_capacity = 256;
+    var decoder: StreamMemory = unbound_memory();
+    decoder.read             = ?fixture.decoder_read[0];
+    decoder.read_capacity    = 128;
+    decoder.encoded          = ?fixture.decoder_encoded[0];
+    decoder.encoded_capacity = 128;
+    ret CriticalMemory{control: control, encoder: encoder, decoder: decoder};
 }
 
 # every argument is the fixture's own storage, so calling this a second time is
 # exactly what a pool does with a recycled engine
 fun start_engine(fixture: *Fixture, role: Role, configured: Config) bool {
-    var i: usize = 0;
-    for (i < fixture.slots) {
-        fixture.memories[i] = StreamMemory{
-            read:       ?fixture.reads[i][0], read_capacity: 128,
-            settings:   ?fixture.settings[i][0], setting_capacity: 5,
-            encoded:    ?fixture.encoded[i][0], encoded_capacity: 256,
-            fields:     ?fixture.fields[i][0], field_capacity: 16,
-            strings:    ?fixture.strings[i][0], string_capacity: 512,
-            scratch:    ?fixture.scratch[i][0], scratch_capacity: 256,
-            output:     ?fixture.output[i][0], output_capacity: 512,
-            references: ?fixture.field_references[i][0], reference_capacity: 16,
-        };
-        i = i + 1;
-    }
     val transport: Transport[TestTransport] = Transport[TestTransport]{
         context:     ?fixture.io,
         open:        test_open, accept: test_accept, ready: test_ready, read: test_read,
@@ -3619,10 +3921,8 @@ fun start_engine(fixture: *Fixture, role: Role, configured: Config) bool {
         release:     test_release, close: test_close
     };
     val storage: Storage = Storage{
-        streams:                     ?fixture.streams[0], memories: ?fixture.memories[0],
-        stream_capacity:             fixture.slots,
-        stream_index:                ?fixture.index[0],
-        stream_index_capacity:       index_size(fixture.slots),
+        source:                      ?fixture.source, account: ?fixture.account,
+        critical:                    fixture_critical(fixture),
         pending_release:             ?fixture.pending[0], pending_release_capacity: 4,
         inbound_entries:             ?fixture.inbound_entries[0], inbound_entry_capacity: 8,
         inbound_storage:             ?fixture.inbound_storage[0], inbound_storage_capacity: 256,
@@ -4554,13 +4854,25 @@ fun settle(fixture: *Fixture) bool {
     ret false;
 }
 
+# drains every queued stream until only a memory refusal remains
+fun settle_blocked(fixture: *Fixture) bool {
+    var i: usize = 0;
+    for (i < 16) {
+        val kind: EventKind = process[TestTransport](?fixture.engine).kind;
+        if (kind == EVENT_MEMORY_BLOCKED) { ret true; }
+        if (kind != EVENT_PENDING)        { ret false; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # one process call over idle client requests with no transport news
 fun idle_process_cost(requests: usize, calls: *usize, visits: *usize,
     reads: *usize) bool {
     var configured: Config = test_config();
     configured.max_requests = requests;
     var fixture: Fixture;
-    if (!make_sized_fixture(?fixture, CLIENT, configured, requests + 3)
+    if (!make_fixture(?fixture, CLIENT, configured)
         || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret false; }
     var i: usize = 0;
     for (i < requests) {
@@ -4850,7 +5162,7 @@ test "http.h3.connection: a budget-limited call reports pending until the queue 
     var configured: Config = test_config();
     configured.max_requests = 96;
     var fixture: Fixture;
-    if (!make_sized_fixture(?fixture, CLIENT, configured, 99)
+    if (!make_fixture(?fixture, CLIENT, configured)
         || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
     var i: usize = 0;
     for (i < 96) {
@@ -4920,5 +5232,220 @@ test "http.h3.connection: undrained readiness reports keep process pending" {
     if (kinds[0] != EVENT_PENDING || kinds[1] != EVENT_PENDING
         || kinds[2] != EVENT_PENDING || kinds[3] != EVENT_NONE
         || fixture.io.signal_count != 0 || fixture.io.signal_dropped) { ret 3; }
+    ret 0;
+}
+
+fun round16(bytes: usize) usize {
+    ret (bytes + 15) & ~(15::usize);
+}
+
+# the exact set one request stream borrows at the test configuration
+fun request_set_bytes() usize {
+    ret round16(128) + round16(256) + round16(16 * $size_of(field.Field)) + round16(512)
+        + round16(256) + round16(512) + round16(16 * $size_of(u64));
+}
+
+# the first record chunk and the index an initialized engine holds
+fun idle_bytes(records_count: usize, index_count: usize) usize {
+    ret round16(records_count * $size_of(Stream))
+        + round16(index_count * $size_of(StreamIndexEntry));
+}
+
+fun test_request_fields(items: *field.Field) {
+    items[0] = field.Field{name: view.view(":method", 7), value: view.view("GET", 3),
+        sensitive: false};
+    items[1] = field.Field{name: view.view(":scheme", 7), value: view.view("https", 5),
+        sensitive: false};
+    items[2] = field.Field{name: view.view(":authority", 10), value: view.view("x", 1),
+        sensitive: false};
+    items[3] = field.Field{name: view.view(":path", 5), value: view.view("/", 1),
+        sensitive: false};
+}
+
+test "http.h3.connection: an idle engine holds only its first records and a request exactly its set" {
+    var configured: Config = test_config();
+    configured.max_peer_unidirectional = 4;
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, CLIENT, configured)
+        || fixture.account.used[1] != idle_bytes(8, 16)
+        || fixture.account.used[0] != 0 || fixture.engine.stream_capacity != 8) { ret 1; }
+    # the peer's critical streams and an ignored one borrow nothing
+    if (client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 2; }
+    var encoder: [1]u8;
+    var decoder: [1]u8;
+    var grease:  [3]u8;
+    encoder[0] = frame.STREAM_QPACK_ENCODER::u8;
+    decoder[0] = frame.STREAM_QPACK_DECODER::u8;
+    grease[0]  = 0x21;
+    grease[1]  = 'x';
+    grease[2]  = 'y';
+    if (peer_stream(?fixture, 7, ?encoder[0], 1, false) == nil
+        || peer_stream(?fixture, 11, ?decoder[0], 1, false) == nil
+        || peer_stream(?fixture, 15, ?grease[0], 3, false) == nil
+        || !settle(?fixture)) { ret 3; }
+    if (fixture.engine.active_peer_unidirectional != 4
+        || fixture.account.used[0] != 0
+        || fixture.account.used[1] != idle_bytes(8, 16)) { ret 4; }
+    val ignored: *Stream = stream_for[TestTransport](?fixture.engine, 15);
+    if (ignored == nil || ignored.kind != STREAM_IGNORED || ignored.memory_held
+        || ignored.memory.read != ?fixture.engine.discard[0]) { ret 5; }
+    val id: u64 = open_request[TestTransport](?fixture.engine, nil);
+    if (id == NO_STREAM || fixture.account.used[0] != request_set_bytes()
+        || fixture.account.used[1] != idle_bytes(8, 16)) { ret 6; }
+    var request: [4]field.Field;
+    test_request_fields(?request[0]);
+    if (send_headers[TestTransport](?fixture.engine, id, ?request[0], 4, true, false).status
+        != OFFER_OUTPUT || !settle(?fixture)) { ret 7; }
+    val stream:     *Stream   = stream_for[TestTransport](?fixture.engine, id);
+    val generation: u64       = stream.generation;
+    val wire:       *TestWire = test_wire(?fixture.io, stream.transport_stream);
+    if (wire == nil || !cancel_stream[TestTransport](?fixture.engine, id,
+        H3_REQUEST_CANCELLED)) { ret 8; }
+    wire.reset_acked = true;
+    wire.stop_acked  = true;
+    if (!release_stream[TestTransport](?fixture.engine, id, generation)
+        || fixture.account.used[0] != 0
+        || fixture.account.used[1] != idle_bytes(8, 16)) { ret 9; }
+    # a closed request the host never released gives its set back at destroy
+    val kept: u64 = open_request[TestTransport](?fixture.engine, nil);
+    if (kept == NO_STREAM
+        || !cancel_stream[TestTransport](?fixture.engine, kept, H3_REQUEST_CANCELLED)
+        || fixture.account.used[0] != request_set_bytes()) { ret 10; }
+    if (!destroy[TestTransport](?fixture.engine) || fixture.account.held != 0
+        || fixture.account.chunks != 0) { ret 11; }
+    ret 0;
+}
+
+test "http.h3.connection: a refused request set rejects only that request" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    fixture.account.budgets[0] = request_set_bytes() - 1;
+    var first_bytes:  [16]u8;
+    var second_bytes: [16]u8;
+    val first_length: usize = static_request(?first_bytes[0], 16);
+    if (peer_stream(?fixture, 0, ?first_bytes[0], first_length, false) == nil) { ret 2; }
+    val rejected: Event = drive(?fixture, EVENT_STREAM_ERROR, 16);
+    if (rejected.stream_id != 0 || rejected.code != H3_REQUEST_REJECTED
+        || fixture.engine.state != OPEN || fixture.io.close_calls != 0
+        || fixture.engine.active_requests != 0 || fixture.engine.request_sets != 0
+        || stream_for[TestTransport](?fixture.engine, 0) != nil
+        || fixture.account.used[0] != 0) { ret 3; }
+    fixture.account.budgets[0] = 1 << 25;
+    val second_length: usize = static_request(?second_bytes[0], 16);
+    if (peer_stream(?fixture, 4, ?second_bytes[0], second_length, false) == nil) { ret 4; }
+    val admitted: Event = drive(?fixture, EVENT_REQUEST_HEADERS, 32);
+    if (admitted.stream_id != 4 || fixture.account.used[0] != request_set_bytes()
+        || fixture.engine.state != OPEN) { ret 5; }
+    ret 0;
+}
+
+test "http.h3.connection: a refused client request opens no transport stream" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, CLIENT, test_config())
+        || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    val opens: usize = fixture.io.opens;
+    fixture.account.budgets[0] = request_set_bytes() - 1;
+    if (open_request[TestTransport](?fixture.engine, nil) != NO_STREAM
+        || fixture.io.opens != opens || fixture.engine.active_requests != 0
+        || fixture.engine.state != OPEN || fixture.account.used[0] != 0) { ret 2; }
+    fixture.account.budgets[0] = 1 << 25;
+    if (open_request[TestTransport](?fixture.engine, nil) == NO_STREAM
+        || fixture.io.opens != opens + 1) { ret 3; }
+    # every live request counts against max_requests until it is released
+    if (open_request[TestTransport](?fixture.engine, nil) == NO_STREAM
+        || open_request[TestTransport](?fixture.engine, nil) == NO_STREAM) { ret 4; }
+    if (!cancel_stream[TestTransport](?fixture.engine, 0, H3_REQUEST_CANCELLED)
+        || fixture.engine.active_requests != 2
+        || open_request[TestTransport](?fixture.engine, nil) != NO_STREAM
+        || fixture.io.opens != opens + 3) { ret 5; }
+    ret 0;
+}
+
+test "http.h3.connection: stream records grow in place and the index follows them" {
+    var configured: Config = test_config();
+    configured.max_requests    = 40;
+    configured.initial_streams = 4;
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, CLIENT, configured)
+        || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var ids:   [40]u64;
+    var first: [3]*Stream;
+    var i:     usize = 0;
+    for (i < 40) {
+        ids[i] = open_request[TestTransport](?fixture.engine, nil);
+        if (ids[i] == NO_STREAM) { ret 2; }
+        if (i < 3)               { first[i] = stream_for[TestTransport](?fixture.engine, ids[i]); }
+        i = i + 1;
+    }
+    if (fixture.engine.stream_capacity < 43 || fixture.engine.records.chunk_count < 2
+        || fixture.engine.index_capacity < 2 * fixture.engine.stream_capacity
+        || fixture.engine.index_rebuilds == 0) { ret 3; }
+    val grown: usize = fixture.account.used[1];
+    i = 0;
+    for (i < 3) {
+        if (stream_for[TestTransport](?fixture.engine, ids[i]) != first[i]
+            || first[i].transport_stream.id != ids[i]) { ret 4; }
+        i = i + 1;
+    }
+    var round: usize = 0;
+    for (round < 3) {
+        i = round;
+        for (i < 40) {
+            val stream:     *Stream   = stream_for[TestTransport](?fixture.engine, ids[i]);
+            val generation: u64       = stream.generation;
+            val wire:       *TestWire = test_wire(?fixture.io, stream.transport_stream);
+            if (wire == nil || !cancel_stream[TestTransport](?fixture.engine, ids[i],
+                H3_REQUEST_CANCELLED)) { ret 5; }
+            wire.reset_acked = true;
+            wire.stop_acked  = true;
+            if (!release_stream[TestTransport](?fixture.engine, ids[i], generation)) { ret 6; }
+            wire.live = false;
+            i         = i + 3;
+        }
+        i = round;
+        for (i < 40) {
+            ids[i] = open_request[TestTransport](?fixture.engine, nil);
+            if (ids[i] == NO_STREAM
+                || stream_for[TestTransport](?fixture.engine, ids[i]).transport_stream.id
+                != ids[i]) { ret 7; }
+            i = i + 3;
+        }
+        if (fixture.account.used[1] != grown
+            || fixture.account.used[0] != 40 * request_set_bytes()) { ret 8; }
+        round = round + 1;
+    }
+    ret 0;
+}
+
+test "http.h3.connection: a refused record rejects a request and parks a unidirectional stream" {
+    var configured: Config = test_config();
+    configured.initial_streams = 1;
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, configured)
+        || fixture.engine.stream_capacity != 1
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    fixture.account.budgets[1] = fixture.account.used[1];
+    var request_bytes:  [16]u8;
+    val request_length: usize = static_request(?request_bytes[0], 16);
+    if (peer_stream(?fixture, 0, ?request_bytes[0], request_length, false) == nil) { ret 2; }
+    val rejected: Event = drive(?fixture, EVENT_STREAM_ERROR, 16);
+    if (rejected.stream_id != 0 || rejected.code != H3_REQUEST_REJECTED
+        || fixture.engine.stream_capacity != 1 || fixture.account.used[0] != 0) { ret 3; }
+    var encoder: [1]u8;
+    encoder[0] = frame.STREAM_QPACK_ENCODER::u8;
+    if (peer_stream(?fixture, 6, ?encoder[0], 1, false) == nil
+        || !settle_blocked(?fixture)) { ret 4; }
+    val accepts: usize = fixture.io.accepts;
+    if (process[TestTransport](?fixture.engine).kind != EVENT_MEMORY_BLOCKED
+        || fixture.io.accepts != accepts || !fixture.engine.accept_parked
+        || stream_for[TestTransport](?fixture.engine, 6) != nil
+        || fixture.engine.state != OPEN || fixture.io.close_calls != 0) { ret 5; }
+    fixture.account.budgets[1] = 1 << 25;
+    if (!settle(?fixture) || fixture.engine.accept_parked
+        || fixture.engine.stream_capacity != 2 || fixture.io.accepts != accepts) { ret 6; }
+    val placed: *Stream = stream_for[TestTransport](?fixture.engine, 6);
+    if (placed == nil || placed.kind != STREAM_QPACK_ENCODER
+        || fixture.engine.active_peer_unidirectional != 2) { ret 7; }
     ret 0;
 }
