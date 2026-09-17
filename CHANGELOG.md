@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-17
+
 ### Added
 - HTTP/2 connection and stream timeouts (#110). `h2.connection.Config` gains `header_timeout_ns`, `request_timeout_ns`, `idle_timeout_ns`, `write_timeout_ns` and `total_timeout_ns`, with the HTTP/1 defaults. `next_deadline` reports the earliest deadline in O(1), and `tick(engine, now)` enforces them:
   - A server that has no request within the header timeout of `init` fails with `ERROR_HEADER_TIMEOUT`. This covers a peer that is silent after the handshake, or sends only the preface and SETTINGS. Pings never extend it.
