@@ -99,7 +99,7 @@ Every per-event path costs O(changed streams), not O(capacity).
 
 Each stream also carries links for the engine's work sets. A stream is a member of
 a set exactly when its state says it has that kind of work. Every mutation that
-can change membership ends in one refresh of all three predicates.
+can change membership ends in one refresh of every predicate.
 
 | Set | Member when | Consumed by |
 | --- | --- | --- |
@@ -107,6 +107,8 @@ can change membership ends in one refresh of all three predicates.
 | window list (FIFO) | the stream is open and owes a WINDOW_UPDATE | output preparation and write completion |
 | writable set | writable, headers sent, positive send window, sendable state | `writable_stream` |
 | exchange list | open with a bound exchange | `tick` |
+| request list (by deadline) | the peer still owes its half: open, half closed locally, or reserved by a push, and for a local stream its headers are sent | `tick`, `next_deadline` |
+| stall list (by deadline) | writable with headers sent, in a sendable state, and a send window at or below zero | `tick`, `next_deadline` |
 
 `Engine.slot_visits` counts the stream records the engine inspects. It is a
 diagnostic for tests and does not count O(1) link fixes on neighbouring slots.
@@ -128,11 +130,12 @@ the result of `process` for a read completion, so the same rules apply to it.
 
 ```text
 loop:
-    event = process(engine)            # or the result of complete_io
+    event = process(engine, now)       # or the result of complete_io
     if event.kind == EVENT_PENDING:    continue
     if event.kind == EVENT_NEED_READ:  submit_read, then wait for a completion
     otherwise:                         handle the event (release or consume it), continue
     whenever output may exist:         submit_write until it returns false
+    when next_deadline(engine) passes: tick(engine, now) until it returns EVENT_NONE
 ```
 
 `submit_read` refuses while unparsed input remains, so a host that stops on
@@ -140,6 +143,70 @@ loop:
 
 After a GOAWAY, `EVENT_STREAM_RETRY` events come out in the order the GOAWAY sweep
 found the streams, one per `process` call.
+
+## Time
+
+Every `now` the engine takes is a `std.chrono.time.Instant`, read with
+`time.instant()`. `init`, `process`, `complete_io`, `tick`, `submit_write`,
+`set_writable`, `offer_data` and `release_stream` take one, because each of them can
+start a timed wait. The engine keeps the latest instant it has seen, and an earlier
+`now` counts as that instant, so a step back in the caller's clock never moves a
+deadline earlier. An invalid instant is refused. Each deadline is absolute from the
+moment it is armed, and progress never refreshes it.
+
+| Deadline | Armed | Cleared | Expiry |
+| --- | --- | --- | --- |
+| total | `init`, at `total_timeout_ns` | never | the connection fails with `ERROR_TOTAL_TIMEOUT` |
+| request wait, server only | `init`, at `header_timeout_ns` | a stream opens | `ERROR_HEADER_TIMEOUT` |
+| idle | `init` for a client, and `release_stream` of the last live stream, at `idle_timeout_ns` | a stream opens | `ERROR_IDLE_TIMEOUT` |
+| header block | a HEADERS or PUSH_PROMISE frame header, at `header_timeout_ns` | the block's last frame is handled | `ERROR_HEADER_TIMEOUT` |
+| write | `submit_write`, at `write_timeout_ns` | the write completes | `ERROR_WRITE_TIMEOUT` |
+| connection window | the connection send window is at or below zero while a stream could otherwise send, at `write_timeout_ns` | the window reopens or no stream waits | `ERROR_WRITE_TIMEOUT` |
+| stream request | the stream joins the request list, at `request_timeout_ns` | it leaves the list | the stream alone is reset |
+| stream stall | the stream joins the stall list, at `write_timeout_ns` | it leaves the list | the stream alone is reset |
+
+PING, SETTINGS, WINDOW_UPDATE and PRIORITY frames refresh nothing, so a peer that
+only pings is still idle, or still owes its first request. Buffered bytes do not arm
+the request wait, because an HTTP/2 frame cannot be told apart from a request until
+its header is parsed, and a HEADERS frame arms the header-block deadline instead.
+When a stream opens, the request wait and the idle deadline stop in the same call
+and the stream's own deadline takes over, so the connection is never counted by
+two timers or by none. A stream that stays live after the peer finished its half,
+while the host still holds it, is bounded only by the total deadline.
+
+A stream stays on a timed list with the deadline it joined with, and leaving the
+list ends the timer. A stall that ends and later starts again is a new stall. Each
+timed list is kept in deadline order: a stream is inserted behind every member due
+no later, walking back from the tail. Every member of a list is armed with one
+duration from the non-decreasing clock, so the walk stops at once, and a member
+armed with a different duration is still placed correctly. `tick` and
+`next_deadline` read only the list heads, so they never scan the streams.
+
+`next_deadline` returns the earliest deadline `tick` would enforce, with `active`
+false when none applies: an uninitialized engine, or one that is closing or closed.
+A failed engine reports only its write deadline. A host with a timer wheel arms one
+timer at that instant, calls `tick` until it returns `EVENT_NONE`, and queries again
+after every call that takes `now`. The engine scope's own std deadline is the host's
+and is not included, but when it fires `tick` fails the connection with
+`ERROR_TOTAL_TIMEOUT`.
+
+`tick` reports one expiry per call:
+
+- An expired stream deadline queues RST_STREAM(CANCEL), times out the bound
+  exchange, closes the stream, and returns `EVENT_STREAM_RESET` with `code`
+  `H2_CANCEL` and `error` naming the timeout. The connection carries on.
+- An expired connection deadline fails the connection and returns the new
+  `EVENT_TIMED_OUT`. `process` and `tick` keep returning it. The connection scope is
+  timed out when the close is submitted, and the close reports
+  `lifecycle.DEADLINE`.
+- Every connection timeout but a write timeout queues GOAWAY(NO_ERROR) with the last
+  admitted stream, and the host drains it as after any failure. Each drain write has
+  its own write deadline, and `tick` still enforces it on the failed engine. A drain
+  the peer does not read drops the unsent output and closes at once.
+- A write timeout, from the write deadline or the connection window, queues nothing.
+  A peer that does not take data will not read a GOAWAY either. Pending output is
+  dropped and the close is submitted at once. The transport cancels a write still in
+  flight, and `complete_io` still takes that completion.
 
 ## Cancelling exchanges
 
@@ -149,7 +216,7 @@ closes the stream. The engine cannot learn about a scope change any other way.
 
 `tick` is only the fallback for scopes cancelled elsewhere. It walks the exchange
 list, which costs O(open exchange-bound streams), and it reports the first
-cancelled one. Call it from a timer, not once per event.
+cancelled one, after any expired deadline. Call it from a timer, not once per event.
 
 ## Complexity
 
@@ -159,7 +226,9 @@ cancelled one. Call it from a timer, not once per event.
 | `process`, per call | O(1) ready-queue work plus O(bytes parsed), capped at 64 units |
 | window flush, per output or completion | O(1) |
 | `writable_stream` | O(writable set) |
-| `tick` | O(open exchange-bound streams) |
+| `tick` | O(1) for deadlines, then O(open exchange-bound streams) |
+| `next_deadline` | O(1) |
+| joining a timed list | O(1) while every member shares one duration |
 | PRIORITY frame or HEADERS priority block, exclusive or not | O(1) |
 
 These passes still cover the whole table. None of them runs on a routine path:
@@ -280,4 +349,7 @@ Existing streams may finish between those frames. `progress_close` submits the
 physical close only after the final GOAWAY, all admitted streams, all header
 continuations, and all queued output have settled. Protocol failure instead flushes
 one error GOAWAY when possible, cancels every bound exchange, and closes after that
-output completes.
+output completes. Output that can never be written is dropped at the failure, so
+the close is not held for it: a server that has not received the client preface
+writes nothing, and nothing is written once the connection scope has ended, for
+example after the host cancels it.

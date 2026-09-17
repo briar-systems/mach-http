@@ -2,7 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+- HTTP/2 connection and stream timeouts (#110). `h2.connection.Config` gains `header_timeout_ns`, `request_timeout_ns`, `idle_timeout_ns`, `write_timeout_ns` and `total_timeout_ns`, with the HTTP/1 defaults. `next_deadline` reports the earliest deadline in O(1), and `tick(engine, now)` enforces them:
+  - A server that has no request within the header timeout of `init` fails with `ERROR_HEADER_TIMEOUT`. This covers a peer that is silent after the handshake, or sends only the preface and SETTINGS. Pings never extend it.
+  - A connection with no live stream fails at the idle timeout with `ERROR_IDLE_TIMEOUT`. For a client it runs from `init`, and for both roles from `release_stream` of the last stream.
+  - A header block that does not end within the header timeout of its first frame fails with `ERROR_HEADER_TIMEOUT`. This covers a truncated HEADERS frame and one without END_HEADERS.
+  - A transport write, or a connection send window that stays closed, fails at the write timeout with `ERROR_WRITE_TIMEOUT`. The connection closes at once, with no GOAWAY.
+  - Every connection fails at the total timeout with `ERROR_TOTAL_TIMEOUT`.
+  - A stream whose peer has not finished its half within the request timeout, or whose send window stays closed past the write timeout, is reset alone with RST_STREAM(CANCEL). Its exchange is timed out, and `EVENT_STREAM_RESET` carries the timeout in `error`.
+  - A connection timeout returns the new `EVENT_TIMED_OUT`, queues GOAWAY(NO_ERROR) except after a write timeout, and times out the connection scope when the close is submitted. The close reports `lifecycle.DEADLINE`. The GOAWAY drain is bounded by the write deadline, which `tick` still enforces after the failure.
+- `http.core.deadline` holds the absolute `Deadline` type and its helpers. `h1.connection.Deadline` is the same type.
+
 ### Changed
+- **Breaking.** `h2.connection` `init`, `process`, `complete_io`, `tick`, `submit_write`, `set_writable`, `offer_data` and `release_stream` take a `time.Instant`. An invalid instant is refused, and an earlier one counts as the latest seen. `process` on a failed engine returns the same event `tick` does, `EVENT_TIMED_OUT` or `EVENT_CANCELLED` where they apply, and no longer always `EVENT_ERROR` (#110).
 - **Behaviour change.** An HTTP/1 server connection with no live slot now closes at `header_timeout_ns` with `ERROR_HEADER_TIMEOUT` (`EVENT_TIMED_OUT`), where it used to wait for `idle_timeout_ns` (#110). This covers two states:
   - A client that completes the handshake, for example TLS, and then sends nothing.
   - A memory-blocked connection, whose read buffer or slot set was refused while its request waits unread. `memory_blocked` stays set when the deadline fires, so a host can count memory timeouts separately.
@@ -19,6 +31,7 @@
   - live streams and owed releases no longer block `destroy`, and h2 releases their memory
   - a closed stream's header event can be released without an exchange
   - held HTTP/3 data can be consumed without granting the transport more credit
+- A failed HTTP/2 connection no longer waits forever for output it can never write. A server that fails before the client preface, and a connection whose scope was cancelled, used to keep a queued frame that `progress_close` waited on. That output is now dropped at the failure (#110).
 
 ## [0.12.0] - 2026-09-17
 

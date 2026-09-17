@@ -63,8 +63,9 @@ when none applies: an uninitialized engine, or a tunnel, closing, closed or fail
 one. The idle and request-wait deadlines count only while no slot is live, as in `tick`. A host with a
 timer wheel arms one timer at that instant, calls `tick` when it fires, and queries
 again after every call that takes `now` or changes a slot. The engine scope's own
-std deadline is the host's and is not included. The HTTP/2 and HTTP/3 engines keep no
-timers. Their `tick` only settles cancelled scopes, so call it after cancelling one.
+std deadline is the host's and is not included. The HTTP/2 engine keeps deadlines of its
+own, described in doc/h2-connection.md. The HTTP/3 engine keeps none, and its `tick`
+only settles cancelled scopes, so call it after cancelling one.
 
 ## Slots and identity
 
