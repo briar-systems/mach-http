@@ -1104,8 +1104,6 @@ fun give_slot[T](engine: *Engine[T], stream: *Stream) {
     engine.free_head = stream.slot;
 }
 
-# a request stream's buffers, all or nothing. a refusal refuses only the stream
-# and registers nothing, since a refused stream gets no wake-up
 # the requests one request set is acquired with, REQUEST_BUFFERS of them into
 # `out`. this is the one table `acquire_request_memory` reads, so a host that
 # funds requests from the same table can never fall out of step with the engine
@@ -1119,6 +1117,24 @@ pub fun request_requests(configured: Config, out: *buffers.Request) bool {
     ret true;
 }
 
+# the bytes `source` charges for one request set: the table measured chunk by
+# chunk at the pool's own class, so it is exactly what `account.held` grows by
+# when a request is admitted. 0 for a config or source the set cannot come from,
+# since `source_measure` refuses every chunk the pool would
+pub fun request_footprint(source: *buffers.Source, configured: Config) usize {
+    var requests: [REQUEST_BUFFERS]buffers.Request;
+    if (!request_requests(configured, ?requests[0])) { ret 0; }
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < REQUEST_BUFFERS) {
+        total = total + buffers.source_measure(source, requests[i]);
+        i     = i + 1;
+    }
+    ret total;
+}
+
+# a request stream's buffers, all or nothing. a refusal refuses only the stream
+# and registers nothing, since a refused stream gets no wake-up
 fun acquire_request_memory[T](engine: *Engine[T], stream: *Stream) bool {
     var requests: [REQUEST_BUFFERS]buffers.Request;
     request_requests(engine.configured, ?requests[0]);
@@ -3617,13 +3633,14 @@ fun test_config() Config {
     ret configured;
 }
 
-# a std pool with no size classes, so every chunk is exactly its request rounded
-# to 16 bytes and the account's `used` counts bytes exactly
-fun make_buffers(fixture: *Fixture) bool {
+# a std pool. with no size classes every chunk is exactly its request rounded to
+# 16 bytes, so the account's `used` counts bytes exactly
+fun make_buffers(fixture: *Fixture, classes: *buffers.ClassConfig, class_count: usize) bool {
     val backed: err[allocator.Error] = page.make(?fixture.backing);
     if (sel backed.err) { ret false; }
     var config: buffers.Config;
-    config.class_count   = 0;
+    config.classes       = classes;
+    config.class_count   = class_count;
     config.lanes         = 2;
     config.global_budget = 1 << 26;
     config.initial_slots = 16;
@@ -3671,8 +3688,14 @@ fun reset_io(fixture: *Fixture, role: Role) {
 }
 
 fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
+    ret make_fixture_on(fixture, role, configured, nil, 0);
+}
+
+# a fixture whose pool has the given size classes
+fun make_fixture_on(fixture: *Fixture, role: Role, configured: Config,
+    classes: *buffers.ClassConfig, class_count: usize) bool {
     if (!operation_ok(cancel.make_root(?fixture.scope, opt[time.Instant].none{}))
-        || !make_buffers(fixture)) { ret false; }
+        || !make_buffers(fixture, classes, class_count)) { ret false; }
     reset_io(fixture, role);
     ret start_engine(fixture, role, configured);
 }
@@ -5070,6 +5093,34 @@ fun test_request_fields(items: *field.Field) {
         sensitive: false};
     items[3] = field.Field{name: view.view(":path", 5), value: view.view("/", 1),
         sensitive: false};
+}
+
+# a pool with one 1024 byte class, so the small chunks of a request set are
+# charged more than their request and the footprint differs from the plain sum
+fun request_classes(classes: *buffers.ClassConfig) {
+    classes[0] = buffers.ClassConfig{size: 1024, align: 0, secret: false, high_water: 4};
+}
+
+test "http.h3.connection: a request's footprint is what a classed pool charges for its set" {
+    var classes: [1]buffers.ClassConfig;
+    request_classes(?classes[0]);
+    var fixture: Fixture;
+    if (!make_fixture_on(?fixture, CLIENT, test_config(), ?classes[0], 1)) { ret 1; }
+    val footprint: usize = request_footprint(?fixture.source, test_config());
+    if (footprint <= request_set_bytes()
+        || request_footprint(nil, test_config()) != 0) { ret 2; }
+    var bad: Config = test_config();
+    bad.max_requests = 0;
+    var far: Config = test_config();
+    far.stream_lane = 3;
+    if (request_footprint(?fixture.source, bad) != 0
+        || request_footprint(?fixture.source, far) != 0) { ret 3; }
+    if (client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 4; }
+    val before: usize = fixture.account.held;
+    val id:     u64   = open_request[TestTransport](?fixture.engine, nil);
+    if (id == NO_STREAM || fixture.account.held != before + footprint
+        || fixture.account.used[0] != footprint) { ret 5; }
+    ret 0;
 }
 
 test "http.h3.connection: an idle engine holds only its first records and a request exactly its set" {

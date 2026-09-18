@@ -710,6 +710,22 @@ pub fun stream_requests(configured: Config, out: *buffers.Request) bool {
     ret true;
 }
 
+# the bytes `source` charges for one stream set: the table measured chunk by
+# chunk at the pool's own class, so it is exactly what `account.held` grows by
+# when a stream opens. 0 for a config or source the set cannot come from, since
+# `source_measure` refuses every chunk the pool would
+pub fun stream_footprint(source: *buffers.Source, configured: Config) usize {
+    var requests: [STREAM_BUFFERS]buffers.Request;
+    if (!stream_requests(configured, ?requests[0])) { ret 0; }
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < STREAM_BUFFERS) {
+        total = total + buffers.source_measure(source, requests[i]);
+        i     = i + 1;
+    }
+    ret total;
+}
+
 # a stream's decoder set, all or nothing. a refusal refuses only the stream and
 # registers nothing, since the peer retries a refused stream on its own
 fun acquire_stream_memory(engine: *Engine, stream: *Stream) bool {
@@ -3271,13 +3287,14 @@ rec Fixture {
     engine:                Engine;
 }
 
-# a std pool with no size classes, so every chunk is exactly its request rounded
-# to 16 bytes and the account's `held` counts bytes exactly
-fun make_buffers(fixture: *Fixture) bool {
+# a std pool. with no size classes every chunk is exactly its request rounded to
+# 16 bytes, so the account's `held` counts bytes exactly
+fun make_buffers(fixture: *Fixture, classes: *buffers.ClassConfig, class_count: usize) bool {
     val backed: err[allocator.Error] = page.make(?fixture.backing);
     if (sel backed.err) { ret false; }
     var config: buffers.Config;
-    config.class_count   = 0;
+    config.classes       = classes;
+    config.class_count   = class_count;
     config.lanes         = 2;
     config.global_budget = 1 << 26;
     config.initial_slots = 16;
@@ -3312,6 +3329,12 @@ fun test_config() Config {
 }
 
 fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
+    ret make_fixture_on(fixture, role, configured, nil, 0);
+}
+
+# a fixture whose pool has the given size classes
+fun make_fixture_on(fixture: *Fixture, role: Role, configured: Config,
+    classes: *buffers.ClassConfig, class_count: usize) bool {
     fixture.clock = test_now(100);
     if (!operation_ok(cancel.make_root(?fixture.operation_root, opt[time.Instant].none{}))
         || !operation_ok(cancel.make_root(?fixture.control_root, opt[time.Instant].none{}))) { ret false; }
@@ -3325,7 +3348,7 @@ fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
     fixture.adapter.submit_close          = test_close;
     if (!transport.init(?fixture.wire, fixture.adapter, ?fixture.operation_root,
         ?fixture.control_root, ?fixture.transport_slots[0], 3)
-        || !make_buffers(fixture)) { ret false; }
+        || !make_buffers(fixture, classes, class_count)) { ret false; }
     ret start_engine(fixture, ?fixture.wire, ?fixture.operation_root, role,
         configured);
 }
@@ -4619,6 +4642,34 @@ test "http.h2.connection: an idle engine holds only its first records and a stre
         || fixture.account.held != idle_bytes() || fixture.account.used[0] != 0) { ret 7; }
     if (!destroy(?fixture.engine) || fixture.account.held != 0
         || fixture.account.chunks != 0) { ret 8; }
+    ret 0;
+}
+
+# a pool with one 1024 byte class, so the 512 byte chunks of a stream set are
+# charged more than their request and the footprint differs from the plain sum
+fun stream_classes(classes: *buffers.ClassConfig) {
+    classes[0] = buffers.ClassConfig{size: 1024, align: 0, secret: false, high_water: 4};
+}
+
+test "http.h2.connection: a stream's footprint is what a classed pool charges for its set" {
+    var classes: [1]buffers.ClassConfig;
+    stream_classes(?classes[0]);
+    var fixture: Fixture;
+    if (!make_fixture_on(?fixture, CLIENT, test_config(), ?classes[0], 1)) { ret 1; }
+    val footprint: usize = stream_footprint(?fixture.source, test_config());
+    if (footprint <= stream_set_bytes()
+        || stream_footprint(nil, test_config()) != 0) { ret 2; }
+    var bad: Config = test_config();
+    bad.max_streams = 0;
+    var far: Config = test_config();
+    far.stream_lane = 3;
+    if (stream_footprint(?fixture.source, bad) != 0
+        || stream_footprint(?fixture.source, far) != 0) { ret 3; }
+    if (client_handshake(?fixture).kind != EVENT_SETTINGS || !drain_output(?fixture)) { ret 4; }
+    val before: usize = fixture.account.held;
+    val id:     u32   = open_local(?fixture.engine, nil);
+    if (id == 0 || fixture.account.held != before + footprint
+        || fixture.account.used[0] != footprint) { ret 5; }
     ret 0;
 }
 
