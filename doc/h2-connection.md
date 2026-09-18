@@ -33,6 +33,15 @@ and a 16-entry index. Records live in `http.core.records` chunks, so a record ne
 moves once handed out. When the table grows, the index is rebuilt at the new size.
 The table never shrinks while the connection lives.
 
+`stream_requests(configured, out)` writes the `STREAM_BUFFERS` requests a stream's
+decoder set is acquired with, the same table `acquire_stream_memory` reads.
+`stream_footprint(source, configured)` measures that table against a source with
+`buffers.source_measure`, so it is the bytes `account.held` grows by when a stream
+opens on that pool, at the pool's own class sizes. Both return nothing useful for a
+config `init` would refuse, and the footprint is 0 for a source that would refuse the
+set. A host sizing lane budgets or admission limits should use the footprint, not the
+sum of the requests, since a pool with size classes charges each chunk its class.
+
 A refusal never fails the connection:
 
 - A refused decoder set or record for a peer stream refuses that stream with

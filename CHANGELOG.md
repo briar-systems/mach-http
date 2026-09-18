@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-18
+
+### Added
+- `h2.connection.stream_requests` and `h3.connection.request_requests` expose the chunk table one stream or request set is acquired with, the same table the engines read (#131).
+- `h2.connection.stream_footprint` and `h3.connection.request_footprint` measure that table against a `buffers.Source` with `source_measure`, so a host learns the bytes `account.held` grows by per stream or request at its pool's own class sizes (#131).
+
+### Changed
+- The `std` dependency is `v5.7.0`, which adds `buffers.measure` and `fn_measure` on `Source`. `Source` grew a word, so rebuild dependents fully.
+
 ## [0.13.2] - 2026-09-18
 
 ### Changed
