@@ -1,0 +1,382 @@
+# http field-section semantics shared by the h2 and h3 connection engines
+
+use http.core.field;
+use http.core.method;
+use http.core.status;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+pub val REQUEST:       u8 = 1;
+pub val RESPONSE:      u8 = 2;
+pub val INFORMATIONAL: u8 = 3;
+pub val TRAILERS:      u8 = 4;
+pub val PUSH:          u8 = 5;
+
+# the validated view of one section. `fields` borrows the caller's or the decoder's
+# array, pseudo-fields come first and regular fields start at `regular_offset`
+pub rec Block {
+    fields:             *field.Field;
+    count:              usize;
+    regular_offset:     usize;
+    method:             view.View;
+    scheme:             view.View;
+    path:               view.View;
+    authority:          view.View;
+    protocol:           view.View;
+    status:             u16;
+    has_content_length: bool;
+    content_length:     u64;
+}
+
+pub fun empty() Block {
+    ret Block{fields: nil, count: 0, regular_offset: 0,
+        method:             view.view(nil, 0), scheme: view.view(nil, 0), path: view.view(nil, 0),
+        authority:          view.view(nil, 0), protocol: view.view(nil, 0), status: 0,
+        has_content_length: false, content_length: 0};
+}
+
+fun same_view(left: view.View, right: view.View) bool {
+    ret left.len == right.len && (left.len == 0
+        || (left.data != nil && right.data != nil
+        && memory.raw_equal(left.data, right.data, left.len)));
+}
+
+fun is_name(name: view.View, literal: *u8, length: usize) bool {
+    ret same_view(name, view.view(literal, length));
+}
+
+# a received name must match exactly, while a caller's name may use any case
+fun name_is(name: view.View, inbound: bool, literal: *u8, length: usize) bool {
+    if (inbound) { ret is_name(name, literal, length); }
+    ret field.name_equal(name, view.view(literal, length));
+}
+
+fun lowercase(name: view.View) bool {
+    if (name.data == nil || name.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < name.len) {
+        if (name.data[i] >= 'A' && name.data[i] <= 'Z') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun trailers_value(value: view.View) bool {
+    ret value.len == 8 && value.data != nil
+        && memory.raw_equal(value.data, "trailers", 8);
+}
+
+fun scheme_valid(value: view.View) bool {
+    if (value.data == nil || value.len == 0
+        || !((value.data[0] >= 'a' && value.data[0] <= 'z')
+        || (value.data[0] >= 'A' && value.data[0] <= 'Z'))) { ret false; }
+    var i: usize = 1;
+    for (i < value.len) {
+        val byte: u8 = value.data[i];
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z')
+            || (byte >= '0' && byte <= '9') || byte == '+' || byte == '-'
+            || byte == '.')) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun authority_valid(value: view.View) bool {
+    if (value.data == nil || value.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val byte: u8 = value.data[i];
+        if (byte <= ' ' || byte == 127 || byte == '/' || byte == '?' || byte == '#'
+            || byte == '@') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun regular_field_valid(item: field.Field, inbound: bool) bool {
+    # the block walk has already refused a received uppercase name
+    if (!field.valid_name(item.name)
+        || !field.valid_value(item.value)) { ret false; }
+    if (name_is(item.name, inbound, "connection", 10)
+        || name_is(item.name, inbound, "proxy-connection", 16)
+        || name_is(item.name, inbound, "keep-alive", 10)
+        || name_is(item.name, inbound, "transfer-encoding", 17)
+        || name_is(item.name, inbound, "upgrade", 7)) { ret false; }
+    if (name_is(item.name, inbound, "te", 2) && !trailers_value(item.value)) { ret false; }
+    ret true;
+}
+
+fun parse_status(value: view.View) u16 {
+    if (value.data == nil || value.len != 3
+        || value.data[0] < '1' || value.data[0] > '9'
+        || value.data[1] < '0' || value.data[1] > '9'
+        || value.data[2] < '0' || value.data[2] > '9') { ret 0; }
+    ret (value.data[0] - '0')::u16 * 100
+        + (value.data[1] - '0')::u16 * 10
+        + (value.data[2] - '0')::u16;
+}
+
+fun parse_length(value: view.View, length: *u64) bool {
+    if (value.data == nil || value.len == 0 || length == nil) { ret false; }
+    var result: u64   = 0;
+    var i:      usize = 0;
+    for (i < value.len) {
+        val byte: u8 = value.data[i];
+        if (byte < '0' || byte > '9' || result > (-1)::u64 / 10
+            || (result == (-1)::u64 / 10
+            && (byte - '0')::u64 > (-1)::u64 % 10)) {
+            ret false;
+        }
+        result = result * 10 + (byte - '0')::u64;
+        i      = i + 1;
+    }
+    @length = result;
+    ret true;
+}
+
+# validates one field section against RFC 9113 §8 and RFC 9114 §4, which share
+# the rules. `inbound` is a section the peer sent: its names must be lowercase and
+# match exactly, since uppercase is malformed on the wire. an outbound section is
+# the caller's, whose names may use any case because the encoders write them
+# lowercase. `maximum_bytes` bounds the section size counted as RFC 9113 §6.5.2
+pub fun validate(items: *field.Field, count: usize, kind: u8,
+    connect_enabled: bool, maximum_bytes: usize, inbound: bool, block: *Block) bool {
+    if (block == nil || (items == nil && count != 0)) { ret false; }
+    @block               = empty();
+    block.fields         = items;
+    block.count          = count;
+    block.regular_offset = count;
+    var saw_regular:   bool      = false;
+    var saw_method:    bool      = false;
+    var saw_scheme:    bool      = false;
+    var saw_path:      bool      = false;
+    var saw_authority: bool      = false;
+    var saw_protocol:  bool      = false;
+    var saw_status:    bool      = false;
+    var saw_host:      bool      = false;
+    var host:          view.View = view.view(nil, 0);
+    var bytes:         usize     = 0;
+    var i:             usize     = 0;
+    for (i < count) {
+        val item: field.Field = items[i];
+        if (item.name.data == nil || item.name.len == 0 || (inbound && !lowercase(item.name))
+            || !field.valid_value(item.value) || item.name.len > maximum_bytes
+            || item.value.len > maximum_bytes - item.name.len
+            || item.name.len + item.value.len > maximum_bytes - bytes
+            || 32 > maximum_bytes - bytes - item.name.len - item.value.len) { ret false; }
+        bytes = bytes + item.name.len + item.value.len + 32;
+        if (item.name.data[0] == ':') {
+            if (saw_regular || kind == TRAILERS) { ret false; }
+            if (name_is(item.name, inbound, ":method", 7) && !saw_method) {
+                block.method = item.value;
+                saw_method   = true;
+            }
+            or (name_is(item.name, inbound, ":scheme", 7) && !saw_scheme) {
+                block.scheme = item.value;
+                saw_scheme   = true;
+            }
+            or (name_is(item.name, inbound, ":path", 5) && !saw_path) {
+                block.path = item.value;
+                saw_path   = true;
+            }
+            or (name_is(item.name, inbound, ":authority", 10) && !saw_authority) {
+                block.authority = item.value;
+                saw_authority   = true;
+            }
+            or (name_is(item.name, inbound, ":protocol", 9) && !saw_protocol) {
+                block.protocol = item.value;
+                saw_protocol   = true;
+            }
+            or (name_is(item.name, inbound, ":status", 7) && !saw_status) {
+                block.status = parse_status(item.value);
+                if (block.status == 0) { ret false; }
+                saw_status = true;
+            }
+            or { ret false; }
+        }
+        or {
+            if (!saw_regular) {
+                block.regular_offset = i;
+                saw_regular          = true;
+            }
+            if (!regular_field_valid(item, inbound)
+                || (kind == TRAILERS && !field.allowed_trailer_name(item.name))) {
+                ret false;
+            }
+            if (name_is(item.name, inbound, "host", 4)) {
+                if (saw_host && !same_view(host, item.value)) { ret false; }
+                host     = item.value;
+                saw_host = true;
+            }
+            if (name_is(item.name, inbound, "content-length", 14)) {
+                var parsed_length: u64 = 0;
+                if (!parse_length(item.value, ?parsed_length)
+                    || (block.has_content_length
+                    && block.content_length != parsed_length)) { ret false; }
+                block.has_content_length = true;
+                block.content_length     = parsed_length;
+            }
+        }
+        i = i + 1;
+    }
+    if (kind == REQUEST || kind == PUSH) {
+        if (!saw_method || saw_status
+            || !method.valid_token(block.method, maximum_bytes)) { ret false; }
+        val connect: bool = is_name(block.method, "CONNECT", 7);
+        if (connect && saw_protocol) {
+            if (!connect_enabled || !saw_scheme || !saw_path || !saw_authority
+                || !method.valid_token(block.protocol, maximum_bytes)
+                || !scheme_valid(block.scheme) || block.path.len == 0
+                || !authority_valid(block.authority)) { ret false; }
+        }
+        or (connect) {
+            if (!saw_authority || saw_scheme || saw_path || saw_protocol
+                || !authority_valid(block.authority)) { ret false; }
+        }
+        or {
+            if (!saw_scheme || !saw_path || saw_protocol
+                || !scheme_valid(block.scheme) || block.path.len == 0
+                || (block.path.data[0] != '/'
+                && !(is_name(block.method, "OPTIONS", 7)
+                && is_name(block.path, "*", 1)))) { ret false; }
+        }
+        if (saw_authority && !authority_valid(block.authority))             { ret false; }
+        if (saw_authority && saw_host && !same_view(block.authority, host)) { ret false; }
+        if (!saw_authority && saw_host)                                     { block.authority = host; }
+        ret true;
+    }
+    if (kind == RESPONSE || kind == INFORMATIONAL) {
+        if (!saw_status || saw_method || saw_scheme || saw_path
+            || saw_authority || saw_protocol || block.status == 101) { ret false; }
+        if (kind == INFORMATIONAL) {
+            ret block.status < 200 && !block.has_content_length;
+        }
+        if (block.status == status.NO_CONTENT && block.has_content_length) { ret false; }
+        ret block.status >= 200;
+    }
+    ret !saw_method && !saw_scheme && !saw_path
+        && !saw_authority && !saw_protocol && !saw_status;
+}
+
+# the parsed status of the first `:status` field, or 0 when the section has none
+pub fun status_of(items: *field.Field, count: usize, inbound: bool) u16 {
+    if (items == nil) { ret 0; }
+    var i: usize = 0;
+    for (i < count) {
+        if (name_is(items[i].name, inbound, ":status", 7)) { ret parse_status(items[i].value); }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+pub fun informational(items: *field.Field, count: usize, inbound: bool) bool {
+    val code: u16 = status_of(items, count, inbound);
+    ret code >= 100 && code < 200;
+}
+
+fun named(name: *u8, length: usize, value: *u8, value_length: usize) field.Field {
+    ret field.Field{name: view.view(name, length), value: view.view(value, value_length),
+        sensitive: false};
+}
+
+fun request_fields(items: *field.Field) {
+    items[0] = named(":method", 7, "GET", 3);
+    items[1] = named(":scheme", 7, "https", 5);
+    items[2] = named(":path", 5, "/a", 2);
+    items[3] = named(":authority", 10, "h", 1);
+}
+
+test "http.core.section: a request section is shaped and bounded" {
+    var items: [6]field.Field;
+    request_fields(?items[0]);
+    items[4] = named("host", 4, "h", 1);
+    items[5] = named("content-length", 14, "12", 2);
+    var block: Block;
+    if (!validate(?items[0], 6, REQUEST, false, 4096, true, ?block)
+        || block.regular_offset != 4 || !same_view(block.path, view.view("/a", 2))
+        || !block.has_content_length || block.content_length != 12) { ret 1; }
+    # a pseudo-field after a regular one, two hosts that disagree, and a second length
+    items[3] = named("x-a", 3, "v", 1);
+    items[4] = named(":authority", 10, "h", 1);
+    if (validate(?items[0], 5, REQUEST, false, 4096, true, ?block)) { ret 2; }
+    request_fields(?items[0]);
+    items[3] = named("host", 4, "h", 1);
+    items[4] = named("host", 4, "other", 5);
+    if (validate(?items[0], 5, REQUEST, false, 4096, true, ?block)) { ret 3; }
+    request_fields(?items[0]);
+    items[4] = named("content-length", 14, "1", 1);
+    items[5] = named("content-length", 14, "2", 1);
+    if (validate(?items[0], 6, REQUEST, false, 4096, true, ?block)) { ret 4; }
+    # host alone supplies the authority, and the size bound counts 32 per field
+    items[3] = named("host", 4, "h", 1);
+    if (!validate(?items[0], 4, REQUEST, false, 4096, true, ?block)
+        || !same_view(block.authority, view.view("h", 1))) { ret 5; }
+    if (validate(?items[0], 4, REQUEST, false, 4 * 32 + 33, true, ?block)
+        || !validate(?items[0], 4, REQUEST, false, 4 * 32 + 34, true, ?block)) { ret 6; }
+    ret 0;
+}
+
+test "http.core.section: connect shapes follow the negotiated protocol" {
+    var items: [5]field.Field;
+    items[0] = named(":method", 7, "CONNECT", 7);
+    items[1] = named(":authority", 10, "h:443", 5);
+    var block: Block;
+    if (!validate(?items[0], 2, REQUEST, false, 4096, true, ?block)) { ret 1; }
+    items[2] = named(":scheme", 7, "https", 5);
+    if (validate(?items[0], 3, REQUEST, false, 4096, true, ?block)) { ret 2; }
+    items[3] = named(":path", 5, "/chat", 5);
+    items[4] = named(":protocol", 9, "websocket", 9);
+    if (validate(?items[0], 5, REQUEST, false, 4096, true, ?block)
+        || !validate(?items[0], 5, REQUEST, true, 4096, true, ?block)
+        || !same_view(block.protocol, view.view("websocket", 9))) { ret 3; }
+    ret 0;
+}
+
+test "http.core.section: responses and trailers keep their own rules" {
+    var items: [3]field.Field;
+    items[0] = named(":status", 7, "204", 3);
+    items[1] = named("content-length", 14, "0", 1);
+    var block: Block;
+    if (!validate(?items[0], 1, RESPONSE, false, 4096, true, ?block) || block.status != 204) { ret 1; }
+    if (validate(?items[0], 2, RESPONSE, false, 4096, true, ?block))                         { ret 2; }
+    items[0] = named(":status", 7, "103", 3);
+    if (validate(?items[0], 2, INFORMATIONAL, false, 4096, true, ?block)
+        || !validate(?items[0], 1, INFORMATIONAL, false, 4096, true, ?block)
+        || validate(?items[0], 1, RESPONSE, false, 4096, true, ?block)) { ret 3; }
+    if (!informational(?items[0], 1, true) || status_of(?items[1], 1, true) != 0) { ret 4; }
+    items[0] = named(":status", 7, "101", 3);
+    if (validate(?items[0], 1, INFORMATIONAL, false, 4096, true, ?block)) { ret 5; }
+    items[0] = named("x-check", 7, "v", 1);
+    items[1] = named("content-length", 14, "1", 1);
+    if (!validate(?items[0], 1, TRAILERS, false, 4096, true, ?block)
+        || validate(?items[0], 2, TRAILERS, false, 4096, true, ?block)) { ret 6; }
+    items[1] = named(":status", 7, "200", 3);
+    if (validate(?items[0], 2, TRAILERS, false, 4096, true, ?block)) { ret 7; }
+    ret 0;
+}
+
+test "http.core.section: names are strict inbound and case-insensitive outbound" {
+    var items: [5]field.Field;
+    request_fields(?items[0]);
+    items[4] = named("X-Custom", 8, "v", 1);
+    var block: Block;
+    if (validate(?items[0], 5, REQUEST, false, 4096, true, ?block)
+        || !validate(?items[0], 5, REQUEST, false, 4096, false, ?block)) { ret 1; }
+    # connection-specific names are refused in any case outbound, and a pseudo-field is recognised
+    items[4] = named("Connection", 10, "close", 5);
+    if (validate(?items[0], 5, REQUEST, false, 4096, false, ?block)) { ret 2; }
+    items[4] = named("TE", 2, "trailers", 8);
+    if (!validate(?items[0], 5, REQUEST, false, 4096, false, ?block)) { ret 3; }
+    items[4] = named("TE", 2, "gzip", 4);
+    if (validate(?items[0], 5, REQUEST, false, 4096, false, ?block)) { ret 4; }
+    items[2] = named(":Path", 5, "/a", 2);
+    if (!validate(?items[0], 4, REQUEST, false, 4096, false, ?block)
+        || validate(?items[0], 4, REQUEST, false, 4096, true, ?block)) { ret 5; }
+    items[0] = named(":Status", 7, "103", 3);
+    if (!informational(?items[0], 1, false) || informational(?items[0], 1, true)) { ret 6; }
+    ret 0;
+}
