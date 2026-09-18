@@ -6,6 +6,9 @@
 - `http.core.section` holds the field-section validator that the HTTP/2 and HTTP/3 engines used to carry as separate copies, with its own tests for both directions. `h2.connection.HeaderBlock` and `h3.connection.HeaderBlock` are the same type as `section.Block` (#119).
 - The HTTP/2 connection doc no longer says to call `tick` until it returns `EVENT_NONE`, which a failed engine never does. It returns its failure event on every call.
 
+### Fixed
+- A failed HTTP/2 engine whose connection scope ends during its GOAWAY drain now closes instead of staying `FAILED` forever with `progress_close` and `destroy` refusing (#123). `tick`, `submit_write` and a cancelled write completion each drop the unsent output and submit the close once the scope is inactive, and a drain write the transport refuses is abandoned the same way. A host that cancels the scope after a failure should call `tick`.
+
 ## [0.13.1] - 2026-09-17
 
 ### Fixed
