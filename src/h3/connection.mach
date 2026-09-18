@@ -6,6 +6,7 @@ use http.core.field;
 use http.core.message;
 use http.core.method;
 use http.core.records;
+use http.core.section;
 use http.core.status;
 use http.core.target;
 use http.h3.frame;
@@ -308,19 +309,7 @@ pub rec Storage {
     decoder_queue_capacity:      usize;
 }
 
-pub rec HeaderBlock {
-    fields:             *field.Field;
-    count:              usize;
-    regular_offset:     usize;
-    method:             view.View;
-    scheme:             view.View;
-    path:               view.View;
-    authority:          view.View;
-    protocol:           view.View;
-    status:             u16;
-    has_content_length: bool;
-    content_length:     u64;
-}
+pub def HeaderBlock: section.Block;
 
 pub rec Event {
     kind:        EventKind;
@@ -488,10 +477,10 @@ pub rec Engine[T] {
     initialized:                 bool;
 }
 
-val HEADER_REQUEST:       u8 = 1;
-val HEADER_RESPONSE:      u8 = 2;
-val HEADER_INFORMATIONAL: u8 = 3;
-val HEADER_TRAILERS:      u8 = 4;
+val HEADER_REQUEST:       u8 = section.REQUEST;
+val HEADER_RESPONSE:      u8 = section.RESPONSE;
+val HEADER_INFORMATIONAL: u8 = section.INFORMATIONAL;
+val HEADER_TRAILERS:      u8 = section.TRAILERS;
 
 val INDEX_EMPTY:     usize = (-1)::usize;
 val INDEX_TOMBSTONE: usize = (-2)::usize;
@@ -693,11 +682,7 @@ fun queue_pop(queue: *ByteQueue, length: usize) bool {
 }
 
 fun empty_headers() HeaderBlock {
-    ret HeaderBlock{fields: nil, count: 0, regular_offset: 0,
-        method:             view.view(nil, 0), scheme: view.view(nil, 0),
-        path:               view.view(nil, 0), authority: view.view(nil, 0),
-        protocol:           view.view(nil, 0), status: 0,
-        has_content_length: false, content_length: 0};
+    ret section.empty();
 }
 
 fun base_event[T](engine: *Engine[T], kind: EventKind) Event {
@@ -1456,221 +1441,6 @@ pub fun dispatch[T](engine: *Engine[T], id: u64,
     ret exchange.dispatch(service, stream.exchange);
 }
 
-fun same_view(left: view.View, right: view.View) bool {
-    ret left.len == right.len && (left.len == 0
-        || (left.data != nil && right.data != nil
-        && memory.raw_equal(left.data, right.data, left.len)));
-}
-
-fun is_name(name: view.View, literal: *u8, length: usize) bool {
-    ret same_view(name, view.view(literal, length));
-}
-
-# a received name must match exactly, while a caller's name may use any case
-fun name_is(name: view.View, inbound: bool, literal: *u8, length: usize) bool {
-    if (inbound) { ret is_name(name, literal, length); }
-    ret field.name_equal(name, view.view(literal, length));
-}
-
-fun lowercase(name: view.View) bool {
-    if (name.data == nil || name.len == 0) { ret false; }
-    var i: usize = 0;
-    for (i < name.len) {
-        if (name.data[i] >= 'A' && name.data[i] <= 'Z') { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-fun trailers_value(value: view.View) bool {
-    ret value.len == 8 && value.data != nil
-        && memory.raw_equal(value.data, "trailers", 8);
-}
-
-fun scheme_valid(value: view.View) bool {
-    if (value.data == nil || value.len == 0
-        || !((value.data[0] >= 'a' && value.data[0] <= 'z')
-        || (value.data[0] >= 'A' && value.data[0] <= 'Z'))) { ret false; }
-    var i: usize = 1;
-    for (i < value.len) {
-        val byte: u8 = value.data[i];
-        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z')
-            || (byte >= '0' && byte <= '9') || byte == '+' || byte == '-'
-            || byte == '.')) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-fun authority_valid(value: view.View) bool {
-    if (value.data == nil || value.len == 0) { ret false; }
-    var i: usize = 0;
-    for (i < value.len) {
-        val byte: u8 = value.data[i];
-        if (byte <= ' ' || byte == 127 || byte == '/' || byte == '?'
-            || byte == '#' || byte == '@') { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-fun regular_field_valid(item: field.Field, inbound: bool) bool {
-    # the block walk has already refused a received uppercase name
-    if (!field.valid_name(item.name)
-        || !field.valid_value(item.value)) { ret false; }
-    if (name_is(item.name, inbound, "connection", 10)
-        || name_is(item.name, inbound, "proxy-connection", 16)
-        || name_is(item.name, inbound, "keep-alive", 10)
-        || name_is(item.name, inbound, "transfer-encoding", 17)
-        || name_is(item.name, inbound, "upgrade", 7)) { ret false; }
-    if (name_is(item.name, inbound, "te", 2) && !trailers_value(item.value)) { ret false; }
-    ret true;
-}
-
-fun parse_status(value: view.View) u16 {
-    if (value.data == nil || value.len != 3
-        || value.data[0] < '1' || value.data[0] > '9'
-        || value.data[1] < '0' || value.data[1] > '9'
-        || value.data[2] < '0' || value.data[2] > '9') { ret 0; }
-    ret (value.data[0] - '0')::u16 * 100
-        + (value.data[1] - '0')::u16 * 10
-        + (value.data[2] - '0')::u16;
-}
-
-fun parse_length(value: view.View, length: *u64) bool {
-    if (value.data == nil || value.len == 0 || length == nil) { ret false; }
-    var result: u64   = 0;
-    var i:      usize = 0;
-    for (i < value.len) {
-        val byte: u8 = value.data[i];
-        if (byte < '0' || byte > '9' || result > (-1)::u64 / 10
-            || (result == (-1)::u64 / 10
-            && (byte - '0')::u64 > (-1)::u64 % 10)) { ret false; }
-        result = result * 10 + (byte - '0')::u64;
-        i      = i + 1;
-    }
-    @length = result;
-    ret true;
-}
-
-fun validate_header_block(items: *field.Field, count: usize, kind: u8,
-    connect_enabled: bool, maximum_bytes: usize, inbound: bool, block: *HeaderBlock) bool {
-    if (block == nil || (items == nil && count != 0)) { ret false; }
-    @block               = empty_headers();
-    block.fields         = items;
-    block.count          = count;
-    block.regular_offset = count;
-    var saw_regular:   bool      = false;
-    var saw_method:    bool      = false;
-    var saw_scheme:    bool      = false;
-    var saw_path:      bool      = false;
-    var saw_authority: bool      = false;
-    var saw_protocol:  bool      = false;
-    var saw_status:    bool      = false;
-    var saw_host:      bool      = false;
-    var host:          view.View = view.view(nil, 0);
-    var bytes:         usize     = 0;
-    var i:             usize     = 0;
-    for (i < count) {
-        val item: field.Field = items[i];
-        if (item.name.data == nil || item.name.len == 0 || (inbound && !lowercase(item.name))
-            || !field.valid_value(item.value) || item.name.len > maximum_bytes
-            || item.value.len > maximum_bytes - item.name.len
-            || item.name.len + item.value.len > maximum_bytes - bytes
-            || 32 > maximum_bytes - bytes - item.name.len - item.value.len) { ret false; }
-        bytes = bytes + item.name.len + item.value.len + 32;
-        if (item.name.data[0] == ':') {
-            if (saw_regular || kind == HEADER_TRAILERS) { ret false; }
-            if (name_is(item.name, inbound, ":method", 7) && !saw_method) {
-                block.method = item.value;
-                saw_method   = true;
-            }
-            or (name_is(item.name, inbound, ":scheme", 7) && !saw_scheme) {
-                block.scheme = item.value;
-                saw_scheme   = true;
-            }
-            or (name_is(item.name, inbound, ":path", 5) && !saw_path) {
-                block.path = item.value;
-                saw_path   = true;
-            }
-            or (name_is(item.name, inbound, ":authority", 10) && !saw_authority) {
-                block.authority = item.value;
-                saw_authority   = true;
-            }
-            or (name_is(item.name, inbound, ":protocol", 9) && !saw_protocol) {
-                block.protocol = item.value;
-                saw_protocol   = true;
-            }
-            or (name_is(item.name, inbound, ":status", 7) && !saw_status) {
-                block.status = parse_status(item.value);
-                if (block.status == 0) { ret false; }
-                saw_status = true;
-            }
-            or { ret false; }
-        }
-        or {
-            if (!saw_regular) {
-                block.regular_offset = i;
-                saw_regular          = true;
-            }
-            if (!regular_field_valid(item, inbound)
-                || (kind == HEADER_TRAILERS
-                && !field.allowed_trailer_name(item.name))) { ret false; }
-            if (name_is(item.name, inbound, "host", 4)) {
-                if (saw_host && !same_view(host, item.value)) { ret false; }
-                host     = item.value;
-                saw_host = true;
-            }
-            if (name_is(item.name, inbound, "content-length", 14)) {
-                var parsed: u64 = 0;
-                if (!parse_length(item.value, ?parsed)
-                    || (block.has_content_length
-                    && block.content_length != parsed)) { ret false; }
-                block.has_content_length = true;
-                block.content_length     = parsed;
-            }
-        }
-        i = i + 1;
-    }
-    if (kind == HEADER_REQUEST) {
-        if (!saw_method || saw_status
-            || !method.valid_token(block.method, maximum_bytes)) { ret false; }
-        val connect: bool = is_name(block.method, "CONNECT", 7);
-        if (connect && saw_protocol) {
-            if (!connect_enabled || !saw_scheme || !saw_path || !saw_authority
-                || !method.valid_token(block.protocol, maximum_bytes)
-                || !scheme_valid(block.scheme) || block.path.len == 0
-                || !authority_valid(block.authority)) { ret false; }
-        }
-        or (connect) {
-            if (!saw_authority || saw_scheme || saw_path || saw_protocol
-                || !authority_valid(block.authority)) { ret false; }
-        }
-        or {
-            if (!saw_scheme || !saw_path || saw_protocol
-                || !scheme_valid(block.scheme) || block.path.len == 0
-                || (block.path.data[0] != '/'
-                && !(is_name(block.method, "OPTIONS", 7)
-                && is_name(block.path, "*", 1)))) { ret false; }
-        }
-        if (saw_authority && !authority_valid(block.authority))             { ret false; }
-        if (saw_authority && saw_host && !same_view(block.authority, host)) { ret false; }
-        if (!saw_authority && saw_host)                                     { block.authority = host; }
-        ret true;
-    }
-    if (kind == HEADER_RESPONSE || kind == HEADER_INFORMATIONAL) {
-        if (!saw_status || saw_method || saw_scheme || saw_path
-            || saw_authority || saw_protocol || block.status == 101) { ret false; }
-        if (kind == HEADER_INFORMATIONAL) {
-            ret block.status < 200 && !block.has_content_length;
-        }
-        if (block.status == status.NO_CONTENT && block.has_content_length) { ret false; }
-        ret block.status >= 200;
-    }
-    ret !saw_method && !saw_scheme && !saw_path
-        && !saw_authority && !saw_protocol && !saw_status;
-}
-
 fun configured_field_limits[T](engine: *Engine[T], kind: u8,
     outbound: bool) field.Limits {
     if (kind == HEADER_REQUEST)  { ret engine.configured.messages.request_fields; }
@@ -2409,13 +2179,8 @@ fun header_kind[T](engine: *Engine[T], stream: *Stream,
     if (engine.role == SERVER && !stream.local
         && !stream.initial_headers_received) { ret HEADER_REQUEST; }
     if (!stream.final_headers_received) {
-        var i: usize = 0;
-        for (i < decoded.count) {
-            if (is_name(stream.memory.fields[i].name, ":status", 7)) {
-                val code: u16 = parse_status(stream.memory.fields[i].value);
-                if (code >= 100 && code < 200) { ret HEADER_INFORMATIONAL; }
-            }
-            i = i + 1;
+        if (section.informational(stream.memory.fields, decoded.count, true)) {
+            ret HEADER_INFORMATIONAL;
         }
         ret HEADER_RESPONSE;
     }
@@ -2434,7 +2199,7 @@ fun finish_headers[T](engine: *Engine[T], stream: *Stream,
     }
     val kind:  u8 = header_kind[T](engine, stream, decoded);
     var block: HeaderBlock;
-    if (!validate_header_block(stream.memory.fields, decoded.count, kind,
+    if (!section.validate(stream.memory.fields, decoded.count, kind,
         engine.configured.local.enable_connect_protocol,
         engine.configured.inbound_qpack.max_field_section_bytes, true, ?block)) {
         ret stream_failure[T](engine, stream, H3_MESSAGE_ERROR);
@@ -2682,14 +2447,7 @@ fun outbound_header_kind[T](engine: *Engine[T], stream: *Stream,
     if (stream.initial_headers_sent)           { ret HEADER_TRAILERS; }
     if (engine.role == CLIENT && stream.local) { ret HEADER_REQUEST; }
     if (engine.role == SERVER && !stream.local) {
-        var i: usize = 0;
-        for (i < count) {
-            if (name_is(items[i].name, false, ":status", 7)) {
-                val code: u16 = parse_status(items[i].value);
-                if (code >= 100 && code < 200) { ret HEADER_INFORMATIONAL; }
-            }
-            i = i + 1;
-        }
+        if (section.informational(items, count, false)) { ret HEADER_INFORMATIONAL; }
         ret HEADER_RESPONSE;
     }
     ret 0;
@@ -2711,7 +2469,7 @@ pub fun send_headers[T](engine: *Engine[T], id: u64, items: *field.Field,
     if (engine.peer.max_field_section_size < maximum) {
         maximum = engine.peer.max_field_section_size;
     }
-    if (kind == 0 || !validate_header_block(items, count, kind,
+    if (kind == 0 || !section.validate(items, count, kind,
         engine.peer.enable_connect_protocol, maximum, false, ?block)
         || (kind == HEADER_INFORMATIONAL && end_stream)
         || (kind == HEADER_TRAILERS && !end_stream)

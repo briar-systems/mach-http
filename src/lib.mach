@@ -3,7 +3,7 @@ use std.types.bool.bool;
 use std.types.size.usize;
 use std.types.string.str;
 
-pub val VERSION: str = "0.13.1";
+pub val VERSION: str = "0.13.2";
 
 fwd http.core.method;
 fwd http.core.status;
@@ -15,6 +15,7 @@ fwd http.core.exchange;
 fwd http.core.transport;
 fwd http.core.records;
 fwd http.core.deadline;
+fwd http.core.section;
 fwd http.h1.framing;
 fwd http.h1.parser;
 fwd http.h1.serializer;

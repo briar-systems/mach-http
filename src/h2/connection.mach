@@ -7,6 +7,7 @@ use http.core.field;
 use http.core.message;
 use http.core.method;
 use http.core.records;
+use http.core.section;
 use http.core.status;
 use http.core.target;
 use http.core.transport;
@@ -136,11 +137,11 @@ val OUTPUT_CONTROL: u8 = 2;
 val OUTPUT_HEADERS: u8 = 3;
 val OUTPUT_DATA:    u8 = 4;
 
-val HEADER_REQUEST:       u8 = 1;
-val HEADER_RESPONSE:      u8 = 2;
-val HEADER_INFORMATIONAL: u8 = 3;
-val HEADER_TRAILERS:      u8 = 4;
-val HEADER_PUSH:          u8 = 5;
+val HEADER_REQUEST:       u8 = section.REQUEST;
+val HEADER_RESPONSE:      u8 = section.RESPONSE;
+val HEADER_INFORMATIONAL: u8 = section.INFORMATIONAL;
+val HEADER_TRAILERS:      u8 = section.TRAILERS;
+val HEADER_PUSH:          u8 = section.PUSH;
 
 pub val NO_STREAM: u32   = 0;
 pub val NO_SLOT:   usize = (-1)::usize;
@@ -284,19 +285,7 @@ pub rec Control {
     length:  usize;
 }
 
-pub rec HeaderBlock {
-    fields:             *field.Field;
-    count:              usize;
-    regular_offset:     usize;
-    method:             view.View;
-    scheme:             view.View;
-    path:               view.View;
-    authority:          view.View;
-    protocol:           view.View;
-    status:             u16;
-    has_content_length: bool;
-    content_length:     u64;
-}
+pub def HeaderBlock: section.Block;
 
 pub rec Event {
     kind:           EventKind;
@@ -531,10 +520,7 @@ fun memory_valid(memory_value: StreamMemory, configured: Config) bool {
 }
 
 fun empty_headers() HeaderBlock {
-    ret HeaderBlock{fields: nil, count: 0, regular_offset: 0,
-        method:             view.view(nil, 0), scheme: view.view(nil, 0), path: view.view(nil, 0),
-        authority:          view.view(nil, 0), protocol: view.view(nil, 0), status: 0,
-        has_content_length: false, content_length: 0};
+    ret section.empty();
 }
 
 fun event(engine: *Engine, kind: EventKind) Event {
@@ -1638,6 +1624,18 @@ fun abort_output(engine: *Engine) {
     submit_close(engine);
 }
 
+# a failed engine drains its goaway only while its scope lives and the peer reads.
+# once either ends the drain is abandoned and the close submitted, so a host that
+# cancels the scope at any point after the failure still reaches CLOSED
+fun settle_failure(engine: *Engine) bool {
+    if (engine.state != FAILED || engine.close_pending) { ret false; }
+    if (scope_active(engine.scope) && !deadline.expired(engine.write_deadline, engine.now)) {
+        ret false;
+    }
+    abort_output(engine);
+    ret true;
+}
+
 fun failure_event(engine: *Engine) Event {
     var result: Event = event(engine, EVENT_ERROR);
     result.code           = engine.h2_error;
@@ -1855,7 +1853,9 @@ pub fun submit_write(engine: *Engine, now: time.Instant) bool {
         engine.transport, engine.scope, ?engine.write_buffer[engine.write_offset],
         engine.write_length - engine.write_offset, engine.write_stream::usize);
     if ((sel submitted.err)) {
-        fail_connection(engine, ERROR_TRANSPORT, H2_INTERNAL_ERROR);
+        # a failed engine's drain that cannot be submitted is abandoned
+        if (engine.state == FAILED) { abort_output(engine); }
+        or                          { fail_connection(engine, ERROR_TRANSPORT, H2_INTERNAL_ERROR); }
         ret false;
     }
     engine.write_token    = submitted.ok;
@@ -2138,224 +2138,6 @@ fun handle_goaway(engine: *Engine) Event {
     ret result;
 }
 
-fun same_view(left: view.View, right: view.View) bool {
-    ret left.len == right.len && (left.len == 0
-        || (left.data != nil && right.data != nil
-        && memory.raw_equal(left.data, right.data, left.len)));
-}
-
-fun is_name(name: view.View, literal: *u8, length: usize) bool {
-    ret same_view(name, view.view(literal, length));
-}
-
-# a received name must match exactly, while a caller's name may use any case
-fun name_is(name: view.View, inbound: bool, literal: *u8, length: usize) bool {
-    if (inbound) { ret is_name(name, literal, length); }
-    ret field.name_equal(name, view.view(literal, length));
-}
-
-fun lowercase(name: view.View) bool {
-    if (name.data == nil || name.len == 0) { ret false; }
-    var i: usize = 0;
-    for (i < name.len) {
-        if (name.data[i] >= 'A' && name.data[i] <= 'Z') { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-fun trailers_value(value: view.View) bool {
-    ret value.len == 8 && value.data != nil
-        && memory.raw_equal(value.data, "trailers", 8);
-}
-
-fun scheme_valid(value: view.View) bool {
-    if (value.data == nil || value.len == 0
-        || !((value.data[0] >= 'a' && value.data[0] <= 'z')
-        || (value.data[0] >= 'A' && value.data[0] <= 'Z'))) { ret false; }
-    var i: usize = 1;
-    for (i < value.len) {
-        val byte: u8 = value.data[i];
-        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z')
-            || (byte >= '0' && byte <= '9') || byte == '+' || byte == '-'
-            || byte == '.')) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-fun authority_valid(value: view.View) bool {
-    if (value.data == nil || value.len == 0) { ret false; }
-    var i: usize = 0;
-    for (i < value.len) {
-        val byte: u8 = value.data[i];
-        if (byte <= ' ' || byte == 127 || byte == '/' || byte == '?' || byte == '#'
-            || byte == '@') { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-fun regular_field_valid(item: field.Field, inbound: bool) bool {
-    # the block walk has already refused a received uppercase name
-    if (!field.valid_name(item.name)
-        || !field.valid_value(item.value)) { ret false; }
-    if (name_is(item.name, inbound, "connection", 10)
-        || name_is(item.name, inbound, "proxy-connection", 16)
-        || name_is(item.name, inbound, "keep-alive", 10)
-        || name_is(item.name, inbound, "transfer-encoding", 17)
-        || name_is(item.name, inbound, "upgrade", 7)) { ret false; }
-    if (name_is(item.name, inbound, "te", 2) && !trailers_value(item.value)) { ret false; }
-    ret true;
-}
-
-fun parse_status(value: view.View) u16 {
-    if (value.data == nil || value.len != 3
-        || value.data[0] < '1' || value.data[0] > '9'
-        || value.data[1] < '0' || value.data[1] > '9'
-        || value.data[2] < '0' || value.data[2] > '9') { ret 0; }
-    ret (value.data[0] - '0')::u16 * 100
-        + (value.data[1] - '0')::u16 * 10
-        + (value.data[2] - '0')::u16;
-}
-
-fun parse_length(value: view.View, length: *u64) bool {
-    if (value.data == nil || value.len == 0 || length == nil) { ret false; }
-    var result: u64   = 0;
-    var i:      usize = 0;
-    for (i < value.len) {
-        val byte: u8 = value.data[i];
-        if (byte < '0' || byte > '9' || result > (-1)::u64 / 10
-            || (result == (-1)::u64 / 10
-            && (byte - '0')::u64 > (-1)::u64 % 10)) {
-            ret false;
-        }
-        result = result * 10 + (byte - '0')::u64;
-        i      = i + 1;
-    }
-    @length = result;
-    ret true;
-}
-
-fun validate_header_block(items: *field.Field, count: usize, kind: u8,
-    connect_enabled: bool, maximum_bytes: usize, inbound: bool, block: *HeaderBlock) bool {
-    if (block == nil || (items == nil && count != 0)) { ret false; }
-    @block               = empty_headers();
-    block.fields         = items;
-    block.count          = count;
-    block.regular_offset = count;
-    var saw_regular:   bool      = false;
-    var saw_method:    bool      = false;
-    var saw_scheme:    bool      = false;
-    var saw_path:      bool      = false;
-    var saw_authority: bool      = false;
-    var saw_protocol:  bool      = false;
-    var saw_status:    bool      = false;
-    var saw_host:      bool      = false;
-    var host:          view.View = view.view(nil, 0);
-    var bytes:         usize     = 0;
-    var i:             usize     = 0;
-    for (i < count) {
-        val item: field.Field = items[i];
-        if (item.name.data == nil || item.name.len == 0 || (inbound && !lowercase(item.name))
-            || !field.valid_value(item.value) || item.name.len > maximum_bytes
-            || item.value.len > maximum_bytes - item.name.len
-            || item.name.len + item.value.len > maximum_bytes - bytes
-            || 32 > maximum_bytes - bytes - item.name.len - item.value.len) { ret false; }
-        bytes = bytes + item.name.len + item.value.len + 32;
-        if (item.name.data[0] == ':') {
-            if (saw_regular || kind == HEADER_TRAILERS) { ret false; }
-            if (name_is(item.name, inbound, ":method", 7) && !saw_method) {
-                block.method = item.value;
-                saw_method   = true;
-            }
-            or (name_is(item.name, inbound, ":scheme", 7) && !saw_scheme) {
-                block.scheme = item.value;
-                saw_scheme   = true;
-            }
-            or (name_is(item.name, inbound, ":path", 5) && !saw_path) {
-                block.path = item.value;
-                saw_path   = true;
-            }
-            or (name_is(item.name, inbound, ":authority", 10) && !saw_authority) {
-                block.authority = item.value;
-                saw_authority   = true;
-            }
-            or (name_is(item.name, inbound, ":protocol", 9) && !saw_protocol) {
-                block.protocol = item.value;
-                saw_protocol   = true;
-            }
-            or (name_is(item.name, inbound, ":status", 7) && !saw_status) {
-                block.status = parse_status(item.value);
-                if (block.status == 0) { ret false; }
-                saw_status = true;
-            }
-            or { ret false; }
-        }
-        or {
-            if (!saw_regular) {
-                block.regular_offset = i;
-                saw_regular          = true;
-            }
-            if (!regular_field_valid(item, inbound)
-                || (kind == HEADER_TRAILERS && !field.allowed_trailer_name(item.name))) {
-                ret false;
-            }
-            if (name_is(item.name, inbound, "host", 4)) {
-                if (saw_host && !same_view(host, item.value)) { ret false; }
-                host     = item.value;
-                saw_host = true;
-            }
-            if (name_is(item.name, inbound, "content-length", 14)) {
-                var parsed_length: u64 = 0;
-                if (!parse_length(item.value, ?parsed_length)
-                    || (block.has_content_length
-                    && block.content_length != parsed_length)) { ret false; }
-                block.has_content_length = true;
-                block.content_length     = parsed_length;
-            }
-        }
-        i = i + 1;
-    }
-    if (kind == HEADER_REQUEST || kind == HEADER_PUSH) {
-        if (!saw_method || saw_status
-            || !method.valid_token(block.method, maximum_bytes)) { ret false; }
-        val connect: bool = is_name(block.method, "CONNECT", 7);
-        if (connect && saw_protocol) {
-            if (!connect_enabled || !saw_scheme || !saw_path || !saw_authority
-                || !method.valid_token(block.protocol, maximum_bytes)
-                || !scheme_valid(block.scheme) || block.path.len == 0
-                || !authority_valid(block.authority)) { ret false; }
-        }
-        or (connect) {
-            if (!saw_authority || saw_scheme || saw_path || saw_protocol
-                || !authority_valid(block.authority)) { ret false; }
-        }
-        or {
-            if (!saw_scheme || !saw_path || saw_protocol
-                || !scheme_valid(block.scheme) || block.path.len == 0
-                || (block.path.data[0] != '/'
-                && !(is_name(block.method, "OPTIONS", 7)
-                && is_name(block.path, "*", 1)))) { ret false; }
-        }
-        if (saw_authority && !authority_valid(block.authority))             { ret false; }
-        if (saw_authority && saw_host && !same_view(block.authority, host)) { ret false; }
-        if (!saw_authority && saw_host)                                     { block.authority = host; }
-        ret true;
-    }
-    if (kind == HEADER_RESPONSE || kind == HEADER_INFORMATIONAL) {
-        if (!saw_status || saw_method || saw_scheme || saw_path
-            || saw_authority || saw_protocol || block.status == 101) { ret false; }
-        if (kind == HEADER_INFORMATIONAL) {
-            ret block.status < 200 && !block.has_content_length;
-        }
-        if (block.status == status.NO_CONTENT && block.has_content_length) { ret false; }
-        ret block.status >= 200;
-    }
-    ret !saw_method && !saw_scheme && !saw_path
-        && !saw_authority && !saw_protocol && !saw_status;
-}
-
 # a remote stream the budget admits but memory refuses is refused like one over
 # budget. `refuse` takes the table first and the inline reserve after, so the
 # block is still decoded and the shared hpack context stays in step
@@ -2450,19 +2232,12 @@ fun finish_headers(engine: *Engine, stream: *Stream, decoded: hpack.Decode) Even
         ret stream_error(engine, stream, code);
     }
     var block: HeaderBlock;
-    if (kind == HEADER_RESPONSE && decoded.count != 0) {
-        var status_value: u16   = 0;
-        var i:            usize = 0;
-        for (i < decoded.count) {
-            if (is_name(stream.memory.fields[i].name, ":status", 7)) {
-                status_value = parse_status(stream.memory.fields[i].value);
-            }
-            i = i + 1;
-        }
-        if (status_value >= 100 && status_value < 200) { kind = HEADER_INFORMATIONAL; }
+    if (kind == HEADER_RESPONSE
+        && section.informational(stream.memory.fields, decoded.count, true)) {
+        kind = HEADER_INFORMATIONAL;
     }
     val connect_enabled: bool = engine.configured.local.enable_connect_protocol == 1;
-    if (!validate_header_block(stream.memory.fields, decoded.count, kind,
+    if (!section.validate(stream.memory.fields, decoded.count, kind,
         connect_enabled, engine.configured.hpack.max_header_list_bytes, true, ?block)) {
         ret stream_error(engine, stream, H2_PROTOCOL_ERROR);
     }
@@ -2947,6 +2722,10 @@ pub fun complete_io(engine: *Engine, completion: *transport.Completion,
         engine.write_pending  = false;
         engine.write_deadline = deadline.none();
         if (completion.status != transport.IO_COMPLETE || completion.count == 0) {
+            if (engine.state == FAILED) {
+                abort_output(engine);
+                ret failure_event(engine);
+            }
             if (completion.status == transport.IO_CANCELLED) {
                 ret fail_connection(engine, ERROR_CANCELLED, H2_CANCEL);
             }
@@ -3048,7 +2827,7 @@ pub fun send_headers(engine: *Engine, id: u32, items: *field.Field,
         && maximum > engine.peer.max_header_list_size::usize) {
         maximum = engine.peer.max_header_list_size::usize;
     }
-    if (!validate_header_block(items, count, kind,
+    if (!section.validate(items, count, kind,
         engine.peer.enable_connect_protocol == 1, maximum, false, ?checked)
         || (end_stream && checked.has_content_length && checked.content_length != 0
         && !(kind == HEADER_RESPONSE && stream.exchange != nil
@@ -3122,7 +2901,7 @@ pub fun send_push_promise(engine: *Engine, parent_id: u32, promised_id: u32,
     if (engine.role != SERVER
         || parent == nil || promised == nil || promised.state != STREAM_RESERVED_LOCAL
         || engine.header_output_active || !stream_writable(parent)
-        || !validate_header_block(items, count, HEADER_PUSH,
+        || !section.validate(items, count, HEADER_PUSH,
         engine.peer.enable_connect_protocol == 1,
         maximum, false, ?checked)) {
         ret Offer{status: OFFER_ERROR, consumed: 0, produced: 0,
@@ -3319,8 +3098,7 @@ pub fun tick(engine: *Engine, now: time.Instant) Event {
     if (engine.state == CLOSED)  { ret event(engine, EVENT_CLOSED); }
     if (engine.state == CLOSING) { ret event(engine, EVENT_NONE); }
     if (engine.state == FAILED) {
-        # a drain the peer stopped reading is bounded like any write
-        if (deadline.expired(engine.write_deadline, engine.now)) { abort_output(engine); }
+        settle_failure(engine);
         ret failure_event(engine);
     }
     val reason: cancel.Reason = cancel.reason(engine.scope);
@@ -3414,6 +3192,7 @@ rec TestIO {
     write_calls:  usize;
     close_token:  transport.Token;
     close_calls:  usize;
+    refuse_write: bool;
 }
 
 fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
@@ -3429,6 +3208,9 @@ fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
 fun test_write(context: ptr, token: transport.Token, scope: *cancel.Scope,
     buffer: *u8, length: usize) res[bool, io_error.Error] {
     val io: *TestIO = context::*TestIO;
+    if (io.refuse_write) {
+        ret res[bool, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_WRITE)};
+    }
     io.write_token  = token;
     io.write_buffer = buffer;
     io.write_length = length;
@@ -5492,5 +5274,67 @@ test "http.h2.connection: a received uppercase name is still malformed" {
     val reported: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
         frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 1, ?block[0], 11);
     if (reported.kind != EVENT_STREAM_ERROR || reported.code != H2_PROTOCOL_ERROR) { ret 2; }
+    ret 0;
+}
+
+test "http.h2.connection: a failed engine whose scope ends before the drain still closes" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
+    var block: [6]u8;
+    request_block(?block[0]);
+    fixture.clock = test_now(105);
+    if (receive_frame(?fixture, frame.FRAME_HEADERS, 0, 3, ?block[0], 3).kind != EVENT_NEED_READ
+        || !times_out_at(?fixture, 115, ERROR_HEADER_TIMEOUT)
+        || fixture.engine.control_count != 1 || fixture.engine.active_streams != 2) { ret 2; }
+    # the host stops before the goaway is written, and nothing more is submitted
+    val writes: usize = fixture.io.write_calls;
+    cancel.cancel(?fixture.operation_root);
+    if (submit_write(?fixture.engine, test_now(116)) || fixture.engine.write_length != 0
+        || fixture.engine.control_count != 0 || fixture.io.write_calls != writes
+        || !fixture.engine.close_pending || fixture.engine.state != FAILED) { ret 3; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed, test_now(116)).kind != EVENT_CLOSED
+        || fixture.engine.error != ERROR_HEADER_TIMEOUT
+        || !destroy(?fixture.engine) || fixture.account.held != 0) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.connection: a failed engine whose scope ends is closed by the next tick" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture) || !times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)
+        || fixture.engine.control_count != 1) { ret 1; }
+    cancel.cancel(?fixture.operation_root);
+    if (tick(?fixture.engine, test_now(111)).kind != EVENT_TIMED_OUT
+        || fixture.engine.control_count != 0 || !fixture.engine.close_pending) { ret 2; }
+    if (!closes(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a drain write cancelled by the scope still closes" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture) || !times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)
+        || !submit_write(?fixture.engine, test_now(111))
+        || fixture.io.write_buffer[3] != frame.FRAME_GOAWAY) { ret 1; }
+    cancel.cancel(?fixture.operation_root);
+    var cancelled: transport.Completion = transport.failed(fixture.io.write_token,
+        transport.WRITE, 0, io_error.make(io_error.CANCELLED, io_error.OP_WRITE));
+    val result: Event = complete_io(?fixture.engine, ?cancelled, test_now(112));
+    if (result.kind != EVENT_TIMED_OUT || fixture.engine.error != ERROR_HEADER_TIMEOUT
+        || fixture.engine.write_length != 0 || fixture.engine.control_count != 0
+        || !fixture.engine.close_pending) { ret 2; }
+    if (!closes(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a drain the transport refuses still closes" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture) || !times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)) { ret 1; }
+    fixture.io.refuse_write = true;
+    if (submit_write(?fixture.engine, test_now(111)) || fixture.engine.control_count != 0
+        || fixture.engine.write_length != 0 || !fixture.engine.close_pending
+        || fixture.engine.error != ERROR_HEADER_TIMEOUT) { ret 2; }
+    if (!closes(?fixture)) { ret 3; }
     ret 0;
 }

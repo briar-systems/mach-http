@@ -185,8 +185,10 @@ armed with a different duration is still placed correctly. `tick` and
 `next_deadline` returns the earliest deadline `tick` would enforce, with `active`
 false when none applies: an uninitialized engine, or one that is closing or closed.
 A failed engine reports only its write deadline. A host with a timer wheel arms one
-timer at that instant, calls `tick` until it returns `EVENT_NONE`, and queries again
-after every call that takes `now`. The engine scope's own std deadline is the host's
+timer at that instant, calls `tick` until it returns `EVENT_NONE` or a connection
+event, and queries again after every call that takes `now`. A failed engine never
+returns `EVENT_NONE`: every `tick` and `process` repeats its failure event, so a host
+that loops on `EVENT_NONE` alone would never leave it. The engine scope's own std deadline is the host's
 and is not included, but when it fires `tick` fails the connection with
 `ERROR_TOTAL_TIMEOUT`.
 
@@ -203,6 +205,11 @@ and is not included, but when it fires `tick` fails the connection with
   admitted stream, and the host drains it as after any failure. Each drain write has
   its own write deadline, and `tick` still enforces it on the failed engine. A drain
   the peer does not read drops the unsent output and closes at once.
+- The drain runs only while the connection scope lives. A host may end the scope at
+  any point after the failure, for example on its own stop path. The next `tick`,
+  `submit_write` or write completion then drops the unsent output and submits the
+  close, so the engine still reaches `CLOSED`. A host that cancels the scope should
+  call `tick` afterwards, since the engine learns of the change no other way.
 - A write timeout, from the write deadline or the connection window, queues nothing.
   A peer that does not take data will not read a GOAWAY either. Pending output is
   dropped and the close is submitted at once. The transport cancels a write still in
@@ -287,7 +294,8 @@ No control frame can interleave with an outbound continuation sequence. Incoming
 blocks commit their shared HPACK table before HTTP semantic validation, as required
 to keep compression synchronized even when one stream is reset.
 
-The semantic validator enforces:
+The semantic validator is `http.core.section`, shared with the HTTP/3 engine since
+the two protocols carry the same field-section rules. It enforces:
 
 - required, unique, ordered request and response pseudo-fields
 - ordinary CONNECT and negotiated extended CONNECT shapes
