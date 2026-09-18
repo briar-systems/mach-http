@@ -152,7 +152,8 @@ val INDEX_TOMBSTONE: usize = (-2)::usize;
 # the slot of the inline stream that decodes refused header blocks
 val RESERVE_SLOT: usize = (-3)::usize;
 
-val STREAM_BUFFERS: usize = 4;
+# the chunks of one decoding stream's set, see `stream_requests`
+pub val STREAM_BUFFERS: usize = 4;
 
 # ready-queue entries serviced and inbound frames handled per `process` call
 val SERVICE_BUDGET: usize = 64;
@@ -695,17 +696,26 @@ fun release_encoder(engine: *Engine) {
     engine.encoder_pending_capacity = 0;
 }
 
+# the requests one decoding stream's set is acquired with, STREAM_BUFFERS of them
+# into `out`. this is the one table `acquire_stream_memory` reads, so a host that
+# funds streams from the same table can never fall out of step with the engine
+pub fun stream_requests(configured: Config, out: *buffers.Request) bool {
+    if (out == nil || !config_valid(configured)) { ret false; }
+    val limits: hpack.Limits = configured.hpack;
+    val lane:   u8           = configured.stream_lane;
+    out[0] = buffer_request(limits.max_encoded_block_bytes, 0, lane);
+    out[1] = buffer_request(limits.max_header_count * $size_of(field.Field), 0, lane);
+    out[2] = buffer_request(limits.max_header_list_bytes, 0, lane);
+    out[3] = buffer_request(limits.max_header_count * $size_of(hpack.Entry), 0, lane);
+    ret true;
+}
+
 # a stream's decoder set, all or nothing. a refusal refuses only the stream and
 # registers nothing, since the peer retries a refused stream on its own
 fun acquire_stream_memory(engine: *Engine, stream: *Stream) bool {
-    val limits:   hpack.Limits       = engine.configured.hpack;
-    val lane:     u8                 = engine.configured.stream_lane;
-    var requests: [4]buffers.Request = [4]buffers.Request{
-        buffer_request(limits.max_encoded_block_bytes, 0, lane),
-        buffer_request(limits.max_header_count * $size_of(field.Field), 0, lane),
-        buffer_request(limits.max_header_list_bytes, 0, lane),
-        buffer_request(limits.max_header_count * $size_of(hpack.Entry), 0, lane),
-    };
+    val limits:   hpack.Limits = engine.configured.hpack;
+    var requests: [STREAM_BUFFERS]buffers.Request;
+    stream_requests(engine.configured, ?requests[0]);
     var set: StreamMemory;
     val got: buffers.Acquired = buffers.source_acquire_n(engine.source, engine.account,
         ?requests[0], STREAM_BUFFERS, ?set.chunks[0], false);
@@ -4543,10 +4553,30 @@ fun round16(bytes: usize) usize {
     ret (bytes + 15) & ~(15::usize);
 }
 
-# the exact decoder set one stream borrows at the test configuration
+# the decoder set one stream borrows, summed from the engine's own table. the
+# test pool has no classes, so each chunk is charged its request rounded to 16
 fun stream_set_bytes() usize {
-    ret round16(512) + round16(16 * $size_of(field.Field)) + round16(512)
-        + round16(16 * $size_of(hpack.Entry));
+    var requests: [STREAM_BUFFERS]buffers.Request;
+    if (!stream_requests(test_config(), ?requests[0])) { ret 0; }
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < STREAM_BUFFERS) {
+        if (requests[i].lane != 0) { ret 0; }
+        total = total + round16(requests[i].bytes);
+        i     = i + 1;
+    }
+    ret total;
+}
+
+test "http.h2.connection: the stream request table is the set a stream acquires" {
+    var requests: [STREAM_BUFFERS]buffers.Request;
+    var bad:      Config = test_config();
+    bad.max_streams = 0;
+    if (stream_requests(bad, ?requests[0]) || stream_requests(test_config(), nil)) { ret 1; }
+    if (!stream_requests(test_config(), ?requests[0])
+        || requests[0].bytes != 512 || requests[1].bytes != 16 * $size_of(field.Field)
+        || requests[2].bytes != 512 || requests[3].bytes != 16 * $size_of(hpack.Entry)) { ret 2; }
+    ret 0;
 }
 
 # the first record chunk and the index an initialized engine holds

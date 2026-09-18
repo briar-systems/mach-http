@@ -486,7 +486,8 @@ val INDEX_EMPTY:     usize = (-1)::usize;
 val INDEX_TOMBSTONE: usize = (-2)::usize;
 
 # the buffers a request stream borrows, all or nothing
-val REQUEST_BUFFERS: usize = 7;
+# the chunks of one request set, see `request_requests`
+pub val REQUEST_BUFFERS: usize = 7;
 
 # transport reports and queued stream services one process call may take
 val READY_BUDGET:   usize = 64;
@@ -543,8 +544,8 @@ fun first_streams(configured: Config) usize {
     ret configured.initial_streams;
 }
 
-fun config_valid(configured: Config, storage: *Storage) bool {
-    ret storage != nil && configured.max_requests != 0
+fun config_valid(configured: Config) bool {
+    ret configured.max_requests != 0
         && configured.max_peer_unidirectional >= 3
         && configured.max_requests <= (-1)::usize / 4 - configured.max_peer_unidirectional
         && configured.initial_streams != 0
@@ -554,10 +555,7 @@ fun config_valid(configured: Config, storage: *Storage) bool {
         && configured.output_bytes - 16 >= configured.outbound_qpack.max_encoded_section_bytes
         && configured.inbound_qpack.max_field_count <= (-1)::usize / $size_of(field.Field)
         && configured.outbound_qpack.max_field_count <= (-1)::usize / $size_of(u64)
-        && storage.source != nil && storage.account != nil && storage.account.open
         && configured.max_pending_release != 0
-        && storage.pending_release != nil
-        && storage.pending_release_capacity >= configured.max_pending_release
         && configured.frames.max_frame_payload != 0
         && configured.frames.max_settings >= 5
         && configured.inbound_qpack.max_encoded_section_bytes <= (-1)::usize - 16
@@ -572,7 +570,15 @@ fun config_valid(configured: Config, storage: *Storage) bool {
         == configured.inbound_qpack.max_blocked_streams
         && !configured.local.h3_datagram
         && configured.local.qpack_max_table_capacity <= qpack.MAX_INTEGER::usize
-        && configured.local.max_field_section_size != 0
+        && configured.local.max_field_section_size != 0;
+}
+
+# the caller storage a valid config needs
+fun storage_valid(configured: Config, storage: *Storage) bool {
+    ret storage != nil
+        && storage.source != nil && storage.account != nil && storage.account.open
+        && storage.pending_release != nil
+        && storage.pending_release_capacity >= configured.max_pending_release
         && storage.outbound_sections != nil
         && storage.outbound_section_capacity
         >= configured.outbound_qpack.max_outstanding_sections
@@ -1100,14 +1106,22 @@ fun give_slot[T](engine: *Engine[T], stream: *Stream) {
 
 # a request stream's buffers, all or nothing. a refusal refuses only the stream
 # and registers nothing, since a refused stream gets no wake-up
-fun acquire_request_memory[T](engine: *Engine[T], stream: *Stream) bool {
-    var requests: [7]buffers.Request;
-    var i:        usize = 0;
+# the requests one request set is acquired with, REQUEST_BUFFERS of them into
+# `out`. this is the one table `acquire_request_memory` reads, so a host that
+# funds requests from the same table can never fall out of step with the engine
+pub fun request_requests(configured: Config, out: *buffers.Request) bool {
+    if (out == nil || !config_valid(configured)) { ret false; }
+    var i: usize = 0;
     for (i < REQUEST_BUFFERS) {
-        requests[i] = buffer_request(request_bytes(engine.configured, i), 0,
-            engine.configured.stream_lane);
-        i = i + 1;
+        out[i] = buffer_request(request_bytes(configured, i), 0, configured.stream_lane);
+        i      = i + 1;
     }
+    ret true;
+}
+
+fun acquire_request_memory[T](engine: *Engine[T], stream: *Stream) bool {
+    var requests: [REQUEST_BUFFERS]buffers.Request;
+    request_requests(engine.configured, ?requests[0]);
     val got: buffers.Acquired = buffers.source_acquire_n(engine.source, engine.account,
         ?requests[0], REQUEST_BUFFERS, ?stream.chunks[0], false);
     if (!granted(got)) { ret false; }
@@ -1310,7 +1324,7 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
     scope: *cancel.Scope, storage: Storage, configured: Config) bool {
     if (engine == nil || engine.initialized || (role != SERVER && role != CLIENT)
         || !transport_valid[T](?transport) || scope == nil
-        || !scope_active(scope) || !config_valid(configured, ?storage)
+        || !scope_active(scope) || !config_valid(configured) || !storage_valid(configured, ?storage)
         || !critical_valid(storage.critical, configured)
         || storage.control_queue == nil || storage.encoder_queue == nil
         || storage.decoder_queue == nil
@@ -5013,10 +5027,32 @@ fun round16(bytes: usize) usize {
     ret (bytes + 15) & ~(15::usize);
 }
 
-# the exact set one request stream borrows at the test configuration
+# the set one request borrows, summed from the engine's own table. the test pool
+# has no classes, so each chunk is charged its request rounded to 16
 fun request_set_bytes() usize {
-    ret round16(128) + round16(256) + round16(16 * $size_of(field.Field)) + round16(512)
-        + round16(256) + round16(512) + round16(16 * $size_of(u64));
+    var requests: [REQUEST_BUFFERS]buffers.Request;
+    if (!request_requests(test_config(), ?requests[0])) { ret 0; }
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < REQUEST_BUFFERS) {
+        if (requests[i].lane != 0) { ret 0; }
+        total = total + round16(requests[i].bytes);
+        i     = i + 1;
+    }
+    ret total;
+}
+
+test "http.h3.connection: the request table is the set a request acquires" {
+    var requests: [REQUEST_BUFFERS]buffers.Request;
+    var bad:      Config = test_config();
+    bad.max_requests = 0;
+    if (request_requests(bad, ?requests[0]) || request_requests(test_config(), nil)) { ret 1; }
+    if (!request_requests(test_config(), ?requests[0])
+        || requests[0].bytes != 128 || requests[1].bytes != 256
+        || requests[2].bytes != 16 * $size_of(field.Field) || requests[3].bytes != 512
+        || requests[4].bytes != 256 || requests[5].bytes != 512
+        || requests[6].bytes != 16 * $size_of(u64)) { ret 2; }
+    ret 0;
 }
 
 # the first record chunk and the index an initialized engine holds
