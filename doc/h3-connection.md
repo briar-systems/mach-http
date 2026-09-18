@@ -267,7 +267,8 @@ after trailers. Unknown extension frames are drained wherever request stream fra
 permits them. Pseudo-fields,
 CONNECT shapes, forbidden connection fields, TE, authority conflicts, content
 length, bodyless responses, and trailer names use the same validation rules as the
-HTTP/2 connection boundary. A received field name must be lowercase. A caller's name
+HTTP/2 connection boundary, through the shared `http.core.section` validator. A
+received field name must be lowercase. A caller's name
 may use any case and is written lowercase by the QPACK encoder.
 
 ## QPACK and receive credit
