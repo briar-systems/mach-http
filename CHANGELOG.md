@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-09-18
+
 ### Changed
 - `http.core.section` holds the field-section validator that the HTTP/2 and HTTP/3 engines used to carry as separate copies, with its own tests for both directions. `h2.connection.HeaderBlock` and `h3.connection.HeaderBlock` are the same type as `section.Block` (#119).
 - The HTTP/2 connection doc no longer says to call `tick` until it returns `EVENT_NONE`, which a failed engine never does. It returns its failure event on every call.
