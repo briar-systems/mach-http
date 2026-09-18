@@ -68,4 +68,4 @@ ref = "tag/v0.12.1"
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v5.3.0"
+ref = "tag/v5.7.0"

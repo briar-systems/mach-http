@@ -123,6 +123,16 @@ records and a 16-entry index. A request set is 217,808 bytes. Records live in
 grows, the index is rebuilt at the new size. The table never shrinks while the
 connection lives.
 
+`request_requests(configured, out)` writes the `REQUEST_BUFFERS` requests a request
+set is acquired with, the same table `acquire_request_memory` reads.
+`request_footprint(source, configured)` measures that table against a source with
+`buffers.source_measure`, so it is the bytes `account.held` grows by when a request
+is admitted on that pool, at the pool's own class sizes. Both return nothing useful
+for a config `init` would refuse, and the footprint is 0 for a source that would
+refuse the set. A host sizing lane budgets or admission limits should use the
+footprint, not the sum of the requests, since a pool with size classes charges each
+chunk its class.
+
 A peer unidirectional stream borrows no buffer. Until its type is known it reads one
 byte at a time into its own record, so no frame byte arrives before the stream is
 classified. A critical stream then reads through its `CriticalMemory`. A stream of an
