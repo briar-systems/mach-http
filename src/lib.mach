@@ -15,6 +15,7 @@ fwd http.core.exchange;
 fwd http.core.transport;
 fwd http.core.records;
 fwd http.core.deadline;
+fwd http.core.section;
 fwd http.h1.framing;
 fwd http.h1.parser;
 fwd http.h1.serializer;

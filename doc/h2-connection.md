@@ -185,8 +185,10 @@ armed with a different duration is still placed correctly. `tick` and
 `next_deadline` returns the earliest deadline `tick` would enforce, with `active`
 false when none applies: an uninitialized engine, or one that is closing or closed.
 A failed engine reports only its write deadline. A host with a timer wheel arms one
-timer at that instant, calls `tick` until it returns `EVENT_NONE`, and queries again
-after every call that takes `now`. The engine scope's own std deadline is the host's
+timer at that instant, calls `tick` until it returns `EVENT_NONE` or a connection
+event, and queries again after every call that takes `now`. A failed engine never
+returns `EVENT_NONE`: every `tick` and `process` repeats its failure event, so a host
+that loops on `EVENT_NONE` alone would never leave it. The engine scope's own std deadline is the host's
 and is not included, but when it fires `tick` fails the connection with
 `ERROR_TOTAL_TIMEOUT`.
 
@@ -287,7 +289,8 @@ No control frame can interleave with an outbound continuation sequence. Incoming
 blocks commit their shared HPACK table before HTTP semantic validation, as required
 to keep compression synchronized even when one stream is reset.
 
-The semantic validator enforces:
+The semantic validator is `http.core.section`, shared with the HTTP/3 engine since
+the two protocols carry the same field-section rules. It enforces:
 
 - required, unique, ordered request and response pseudo-fields
 - ordinary CONNECT and negotiated extended CONNECT shapes
