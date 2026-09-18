@@ -1638,6 +1638,18 @@ fun abort_output(engine: *Engine) {
     submit_close(engine);
 }
 
+# a failed engine drains its goaway only while its scope lives and the peer reads.
+# once either ends the drain is abandoned and the close submitted, so a host that
+# cancels the scope at any point after the failure still reaches CLOSED
+fun settle_failure(engine: *Engine) bool {
+    if (engine.state != FAILED || engine.close_pending) { ret false; }
+    if (scope_active(engine.scope) && !deadline.expired(engine.write_deadline, engine.now)) {
+        ret false;
+    }
+    abort_output(engine);
+    ret true;
+}
+
 fun failure_event(engine: *Engine) Event {
     var result: Event = event(engine, EVENT_ERROR);
     result.code           = engine.h2_error;
@@ -1855,7 +1867,9 @@ pub fun submit_write(engine: *Engine, now: time.Instant) bool {
         engine.transport, engine.scope, ?engine.write_buffer[engine.write_offset],
         engine.write_length - engine.write_offset, engine.write_stream::usize);
     if ((sel submitted.err)) {
-        fail_connection(engine, ERROR_TRANSPORT, H2_INTERNAL_ERROR);
+        # a failed engine's drain that cannot be submitted is abandoned
+        if (engine.state == FAILED) { abort_output(engine); }
+        or                          { fail_connection(engine, ERROR_TRANSPORT, H2_INTERNAL_ERROR); }
         ret false;
     }
     engine.write_token    = submitted.ok;
@@ -2947,6 +2961,10 @@ pub fun complete_io(engine: *Engine, completion: *transport.Completion,
         engine.write_pending  = false;
         engine.write_deadline = deadline.none();
         if (completion.status != transport.IO_COMPLETE || completion.count == 0) {
+            if (engine.state == FAILED) {
+                abort_output(engine);
+                ret failure_event(engine);
+            }
             if (completion.status == transport.IO_CANCELLED) {
                 ret fail_connection(engine, ERROR_CANCELLED, H2_CANCEL);
             }
@@ -3319,8 +3337,7 @@ pub fun tick(engine: *Engine, now: time.Instant) Event {
     if (engine.state == CLOSED)  { ret event(engine, EVENT_CLOSED); }
     if (engine.state == CLOSING) { ret event(engine, EVENT_NONE); }
     if (engine.state == FAILED) {
-        # a drain the peer stopped reading is bounded like any write
-        if (deadline.expired(engine.write_deadline, engine.now)) { abort_output(engine); }
+        settle_failure(engine);
         ret failure_event(engine);
     }
     val reason: cancel.Reason = cancel.reason(engine.scope);
@@ -3414,6 +3431,7 @@ rec TestIO {
     write_calls:  usize;
     close_token:  transport.Token;
     close_calls:  usize;
+    refuse_write: bool;
 }
 
 fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
@@ -3429,6 +3447,9 @@ fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
 fun test_write(context: ptr, token: transport.Token, scope: *cancel.Scope,
     buffer: *u8, length: usize) res[bool, io_error.Error] {
     val io: *TestIO = context::*TestIO;
+    if (io.refuse_write) {
+        ret res[bool, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_WRITE)};
+    }
     io.write_token  = token;
     io.write_buffer = buffer;
     io.write_length = length;
@@ -5492,5 +5513,67 @@ test "http.h2.connection: a received uppercase name is still malformed" {
     val reported: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
         frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 1, ?block[0], 11);
     if (reported.kind != EVENT_STREAM_ERROR || reported.code != H2_PROTOCOL_ERROR) { ret 2; }
+    ret 0;
+}
+
+test "http.h2.connection: a failed engine whose scope ends before the drain still closes" {
+    var fixture: Fixture;
+    var first:   ExchangeMemory;
+    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
+    var block: [6]u8;
+    request_block(?block[0]);
+    fixture.clock = test_now(105);
+    if (receive_frame(?fixture, frame.FRAME_HEADERS, 0, 3, ?block[0], 3).kind != EVENT_NEED_READ
+        || !times_out_at(?fixture, 115, ERROR_HEADER_TIMEOUT)
+        || fixture.engine.control_count != 1 || fixture.engine.active_streams != 2) { ret 2; }
+    # the host stops before the goaway is written, and nothing more is submitted
+    val writes: usize = fixture.io.write_calls;
+    cancel.cancel(?fixture.operation_root);
+    if (submit_write(?fixture.engine, test_now(116)) || fixture.engine.write_length != 0
+        || fixture.engine.control_count != 0 || fixture.io.write_calls != writes
+        || !fixture.engine.close_pending || fixture.engine.state != FAILED) { ret 3; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed, test_now(116)).kind != EVENT_CLOSED
+        || fixture.engine.error != ERROR_HEADER_TIMEOUT
+        || !destroy(?fixture.engine) || fixture.account.held != 0) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.connection: a failed engine whose scope ends is closed by the next tick" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture) || !times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)
+        || fixture.engine.control_count != 1) { ret 1; }
+    cancel.cancel(?fixture.operation_root);
+    if (tick(?fixture.engine, test_now(111)).kind != EVENT_TIMED_OUT
+        || fixture.engine.control_count != 0 || !fixture.engine.close_pending) { ret 2; }
+    if (!closes(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a drain write cancelled by the scope still closes" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture) || !times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)
+        || !submit_write(?fixture.engine, test_now(111))
+        || fixture.io.write_buffer[3] != frame.FRAME_GOAWAY) { ret 1; }
+    cancel.cancel(?fixture.operation_root);
+    var cancelled: transport.Completion = transport.failed(fixture.io.write_token,
+        transport.WRITE, 0, io_error.make(io_error.CANCELLED, io_error.OP_WRITE));
+    val result: Event = complete_io(?fixture.engine, ?cancelled, test_now(112));
+    if (result.kind != EVENT_TIMED_OUT || fixture.engine.error != ERROR_HEADER_TIMEOUT
+        || fixture.engine.write_length != 0 || fixture.engine.control_count != 0
+        || !fixture.engine.close_pending) { ret 2; }
+    if (!closes(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a drain the transport refuses still closes" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture) || !times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)) { ret 1; }
+    fixture.io.refuse_write = true;
+    if (submit_write(?fixture.engine, test_now(111)) || fixture.engine.control_count != 0
+        || fixture.engine.write_length != 0 || !fixture.engine.close_pending
+        || fixture.engine.error != ERROR_HEADER_TIMEOUT) { ret 2; }
+    if (!closes(?fixture)) { ret 3; }
     ret 0;
 }

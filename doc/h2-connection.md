@@ -203,6 +203,11 @@ and is not included, but when it fires `tick` fails the connection with
   admitted stream, and the host drains it as after any failure. Each drain write has
   its own write deadline, and `tick` still enforces it on the failed engine. A drain
   the peer does not read drops the unsent output and closes at once.
+- The drain runs only while the connection scope lives. A host may end the scope at
+  any point after the failure, for example on its own stop path. The next `tick`,
+  `submit_write` or write completion then drops the unsent output and submits the
+  close, so the engine still reaches `CLOSED`. A host that cancels the scope should
+  call `tick` afterwards, since the engine learns of the change no other way.
 - A write timeout, from the write deadline or the connection window, queues nothing.
   A peer that does not take data will not read a GOAWAY either. Pending output is
   dropped and the close is submitted at once. The transport cancels a write still in

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- A failed HTTP/2 engine whose connection scope ends during its GOAWAY drain now closes instead of staying `FAILED` forever with `progress_close` and `destroy` refusing (#123). `tick`, `submit_write` and a cancelled write completion each drop the unsent output and submit the close once the scope is inactive, and a drain write the transport refuses is abandoned the same way. A host that cancels the scope after a failure should call `tick`.
+
 ## [0.13.1] - 2026-09-17
 
 ### Fixed
