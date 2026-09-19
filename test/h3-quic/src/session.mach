@@ -250,6 +250,16 @@ pub fun close_fabric(fabric: *Fabric, abortive: bool, code: u64) bool {
     ret loopback.close_link(?fabric.link, abortive, code, CLOSE_BUDGET);
 }
 
+# close_fabric in two halves, so the engines can step against the closed
+# drivers before their storage goes
+pub fun settle_fabric_close(fabric: *Fabric, abortive: bool, code: u64) bool {
+    ret loopback.settle_link_close(?fabric.link, abortive, code, CLOSE_BUDGET);
+}
+
+pub fun release_fabric(fabric: *Fabric) bool {
+    ret loopback.release_link(?fabric.link);
+}
+
 # both endpoints of the connection settled, with every stream record freed
 pub fun fabric_closed(fabric: *Fabric) bool {
     ret loopback.endpoint_closed(fabric.link.client)
