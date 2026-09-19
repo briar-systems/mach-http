@@ -837,14 +837,16 @@ test "h3quic: an abortive close settles with a request still live on both ends" 
     if (fabric.client_wire.manager.valid
         || fabric.server_wire.manager.valid) { ret 14; }
     # the next step on either engine finds the driver gone: the connection
-    # fails once as a transport failure, the live request's exchange is
+    # fails once as a transport close, the live request's exchange is
     # cancelled, and the engine keeps reporting the failure and destroys
     # without the driver. what the closed driver answers to the engine's own
     # close is the transport's business and is not checked here
     val server_failed: h3.Event = session.poll(?fabric.server);
     val client_failed: h3.Event = session.poll(?fabric.client);
-    if (server_failed.kind != h3.EVENT_ERROR || server_failed.error != h3.ERROR_TRANSPORT
-        || client_failed.kind != h3.EVENT_ERROR || client_failed.error != h3.ERROR_TRANSPORT
+    if (server_failed.kind != h3.EVENT_ERROR || client_failed.kind != h3.EVENT_ERROR
+        || server_failed.error != h3.ERROR_TRANSPORT_CLOSED
+        || client_failed.error != h3.ERROR_TRANSPORT_CLOSED
+        || server_failed.code != h3.H3_NO_ERROR || client_failed.code != h3.H3_NO_ERROR
         || fabric.server.engine.state != h3.FAILED
         || fabric.client.engine.state != h3.FAILED) { ret 15; }
     if (app.exchanges[0].exchange.state != exchange.CANCELLED_STATE
