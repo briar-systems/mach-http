@@ -38,6 +38,15 @@ status combinations, duplicate local stream IDs, and failed cancellation close t
 connection as transport failures. A blocked connection close is retried and is never
 reported complete early.
 
+A transport answer the engine cannot continue on fails the connection once, and the
+failure names the answer. `TRANSPORT_CLOSED` under live work is the connection ending
+beneath the engine, not an HTTP/3 error: the event carries `ERROR_TRANSPORT_CLOSED`
+with code `H3_NO_ERROR`. Any other refusal, and any result that violates this
+contract, is `ERROR_TRANSPORT` with `H3_INTERNAL_ERROR`. In both cases
+`Event.transport_error` holds the `error` value of the result that failed the
+connection (zero for a readiness report or a contract violation), and the engine
+keeps it in `transport_error`, so a host can report the adapter's own reason.
+
 ## Readiness
 
 `Transport.ready` returns the next stream whose transport state changed, as a

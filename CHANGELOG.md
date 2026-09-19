@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+- `h3.connection.Event` and `Engine` carry `transport_error`, the `error` value of the transport result that failed the connection, so a host can report the adapter's own reason (#139).
+
+### Changed
+- An HTTP/3 transport that reports `TRANSPORT_CLOSED` under live work now fails the connection as `ERROR_TRANSPORT_CLOSED` with code `H3_NO_ERROR`, distinct from an adapter fault, which stays `ERROR_TRANSPORT` with `H3_INTERNAL_ERROR`. `Error` gains `ERROR_TRANSPORT_CLOSED` (#139).
+
 ### Fixed
 - A failed HTTP/3 engine reports the same failure on every later `process` and `tick`: `EVENT_ERROR`, or `EVENT_CANCELLED` for a cancellation, carrying the engine's error and HTTP/3 code. Repeat `process` calls used to report code 0 and lose the cancelled kind, and `tick` on a failed engine returned `EVENT_NONE` (#140). `tick` on a closed engine now returns `EVENT_CLOSED` like `process`.
 
