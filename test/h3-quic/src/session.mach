@@ -109,9 +109,11 @@ fun make_buffers(session: *Session) bool {
     config.initial_slots = 16;
     if (!buffers.make(?session.pool, config, ?session.backing)) { ret false; }
     session.source = buffers.source(?session.pool);
-    var budgets: [1]usize       = [1]usize{1 << 22};
-    val opened:  buffers.Reason = buffers.source_open_account(?session.source,
-        ?session.account, 1, ?budgets[0], 0);
+    var budgets: buffers.Budgets;
+    budgets.lanes    = 1;
+    budgets.bytes[0] = 1 << 22;
+    val opened: buffers.Reason = buffers.source_open_account(?session.source,
+        ?session.account, 1, budgets, 0);
     ret sel opened.none;
 }
 
