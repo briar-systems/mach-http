@@ -62,10 +62,10 @@ need = []
 [dep.http]
 path = "../.."
 
-[dep.quic]
-git = "https://github.com/briar-systems/mach-quic"
-ref = "tag/v0.12.1"
-
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
 version = "^6.0"
+
+[dep.quic]
+git = "https://github.com/briar-systems/mach-quic"
+version = "^0.15"
