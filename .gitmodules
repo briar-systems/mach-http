@@ -1,3 +1,15 @@
 [submodule "dep/std"]
 	path = dep/std
 	url = https://github.com/briar-systems/mach-std
+[submodule "test/h3-quic/dep/std"]
+	path = test/h3-quic/dep/std
+	url = https://github.com/briar-systems/mach-std
+[submodule "test/h3-quic/dep/quic"]
+	path = test/h3-quic/dep/quic
+	url = https://github.com/briar-systems/mach-quic
+[submodule "test/h3-quic/dep/crypto"]
+	path = test/h3-quic/dep/crypto
+	url = https://github.com/briar-systems/mach-crypto
+[submodule "test/h3-quic/dep/tls"]
+	path = test/h3-quic/dep/tls
+	url = https://github.com/briar-systems/mach-tls
