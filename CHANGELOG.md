@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-19
+
 ### Changed
 - **Breaking.** Dependencies: mach-std `^6.0` pinned at v6.0.0 (was v5.7.0), and `mach.toml` now requires mach `^5.9`. A consumer must be on std 6.x as well. The only std 6 change that reaches http is `buffers.source_open_account` taking a `buffers.Budgets` value that carries its lane count, which the fixtures and tests now build; http's own public surface is unchanged (#135).
 - The h3-quic subproject qualifies the h3 engine against mach-quic `^0.15` (v0.15.0, on std 6, crypto 0.18 and tls 0.9). Its dependency pins are committed gitlinks under `test/h3-quic/dep`, and CI asks the family workflow for `dit: required` because crypto now reaches the tests through quic (#135).
