@@ -3300,9 +3300,12 @@ fun make_buffers(fixture: *Fixture, classes: *buffers.ClassConfig, class_count: 
     config.initial_slots = 16;
     if (!buffers.make(?fixture.pool, config, ?fixture.backing)) { ret false; }
     fixture.source = buffers.source(?fixture.pool);
-    var budgets: [2]usize       = [2]usize{1 << 25, 1 << 25};
-    val opened:  buffers.Reason = buffers.source_open_account(?fixture.source,
-        ?fixture.account, 1, ?budgets[0], 0);
+    var budgets: buffers.Budgets;
+    budgets.lanes    = 2;
+    budgets.bytes[0] = 1 << 25;
+    budgets.bytes[1] = 1 << 25;
+    val opened: buffers.Reason = buffers.source_open_account(?fixture.source,
+        ?fixture.account, 1, budgets, 0);
     ret sel opened.none;
 }
 

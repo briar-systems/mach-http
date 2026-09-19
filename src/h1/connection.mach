@@ -1504,9 +1504,12 @@ fun make_buffers(fixture: *Fixture, slot_budget: usize, connection_budget: usize
     config.initial_slots = 16;
     if (!buffers.make(?fixture.pool, config, ?fixture.backing)) { ret false; }
     fixture.source = buffers.source(?fixture.pool);
-    var budgets: [2]usize       = [2]usize{slot_budget, connection_budget};
-    val opened:  buffers.Reason = buffers.source_open_account(?fixture.source,
-        ?fixture.account, 1, ?budgets[0], 0);
+    var budgets: buffers.Budgets;
+    budgets.lanes    = 2;
+    budgets.bytes[0] = slot_budget;
+    budgets.bytes[1] = connection_budget;
+    val opened: buffers.Reason = buffers.source_open_account(?fixture.source,
+        ?fixture.account, 1, budgets, 0);
     ret sel opened.none;
 }
 
@@ -2372,10 +2375,13 @@ test "http.h1.connection: an exhausted pool registers the connection for a wake 
     var fixture: Fixture;
     val now:     time.Instant = test_now(100);
     if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
-    var other:        buffers.Account;
-    var budgets:      [2]usize       = [2]usize{1 << 20, 1 << 20};
+    var other:   buffers.Account;
+    var budgets: buffers.Budgets;
+    budgets.lanes    = 2;
+    budgets.bytes[0] = 1 << 20;
+    budgets.bytes[1] = 1 << 20;
     val other_opened: buffers.Reason = buffers.source_open_account(?fixture.source, ?other,
-        2, ?budgets[0], 0);
+        2, budgets, 0);
     if (!(sel other_opened.none)) { ret 2; }
     val parked: buffers.Acquired = buffers.source_acquire(?fixture.source, ?other,
         buffers.Request{bytes: 4096, align: 0, lane: 0, secret: false}, false);

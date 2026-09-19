@@ -23,6 +23,8 @@ jobs:
     uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
     with:
       heavy: ${{ inputs.heavy }}
+      # crypto 0.17+ reaches http through quic in the h3-quic subproject
+      dit: required
       # qualifies http.h3.connection against the real mach-quic driver. quic lives
       # in this subproject so no consumer of http has to build it
       subprojects: '[{"path": "test/h3-quic", "clean-dep": true}]'
