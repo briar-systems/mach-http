@@ -798,19 +798,22 @@ test "h3quic: an abortive close settles with a request still live on both ends" 
     app.release_streams   = false;
     app.withhold_response = true;
     app.hold_body         = true;
+    # the exchange is bound but never served, so it is in flight when the
+    # transport goes
+    app.skip_dispatch = true;
     if (!session.handshake(?fabric, 64)) { ret 2; }
     if (start_request(?app, true) != 0)  { ret 3; }
     cycle(?app, 16);
-    if (session.count_of(?fabric.server, h3.EVENT_REQUEST_HEADERS) != 1) { ret 4; }
+    if (session.count_of(?fabric.server, h3.EVENT_REQUEST_HEADERS) != 1
+        || app.exchanges[0].exchange.state != exchange.NEW) { ret 4; }
     # six critical streams plus the request neither side has finished, which the
     # engines still hold: an abortive close does not wait for them
     if (fabric.client_wire.manager.active_streams != 7
         || fabric.server_wire.manager.active_streams != 7) { ret 5; }
     if (fabric.client.engine.active_requests != 1
         || fabric.server.engine.active_requests != 1) { ret 6; }
-    if (!session.close_fabric(?fabric, true, h3.H3_REQUEST_CANCELLED)) { ret 7; }
-    if (!session.fabric_closed(?fabric))                               { ret 8; }
-    if (fabric.link.close_rounds != 1)                                 { ret 9; }
+    if (!session.settle_fabric_close(?fabric, true, h3.H3_REQUEST_CANCELLED)) { ret 7; }
+    if (fabric.link.close_rounds != 1)                                        { ret 9; }
     if (!fabric.client_wire.core.abortive
         || !fabric.server_wire.core.abortive) { ret 10; }
     # the driver publishes no abortive entry, so the harness escalates a
@@ -833,5 +836,28 @@ test "h3quic: an abortive close settles with a request still live on both ends" 
         || fabric.server.engine.state != h3.OPEN) { ret 13; }
     if (fabric.client_wire.manager.valid
         || fabric.server_wire.manager.valid) { ret 14; }
+    # the next step on either engine finds the driver gone: the connection
+    # fails once as a transport failure, the live request's exchange is
+    # cancelled, and the engine keeps reporting the failure and destroys
+    # without the driver. what the closed driver answers to the engine's own
+    # close is the transport's business and is not checked here
+    val server_failed: h3.Event = session.poll(?fabric.server);
+    val client_failed: h3.Event = session.poll(?fabric.client);
+    if (server_failed.kind != h3.EVENT_ERROR || server_failed.error != h3.ERROR_TRANSPORT
+        || client_failed.kind != h3.EVENT_ERROR || client_failed.error != h3.ERROR_TRANSPORT
+        || fabric.server.engine.state != h3.FAILED
+        || fabric.client.engine.state != h3.FAILED) { ret 15; }
+    if (app.exchanges[0].exchange.state != exchange.CANCELLED_STATE
+        || fabric.server.engine.active_requests != 0
+        || fabric.client.engine.active_requests != 0) { ret 16; }
+    if (session.poll(?fabric.server).kind != h3.EVENT_ERROR
+        || session.poll(?fabric.client).kind != h3.EVENT_ERROR
+        || fabric.server.io.close_calls != 1
+        || fabric.client.io.close_calls != 1) { ret 17; }
+    if (!h3.destroy[adapter.Adapter](?fabric.server.engine)
+        || !h3.destroy[adapter.Adapter](?fabric.client.engine)
+        || !session.session_clean(?fabric.server)
+        || !session.session_clean(?fabric.client)) { ret 18; }
+    if (!session.release_fabric(?fabric) || !session.fabric_closed(?fabric)) { ret 19; }
     ret 0;
 }

@@ -644,6 +644,13 @@ pub fun finish_close_endpoint(endpoint: *Endpoint) bool {
 # the two ends settle independently, so each is retried until it reports closed
 # and the link is pumped between rounds to settle whatever a driver still owes.
 pub fun close_link(link: *Link, abortive: bool, code: u64, budget: usize) bool {
+    ret settle_link_close(link, abortive, code, budget) && release_link(link);
+}
+
+# the driver half of close_link: both drivers report closed, but their scopes
+# and accounts stay live, so an engine above can still step against the closed
+# drivers exactly as a host's engine does after its transport goes
+pub fun settle_link_close(link: *Link, abortive: bool, code: u64, budget: usize) bool {
     link.now_ns = link.now_ns + 1;
     if (!begin_close_endpoint(link.client, abortive, code, link.now_ns)
         || !begin_close_endpoint(link.server, abortive, code, link.now_ns)) {
@@ -666,6 +673,12 @@ pub fun close_link(link: *Link, abortive: bool, code: u64, budget: usize) bool {
         i = i + 1;
     }
     if (!client_closed || !server_closed) { ret false; }
+    ret true;
+}
+
+# the storage half of close_link: releases the operation scopes and accounts
+# of two drivers that already settled their close
+pub fun release_link(link: *Link) bool {
     ret operation_ok(cancel.destroy(?link.client.scope)) && operation_ok(cancel.destroy(?link.server.scope))
         && close_account(link.client) && close_account(link.server);
 }

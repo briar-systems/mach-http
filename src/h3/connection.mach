@@ -3273,6 +3273,18 @@ rec TestTransport {
     signal_head:    usize;
     signal_count:   usize;
     signal_dropped: bool;
+    gone_hook:      u8;
+    gone_status:    TransportStatus;
+    gone_error:     u64;
+}
+
+# the connection is gone: the named hook reports gone_status from now on
+val GONE_READY: u8 = 1;
+val GONE_READ:  u8 = 2;
+val GONE_WRITE: u8 = 3;
+
+fun test_gone(io: *TestTransport, hook: u8) bool {
+    ret io.gone_hook == hook;
 }
 
 fun test_call(io: *TestTransport) {
@@ -3297,6 +3309,10 @@ fun test_signal(io: *TestTransport, value: StreamHandle, readable: bool,
 fun test_ready(context: *TestTransport) TransportReady {
     val io: *TestTransport = context;
     test_call(io);
+    if (test_gone(io, GONE_READY)) {
+        ret TransportReady{status: io.gone_status, handle: no_handle(),
+            readable: false, writable: false, reset: false};
+    }
     if (io.signal_count == 0) {
         ret TransportReady{status: TRANSPORT_EMPTY, handle: no_handle(),
             readable: false, writable: false, reset: false};
@@ -3415,6 +3431,10 @@ fun test_read(context: *TestTransport, value: StreamHandle,
     val wire: *TestWire      = test_wire(io, value);
     test_call(io);
     io.reads = io.reads + 1;
+    if (test_gone(io, GONE_READ)) {
+        ret TransportRead{status: io.gone_status, count: 0, final_size: 0,
+            application_error: 0, fin: false, error: io.gone_error};
+    }
     if (wire == nil || (output == nil && capacity != 0)) {
         ret TransportRead{status: TRANSPORT_ERROR, count: 0, final_size: 0,
             application_error: 0, fin: false, error: 1};
@@ -3460,6 +3480,11 @@ fun test_write(context: *TestTransport, value: StreamHandle,
     val io:   *TestTransport = context;
     val wire: *TestWire      = test_wire(io, value);
     test_call(io);
+    if (test_gone(io, GONE_WRITE)) {
+        ret TransportWrite{status: io.gone_status, count: 0,
+            connection_blocked: false, stream_blocked: false,
+            storage_blocked:    false, error: io.gone_error};
+    }
     if (wire == nil || (input == nil && length != 0)
         || wire.output_length > wire.output_capacity
         || length > wire.output_capacity - wire.output_length) {
@@ -3680,6 +3705,9 @@ fun reset_io(fixture: *Fixture, role: Role) {
     fixture.io.signal_head    = 0;
     fixture.io.signal_count   = 0;
     fixture.io.signal_dropped = false;
+    fixture.io.gone_hook      = 0;
+    fixture.io.gone_status    = TRANSPORT_OK;
+    fixture.io.gone_error     = 0;
     var i: usize = 0;
     for (i < FIXTURE_WIRES) {
         fixture.wires[i].live              = false;
@@ -5407,6 +5435,78 @@ test "http.h3.connection: a closed connection destroys with releases the transpo
     if (!destroy[TestTransport](?fixture.engine)) { ret 5; }
     if (fixture.account.held != 0)                { ret 6; }
     if (fixture.account.chunks != 0)              { ret 7; }
+    ret 0;
+}
+
+# a served request is open, then the named transport hook reports the connection
+# gone with the given status. returns the first failing check, 0 when the
+# engine fails once, cancels the request, closes once, and tears down cleanly.
+fun gone_under_request(hook: u8, gone: TransportStatus, gone_error: u64) u8 {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var storage: ExchangeMemory;
+    val wire:    *TestWire = taken_request(?fixture, ?storage);
+    if (wire == nil) { ret 2; }
+    if (hook == GONE_READ) {
+        var payload: [4]u8;
+        var data:    [8]u8;
+        val length:  usize = append_frame(?data[0], 8, frame.FRAME_DATA, ?payload[0], 4);
+        if (length == 0) { ret 3; }
+        wire_feed(?fixture.io, wire, ?data[0], length, false);
+    }
+    if (hook == GONE_READY) {
+        test_signal(?fixture.io, wire.handle, true, false, false);
+    }
+    fixture.io.gone_hook   = hook;
+    fixture.io.gone_status = gone;
+    fixture.io.gone_error  = gone_error;
+    if (hook == GONE_WRITE) {
+        var response: [1]field.Field;
+        response[0] = field.Field{name: view.view(":status", 7),
+            value: view.view("204", 3), sensitive: false};
+        if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 1, true,
+            false).status != OFFER_OUTPUT) { ret 4; }
+    }
+    val failed: Event = drive(?fixture, EVENT_ERROR, 64);
+    if (failed.kind != EVENT_ERROR || failed.error != ERROR_TRANSPORT
+        || failed.code != H3_INTERNAL_ERROR || failed.stream_id != NO_STREAM
+        || fixture.engine.state != FAILED) { ret 5; }
+    # the request was cancelled, its stream closed, and its halves cancelled on the wire
+    val stream: *Stream = stream_for[TestTransport](?fixture.engine, 0);
+    if (stream == nil || stream.state != STREAM_CLOSED
+        || stream.reset_code != H3_INTERNAL_ERROR
+        || !wire.send_cancelled || !wire.receive_cancelled
+        || storage.exchange.state != exchange.CANCELLED_STATE
+        || fixture.engine.active_requests != 0) { ret 6; }
+    # the connection closed exactly once with the failure code
+    if (fixture.io.close_calls != 1 || fixture.io.close_code != H3_INTERNAL_ERROR
+        || !fixture.engine.close_started) { ret 7; }
+    # later calls keep reporting the failure without closing again. the repeat
+    # event's code and tick's report are #140
+    val again: Event = process[TestTransport](?fixture.engine);
+    if (again.kind != EVENT_ERROR || again.error != ERROR_TRANSPORT
+        || tick[TestTransport](?fixture.engine).kind == EVENT_STREAM_RESET
+        || fixture.io.close_calls != 1) { ret 8; }
+    if (!progress_close[TestTransport](?fixture.engine)
+        || fixture.engine.state != CLOSED) { ret 9; }
+    if (!destroy[TestTransport](?fixture.engine) || fixture.account.held != 0) { ret 10; }
+    ret 0;
+}
+
+test "http.h3.connection: a transport closed or failed under a live request fails once and tears down" {
+    var code: u8 = gone_under_request(GONE_READ, TRANSPORT_CLOSED, 0);
+    if (code != 0) { ret (16 + code)::i32; }
+    code = gone_under_request(GONE_READ, TRANSPORT_ERROR, 7);
+    if (code != 0) { ret (32 + code)::i32; }
+    code = gone_under_request(GONE_WRITE, TRANSPORT_CLOSED, 0);
+    if (code != 0) { ret (48 + code)::i32; }
+    code = gone_under_request(GONE_WRITE, TRANSPORT_ERROR, 7);
+    if (code != 0) { ret (64 + code)::i32; }
+    code = gone_under_request(GONE_READY, TRANSPORT_CLOSED, 0);
+    if (code != 0) { ret (80 + code)::i32; }
+    code = gone_under_request(GONE_READY, TRANSPORT_ERROR, 7);
+    if (code != 0) { ret (96 + code)::i32; }
     ret 0;
 }
 
