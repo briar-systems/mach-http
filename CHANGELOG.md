@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- A failed HTTP/3 engine reports the same failure on every later `process` and `tick`: `EVENT_ERROR`, or `EVENT_CANCELLED` for a cancellation, carrying the engine's error and HTTP/3 code. Repeat `process` calls used to report code 0 and lose the cancelled kind, and `tick` on a failed engine returned `EVENT_NONE` (#140). `tick` on a closed engine now returns `EVENT_CLOSED` like `process`.
+
 ## [0.15.0] - 2026-09-19
 
 ### Changed

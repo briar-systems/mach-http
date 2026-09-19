@@ -319,4 +319,7 @@ while the local response side remains open.
 
 Connection cancellation and protocol failure cancel every bound exchange, reset
 live request streams, map the exact HTTP/3 or QPACK application error to QUIC, and
-close once.
+close once. The failure is reported the same way on every later `process` and
+`tick`: `EVENT_ERROR` (or `EVENT_CANCELLED` for a cancellation) carrying the
+engine's error and its HTTP/3 code, so a host may read the reason from whichever
+event it holds.

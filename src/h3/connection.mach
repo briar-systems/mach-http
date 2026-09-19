@@ -1598,9 +1598,14 @@ fun fail_connection[T](engine: *Engine[T], error: Error, code: u64) Event {
                 || closed.status == TRANSPORT_CLOSED;
         }
     }
+    ret failure_event[T](engine);
+}
+
+# the failure as the engine reports it on every call after it
+fun failure_event[T](engine: *Engine[T]) Event {
     var result: Event = base_event[T](engine, EVENT_ERROR);
-    result.code = code;
-    if (error == ERROR_CANCELLED) { result.kind = EVENT_CANCELLED; }
+    result.code = engine.h3_error;
+    if (engine.error == ERROR_CANCELLED) { result.kind = EVENT_CANCELLED; }
     ret result;
 }
 
@@ -2954,7 +2959,7 @@ pub fun process[T](engine: *Engine[T]) Event {
         ret invalid_event();
     }
     if (engine.state == CLOSED) { ret base_event[T](engine, EVENT_CLOSED); }
-    if (engine.state == FAILED) { ret base_event[T](engine, EVENT_ERROR); }
+    if (engine.state == FAILED) { ret failure_event[T](engine); }
     if (!scope_active(engine.scope)) {
         ret fail_connection[T](engine, ERROR_CANCELLED, H3_REQUEST_CANCELLED);
     }
@@ -3096,6 +3101,8 @@ pub fun tick[T](engine: *Engine[T]) Event {
     if (engine == nil || !engine.initialized) {
         ret invalid_event();
     }
+    if (engine.state == CLOSED) { ret base_event[T](engine, EVENT_CLOSED); }
+    if (engine.state == FAILED) { ret failure_event[T](engine); }
     if (!scope_active(engine.scope)) {
         ret fail_connection[T](engine, ERROR_CANCELLED, H3_REQUEST_CANCELLED);
     }
@@ -5482,11 +5489,13 @@ fun gone_under_request(hook: u8, gone: TransportStatus, gone_error: u64) u8 {
     # the connection closed exactly once with the failure code
     if (fixture.io.close_calls != 1 || fixture.io.close_code != H3_INTERNAL_ERROR
         || !fixture.engine.close_started) { ret 7; }
-    # later calls keep reporting the failure without closing again. the repeat
-    # event's code and tick's report are #140
-    val again: Event = process[TestTransport](?fixture.engine);
+    # later calls keep reporting the failure without closing again
+    val again:  Event = process[TestTransport](?fixture.engine);
+    val ticked: Event = tick[TestTransport](?fixture.engine);
     if (again.kind != EVENT_ERROR || again.error != ERROR_TRANSPORT
-        || tick[TestTransport](?fixture.engine).kind == EVENT_STREAM_RESET
+        || again.code != H3_INTERNAL_ERROR
+        || ticked.kind != EVENT_ERROR || ticked.error != ERROR_TRANSPORT
+        || ticked.code != H3_INTERNAL_ERROR
         || fixture.io.close_calls != 1) { ret 8; }
     if (!progress_close[TestTransport](?fixture.engine)
         || fixture.engine.state != CLOSED) { ret 9; }
@@ -5507,6 +5516,41 @@ test "http.h3.connection: a transport closed or failed under a live request fail
     if (code != 0) { ret (80 + code)::i32; }
     code = gone_under_request(GONE_READY, TRANSPORT_ERROR, 7);
     if (code != 0) { ret (96 + code)::i32; }
+    ret 0;
+}
+
+test "http.h3.connection: a failed engine reports the same failure on every later call" {
+    var cancelled: Fixture;
+    if (!make_fixture(?cancelled, SERVER, test_config())
+        || server_handshake(?cancelled).kind != EVENT_SETTINGS) { ret 1; }
+    if (!transition_ok(cancel.cancel(?cancelled.scope))) { ret 2; }
+    val first: Event = process[TestTransport](?cancelled.engine);
+    if (first.kind != EVENT_CANCELLED || first.error != ERROR_CANCELLED
+        || first.code != H3_REQUEST_CANCELLED) { ret 3; }
+    val again:  Event = process[TestTransport](?cancelled.engine);
+    val ticked: Event = tick[TestTransport](?cancelled.engine);
+    if (again.kind != EVENT_CANCELLED || again.error != ERROR_CANCELLED
+        || again.code != H3_REQUEST_CANCELLED
+        || ticked.kind != EVENT_CANCELLED || ticked.error != ERROR_CANCELLED
+        || ticked.code != H3_REQUEST_CANCELLED) { ret 4; }
+    var failed: Fixture;
+    if (!make_fixture(?failed, SERVER, test_config())
+        || server_handshake(?failed).kind != EVENT_SETTINGS) { ret 5; }
+    # a second control stream closes the connection as a critical-stream error
+    var control: [1]u8;
+    control[0] = frame.STREAM_CONTROL::u8;
+    if (peer_stream(?failed, 6, ?control[0], 1, false) == nil) { ret 6; }
+    val error: Event = drive(?failed, EVENT_ERROR, 64);
+    if (error.kind != EVENT_ERROR || error.code != H3_STREAM_CREATION_ERROR
+        || failed.engine.state != FAILED) { ret 7; }
+    val repeat: Event = process[TestTransport](?failed.engine);
+    val retick: Event = tick[TestTransport](?failed.engine);
+    if (repeat.kind != EVENT_ERROR || repeat.error != error.error
+        || repeat.code != H3_STREAM_CREATION_ERROR
+        || retick.kind != EVENT_ERROR || retick.error != error.error
+        || retick.code != H3_STREAM_CREATION_ERROR) { ret 8; }
+    if (!progress_close[TestTransport](?failed.engine)
+        || tick[TestTransport](?failed.engine).kind != EVENT_CLOSED) { ret 9; }
     ret 0;
 }
 
