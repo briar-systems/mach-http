@@ -63,7 +63,12 @@ Call `submit`, then call `next` until it publishes an external action or complet
   `exchange_failed`, returning the exact published lease value. Stale lease,
   connection, driver, and wire evidence is rejected without consuming the live
   exchange. Protocol reasons such as refused-stream and GOAWAY are accepted only
-  for HTTP/2 and HTTP/3. A complete retryable HTTP response enters through
+  for HTTP/2 and HTTP/3. A host that drove the exchange through an HTTP/2 or
+  HTTP/3 engine derives the failure from the engine's closure with
+  `policy.failure_from_closure` instead of choosing a reason: a peer refusal
+  (`REFUSED_STREAM`, `H3_REQUEST_REJECTED`) or an HTTP/3 GOAWAY rejection is
+  definitely unprocessed, every other engine close is an ambiguous
+  `RETRY_TRANSPORT`, and a closure the caller made is not a failure at all. A complete retryable HTTP response enters through
   `exchange_response_retry`, which either schedules replay or preserves that exact
   response as the final successful HTTP outcome when policy denies or exhausts the
   retry. Every callback that consumes the exchange requires the transferred request

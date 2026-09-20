@@ -332,3 +332,20 @@ close once. The failure is reported the same way on every later `process` and
 `tick`: `EVENT_ERROR` (or `EVENT_CANCELLED` for a cancellation) carrying the
 engine's error and its HTTP/3 code, so a host may read the reason from whichever
 event it holds.
+
+## Exchange closure
+
+Every exchange the engine closes records why on `Completion.closure`
+(`http.core.exchange.Closure`), so the holder of the exchange learns its fate
+without walking its own table against `EVENT_ERROR`. `code` is the HTTP/3
+application error that went on the wire or came from it. Whoever ends the scope
+owns the cause: an exchange whose scope the caller ended first keeps
+`CAUSE_CALLER` however the engine later closes its stream.
+
+| Path | Cause | `code` |
+| --- | --- | --- |
+| connection failure, other than below | `CAUSE_CONNECTION` | the connection close code |
+| `ERROR_TRANSPORT` or `ERROR_TRANSPORT_CLOSED` | `CAUSE_TRANSPORT` | the close code, `detail` the transport error |
+| connection scope cancelled (`ERROR_CANCELLED`) | `CAUSE_CALLER` | `H3_REQUEST_CANCELLED` |
+| peer reset or stop-sending | `CAUSE_PEER_RESET` | the peer's application error |
+| stream error, GOAWAY rejection | `CAUSE_LOCAL_RESET` | the reset code (`H3_REQUEST_REJECTED` for a rejection) |
