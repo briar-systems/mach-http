@@ -1,6 +1,7 @@
 # client origin, protocol, redirect, and retry policy
 
 use http.client.memory;
+use http.core.exchange;
 use http.core.message;
 use http.core.method;
 use http.core.status;
@@ -522,6 +523,35 @@ fun policy_allows(configured: RetryPolicy, reason: RetryReason) bool {
     ret true;
 }
 
+val H2_REFUSED_STREAM:   u64 = 7;
+val H3_REQUEST_REJECTED: u64 = 0x10b;
+
+# the failure an engine's exchange closure amounts to. a peer that refused the
+# stream, or a goaway that rejected it, never processed the request; every other
+# engine close leaves processing ambiguous and retries only an unprocessed replay.
+# a closure the caller made (CAUSE_CALLER, CAUSE_NONE) is not a failure and fails
+# failure_valid
+pub fun failure_from_closure(closure: exchange.Closure, wire: message.Wire,
+    response_started: bool, response_complete: bool) Failure {
+    var result: Failure = Failure{reason: 0, definitely_unprocessed: false,
+        response_started: response_started, response_complete: response_complete,
+        retry_after_ns:   0};
+    if (closure.cause == exchange.CAUSE_NONE || closure.cause == exchange.CAUSE_CALLER) { ret result; }
+    result.reason = RETRY_TRANSPORT;
+    if (closure.cause == exchange.CAUSE_PEER_RESET
+        && ((wire == message.WIRE_H2 && closure.code == H2_REFUSED_STREAM)
+        || (wire == message.WIRE_H3 && closure.code == H3_REQUEST_REJECTED))) {
+        result.reason                 = RETRY_REFUSED_STREAM;
+        result.definitely_unprocessed = true;
+    }
+    or (closure.cause == exchange.CAUSE_LOCAL_RESET && wire == message.WIRE_H3
+        && closure.code == H3_REQUEST_REJECTED) {
+        result.reason                 = RETRY_GOAWAY;
+        result.definitely_unprocessed = true;
+    }
+    ret result;
+}
+
 pub fun retry(configured: RetryPolicy, replay: Replay, failure: Failure,
     attempts: usize) RetryDecision {
     if (configured.max_attempts == 0 || !replay_valid(replay)
@@ -629,5 +659,36 @@ test "http.client.policy: retries require explicit and unambiguous replay safety
         definitely_unprocessed: false, response_started: true,
         response_complete:      false, retry_after_ns: 0}, 1).status
         != RETRY_INVALID) { ret 1; }
+    ret 0;
+}
+
+test "http.client.policy: failure_from_closure maps engine closures to retry reasons" {
+    val refused_h2: Failure = failure_from_closure(
+        exchange.closure(exchange.CAUSE_PEER_RESET, H2_REFUSED_STREAM, 0), message.WIRE_H2, false, false);
+    val refused_h3: Failure = failure_from_closure(
+        exchange.closure(exchange.CAUSE_PEER_RESET, H3_REQUEST_REJECTED, 0), message.WIRE_H3, false, false);
+    val goaway_h3: Failure = failure_from_closure(
+        exchange.closure(exchange.CAUSE_LOCAL_RESET, H3_REQUEST_REJECTED, 0), message.WIRE_H3, false, false);
+    val transport: Failure = failure_from_closure(
+        exchange.closure(exchange.CAUSE_TRANSPORT, 0x100, 7), message.WIRE_H3, true, false);
+    val connection: Failure = failure_from_closure(
+        exchange.closure(exchange.CAUSE_CONNECTION, 1, 0), message.WIRE_H2, false, false);
+    val timeout: Failure = failure_from_closure(
+        exchange.closure(exchange.CAUSE_TIMEOUT, 8, 0), message.WIRE_H2, false, false);
+    val cancel_peer_h2: Failure = failure_from_closure(
+        exchange.closure(exchange.CAUSE_PEER_RESET, 8, 0), message.WIRE_H2, false, false);
+    val caller: Failure = failure_from_closure(
+        exchange.closure(exchange.CAUSE_CALLER, 0, 0), message.WIRE_H2, false, false);
+    val none: Failure = failure_from_closure(exchange.no_closure(), message.WIRE_H1, false, false);
+    if (refused_h2.reason != RETRY_REFUSED_STREAM || !refused_h2.definitely_unprocessed
+        || refused_h3.reason != RETRY_REFUSED_STREAM || !refused_h3.definitely_unprocessed
+        || goaway_h3.reason != RETRY_GOAWAY || !goaway_h3.definitely_unprocessed
+        || transport.reason != RETRY_TRANSPORT || transport.definitely_unprocessed
+        || !transport.response_started
+        || connection.reason != RETRY_TRANSPORT || connection.definitely_unprocessed
+        || timeout.reason != RETRY_TRANSPORT || timeout.definitely_unprocessed
+        || cancel_peer_h2.reason != RETRY_TRANSPORT || cancel_peer_h2.definitely_unprocessed
+        || failure_valid(caller) || failure_valid(none)
+        || !failure_valid(refused_h2) || !failure_valid(transport)) { ret 1; }
     ret 0;
 }

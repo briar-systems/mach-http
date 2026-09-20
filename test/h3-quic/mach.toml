@@ -68,4 +68,4 @@ version = "^6.0"
 
 [dep.quic]
 git = "https://github.com/briar-systems/mach-quic"
-version = "^0.15"
+version = "^0.16"

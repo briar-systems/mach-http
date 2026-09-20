@@ -1,6 +1,18 @@
 # Changelog
 
-## [Unreleased]
+## [0.16.0] - 2026-09-19
+
+### Added
+- `core.exchange.Completion` and `Exchange` carry a `closure` (`Closure{cause, code, detail}`) recording why the engine closed the exchange: `CAUSE_CONNECTION`, `CAUSE_TRANSPORT` (with the transport error in `detail`), `CAUSE_PEER_RESET`, `CAUSE_LOCAL_RESET`, `CAUSE_TIMEOUT`, or `CAUSE_CALLER` when the exchange's own scope ended first. `code` is the wire's error code. Engines close exchanges through the new `close_exchange(exchange, closure)`; `cancel_exchange` and `timeout_exchange` remain as caller-cause wrappers. The HTTP/2 and HTTP/3 engines fill it on every path that closes a bound exchange, so a host no longer walks its own table against `EVENT_ERROR` to learn which requests a connection failure took (#141).
+- `client.policy.failure_from_closure` derives the `Failure` an engine's closure amounts to: a peer refusal (`REFUSED_STREAM`, `H3_REQUEST_REJECTED`) or an HTTP/3 GOAWAY rejection is a definitely unprocessed `RETRY_REFUSED_STREAM` or `RETRY_GOAWAY`, any other engine close is an ambiguous `RETRY_TRANSPORT`, and a caller-made closure is not a failure (#141).
+- `h3.connection.Event` and `Engine` carry `transport_error`, the `error` value of the transport result that failed the connection, so a host can report the adapter's own reason (#139).
+
+### Changed
+- The h3-quic subproject qualifies the h3 engine against mach-quic `^0.16` (v0.16.0, on std 6.1.0), whose `begin_close` on an already-closed driver answers closed instead of a buffer error. The abortive-close case now asserts the engine's own close is satisfied by the settled driver: `close_started` on both engines, `progress_close` reaches `CLOSED` with no second transport call (#145).
+- An HTTP/3 transport that reports `TRANSPORT_CLOSED` under live work now fails the connection as `ERROR_TRANSPORT_CLOSED` with code `H3_NO_ERROR`, distinct from an adapter fault, which stays `ERROR_TRANSPORT` with `H3_INTERNAL_ERROR`. `Error` gains `ERROR_TRANSPORT_CLOSED` (#139).
+
+### Fixed
+- A failed HTTP/3 engine reports the same failure on every later `process` and `tick`: `EVENT_ERROR`, or `EVENT_CANCELLED` for a cancellation, carrying the engine's error and HTTP/3 code. Repeat `process` calls used to report code 0 and lose the cancelled kind, and `tick` on a failed engine returned `EVENT_NONE` (#140). `tick` on a closed engine now returns `EVENT_CLOSED` like `process`.
 
 ## [0.15.0] - 2026-09-19
 

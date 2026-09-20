@@ -31,6 +31,7 @@ pub def State:         u8;
 pub def FinishStatus:  u8;
 pub def Outcome:       u8;
 pub def ServiceStatus: u8;
+pub def Cause:         u8;
 
 pub val NEW:             State = 1;
 pub val HANDLING:        State = 2;
@@ -55,6 +56,22 @@ pub val SERVICE_COMPLETE: ServiceStatus = 1;
 pub val SERVICE_PENDING:  ServiceStatus = 2;
 pub val SERVICE_FAILED:   ServiceStatus = 3;
 
+# why the engine closed the exchange; CAUSE_CALLER when its own scope ended first
+pub val CAUSE_NONE:        Cause = 0;
+pub val CAUSE_CALLER:      Cause = 1;
+pub val CAUSE_CONNECTION:  Cause = 2;
+pub val CAUSE_TRANSPORT:   Cause = 3;
+pub val CAUSE_PEER_RESET:  Cause = 4;
+pub val CAUSE_LOCAL_RESET: Cause = 5;
+pub val CAUSE_TIMEOUT:     Cause = 6;
+
+# code is in the wire's code space, detail is the transport error for CAUSE_TRANSPORT
+pub rec Closure {
+    cause:  Cause;
+    code:   u64;
+    detail: u64;
+}
+
 pub rec Completion {
     outcome:   Outcome;
     status:    status.Status;
@@ -62,6 +79,15 @@ pub rec Completion {
     bytes_in:  u64;
     bytes_out: u64;
     error:     str;
+    closure:   Closure;
+}
+
+pub fun no_closure() Closure {
+    ret Closure{cause: CAUSE_NONE, code: 0, detail: 0};
+}
+
+pub fun closure(cause: Cause, code: u64, detail: u64) Closure {
+    ret Closure{cause: cause, code: code, detail: detail};
 }
 
 # exchanges own no connection or protocol engine and borrow one cancellation scope
@@ -74,6 +100,7 @@ pub rec Exchange {
     generation:     u64;
     state:          State;
     completion:     Completion;
+    closure:        Closure;
     valid:          bool;
 }
 
@@ -110,8 +137,10 @@ pub fun init(exchange: *Exchange, request: *message.Request, response: *message.
         bytes_in:  0,
         bytes_out: 0,
         error:     nil,
+        closure:   no_closure(),
     };
-    exchange.valid = exchange.informationals.valid && request.generation == generation
+    exchange.closure = no_closure();
+    exchange.valid   = exchange.informationals.valid && request.generation == generation
         && response.generation == generation && message.validate_request(request, configured)
         && scope_active(scope) && deadline_matches(request, scope)
         && (request.body.scope == nil || request.body.scope == scope);
@@ -203,6 +232,7 @@ pub fun finish(exchange: *Exchange) FinishStatus {
             bytes_in:  exchange.request.body.transferred,
             bytes_out: 0,
             error:     "field collection changed outside its configured bounds",
+            closure:   exchange.closure,
         };
         if (exchange.response.body_kind == message.BODY_READER) {
             exchange.completion.bytes_out = exchange.response.body_reader.transferred;
@@ -227,6 +257,7 @@ pub fun finish(exchange: *Exchange) FinishStatus {
         bytes_in:  exchange.request.body.transferred,
         bytes_out: response_result.count,
         error:     outcome_error(request_progress, response_result),
+        closure:   exchange.closure,
     };
     if (exchange.response.body_kind == message.BODY_READER) {
         exchange.completion.bytes_out = exchange.response.body_reader.transferred;
@@ -258,6 +289,7 @@ pub fun settle_cancellation(exchange: *Exchange) FinishStatus {
     if (exchange == nil || !exchange.valid) { ret FINISH_INVALID; }
     val reason: cancel.Reason = cancel.reason(exchange.scope);
     if (!(sel reason.cancelled) && !(sel reason.timed_out)) { ret FINISH_INVALID; }
+    if (exchange.closure.cause == CAUSE_NONE)               { exchange.closure = closure(CAUSE_CALLER, 0, 0); }
     val timed_out:        bool = (sel reason.timed_out);
     var request_progress: body.Progress;
     if (timed_out) { request_progress = body.timeout_reader(exchange.request.body); }
@@ -274,18 +306,24 @@ pub fun settle_cancellation(exchange: *Exchange) FinishStatus {
     ret finish(exchange);
 }
 
-pub fun cancel_exchange(exchange: *Exchange) FinishStatus {
+# whoever ends the scope owns the cause: a closure recorded here sticks only if the scope was still active
+pub fun close_exchange(exchange: *Exchange, why: Closure) FinishStatus {
     if (exchange == nil || !exchange.valid) { ret FINISH_INVALID; }
     val reason: cancel.Reason = cancel.reason(exchange.scope);
-    if ((sel reason.active)) { transition_ok(cancel.cancel(exchange.scope)); }
+    if ((sel reason.active)) {
+        exchange.closure = why;
+        if (why.cause == CAUSE_TIMEOUT) { transition_ok(cancel.timeout(exchange.scope)); }
+        or                              { transition_ok(cancel.cancel(exchange.scope)); }
+    }
     ret settle_cancellation(exchange);
 }
 
+pub fun cancel_exchange(exchange: *Exchange) FinishStatus {
+    ret close_exchange(exchange, closure(CAUSE_CALLER, 0, 0));
+}
+
 pub fun timeout_exchange(exchange: *Exchange) FinishStatus {
-    if (exchange == nil || !exchange.valid) { ret FINISH_INVALID; }
-    val reason: cancel.Reason = cancel.reason(exchange.scope);
-    if ((sel reason.active)) { transition_ok(cancel.timeout(exchange.scope)); }
-    ret settle_cancellation(exchange);
+    ret close_exchange(exchange, closure(CAUSE_TIMEOUT, 0, 0));
 }
 
 pub fun reusable(exchange: *Exchange) bool {

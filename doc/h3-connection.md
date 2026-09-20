@@ -38,6 +38,15 @@ status combinations, duplicate local stream IDs, and failed cancellation close t
 connection as transport failures. A blocked connection close is retried and is never
 reported complete early.
 
+A transport answer the engine cannot continue on fails the connection once, and the
+failure names the answer. `TRANSPORT_CLOSED` under live work is the connection ending
+beneath the engine, not an HTTP/3 error: the event carries `ERROR_TRANSPORT_CLOSED`
+with code `H3_NO_ERROR`. Any other refusal, and any result that violates this
+contract, is `ERROR_TRANSPORT` with `H3_INTERNAL_ERROR`. In both cases
+`Event.transport_error` holds the `error` value of the result that failed the
+connection (zero for a readiness report or a contract violation), and the engine
+keeps it in `transport_error`, so a host can report the adapter's own reason.
+
 ## Readiness
 
 `Transport.ready` returns the next stream whose transport state changed, as a
@@ -319,4 +328,24 @@ while the local response side remains open.
 
 Connection cancellation and protocol failure cancel every bound exchange, reset
 live request streams, map the exact HTTP/3 or QPACK application error to QUIC, and
-close once.
+close once. The failure is reported the same way on every later `process` and
+`tick`: `EVENT_ERROR` (or `EVENT_CANCELLED` for a cancellation) carrying the
+engine's error and its HTTP/3 code, so a host may read the reason from whichever
+event it holds.
+
+## Exchange closure
+
+Every exchange the engine closes records why on `Completion.closure`
+(`http.core.exchange.Closure`), so the holder of the exchange learns its fate
+without walking its own table against `EVENT_ERROR`. `code` is the HTTP/3
+application error that went on the wire or came from it. Whoever ends the scope
+owns the cause: an exchange whose scope the caller ended first keeps
+`CAUSE_CALLER` however the engine later closes its stream.
+
+| Path | Cause | `code` |
+| --- | --- | --- |
+| connection failure, other than below | `CAUSE_CONNECTION` | the connection close code |
+| `ERROR_TRANSPORT` or `ERROR_TRANSPORT_CLOSED` | `CAUSE_TRANSPORT` | the close code, `detail` the transport error |
+| connection scope cancelled (`ERROR_CANCELLED`) | `CAUSE_CALLER` | `H3_REQUEST_CANCELLED` |
+| peer reset or stop-sending | `CAUSE_PEER_RESET` | the peer's application error |
+| stream error, GOAWAY rejection | `CAUSE_LOCAL_RESET` | the reset code (`H3_REQUEST_REJECTED` for a rejection) |

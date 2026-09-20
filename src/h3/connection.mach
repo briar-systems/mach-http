@@ -86,16 +86,17 @@ pub val QPACK_ENCODER_STREAM_ERROR: u64 = 0x201;
 pub val QPACK_DECODER_STREAM_ERROR: u64 = 0x202;
 
 pub def Error: u8;
-pub val ERROR_NONE:        Error = 0;
-pub val ERROR_STATE:       Error = 1;
-pub val ERROR_LIMIT:       Error = 2;
-pub val ERROR_PROTOCOL:    Error = 3;
-pub val ERROR_FRAME:       Error = 4;
-pub val ERROR_QPACK:       Error = 5;
-pub val ERROR_TRANSPORT:   Error = 6;
-pub val ERROR_CANCELLED:   Error = 7;
-pub val ERROR_NO_PROGRESS: Error = 8;
-pub val ERROR_MEMORY:      Error = 9;
+pub val ERROR_NONE:             Error = 0;
+pub val ERROR_STATE:            Error = 1;
+pub val ERROR_LIMIT:            Error = 2;
+pub val ERROR_PROTOCOL:         Error = 3;
+pub val ERROR_FRAME:            Error = 4;
+pub val ERROR_QPACK:            Error = 5;
+pub val ERROR_TRANSPORT:        Error = 6;
+pub val ERROR_CANCELLED:        Error = 7;
+pub val ERROR_NO_PROGRESS:      Error = 8;
+pub val ERROR_MEMORY:           Error = 9;
+pub val ERROR_TRANSPORT_CLOSED: Error = 10;
 
 pub def EventKind: u8;
 pub val EVENT_NONE:             EventKind = 0;
@@ -312,16 +313,17 @@ pub rec Storage {
 pub def HeaderBlock: section.Block;
 
 pub rec Event {
-    kind:        EventKind;
-    stream_id:   u64;
-    generation:  u64;
-    headers:     HeaderBlock;
-    data:        *u8;
-    data_length: usize;
-    end_stream:  bool;
-    code:        u64;
-    goaway_id:   u64;
-    error:       Error;
+    kind:            EventKind;
+    stream_id:       u64;
+    generation:      u64;
+    headers:         HeaderBlock;
+    data:            *u8;
+    data_length:     usize;
+    end_stream:      bool;
+    code:            u64;
+    goaway_id:       u64;
+    error:           Error;
+    transport_error: u64;
 }
 
 pub rec Offer {
@@ -474,6 +476,7 @@ pub rec Engine[T] {
     close_started:               bool;
     error:                       Error;
     h3_error:                    u64;
+    transport_error:             u64;
     initialized:                 bool;
 }
 
@@ -693,15 +696,16 @@ fun empty_headers() HeaderBlock {
 
 fun base_event[T](engine: *Engine[T], kind: EventKind) Event {
     ret Event{kind: kind, stream_id: NO_STREAM, generation: 0,
-        headers:    empty_headers(), data: nil, data_length: 0,
-        end_stream: false, code: 0, goaway_id: 0, error: engine.error};
+        headers:         empty_headers(), data: nil, data_length: 0,
+        end_stream:      false, code: 0, goaway_id: 0, error: engine.error,
+        transport_error: 0};
 }
 
 fun invalid_event() Event {
     ret Event{kind: EVENT_ERROR, stream_id: NO_STREAM, generation: 0,
         headers:    empty_headers(), data: nil, data_length: 0,
         end_stream: false, code: H3_INTERNAL_ERROR, goaway_id: 0,
-        error:      ERROR_STATE};
+        error:      ERROR_STATE, transport_error: 0};
 }
 
 fun stream_event[T](engine: *Engine[T], kind: EventKind, stream: *Stream) Event {
@@ -1263,6 +1267,20 @@ fun transport_status(value: TransportStatus) bool {
     ret value >= TRANSPORT_OK && value <= TRANSPORT_ERROR;
 }
 
+fun answer(status: TransportStatus, error: u64) TransportOperation {
+    ret TransportOperation{status: status, error: error};
+}
+
+# an adapter result that violates the contract, whatever status it claims
+fun contract_broken() TransportOperation {
+    ret answer(TRANSPORT_ERROR, 0);
+}
+
+fun refused(first: TransportOperation, second: TransportOperation) TransportOperation {
+    if (first.status != TRANSPORT_OK) { ret first; }
+    ret second;
+}
+
 fun encode_settings(settings: Settings, output: *u8, capacity: usize) usize {
     var payload: [80]u8;
     var length:  usize = 0;
@@ -1431,6 +1449,7 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
     engine.close_started              = false;
     engine.error                      = ERROR_NONE;
     engine.h3_error                   = H3_NO_ERROR;
+    engine.transport_error            = 0;
     engine.outbound_limits            = configured.outbound_qpack;
     engine.initialized                = true;
     if (!queue_stream_prefix(?engine.control, frame.STREAM_CONTROL)
@@ -1564,12 +1583,29 @@ fun frame_error_code(error: frame.Error) u64 {
     ret H3_FRAME_ERROR;
 }
 
-fun cancel_all_streams[T](engine: *Engine[T], code: u64) {
-    var i: usize = 0;
+fun local_reset(code: u64) exchange.Closure {
+    ret exchange.closure(exchange.CAUSE_LOCAL_RESET, code, 0);
+}
+
+fun peer_reset(code: u64) exchange.Closure {
+    ret exchange.closure(exchange.CAUSE_PEER_RESET, code, 0);
+}
+
+fun connection_closure[T](engine: *Engine[T], error: Error, code: u64) exchange.Closure {
+    if (error == ERROR_TRANSPORT || error == ERROR_TRANSPORT_CLOSED) {
+        ret exchange.closure(exchange.CAUSE_TRANSPORT, code, engine.transport_error);
+    }
+    if (error == ERROR_CANCELLED) { ret exchange.closure(exchange.CAUSE_CALLER, code, 0); }
+    ret exchange.closure(exchange.CAUSE_CONNECTION, code, 0);
+}
+
+fun cancel_all_streams[T](engine: *Engine[T], error: Error, code: u64) {
+    val why: exchange.Closure = connection_closure[T](engine, error, code);
+    var i:   usize            = 0;
     for (i < engine.stream_capacity) {
         val stream: *Stream = slot_stream[T](engine, i);
         if (stream.live && !stream_terminal(stream)) {
-            if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
+            if (stream.exchange != nil) { exchange.close_exchange(stream.exchange, why); }
             if (stream_readable(stream)) {
                 engine.transport.cancel_receive(engine.transport.context,
                     stream.transport_stream, code);
@@ -1590,7 +1626,7 @@ fun fail_connection[T](engine: *Engine[T], error: Error, code: u64) Event {
         engine.error    = error;
         engine.h3_error = code;
         engine.state    = FAILED;
-        cancel_all_streams[T](engine, code);
+        cancel_all_streams[T](engine, error, code);
         if (!engine.close_started) {
             val closed: TransportOperation = engine.transport.close(
                 engine.transport.context, code);
@@ -1598,10 +1634,29 @@ fun fail_connection[T](engine: *Engine[T], error: Error, code: u64) Event {
                 || closed.status == TRANSPORT_CLOSED;
         }
     }
+    ret failure_event[T](engine);
+}
+
+# the failure as the engine reports it on every call after it
+fun failure_event[T](engine: *Engine[T]) Event {
     var result: Event = base_event[T](engine, EVENT_ERROR);
-    result.code = code;
-    if (error == ERROR_CANCELLED) { result.kind = EVENT_CANCELLED; }
+    result.code            = engine.h3_error;
+    result.transport_error = engine.transport_error;
+    if (engine.error == ERROR_CANCELLED) { result.kind = EVENT_CANCELLED; }
     ret result;
+}
+
+# a transport answer the engine cannot continue on. a closed connection is the
+# transport ending under the engine, and no HTTP/3 error; anything else is the
+# adapter failing its contract. the answer's error value is kept for the host.
+fun transport_failure[T](engine: *Engine[T], refusal: TransportOperation) Event {
+    if (engine.state != FAILED && engine.state != CLOSED) {
+        engine.transport_error = refusal.error;
+    }
+    if (refusal.status == TRANSPORT_CLOSED) {
+        ret fail_connection[T](engine, ERROR_TRANSPORT_CLOSED, H3_NO_ERROR);
+    }
+    ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
 }
 
 fun queue_cancel[T](engine: *Engine[T], id: u64) bool {
@@ -1620,7 +1675,7 @@ fun stream_failure[T](engine: *Engine[T], stream: *Stream, code: u64) Event {
         val send: TransportOperation = engine.transport.cancel_send(
             engine.transport.context, stream.transport_stream, code);
         if (receive.status != TRANSPORT_OK || send.status != TRANSPORT_OK) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, refused(receive, send));
         }
         if (stream.qpack_blocked) {
             qpack.field_decoder_cancel(?stream.decoder);
@@ -1629,7 +1684,7 @@ fun stream_failure[T](engine: *Engine[T], stream: *Stream, code: u64) Event {
                 ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
             }
         }
-        if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
+        if (stream.exchange != nil) { exchange.close_exchange(stream.exchange, local_reset(code)); }
         mark_closed[T](engine, stream);
         stream.reset_code = code;
     }
@@ -1643,31 +1698,42 @@ val RELEASE_PARKED: u8 = 2;
 val RELEASE_FULL:   u8 = 3;
 val RELEASE_FAILED: u8 = 4;
 
-fun park_release[T](engine: *Engine[T], value: StreamHandle) u8 {
+# how a stream release went, with the transport's answer when it failed
+rec Release { outcome: u8; refusal: TransportOperation; }
+
+fun release_result(outcome: u8) Release {
+    ret Release{outcome: outcome, refusal: answer(TRANSPORT_OK, 0)};
+}
+
+fun release_failed(refusal: TransportOperation) Release {
+    ret Release{outcome: RELEASE_FAILED, refusal: refusal};
+}
+
+fun park_release[T](engine: *Engine[T], value: StreamHandle) Release {
     if (engine.pending_release_count >= engine.pending_release_capacity) {
-        ret RELEASE_FULL;
+        ret release_result(RELEASE_FULL);
     }
     engine.pending_release[engine.pending_release_count] = value;
     engine.pending_release_count                         = engine.pending_release_count + 1;
-    ret RELEASE_PARKED;
+    ret release_result(RELEASE_PARKED);
 }
 
 # a cancelled stream is not settled until the peer has acknowledged the reset
 # and stop, so a blocked release is retried rather than failing the connection
-fun release_or_park[T](engine: *Engine[T], value: StreamHandle) u8 {
+fun release_or_park[T](engine: *Engine[T], value: StreamHandle) Release {
     val released: TransportOperation = engine.transport.release(
         engine.transport.context, value);
-    if (released.status == TRANSPORT_OK)      { ret RELEASE_DONE; }
-    if (released.status != TRANSPORT_BLOCKED) { ret RELEASE_FAILED; }
+    if (released.status == TRANSPORT_OK)      { ret release_result(RELEASE_DONE); }
+    if (released.status != TRANSPORT_BLOCKED) { ret release_failed(released); }
     ret park_release[T](engine, value);
 }
 
-fun release_outcome[T](engine: *Engine[T], outcome: u8) Event {
-    if (outcome == RELEASE_FULL) {
+fun release_outcome[T](engine: *Engine[T], released: Release) Event {
+    if (released.outcome == RELEASE_FULL) {
         ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
     }
-    if (outcome == RELEASE_FAILED) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+    if (released.outcome == RELEASE_FAILED) {
+        ret transport_failure[T](engine, released.refusal);
     }
     ret base_event[T](engine, EVENT_NONE);
 }
@@ -1679,7 +1745,7 @@ fun drain_releases[T](engine: *Engine[T]) Event {
             engine.transport.context, engine.pending_release[i]);
         if (released.status == TRANSPORT_BLOCKED) { i = i + 1; }
         or (released.status != TRANSPORT_OK) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, released);
         }
         or {
             engine.pending_release_count = engine.pending_release_count - 1;
@@ -1690,19 +1756,20 @@ fun drain_releases[T](engine: *Engine[T]) Event {
     ret base_event[T](engine, EVENT_NONE);
 }
 
-fun credit[T](engine: *Engine[T], stream: *Stream, count: usize) bool {
-    if (count == 0)                                 { ret true; }
-    if (stream == nil || count > stream.uncredited) { ret false; }
+# TRANSPORT_OK, or the answer that refused the credit
+fun credit[T](engine: *Engine[T], stream: *Stream, count: usize) TransportOperation {
+    if (count == 0)                                 { ret answer(TRANSPORT_OK, 0); }
+    if (stream == nil || count > stream.uncredited) { ret contract_broken(); }
     # a failed or closed connection grants no more credit, so a held borrow can still end
     if (engine.state == FAILED || engine.state == CLOSED) {
         stream.uncredited = stream.uncredited - count;
-        ret true;
+        ret answer(TRANSPORT_OK, 0);
     }
     val result: TransportOperation = engine.transport.credit(
         engine.transport.context, stream.transport_stream, count);
-    if (result.status != TRANSPORT_OK) { ret false; }
+    if (result.status != TRANSPORT_OK) { ret result; }
     stream.uncredited = stream.uncredited - count;
-    ret true;
+    ret answer(TRANSPORT_OK, 0);
 }
 
 fun input_available(stream: *Stream) usize {
@@ -1721,11 +1788,11 @@ fun read_stream[T](engine: *Engine[T], stream: *Stream) Event {
         || result.count > stream.memory.read_capacity
         || (result.fin && result.status != TRANSPORT_OK)
         || (result.status == TRANSPORT_OK && result.count == 0 && !result.fin)) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, contract_broken());
     }
     if (result.status == TRANSPORT_CANCELLED) {
         if (result.final_size < stream.received_bytes) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, contract_broken());
         }
         if (stream.critical) {
             ret fail_connection[T](engine, ERROR_PROTOCOL, H3_CLOSED_CRITICAL_STREAM);
@@ -1734,29 +1801,30 @@ fun read_stream[T](engine: *Engine[T], stream: *Stream) Event {
             engine.transport.context, stream.transport_stream,
             H3_REQUEST_CANCELLED);
         if (cancelled.status != TRANSPORT_OK) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, cancelled);
         }
-        if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
+        if (stream.exchange != nil) {
+            exchange.close_exchange(stream.exchange, peer_reset(result.application_error));
+        }
         mark_closed[T](engine, stream);
         stream.reset_code = result.application_error;
         var reset: Event = stream_event[T](engine, EVENT_STREAM_RESET, stream);
         reset.code = result.application_error;
         ret reset;
     }
-    if (result.status == TRANSPORT_CLOSED) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
-    }
     if (result.status == TRANSPORT_EMPTY || result.status == TRANSPORT_BLOCKED) {
         stream.read_parked = true;
         ret base_event[T](engine, EVENT_NONE);
     }
-    if (result.status != TRANSPORT_OK
-        || stream.received_bytes > (-1)::u64 - result.count::u64) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+    if (result.status != TRANSPORT_OK) {
+        ret transport_failure[T](engine, answer(result.status, result.error));
+    }
+    if (stream.received_bytes > (-1)::u64 - result.count::u64) {
+        ret transport_failure[T](engine, contract_broken());
     }
     val received: u64 = stream.received_bytes + result.count::u64;
     if (result.fin && result.final_size != received) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, contract_broken());
     }
     if (stream.uncredited > (-1)::usize - result.count) {
         ret fail_connection[T](engine, ERROR_LIMIT, H3_EXCESSIVE_LOAD);
@@ -1852,15 +1920,17 @@ fun open_critical[T](engine: *Engine[T], local: *LocalStream) Event {
     val opened: TransportOpen = engine.transport.open(
         engine.transport.context, UNIDIRECTIONAL);
     if (!transport_status(opened.status)) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, contract_broken());
     }
     if (opened.status == TRANSPORT_BLOCKED || opened.status == TRANSPORT_EMPTY) {
         ret base_event[T](engine, EVENT_BLOCKED);
     }
-    if (opened.status != TRANSPORT_OK
-        || !local_stream_valid[T](engine, opened.stream, UNIDIRECTIONAL)
+    if (opened.status != TRANSPORT_OK) {
+        ret transport_failure[T](engine, answer(opened.status, opened.error));
+    }
+    if (!local_stream_valid[T](engine, opened.stream, UNIDIRECTIONAL)
         || !local_stream_unused[T](engine, opened.stream)) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, contract_broken());
     }
     local.stream = opened.stream;
     local.opened = true;
@@ -1876,13 +1946,13 @@ fun write_queue[T](engine: *Engine[T], local: *LocalStream,
     if (!transport_status(written.status) || written.count > available
         || (written.count != 0 && written.status != TRANSPORT_OK)
         || (written.status == TRANSPORT_OK && written.count == 0)) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, contract_broken());
     }
     if (written.status == TRANSPORT_BLOCKED || written.status == TRANSPORT_EMPTY) {
         ret base_event[T](engine, EVENT_BLOCKED);
     }
     if (written.status != TRANSPORT_OK) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, answer(written.status, written.error));
     }
     queue_pop(queue, written.count);
     ret base_event[T](engine, EVENT_NONE);
@@ -1922,7 +1992,7 @@ fun reject_request[T](engine: *Engine[T], opened: TransportOpen) Event {
     val send: TransportOperation = engine.transport.cancel_send(
         engine.transport.context, opened.stream, H3_REQUEST_REJECTED);
     if (receive.status != TRANSPORT_OK || send.status != TRANSPORT_OK) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, refused(receive, send));
     }
     val outcome: Event = release_outcome[T](engine,
         release_or_park[T](engine, opened.stream));
@@ -1960,13 +2030,13 @@ fun accept_peer[T](engine: *Engine[T]) Event {
     if (engine.accept_parked) { ret place_unidirectional[T](engine, engine.parked_stream); }
     val opened: TransportOpen = engine.transport.accept(engine.transport.context);
     if (!transport_status(opened.status)) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, contract_broken());
     }
     if (opened.status == TRANSPORT_EMPTY || opened.status == TRANSPORT_BLOCKED) {
         ret base_event[T](engine, EVENT_NONE);
     }
     if (opened.status != TRANSPORT_OK) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, answer(opened.status, opened.error));
     }
     if (!accepted_shape[T](engine, opened)) {
         ret fail_connection[T](engine, ERROR_PROTOCOL, H3_STREAM_CREATION_ERROR);
@@ -2003,13 +2073,13 @@ fun accept_peer[T](engine: *Engine[T]) Event {
     ret place_unidirectional[T](engine, opened.stream);
 }
 
-fun discard_opened[T](engine: *Engine[T], opened: StreamHandle, code: u64) u8 {
+fun discard_opened[T](engine: *Engine[T], opened: StreamHandle, code: u64) Release {
     val send: TransportOperation = engine.transport.cancel_send(
         engine.transport.context, opened, code);
     val receive: TransportOperation = engine.transport.cancel_receive(
         engine.transport.context, opened, code);
     if (send.status != TRANSPORT_OK || receive.status != TRANSPORT_OK) {
-        ret RELEASE_FAILED;
+        ret release_failed(refused(send, receive));
     }
     ret release_or_park[T](engine, opened);
 }
@@ -2028,12 +2098,16 @@ pub fun open_request[T](engine: *Engine[T], bound: *exchange.Exchange) u64 {
         unprepare_stream[T](engine, prepared);
         ret NO_STREAM;
     }
-    if (opened.status != TRANSPORT_OK
-        || !local_stream_valid[T](engine, opened.stream, BIDIRECTIONAL)
+    if (opened.status != TRANSPORT_OK) {
+        unprepare_stream[T](engine, prepared);
+        transport_failure[T](engine, answer(opened.status, opened.error));
+        ret NO_STREAM;
+    }
+    if (!local_stream_valid[T](engine, opened.stream, BIDIRECTIONAL)
         || !request_id(opened.stream.id)
         || (engine.goaway_received && opened.stream.id >= engine.remote_goaway)) {
         unprepare_stream[T](engine, prepared);
-        fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        transport_failure[T](engine, contract_broken());
         ret NO_STREAM;
     }
     if (!stream_admissible[T](engine, opened.stream)) {
@@ -2068,8 +2142,9 @@ fun classify_stream[T](engine: *Engine[T], stream: *Stream) Event {
     val parsed: frame.StreamEvent = frame.stream_feed(?stream.classifier,
         input, input_available(stream), stream.input_fin);
     stream.input_offset = stream.input_offset + parsed.consumed;
-    if (!credit[T](engine, stream, parsed.consumed)) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+    val credited: TransportOperation = credit[T](engine, stream, parsed.consumed);
+    if (credited.status != TRANSPORT_OK) {
+        ret transport_failure[T](engine, credited);
     }
     if (parsed.kind == frame.STREAM_EVENT_ERROR) {
         ret fail_connection[T](engine, ERROR_FRAME, frame_error_code(parsed.error));
@@ -2143,8 +2218,9 @@ fun process_encoder_stream[T](engine: *Engine[T], stream: *Stream) Event {
     val instruction: qpack.Instruction = qpack.encoder_stream_feed(
         ?stream.encoder_stream, input, input_available(stream), stream.input_fin);
     stream.input_offset = stream.input_offset + instruction.consumed;
-    if (!credit[T](engine, stream, instruction.consumed)) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+    val credited: TransportOperation = credit[T](engine, stream, instruction.consumed);
+    if (credited.status != TRANSPORT_OK) {
+        ret transport_failure[T](engine, credited);
     }
     if (instruction.status == qpack.INSTRUCTION_ERROR) {
         ret fail_connection[T](engine, ERROR_QPACK,
@@ -2174,8 +2250,9 @@ fun process_decoder_stream[T](engine: *Engine[T], stream: *Stream) Event {
     val instruction: qpack.Instruction = qpack.decoder_stream_feed(
         ?stream.decoder_stream, input, input_available(stream), stream.input_fin);
     stream.input_offset = stream.input_offset + instruction.consumed;
-    if (!credit[T](engine, stream, instruction.consumed)) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+    val credited: TransportOperation = credit[T](engine, stream, instruction.consumed);
+    if (credited.status != TRANSPORT_OK) {
+        ret transport_failure[T](engine, credited);
     }
     if (instruction.status == qpack.INSTRUCTION_ERROR) {
         ret fail_connection[T](engine, ERROR_QPACK,
@@ -2219,8 +2296,9 @@ fun header_kind[T](engine: *Engine[T], stream: *Stream,
 
 fun finish_headers[T](engine: *Engine[T], stream: *Stream,
     decoded: qpack.Decode) Event {
-    if (!credit[T](engine, stream, stream.qpack_credit)) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+    val credited: TransportOperation = credit[T](engine, stream, stream.qpack_credit);
+    if (credited.status != TRANSPORT_OK) {
+        ret transport_failure[T](engine, credited);
     }
     stream.qpack_credit = 0;
     clear_blocked[T](engine, stream);
@@ -2316,9 +2394,11 @@ fun handle_goaway[T](engine: *Engine[T], value: u64) Event {
                     engine.transport.context, stream.transport_stream,
                     H3_REQUEST_REJECTED);
                 if (send.status != TRANSPORT_OK || receive.status != TRANSPORT_OK) {
-                    ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+                    ret transport_failure[T](engine, refused(send, receive));
                 }
-                if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
+                if (stream.exchange != nil) {
+                    exchange.close_exchange(stream.exchange, local_reset(H3_REQUEST_REJECTED));
+                }
                 mark_closed[T](engine, stream);
                 stream.retry_pending = true;
                 stream.reset_code    = H3_REQUEST_REJECTED;
@@ -2371,14 +2451,16 @@ fun process_request_frame[T](engine: *Engine[T], stream: *Stream) Event {
         ret fail_connection[T](engine, ERROR_FRAME, frame_error_code(parsed.error));
     }
     if (parsed.kind == frame.EVENT_NEED_INPUT) {
-        if (!credit[T](engine, stream, parsed.consumed)) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        val credited: TransportOperation = credit[T](engine, stream, parsed.consumed);
+        if (credited.status != TRANSPORT_OK) {
+            ret transport_failure[T](engine, credited);
         }
         ret base_event[T](engine, EVENT_NONE);
     }
     if (parsed.kind == frame.EVENT_HEADER) {
-        if (!credit[T](engine, stream, parsed.consumed)) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        val credited: TransportOperation = credit[T](engine, stream, parsed.consumed);
+        if (credited.status != TRANSPORT_OK) {
+            ret transport_failure[T](engine, credited);
         }
         stream.current_frame = parsed.header;
         stream.frame_started = true;
@@ -2451,9 +2533,10 @@ fun process_request_frame[T](engine: *Engine[T], stream: *Stream) Event {
             data_event.data_length = parsed.data_length;
             ret data_event;
         }
-        if (!credit[T](engine, stream, parsed.consumed)) {
+        val credited: TransportOperation = credit[T](engine, stream, parsed.consumed);
+        if (credited.status != TRANSPORT_OK) {
             frame.release(?stream.parser);
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, credited);
         }
         frame.release(?stream.parser);
         ret base_event[T](engine, EVENT_NONE);
@@ -2661,14 +2744,14 @@ fun flush_request_output[T](engine: *Engine[T], stream: *Stream) Event {
         if (!transport_status(written.status) || written.count > available
             || (written.count != 0 && written.status != TRANSPORT_OK)
             || (written.status == TRANSPORT_OK && written.count == 0)) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, contract_broken());
         }
         if (written.status == TRANSPORT_BLOCKED || written.status == TRANSPORT_EMPTY) {
             stream.write_parked = true;
             ret base_event[T](engine, EVENT_BLOCKED);
         }
         if (written.status != TRANSPORT_OK) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, answer(written.status, written.error));
         }
         stream.output_offset = stream.output_offset + written.count;
         if (stream.output_offset != stream.output_length) {
@@ -2685,7 +2768,7 @@ fun flush_request_output[T](engine: *Engine[T], stream: *Stream) Event {
             ret base_event[T](engine, EVENT_BLOCKED);
         }
         if (finished.status != TRANSPORT_OK) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, finished);
         }
         stream.output_end_stream = false;
         close_local_side[T](engine, stream);
@@ -2758,11 +2841,11 @@ fun poll_blocked_reset[T](engine: *Engine[T], stream: *Stream) Event {
     val result: TransportRead = engine.transport.read(engine.transport.context,
         stream.transport_stream, nil, 0);
     if (!transport_status(result.status) || result.count != 0) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, contract_broken());
     }
     if (result.status == TRANSPORT_CANCELLED) {
         if (result.final_size < stream.received_bytes) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, contract_broken());
         }
         qpack.field_decoder_cancel(?stream.decoder);
         if (!queue_cancel[T](engine, stream.transport_stream.id)) {
@@ -2772,9 +2855,11 @@ fun poll_blocked_reset[T](engine: *Engine[T], stream: *Stream) Event {
             engine.transport.context, stream.transport_stream,
             H3_REQUEST_CANCELLED);
         if (cancelled.status != TRANSPORT_OK) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, cancelled);
         }
-        if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
+        if (stream.exchange != nil) {
+            exchange.close_exchange(stream.exchange, peer_reset(result.application_error));
+        }
         stream.uncredited   = 0;
         stream.qpack_credit = 0;
         clear_blocked[T](engine, stream);
@@ -2786,16 +2871,16 @@ fun poll_blocked_reset[T](engine: *Engine[T], stream: *Stream) Event {
     }
     if (result.status == TRANSPORT_OK && result.fin) {
         if (result.final_size != stream.received_bytes) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, contract_broken());
         }
         stream.input_fin = true;
     }
     if (result.status == TRANSPORT_OK && !result.fin) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, contract_broken());
     }
     if (result.status != TRANSPORT_EMPTY && result.status != TRANSPORT_BLOCKED
         && result.status != TRANSPORT_OK) {
-        ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        ret transport_failure[T](engine, answer(result.status, result.error));
     }
     ret retry_blocked[T](engine, stream);
 }
@@ -2836,8 +2921,9 @@ fun process_one_stream[T](engine: *Engine[T], stream: *Stream) Event {
     if (stream.kind == STREAM_IGNORED) {
         val length: usize = input_available(stream);
         stream.input_offset = stream.input_length;
-        if (!credit[T](engine, stream, length)) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+        val credited: TransportOperation = credit[T](engine, stream, length);
+        if (credited.status != TRANSPORT_OK) {
+            ret transport_failure[T](engine, credited);
         }
         ret base_event[T](engine, EVENT_NONE);
     }
@@ -2895,7 +2981,7 @@ fun drain_ready[T](engine: *Engine[T]) Event {
         val report: TransportReady = engine.transport.ready(engine.transport.context);
         if (report.status == TRANSPORT_EMPTY) { ret base_event[T](engine, EVENT_NONE); }
         if (report.status != TRANSPORT_OK) {
-            ret fail_connection[T](engine, ERROR_TRANSPORT, H3_INTERNAL_ERROR);
+            ret transport_failure[T](engine, answer(report.status, 0));
         }
         note_ready[T](engine, report);
         taken = taken + 1;
@@ -2954,7 +3040,7 @@ pub fun process[T](engine: *Engine[T]) Event {
         ret invalid_event();
     }
     if (engine.state == CLOSED) { ret base_event[T](engine, EVENT_CLOSED); }
-    if (engine.state == FAILED) { ret base_event[T](engine, EVENT_ERROR); }
+    if (engine.state == FAILED) { ret failure_event[T](engine); }
     if (!scope_active(engine.scope)) {
         ret fail_connection[T](engine, ERROR_CANCELLED, H3_REQUEST_CANCELLED);
     }
@@ -2974,7 +3060,8 @@ pub fun process[T](engine: *Engine[T]) Event {
 pub fun consume_data[T](engine: *Engine[T], id: u64, count: usize) bool {
     val stream: *Stream = stream_for[T](engine, id);
     if (stream == nil || !stream.held || stream.held_kind != EVENT_DATA
-        || count == 0 || count > stream.held_length || !credit[T](engine, stream, count)) {
+        || count == 0 || count > stream.held_length
+        || credit[T](engine, stream, count).status != TRANSPORT_OK) {
         ret false;
     }
     stream.held_data   = ?stream.held_data[count];
@@ -3096,6 +3183,8 @@ pub fun tick[T](engine: *Engine[T]) Event {
     if (engine == nil || !engine.initialized) {
         ret invalid_event();
     }
+    if (engine.state == CLOSED) { ret base_event[T](engine, EVENT_CLOSED); }
+    if (engine.state == FAILED) { ret failure_event[T](engine); }
     if (!scope_active(engine.scope)) {
         ret fail_connection[T](engine, ERROR_CANCELLED, H3_REQUEST_CANCELLED);
     }
@@ -3207,9 +3296,10 @@ pub fun progress_close[T](engine: *Engine[T]) bool {
     if (closed.status == TRANSPORT_BLOCKED) { ret false; }
     # a transport the peer already closed has satisfied the close
     if (closed.status != TRANSPORT_OK && closed.status != TRANSPORT_CLOSED) {
-        engine.error    = ERROR_TRANSPORT;
-        engine.h3_error = H3_INTERNAL_ERROR;
-        engine.state    = FAILED;
+        engine.error           = ERROR_TRANSPORT;
+        engine.h3_error        = H3_INTERNAL_ERROR;
+        engine.transport_error = closed.error;
+        engine.state           = FAILED;
         ret false;
     }
     engine.close_started = true;
@@ -3273,6 +3363,18 @@ rec TestTransport {
     signal_head:    usize;
     signal_count:   usize;
     signal_dropped: bool;
+    gone_hook:      u8;
+    gone_status:    TransportStatus;
+    gone_error:     u64;
+}
+
+# the connection is gone: the named hook reports gone_status from now on
+val GONE_READY: u8 = 1;
+val GONE_READ:  u8 = 2;
+val GONE_WRITE: u8 = 3;
+
+fun test_gone(io: *TestTransport, hook: u8) bool {
+    ret io.gone_hook == hook;
 }
 
 fun test_call(io: *TestTransport) {
@@ -3297,6 +3399,10 @@ fun test_signal(io: *TestTransport, value: StreamHandle, readable: bool,
 fun test_ready(context: *TestTransport) TransportReady {
     val io: *TestTransport = context;
     test_call(io);
+    if (test_gone(io, GONE_READY)) {
+        ret TransportReady{status: io.gone_status, handle: no_handle(),
+            readable: false, writable: false, reset: false};
+    }
     if (io.signal_count == 0) {
         ret TransportReady{status: TRANSPORT_EMPTY, handle: no_handle(),
             readable: false, writable: false, reset: false};
@@ -3415,6 +3521,10 @@ fun test_read(context: *TestTransport, value: StreamHandle,
     val wire: *TestWire      = test_wire(io, value);
     test_call(io);
     io.reads = io.reads + 1;
+    if (test_gone(io, GONE_READ)) {
+        ret TransportRead{status: io.gone_status, count: 0, final_size: 0,
+            application_error: 0, fin: false, error: io.gone_error};
+    }
     if (wire == nil || (output == nil && capacity != 0)) {
         ret TransportRead{status: TRANSPORT_ERROR, count: 0, final_size: 0,
             application_error: 0, fin: false, error: 1};
@@ -3460,6 +3570,11 @@ fun test_write(context: *TestTransport, value: StreamHandle,
     val io:   *TestTransport = context;
     val wire: *TestWire      = test_wire(io, value);
     test_call(io);
+    if (test_gone(io, GONE_WRITE)) {
+        ret TransportWrite{status: io.gone_status, count: 0,
+            connection_blocked: false, stream_blocked: false,
+            storage_blocked:    false, error: io.gone_error};
+    }
     if (wire == nil || (input == nil && length != 0)
         || wire.output_length > wire.output_capacity
         || length > wire.output_capacity - wire.output_length) {
@@ -3680,6 +3795,9 @@ fun reset_io(fixture: *Fixture, role: Role) {
     fixture.io.signal_head    = 0;
     fixture.io.signal_count   = 0;
     fixture.io.signal_dropped = false;
+    fixture.io.gone_hook      = 0;
+    fixture.io.gone_status    = TRANSPORT_OK;
+    fixture.io.gone_error     = 0;
     var i: usize = 0;
     for (i < FIXTURE_WIRES) {
         fixture.wires[i].live              = false;
@@ -4633,7 +4751,90 @@ test "http.h3.connection: blocked reset and application cancellation settle once
     val event: Event = tick[TestTransport](?cancelled.engine);
     if (event.kind != EVENT_STREAM_RESET || event.code != H3_REQUEST_CANCELLED
         || !wire.send_cancelled || !wire.receive_cancelled
-        || exchange_memory.exchange.state != exchange.CANCELLED_STATE) { ret 6; }
+        || exchange_memory.exchange.state != exchange.CANCELLED_STATE
+        || exchange_memory.exchange.completion.closure.cause != exchange.CAUSE_CALLER) { ret 6; }
+    ret 0;
+}
+
+fun closure_is(storage: *ExchangeMemory, cause: exchange.Cause, code: u64) bool {
+    val why: exchange.Closure = storage.exchange.completion.closure;
+    ret storage.exchange.state == exchange.CANCELLED_STATE
+        && why.cause == cause && why.code == code && why.detail == 0;
+}
+
+fun second_control(fixture: *Fixture) bool {
+    var control: [1]u8;
+    control[0] = frame.STREAM_CONTROL::u8;
+    ret peer_stream(fixture, 6, ?control[0], 1, false) != nil;
+}
+
+test "http.h3.connection: an exchange the engine closes carries the cause" {
+    # the peer reset the request stream
+    var peer_fixture: Fixture;
+    var peer_storage: ExchangeMemory;
+    if (!make_fixture(?peer_fixture, SERVER, test_config())
+        || server_handshake(?peer_fixture).kind != EVENT_SETTINGS) { ret 1; }
+    val peer_wire: *TestWire = taken_request(?peer_fixture, ?peer_storage);
+    if (peer_wire == nil) { ret 2; }
+    wire_reset(?peer_fixture.io, peer_wire, H3_REQUEST_CANCELLED);
+    if (drive(?peer_fixture, EVENT_STREAM_RESET, 16).code != H3_REQUEST_CANCELLED
+        || !closure_is(?peer_storage, exchange.CAUSE_PEER_RESET, H3_REQUEST_CANCELLED)) { ret 3; }
+    # the host reset the stream through the engine
+    var local_fixture: Fixture;
+    var local_storage: ExchangeMemory;
+    if (!make_fixture(?local_fixture, SERVER, test_config())
+        || server_handshake(?local_fixture).kind != EVENT_SETTINGS
+        || taken_request(?local_fixture, ?local_storage) == nil) { ret 4; }
+    if (!cancel_stream[TestTransport](?local_fixture.engine, 0, H3_REQUEST_CANCELLED)
+        || !closure_is(?local_storage, exchange.CAUSE_LOCAL_RESET, H3_REQUEST_CANCELLED)) { ret 5; }
+    # the connection failed on a protocol error
+    var protocol_fixture: Fixture;
+    var protocol_storage: ExchangeMemory;
+    if (!make_fixture(?protocol_fixture, SERVER, test_config())
+        || server_handshake(?protocol_fixture).kind != EVENT_SETTINGS
+        || taken_request(?protocol_fixture, ?protocol_storage) == nil
+        || !second_control(?protocol_fixture)) { ret 6; }
+    if (drive(?protocol_fixture, EVENT_ERROR, 64).code != H3_STREAM_CREATION_ERROR
+        || !closure_is(?protocol_storage, exchange.CAUSE_CONNECTION, H3_STREAM_CREATION_ERROR)) { ret 7; }
+    # the connection scope was cancelled by its owner
+    var owner_fixture: Fixture;
+    var owner_storage: ExchangeMemory;
+    if (!make_fixture(?owner_fixture, SERVER, test_config())
+        || server_handshake(?owner_fixture).kind != EVENT_SETTINGS
+        || taken_request(?owner_fixture, ?owner_storage) == nil
+        || !transition_ok(cancel.cancel(?owner_fixture.scope))) { ret 8; }
+    if (process[TestTransport](?owner_fixture.engine).kind != EVENT_CANCELLED
+        || !closure_is(?owner_storage, exchange.CAUSE_CALLER, H3_REQUEST_CANCELLED)) { ret 9; }
+    # a scope the exchange's caller ended first keeps its cause through the engine's close
+    var caller_fixture: Fixture;
+    var caller_storage: ExchangeMemory;
+    if (!make_fixture(?caller_fixture, SERVER, test_config())
+        || server_handshake(?caller_fixture).kind != EVENT_SETTINGS
+        || taken_request(?caller_fixture, ?caller_storage) == nil
+        || !transition_ok(cancel.cancel(?caller_storage.scope))
+        || !second_control(?caller_fixture)) { ret 10; }
+    if (drive(?caller_fixture, EVENT_ERROR, 64).code != H3_STREAM_CREATION_ERROR
+        || !closure_is(?caller_storage, exchange.CAUSE_CALLER, 0)) { ret 11; }
+    # a goaway rejection on the client side
+    var goaway_fixture: Fixture;
+    var goaway_storage: ExchangeMemory;
+    if (!make_fixture(?goaway_fixture, CLIENT, test_config())
+        || client_handshake(?goaway_fixture).kind != EVENT_SETTINGS) { ret 12; }
+    val request_id: u64     = open_request[TestTransport](?goaway_fixture.engine, nil);
+    val request:    *Stream = stream_for[TestTransport](?goaway_fixture.engine, request_id);
+    if (request_id != 0 || request == nil
+        || !make_exchange(?goaway_storage, request.generation, request_id)
+        || !bind_exchange[TestTransport](?goaway_fixture.engine, request_id, ?goaway_storage.exchange)) { ret 13; }
+    val control_stream: *Stream = stream_for[TestTransport](?goaway_fixture.engine, 3);
+    if (control_stream == nil) { ret 14; }
+    val control: *TestWire = test_wire(?goaway_fixture.io, control_stream.transport_stream);
+    var goaway:  [3]u8;
+    goaway[0] = frame.FRAME_GOAWAY::u8;
+    goaway[1] = 1;
+    goaway[2] = 0;
+    wire_feed(?goaway_fixture.io, control, ?goaway[0], 3, false);
+    if (drive(?goaway_fixture, EVENT_GOAWAY, 32).goaway_id != 0
+        || !closure_is(?goaway_storage, exchange.CAUSE_LOCAL_RESET, H3_REQUEST_REJECTED)) { ret 15; }
     ret 0;
 }
 
@@ -5407,6 +5608,127 @@ test "http.h3.connection: a closed connection destroys with releases the transpo
     if (!destroy[TestTransport](?fixture.engine)) { ret 5; }
     if (fixture.account.held != 0)                { ret 6; }
     if (fixture.account.chunks != 0)              { ret 7; }
+    ret 0;
+}
+
+# a served request is open, then the named transport hook reports the connection
+# gone with the given status. returns the first failing check, 0 when the
+# engine fails once naming the transport's answer, cancels the request, closes
+# once, and tears down cleanly.
+fun gone_under_request(hook: u8, gone: TransportStatus, gone_error: u64) u8 {
+    var error: Error = ERROR_TRANSPORT;
+    var code:  u64   = H3_INTERNAL_ERROR;
+    if (gone == TRANSPORT_CLOSED) {
+        error = ERROR_TRANSPORT_CLOSED;
+        code  = H3_NO_ERROR;
+    }
+    # a readiness report carries no error value
+    var carried: u64 = gone_error;
+    if (hook == GONE_READY) { carried = 0; }
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
+    var storage: ExchangeMemory;
+    val wire:    *TestWire = taken_request(?fixture, ?storage);
+    if (wire == nil) { ret 2; }
+    if (hook == GONE_READ) {
+        var payload: [4]u8;
+        var data:    [8]u8;
+        val length:  usize = append_frame(?data[0], 8, frame.FRAME_DATA, ?payload[0], 4);
+        if (length == 0) { ret 3; }
+        wire_feed(?fixture.io, wire, ?data[0], length, false);
+    }
+    if (hook == GONE_READY) {
+        test_signal(?fixture.io, wire.handle, true, false, false);
+    }
+    fixture.io.gone_hook   = hook;
+    fixture.io.gone_status = gone;
+    fixture.io.gone_error  = gone_error;
+    if (hook == GONE_WRITE) {
+        var response: [1]field.Field;
+        response[0] = field.Field{name: view.view(":status", 7),
+            value: view.view("204", 3), sensitive: false};
+        if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 1, true,
+            false).status != OFFER_OUTPUT) { ret 4; }
+    }
+    val failed: Event = drive(?fixture, EVENT_ERROR, 64);
+    if (failed.kind != EVENT_ERROR || failed.error != error || failed.code != code
+        || failed.transport_error != carried || failed.stream_id != NO_STREAM
+        || fixture.engine.state != FAILED) { ret 5; }
+    # the request was cancelled, its stream closed, and its halves cancelled on the wire
+    val stream: *Stream = stream_for[TestTransport](?fixture.engine, 0);
+    if (stream == nil || stream.state != STREAM_CLOSED || stream.reset_code != code
+        || !wire.send_cancelled || !wire.receive_cancelled
+        || storage.exchange.state != exchange.CANCELLED_STATE
+        || fixture.engine.active_requests != 0) { ret 6; }
+    # the exchange carries the transport cause, the close code and the transport error
+    val why: exchange.Closure = storage.exchange.completion.closure;
+    if (why.cause != exchange.CAUSE_TRANSPORT || why.code != code || why.detail != carried) { ret 11; }
+    # the connection closed exactly once with the failure code
+    if (fixture.io.close_calls != 1 || fixture.io.close_code != code
+        || !fixture.engine.close_started) { ret 7; }
+    # later calls keep reporting the failure without closing again
+    val again:  Event = process[TestTransport](?fixture.engine);
+    val ticked: Event = tick[TestTransport](?fixture.engine);
+    if (again.kind != EVENT_ERROR || again.error != error || again.code != code
+        || again.transport_error != carried
+        || ticked.kind != EVENT_ERROR || ticked.error != error || ticked.code != code
+        || ticked.transport_error != carried
+        || fixture.io.close_calls != 1) { ret 8; }
+    if (!progress_close[TestTransport](?fixture.engine)
+        || fixture.engine.state != CLOSED) { ret 9; }
+    if (!destroy[TestTransport](?fixture.engine) || fixture.account.held != 0) { ret 10; }
+    ret 0;
+}
+
+test "http.h3.connection: a transport closed or failed under a live request fails once and tears down" {
+    var code: u8 = gone_under_request(GONE_READ, TRANSPORT_CLOSED, 0);
+    if (code != 0) { ret (16 + code)::i32; }
+    code = gone_under_request(GONE_READ, TRANSPORT_ERROR, 7);
+    if (code != 0) { ret (32 + code)::i32; }
+    code = gone_under_request(GONE_WRITE, TRANSPORT_CLOSED, 0);
+    if (code != 0) { ret (48 + code)::i32; }
+    code = gone_under_request(GONE_WRITE, TRANSPORT_ERROR, 7);
+    if (code != 0) { ret (64 + code)::i32; }
+    code = gone_under_request(GONE_READY, TRANSPORT_CLOSED, 0);
+    if (code != 0) { ret (80 + code)::i32; }
+    code = gone_under_request(GONE_READY, TRANSPORT_ERROR, 7);
+    if (code != 0) { ret (96 + code)::i32; }
+    ret 0;
+}
+
+test "http.h3.connection: a failed engine reports the same failure on every later call" {
+    var cancelled: Fixture;
+    if (!make_fixture(?cancelled, SERVER, test_config())
+        || server_handshake(?cancelled).kind != EVENT_SETTINGS) { ret 1; }
+    if (!transition_ok(cancel.cancel(?cancelled.scope))) { ret 2; }
+    val first: Event = process[TestTransport](?cancelled.engine);
+    if (first.kind != EVENT_CANCELLED || first.error != ERROR_CANCELLED
+        || first.code != H3_REQUEST_CANCELLED) { ret 3; }
+    val again:  Event = process[TestTransport](?cancelled.engine);
+    val ticked: Event = tick[TestTransport](?cancelled.engine);
+    if (again.kind != EVENT_CANCELLED || again.error != ERROR_CANCELLED
+        || again.code != H3_REQUEST_CANCELLED
+        || ticked.kind != EVENT_CANCELLED || ticked.error != ERROR_CANCELLED
+        || ticked.code != H3_REQUEST_CANCELLED) { ret 4; }
+    var failed: Fixture;
+    if (!make_fixture(?failed, SERVER, test_config())
+        || server_handshake(?failed).kind != EVENT_SETTINGS) { ret 5; }
+    # a second control stream closes the connection as a critical-stream error
+    var control: [1]u8;
+    control[0] = frame.STREAM_CONTROL::u8;
+    if (peer_stream(?failed, 6, ?control[0], 1, false) == nil) { ret 6; }
+    val error: Event = drive(?failed, EVENT_ERROR, 64);
+    if (error.kind != EVENT_ERROR || error.code != H3_STREAM_CREATION_ERROR
+        || failed.engine.state != FAILED) { ret 7; }
+    val repeat: Event = process[TestTransport](?failed.engine);
+    val retick: Event = tick[TestTransport](?failed.engine);
+    if (repeat.kind != EVENT_ERROR || repeat.error != error.error
+        || repeat.code != H3_STREAM_CREATION_ERROR
+        || retick.kind != EVENT_ERROR || retick.error != error.error
+        || retick.code != H3_STREAM_CREATION_ERROR) { ret 8; }
+    if (!progress_close[TestTransport](?failed.engine)
+        || tick[TestTransport](?failed.engine).kind != EVENT_CLOSED) { ret 9; }
     ret 0;
 }
 

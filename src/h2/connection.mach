@@ -1610,7 +1610,7 @@ pub fun abandon_exchange(engine: *Engine, id: u32,
         && abandoned.state != exchange.TIMED_OUT_STATE
         && abandoned.state != exchange.FAILED_STATE
         && scope_active(abandoned.scope)) {
-        exchange.cancel_exchange(abandoned);
+        exchange.close_exchange(abandoned, local_reset(H2_CANCEL));
     }
     stream.exchange = nil;
     refresh_stream(engine, stream);
@@ -1625,6 +1625,22 @@ fun close_cause(error: Error) lifecycle.Cause {
     if (timeout_error(error))     { ret lifecycle.DEADLINE; }
     if (error == ERROR_CANCELLED) { ret lifecycle.CANCELLATION; }
     ret lifecycle.FAILURE;
+}
+
+fun local_reset(code: u32) exchange.Closure {
+    ret exchange.closure(exchange.CAUSE_LOCAL_RESET, code::u64, 0);
+}
+
+fun peer_reset(code: u32) exchange.Closure {
+    ret exchange.closure(exchange.CAUSE_PEER_RESET, code::u64, 0);
+}
+
+# h2 carries no transport error value yet, so a transport failure's detail is zero
+fun connection_closure(error: Error, h2_error: u32) exchange.Closure {
+    if (timeout_error(error))     { ret exchange.closure(exchange.CAUSE_TIMEOUT, h2_error::u64, 0); }
+    if (error == ERROR_TRANSPORT) { ret exchange.closure(exchange.CAUSE_TRANSPORT, h2_error::u64, 0); }
+    if (error == ERROR_CANCELLED) { ret exchange.closure(exchange.CAUSE_CALLER, h2_error::u64, 0); }
+    ret exchange.closure(exchange.CAUSE_CONNECTION, h2_error::u64, 0);
 }
 
 # output that can never be written is dropped, so the close is not held for it.
@@ -1705,10 +1721,9 @@ fun fail_connection(engine: *Engine, error: Error, h2_error: u32) Event {
         for (i < sweep_count(engine)) {
             val stream: *Stream = sweep_at(engine, i);
             if (stream.live && stream.state != STREAM_CLOSED) {
-                if (stream.exchange != nil && timeout_error(error)) {
-                    exchange.timeout_exchange(stream.exchange);
+                if (stream.exchange != nil) {
+                    exchange.close_exchange(stream.exchange, connection_closure(error, h2_error));
                 }
-                or (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
                 mark_closed(engine, stream);
             }
             i = i + 1;
@@ -1731,7 +1746,7 @@ fun stream_error(engine: *Engine, stream: *Stream, code: u32) Event {
         if (!queue_reset(engine, stream.id, code)) {
             ret fail_connection(engine, ERROR_LIMIT, H2_ENHANCE_YOUR_CALM);
         }
-        if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
+        if (stream.exchange != nil) { exchange.close_exchange(stream.exchange, local_reset(code)); }
         mark_closed(engine, stream);
     }
     stream.reset_code = code;
@@ -2125,7 +2140,7 @@ fun handle_reset(engine: *Engine, header: frame.Header) Event {
         ret event(engine, EVENT_NONE);
     }
     val code: u32 = read_u32(engine.frame_payload);
-    if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
+    if (stream.exchange != nil) { exchange.close_exchange(stream.exchange, peer_reset(code)); }
     mark_closed(engine, stream);
     stream.reset_code = code;
     var result: Event = stream_event(engine, EVENT_STREAM_RESET, stream);
@@ -3071,7 +3086,7 @@ pub fun cancel_stream(engine: *Engine, id: u32, code: u32) bool {
     val stream: *Stream = stream_for(engine, id);
     if (stream == nil || stream.state == STREAM_CLOSED || code == H2_NO_ERROR
         || !queue_reset(engine, id, code)) { ret false; }
-    if (stream.exchange != nil) { exchange.cancel_exchange(stream.exchange); }
+    if (stream.exchange != nil) { exchange.close_exchange(stream.exchange, local_reset(code)); }
     mark_closed(engine, stream);
     stream.reset_code = code;
     ret true;
@@ -3083,7 +3098,9 @@ fun time_out_stream(engine: *Engine, kind: usize, error: Error) Event {
     if (!queue_reset(engine, stream.id, H2_CANCEL)) {
         ret fail_connection(engine, ERROR_LIMIT, H2_ENHANCE_YOUR_CALM);
     }
-    if (stream.exchange != nil) { exchange.timeout_exchange(stream.exchange); }
+    if (stream.exchange != nil) {
+        exchange.close_exchange(stream.exchange, exchange.closure(exchange.CAUSE_TIMEOUT, H2_CANCEL::u64, 0));
+    }
     mark_closed(engine, stream);
     stream.reset_code = H2_CANCEL;
     var result: Event = stream_event(engine, EVENT_STREAM_RESET, stream);
@@ -5272,6 +5289,89 @@ test "http.h2.connection: a client is idle from init until it opens a stream" {
         || send_headers(?opened.engine, 1, ?request[0], 4, true, true).status != OFFER_OUTPUT
         || !drain_output(?opened)) { ret 5; }
     if (!resets_at(?opened, 135, 1, ERROR_REQUEST_TIMEOUT)) { ret 6; }
+    ret 0;
+}
+
+fun closure_is(storage: *ExchangeMemory, state: exchange.State, cause: exchange.Cause, code: u32) bool {
+    val why: exchange.Closure = storage.exchange.completion.closure;
+    ret storage.exchange.state == state && why.cause == cause && why.code == code::u64 && why.detail == 0;
+}
+
+fun failing_write(fixture: *Fixture, seconds: i64) Event {
+    var response: [1]field.Field;
+    response[0] = field.Field{name: view.view(":status", 7),
+        value: view.view("200", 3), sensitive: false};
+    if (send_headers(?fixture.engine, 1, ?response[0], 1, true, true).status != OFFER_OUTPUT
+        || !submit_write(?fixture.engine, test_now(seconds))) { ret event(?fixture.engine, EVENT_NONE); }
+    var reset: transport.Completion = transport.failed(fixture.io.write_token,
+        transport.WRITE, 0, io_error.make(io_error.RESET, io_error.OP_WRITE));
+    ret complete_io(?fixture.engine, ?reset, test_now(seconds + 1));
+}
+
+test "http.h2.connection: an exchange the engine closes carries the cause" {
+    # the peer reset the stream
+    var peer_fixture: Fixture;
+    var peer_storage: ExchangeMemory;
+    if (!served_handshake(?peer_fixture) || !open_request(?peer_fixture, 1, false, ?peer_storage)) { ret 1; }
+    var code: [4]u8;
+    put_u32(?code[0], H2_CANCEL);
+    val peer_reset: Event = receive_frame(?peer_fixture, frame.FRAME_RESET_STREAM, 0, 1, ?code[0], 4);
+    if (peer_reset.kind != EVENT_STREAM_RESET || peer_reset.code != H2_CANCEL
+        || !closure_is(?peer_storage, exchange.CANCELLED_STATE, exchange.CAUSE_PEER_RESET, H2_CANCEL)) { ret 2; }
+    # the host reset the stream through the engine
+    var local_fixture: Fixture;
+    var local_storage: ExchangeMemory;
+    if (!served_handshake(?local_fixture) || !open_request(?local_fixture, 1, false, ?local_storage)
+        || !cancel_stream(?local_fixture.engine, 1, H2_INTERNAL_ERROR)
+        || !closure_is(?local_storage, exchange.CANCELLED_STATE, exchange.CAUSE_LOCAL_RESET, H2_INTERNAL_ERROR)) {
+        ret 3;
+    }
+    # the request deadline expired
+    var stall_fixture: Fixture;
+    var stall_storage: ExchangeMemory;
+    if (!served_handshake(?stall_fixture) || !open_request(?stall_fixture, 1, false, ?stall_storage)
+        || !resets_at(?stall_fixture, 130, 1, ERROR_REQUEST_TIMEOUT)
+        || !closure_is(?stall_storage, exchange.TIMED_OUT_STATE, exchange.CAUSE_TIMEOUT, H2_CANCEL)) { ret 4; }
+    # the connection timed out as a whole
+    var total_fixture: Fixture;
+    var total_storage: ExchangeMemory;
+    if (!served_handshake(?total_fixture) || !open_request(?total_fixture, 1, true, ?total_storage)
+        || !ping_at(?total_fixture, 200)
+        || !times_out_at(?total_fixture, 400, ERROR_TOTAL_TIMEOUT)
+        || !closure_is(?total_storage, exchange.TIMED_OUT_STATE, exchange.CAUSE_TIMEOUT, H2_NO_ERROR)) { ret 5; }
+    # the connection failed on a protocol error
+    var protocol_fixture: Fixture;
+    var protocol_storage: ExchangeMemory;
+    var opaque:           [8]u8;
+    if (!served_handshake(?protocol_fixture) || !open_request(?protocol_fixture, 1, false, ?protocol_storage)
+        || receive_frame(?protocol_fixture, frame.FRAME_PING, 0, 1, ?opaque[0], 8).kind != EVENT_ERROR
+        || !closure_is(?protocol_storage, exchange.CANCELLED_STATE, exchange.CAUSE_CONNECTION, H2_PROTOCOL_ERROR)) {
+        ret 6;
+    }
+    # the transport failed under the connection
+    var transport_fixture: Fixture;
+    var transport_storage: ExchangeMemory;
+    if (!served_handshake(?transport_fixture) || !open_request(?transport_fixture, 1, true, ?transport_storage)) { ret 7; }
+    val failed: Event = failing_write(?transport_fixture, 100);
+    if (failed.kind != EVENT_ERROR || failed.error != ERROR_TRANSPORT
+        || !closure_is(?transport_storage, exchange.CANCELLED_STATE, exchange.CAUSE_TRANSPORT, H2_INTERNAL_ERROR)) {
+        ret 8;
+    }
+    # the connection scope was cancelled by its owner
+    var owner_fixture: Fixture;
+    var owner_storage: ExchangeMemory;
+    if (!served_handshake(?owner_fixture) || !open_request(?owner_fixture, 1, true, ?owner_storage)) { ret 9; }
+    cancel.cancel(?owner_fixture.operation_root);
+    if (tick(?owner_fixture.engine, test_now(101)).kind != EVENT_CANCELLED
+        || !closure_is(?owner_storage, exchange.CANCELLED_STATE, exchange.CAUSE_CALLER, H2_CANCEL)) { ret 10; }
+    # a scope the exchange's caller ended first keeps its cause through the engine's close
+    var caller_fixture: Fixture;
+    var caller_storage: ExchangeMemory;
+    if (!served_handshake(?caller_fixture) || !open_request(?caller_fixture, 1, false, ?caller_storage)) { ret 11; }
+    cancel.cancel(?caller_storage.scope);
+    if (scope_active(?caller_storage.scope)
+        || receive_frame(?caller_fixture, frame.FRAME_PING, 0, 1, ?opaque[0], 8).kind != EVENT_ERROR
+        || !closure_is(?caller_storage, exchange.CANCELLED_STATE, exchange.CAUSE_CALLER, 0)) { ret 12; }
     ret 0;
 }
 
