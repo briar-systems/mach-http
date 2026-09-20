@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.16.0] - 2026-09-19
 
 ### Added
 - `core.exchange.Completion` and `Exchange` carry a `closure` (`Closure{cause, code, detail}`) recording why the engine closed the exchange: `CAUSE_CONNECTION`, `CAUSE_TRANSPORT` (with the transport error in `detail`), `CAUSE_PEER_RESET`, `CAUSE_LOCAL_RESET`, `CAUSE_TIMEOUT`, or `CAUSE_CALLER` when the exchange's own scope ended first. `code` is the wire's error code. Engines close exchanges through the new `close_exchange(exchange, closure)`; `cancel_exchange` and `timeout_exchange` remain as caller-cause wrappers. The HTTP/2 and HTTP/3 engines fill it on every path that closes a bound exchange, so a host no longer walks its own table against `EVENT_ERROR` to learn which requests a connection failure took (#141).
