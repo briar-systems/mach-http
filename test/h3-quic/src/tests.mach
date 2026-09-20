@@ -527,7 +527,8 @@ test "h3quic: stream reset and application cancellation settle exactly once" {
     if (session.count_of(?second.server, h3.EVENT_STREAM_RESET) != 1)  { ret 15; }
     if (session.count_of(?second.client, h3.EVENT_STREAM_RESET) != 1)  { ret 16; }
     if (other.last_reset_code != h3.H3_REQUEST_CANCELLED)              { ret 17; }
-    if (other.exchanges[0].exchange.state != exchange.CANCELLED_STATE) { ret 18; }
+    if (other.exchanges[0].exchange.state != exchange.CANCELLED_STATE
+        || other.exchanges[0].exchange.completion.closure.cause != exchange.CAUSE_CALLER) { ret 18; }
     cycle(?other, 32);
     if (session.count_of(?second.server, h3.EVENT_STREAM_RESET) != 1
         || session.count_of(?second.client, h3.EVENT_STREAM_RESET) != 1) { ret 19; }
@@ -852,6 +853,10 @@ test "h3quic: an abortive close settles with a request still live on both ends" 
     if (app.exchanges[0].exchange.state != exchange.CANCELLED_STATE
         || fabric.server.engine.active_requests != 0
         || fabric.client.engine.active_requests != 0) { ret 16; }
+    # the exchange itself says the transport took it, with the transport's error
+    val why: exchange.Closure = app.exchanges[0].exchange.completion.closure;
+    if (why.cause != exchange.CAUSE_TRANSPORT || why.code != h3.H3_NO_ERROR
+        || why.detail != server_failed.transport_error) { ret 20; }
     if (session.poll(?fabric.server).kind != h3.EVENT_ERROR
         || session.poll(?fabric.client).kind != h3.EVENT_ERROR
         || fabric.server.io.close_calls != 1

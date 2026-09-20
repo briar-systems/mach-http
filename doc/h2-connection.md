@@ -234,6 +234,27 @@ closes the stream. The engine cannot learn about a scope change any other way.
 list, which costs O(open exchange-bound streams), and it reports the first
 cancelled one, after any expired deadline. Call it from a timer, not once per event.
 
+## Exchange closure
+
+Every exchange the engine closes records why on `Completion.closure`
+(`http.core.exchange.Closure`), so the holder of the exchange learns its fate
+without correlating connection events. `code` is the HTTP/2 error code that went
+on the wire or came from it. Whoever ends the scope owns the cause: an exchange
+whose scope the caller ended first keeps `CAUSE_CALLER` however the engine later
+closes its stream.
+
+| Path | Cause | `code` |
+| --- | --- | --- |
+| connection failure, other than below | `CAUSE_CONNECTION` | the GOAWAY error |
+| connection failure with `ERROR_TRANSPORT` | `CAUSE_TRANSPORT` | the GOAWAY error, `detail` 0 |
+| connection timeout (`ERROR_*_TIMEOUT`) | `CAUSE_TIMEOUT` | the GOAWAY error |
+| connection scope cancelled (`ERROR_CANCELLED`) | `CAUSE_CALLER` | `H2_CANCEL` |
+| peer RST_STREAM | `CAUSE_PEER_RESET` | the peer's code |
+| stream error, `cancel_stream`, `abandon_exchange` | `CAUSE_LOCAL_RESET` | the RST_STREAM code |
+| request or stall deadline | `CAUSE_TIMEOUT` | `H2_CANCEL` |
+
+A GOAWAY retry detaches the exchange intact, so it carries no closure.
+
 ## Complexity
 
 | Path | Cost |
