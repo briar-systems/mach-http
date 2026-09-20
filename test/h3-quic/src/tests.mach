@@ -524,9 +524,9 @@ test "h3quic: stream reset and application cancellation settle exactly once" {
     if (other.used != 1)                                          { ret 13; }
     if (!transition_ok(cancel.cancel(?other.exchanges[0].scope))) { ret 14; }
     cycle(?other, 48);
-    if (session.count_of(?second.server, h3.EVENT_STREAM_RESET) != 1)  { ret 15; }
-    if (session.count_of(?second.client, h3.EVENT_STREAM_RESET) != 1)  { ret 16; }
-    if (other.last_reset_code != h3.H3_REQUEST_CANCELLED)              { ret 17; }
+    if (session.count_of(?second.server, h3.EVENT_STREAM_RESET) != 1) { ret 15; }
+    if (session.count_of(?second.client, h3.EVENT_STREAM_RESET) != 1) { ret 16; }
+    if (other.last_reset_code != h3.H3_REQUEST_CANCELLED)             { ret 17; }
     if (other.exchanges[0].exchange.state != exchange.CANCELLED_STATE
         || other.exchanges[0].exchange.completion.closure.cause != exchange.CAUSE_CALLER) { ret 18; }
     cycle(?other, 32);
