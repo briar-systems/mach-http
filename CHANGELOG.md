@@ -8,6 +8,7 @@
 - `h3.connection.Event` and `Engine` carry `transport_error`, the `error` value of the transport result that failed the connection, so a host can report the adapter's own reason (#139).
 
 ### Changed
+- The h3-quic subproject qualifies the h3 engine against mach-quic `^0.16` (v0.16.0, on std 6.1.0), whose `begin_close` on an already-closed driver answers closed instead of a buffer error. The abortive-close case now asserts the engine's own close is satisfied by the settled driver: `close_started` on both engines, `progress_close` reaches `CLOSED` with no second transport call (#145).
 - An HTTP/3 transport that reports `TRANSPORT_CLOSED` under live work now fails the connection as `ERROR_TRANSPORT_CLOSED` with code `H3_NO_ERROR`, distinct from an adapter fault, which stays `ERROR_TRANSPORT` with `H3_INTERNAL_ERROR`. `Error` gains `ERROR_TRANSPORT_CLOSED` (#139).
 
 ### Fixed
