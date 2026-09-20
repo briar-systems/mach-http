@@ -1,5 +1,7 @@
 # bounded completion-driven ordered-byte transports
 
+use std.allocator;
+use std.allocator.page;
 use std.chrono.time;
 use io_error: std.io.error;
 use std.io.lifecycle;
@@ -785,6 +787,7 @@ fun test_runtime_close(context: ptr, scope: *cancel.Scope,
 }
 
 rec Fixture {
+    allocator:      allocator.Allocator;
     runtime:        io_runtime.Runtime;
     operation_root: cancel.Scope;
     control_root:   cancel.Scope;
@@ -799,6 +802,10 @@ fun refused(outcome: err[io_error.Error]) bool {
     ret sel outcome.err;
 }
 
+fun page_refused(outcome: err[allocator.Error]) bool {
+    ret sel outcome.err;
+}
+
 fun close_refused(outcome: res[bool, io_error.Error]) bool {
     ret sel outcome.err;
 }
@@ -808,7 +815,8 @@ fun submit_refused(outcome: res[Token, io_error.Error]) bool {
 }
 
 fun make_fixture(fixture: *Fixture, security: Security) bool {
-    if (refused(io_runtime.make(?fixture.runtime, 16))) { ret false; }
+    if (page_refused(page.make(?fixture.allocator)))                        { ret false; }
+    if (refused(io_runtime.make(?fixture.runtime, ?fixture.allocator, 16))) { ret false; }
     val none: time.Instant = time.Instant{sec: 0, nsec: 0};
     if (!operation_ok(cancel.make_root(?fixture.operation_root, opt[time.Instant].none{}))
         || !operation_ok(cancel.make_root(?fixture.control_root, opt[time.Instant].none{}))) { ret false; }
@@ -1070,8 +1078,10 @@ fun buffered_control(context: ptr, token: Token,
 }
 
 test "http.core.transport: a readable wait completes at once over buffered plaintext" {
+    var backing: allocator.Allocator;
+    if (page_refused(page.make(?backing))) { ret 1; }
     var runtime: io_runtime.Runtime;
-    if (refused(io_runtime.make(?runtime, 4))) { ret 1; }
+    if (refused(io_runtime.make(?runtime, ?backing, 4))) { ret 1; }
     val none:       time.Instant = time.Instant{sec: 0, nsec: 0};
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
@@ -1161,8 +1171,10 @@ fun secure_control(context: ptr, token: Token,
 }
 
 test "http.core.transport: secured adapters hide internal read and write direction" {
+    var backing: allocator.Allocator;
+    if (page_refused(page.make(?backing))) { ret 1; }
     var runtime: io_runtime.Runtime;
-    if (refused(io_runtime.make(?runtime, 2))) { ret 1; }
+    if (refused(io_runtime.make(?runtime, ?backing, 2))) { ret 1; }
     val none:       time.Instant = time.Instant{sec: 0, nsec: 0};
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
@@ -1198,8 +1210,10 @@ test "http.core.transport: secured adapters hide internal read and write directi
 }
 
 test "http.core.transport: reused slots reject stale generations" {
+    var backing: allocator.Allocator;
+    if (page_refused(page.make(?backing))) { ret 1; }
     var runtime: io_runtime.Runtime;
-    if (refused(io_runtime.make(?runtime, 4))) { ret 1; }
+    if (refused(io_runtime.make(?runtime, ?backing, 4))) { ret 1; }
     val none:       time.Instant = time.Instant{sec: 0, nsec: 0};
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
