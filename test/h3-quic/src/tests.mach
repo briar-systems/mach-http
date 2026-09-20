@@ -840,8 +840,8 @@ test "h3quic: an abortive close settles with a request still live on both ends" 
     # the next step on either engine finds the driver gone: the connection
     # fails once as a transport close, the live request's exchange is
     # cancelled, and the engine keeps reporting the failure and destroys
-    # without the driver. what the closed driver answers to the engine's own
-    # close is the transport's business and is not checked here
+    # without the driver. the closed driver answers the engine's own close as
+    # already closed, which satisfies it
     val server_failed: h3.Event = session.poll(?fabric.server);
     val client_failed: h3.Event = session.poll(?fabric.client);
     if (server_failed.kind != h3.EVENT_ERROR || client_failed.kind != h3.EVENT_ERROR
@@ -861,6 +861,16 @@ test "h3quic: an abortive close settles with a request still live on both ends" 
         || session.poll(?fabric.client).kind != h3.EVENT_ERROR
         || fabric.server.io.close_calls != 1
         || fabric.client.io.close_calls != 1) { ret 17; }
+    # the failure's close on the settled driver counted as started, so the
+    # engines close without another call to the transport
+    if (!fabric.server.engine.close_started
+        || !fabric.client.engine.close_started) { ret 21; }
+    if (!h3.progress_close[adapter.Adapter](?fabric.server.engine)
+        || !h3.progress_close[adapter.Adapter](?fabric.client.engine)
+        || fabric.server.engine.state != h3.CLOSED
+        || fabric.client.engine.state != h3.CLOSED
+        || fabric.server.io.close_calls != 1
+        || fabric.client.io.close_calls != 1) { ret 22; }
     if (!h3.destroy[adapter.Adapter](?fabric.server.engine)
         || !h3.destroy[adapter.Adapter](?fabric.client.engine)
         || !session.session_clean(?fabric.server)
