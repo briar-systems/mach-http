@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.17.0] - 2026-09-22
 
 ### Changed
 - **Breaking.** Dependencies: mach-std `^7.0` pinned at v7.0.2 (was `^6.0` at v6.0.0). A consumer must be on std 7.x as well. Nothing in http's own public surface changes: `io.runtime.make` now takes the allocator the runtime draws from, and http only builds runtimes in its transport tests, which now hand the fixture a page allocator that outlives the runtime (#151).
