@@ -3,6 +3,5 @@ test/*/dep/http/
 test/*/out/
 *.swp
 *.swo
-.wt/
 .mach-seed/
 .mach-txn-lock
