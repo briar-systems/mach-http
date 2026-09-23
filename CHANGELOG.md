@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- An HTTP/2 frame whose last byte arrives with the peer's end of stream is handled. `process` used to drop it and report `EVENT_PEER_CLOSED` straight away, so the frame was lost whatever its type (#155).
+
 ## [0.17.0] - 2026-09-22
 
 ### Changed

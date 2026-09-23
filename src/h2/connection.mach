@@ -2606,13 +2606,8 @@ pub fun process(engine: *Engine, now: time.Instant) Event {
         if (budget == 0 && (input_available(engine) != 0 || engine.input_eof)) {
             ret event(engine, EVENT_PENDING);
         }
-        if (input_available(engine) == 0 && engine.input_eof) {
-            if (engine.parser.header_length != 0 || engine.parser.remaining != 0) {
-                val eof_event: frame.Event = frame.feed(?engine.parser, nil, 0, true);
-                if (eof_event.kind == frame.EVENT_ERROR) {
-                    ret frame_error(engine, eof_event.error);
-                }
-            }
+        # a frame still open at the end is finished or refused as truncated by the feed below
+        if (input_available(engine) == 0 && engine.input_eof && engine.parser.header_length == 0) {
             engine.state = DRAINING;
             ret event(engine, EVENT_PEER_CLOSED);
         }
@@ -5520,5 +5515,23 @@ test "http.h2.connection: a drain the transport refuses still closes" {
         || fixture.engine.write_length != 0 || !fixture.engine.close_pending
         || fixture.engine.error != ERROR_HEADER_TIMEOUT) { ret 2; }
     if (!closes(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a frame that ends with the peer's stream is still handled" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture)) { ret 1; }
+    var opaque: [8]u8;
+    var wire:   [17]u8;
+    val length: usize = test_frame(?wire[0], 17, frame.FRAME_PING, 0, 0, ?opaque[0], 8);
+    if (receive_bytes(?fixture, ?wire[0], length, true).kind != EVENT_PING
+        || process(?fixture.engine, fixture.clock).kind != EVENT_PEER_CLOSED
+        || !submit_write(?fixture.engine, fixture.clock)
+        || fixture.io.write_buffer[3] != frame.FRAME_PING) { ret 2; }
+    # a frame cut short by the end is still refused as truncated
+    var truncated: Fixture;
+    if (!served_handshake(?truncated)
+        || receive_bytes(?truncated, ?wire[0], length - 1, true).kind != EVENT_ERROR
+        || truncated.engine.error != ERROR_FRAME) { ret 3; }
     ret 0;
 }
