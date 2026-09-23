@@ -1706,8 +1706,9 @@ fun submit_close(engine: *Engine) {
     }
 }
 
+# the first failure stands: a submitted close is never failed again
 fun fail_connection(engine: *Engine, error: Error, h2_error: u32) Event {
-    if (engine.state != FAILED && engine.state != CLOSED) {
+    if (engine.state != FAILED && engine.state != CLOSING && engine.state != CLOSED) {
         engine.error    = error;
         engine.h2_error = h2_error;
         engine.state    = FAILED;
@@ -2592,7 +2593,9 @@ pub fun process(engine: *Engine, now: time.Instant) Event {
     }
     engine.now = deadline.latest(engine.now, now);
     if (engine.state == CLOSED) { ret event(engine, EVENT_CLOSED); }
-    if (engine.state == FAILED) { ret failure_event(engine); }
+    # a submitted close waits only on its completion, so leftover input is never parsed
+    if (engine.state == CLOSING) { ret event(engine, EVENT_NONE); }
+    if (engine.state == FAILED)  { ret failure_event(engine); }
     if (engine.held) {
         val stream:     *Stream = stream_for(engine, engine.held_stream);
         var held_event: Event   = stream_event(engine, engine.held_kind, stream);
@@ -5574,6 +5577,121 @@ test "http.h2.connection: a drain the transport refuses still closes" {
     if (submit_write(?fixture.engine, test_now(111)) || fixture.engine.control_count != 0
         || fixture.engine.write_length != 0 || !fixture.engine.close_pending
         || fixture.engine.error != ERROR_HEADER_TIMEOUT) { ret 2; }
+    if (!closes(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a submitted close parses no leftover input and keeps the first error" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture)) { ret 1; }
+    var payload: [7]u8;
+    var wire:    [32]u8;
+    # data on an idle stream fails the connection once the frame is whole
+    var length: usize = test_frame(?wire[0], 32, frame.FRAME_DATA, 0, 1, ?payload[0], 0);
+    # a ping of seven bytes would fail the connection again, as a frame size error
+    length = length + test_frame(?wire[length], 32 - length, frame.FRAME_PING, 0, 0,
+        ?payload[0], 7);
+    val failed: Event = receive_bytes(?fixture, ?wire[0], length, false);
+    if (failed.kind != EVENT_ERROR || failed.error != ERROR_PROTOCOL
+        || failed.code != H2_PROTOCOL_ERROR || input_available(?fixture.engine) != 16) { ret 2; }
+    if (!drain_output(?fixture) || !progress_close(?fixture.engine)
+        || fixture.engine.state != CLOSING || !fixture.engine.close_pending) { ret 3; }
+    if (process(?fixture.engine, fixture.clock).kind != EVENT_NONE
+        || fixture.engine.state != CLOSING || fixture.engine.error != ERROR_PROTOCOL
+        || fixture.engine.h2_error != H2_PROTOCOL_ERROR
+        || input_available(?fixture.engine) != 16 || pending_work(?fixture.engine)) { ret 4; }
+    if (!closes(?fixture)) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: a graceful close parses no leftover input once it is submitted" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture)) { ret 1; }
+    var priority: [5]u8;
+    put_u32(?priority[0], 0);
+    priority[4] = 15;
+    var wire:   [28]u8;
+    var length: usize = test_frame(?wire[0], 28, frame.FRAME_PRIORITY, 0, 1, ?priority[0], 5);
+    length = length + test_frame(?wire[length], 28 - length, frame.FRAME_PRIORITY, 0, 3,
+        ?priority[0], 5);
+    if (receive_bytes(?fixture, ?wire[0], length, false).kind != EVENT_PRIORITY
+        || input_available(?fixture.engine) != 14) { ret 2; }
+    if (!begin_graceful(?fixture.engine) || !finish_graceful(?fixture.engine)
+        || !drain_output(?fixture) || !progress_close(?fixture.engine)
+        || fixture.engine.state != CLOSING) { ret 3; }
+    if (process(?fixture.engine, fixture.clock).kind != EVENT_NONE
+        || input_available(?fixture.engine) != 14 || fixture.engine.control_count != 0
+        || fixture.engine.error != ERROR_NONE) { ret 4; }
+    if (!closes(?fixture)) { ret 5; }
+    ret 0;
+}
+
+# a failed server engine whose close is submitted while its read is still in flight
+fun closing_with_read(fixture: *Fixture) bool {
+    ret served_handshake(fixture) && submit_read(?fixture.engine)
+        && times_out_at(fixture, 110, ERROR_HEADER_TIMEOUT) && drain_output(fixture)
+        && progress_close(?fixture.engine) && fixture.engine.state == CLOSING
+        && fixture.engine.close_pending && fixture.engine.read_pending;
+}
+
+# the close cancels the read still in flight, which fails nothing again either
+fun closes_after_read(fixture: *Fixture) bool {
+    var cancelled: transport.Completion = transport.failed(fixture.io.read_token,
+        transport.READ, 0, io_error.make(io_error.CANCELLED, io_error.OP_READ));
+    ret kept_first_error(fixture, complete_io(?fixture.engine, ?cancelled, fixture.clock))
+        && !fixture.engine.read_pending && closes(fixture);
+}
+
+fun kept_first_error(fixture: *Fixture, reported: Event) bool {
+    ret reported.kind == EVENT_TIMED_OUT && reported.error == ERROR_HEADER_TIMEOUT
+        && fixture.engine.state == CLOSING && fixture.engine.error == ERROR_HEADER_TIMEOUT
+        && fixture.engine.h2_error == H2_NO_ERROR;
+}
+
+test "http.h2.connection: a stale completion after the close is submitted keeps the first error" {
+    var fixture: Fixture;
+    if (!closing_with_read(?fixture)) { ret 1; }
+    var stale: transport.Token = fixture.io.read_token;
+    stale.generation = stale.generation + 1;
+    var completion: transport.Completion = transport.completed(stale, transport.READ, 1);
+    if (!kept_first_error(?fixture, complete_io(?fixture.engine, ?completion, fixture.clock))) {
+        ret 2;
+    }
+    if (!closes_after_read(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a completion the transport refuses after the close keeps the first error" {
+    var fixture: Fixture;
+    if (!closing_with_read(?fixture)) { ret 1; }
+    # a close never ends a stream, so the transport refuses this one and keeps the close in flight
+    var refused: transport.Completion = transport.end_of(fixture.io.close_token,
+        transport.CLOSE, 0);
+    if (!kept_first_error(?fixture, complete_io(?fixture.engine, ?refused, fixture.clock))) {
+        ret 2;
+    }
+    if (!closes_after_read(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: a read that fails after the close is submitted keeps the first error" {
+    var fixture: Fixture;
+    if (!closing_with_read(?fixture)) { ret 1; }
+    var completion: transport.Completion = transport.failed(fixture.io.read_token,
+        transport.READ, 0, io_error.make(io_error.RESET, io_error.OP_READ));
+    if (!kept_first_error(?fixture, complete_io(?fixture.engine, ?completion, fixture.clock))
+        || fixture.engine.read_pending) { ret 2; }
+    if (!closes(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: an empty read after the close is submitted keeps the first error" {
+    var fixture: Fixture;
+    if (!closing_with_read(?fixture)) { ret 1; }
+    var completion: transport.Completion = transport.completed(fixture.io.read_token,
+        transport.READ, 0);
+    if (!kept_first_error(?fixture, complete_io(?fixture.engine, ?completion, fixture.clock))
+        || fixture.engine.read_pending) { ret 2; }
     if (!closes(?fixture)) { ret 3; }
     ret 0;
 }

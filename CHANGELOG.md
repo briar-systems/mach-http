@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- `h2.connection.process` on an engine whose close is submitted (`CLOSING`) returns `EVENT_NONE` and parses nothing. It used to resume parsing input left in the buffer, so a failed engine could fail a second time and overwrite its first error and code, and the host reported the wrong cause. `complete_io` on a `CLOSING` engine no longer fails it again either: a stale or refused completion, a failed read and an empty read each leave the first error and code in place and report that failure (#157).
+
 ## [0.18.0] - 2026-09-23
 
 ### Added
