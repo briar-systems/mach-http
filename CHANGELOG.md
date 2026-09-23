@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-23
+
 ### Added
 - `h2.connection.pending_work(engine)` answers, without changing anything, whether the engine holds work its host must act on now: output `submit_write` would send, an event `process` has not reported, a stream `writable_stream` would name, or a close `progress_close` would submit. Work that needs a buffer reads false while `memory_blocked` is set, since the account's wake drives it, and deadlines stay with `next_deadline`. Each part is the predicate its own call gates on (#155).
 
