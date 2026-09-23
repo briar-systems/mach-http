@@ -386,6 +386,7 @@ pub rec Engine {
     input_length:              usize;
     input_offset:              usize;
     input_eof:                 bool;
+    peer_closed_reported:      bool;
     read_pending:              bool;
     read_token:                transport.Token;
     write_buffer:              *u8;
@@ -1405,6 +1406,7 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     engine.input_length              = 0;
     engine.input_offset              = 0;
     engine.input_eof                 = false;
+    engine.peer_closed_reported      = false;
     engine.read_pending              = false;
     engine.write_buffer              = nil;
     engine.write_capacity            = 0;
@@ -1838,8 +1840,27 @@ fun prepare_header_output(engine: *Engine) bool {
     ret true;
 }
 
+# nothing is staged, in flight, or waiting to be framed
+fun output_idle(engine: *Engine) bool {
+    ret engine.write_length == 0 && !engine.write_pending
+        && !engine.header_output_active && engine.control_count == 0;
+}
+
+# the transport can take a write
+fun write_open(engine: *Engine) bool {
+    ret !engine.write_pending && !engine.close_pending
+        && engine.state != CLOSED && engine.state != CLOSING;
+}
+
+# prepare_output has a frame to build into an empty write buffer
+fun frame_ready(engine: *Engine) bool {
+    if (engine.role == CLIENT && engine.preface_offset < CLIENT_PREFACE_LENGTH) { ret true; }
+    ret engine.preface_received && (engine.control_count != 0 || engine.header_output_active
+        || connection_window_owed(engine) || engine.lists[LIST_WINDOW].head != NO_SLOT);
+}
+
 fun prepare_output(engine: *Engine) bool {
-    if (engine.write_pending || engine.write_length != 0) { ret false; }
+    if (engine.write_pending || engine.write_length != 0 || !frame_ready(engine)) { ret false; }
     if (engine.role == CLIENT && engine.preface_offset < CLIENT_PREFACE_LENGTH) {
         if (!acquire_write(engine)) { ret false; }
         val length: usize = CLIENT_PREFACE_LENGTH - engine.preface_offset;
@@ -1851,7 +1872,6 @@ fun prepare_output(engine: *Engine) bool {
         engine.write_end_stream = false;
         ret true;
     }
-    if (!engine.preface_received) { ret false; }
     flush_window_update(engine);
     if (engine.header_output_active && !engine.header_output_first) {
         ret prepare_header_output(engine);
@@ -1886,8 +1906,9 @@ pub fun submit_read(engine: *Engine) bool {
 }
 
 pub fun submit_write(engine: *Engine, now: time.Instant) bool {
-    if (engine == nil || !engine.initialized || engine.write_pending || !deadline.valid_now(now)
-        || engine.close_pending || engine.state == CLOSED || engine.state == CLOSING) { ret false; }
+    if (engine == nil || !engine.initialized || !write_open(engine) || !deadline.valid_now(now)) {
+        ret false;
+    }
     engine.now = deadline.latest(engine.now, now);
     if (engine.write_length == 0 && !prepare_output(engine)) { ret false; }
     val submitted: res[transport.Token, io_error.Error] = transport.write(
@@ -2606,14 +2627,10 @@ pub fun process(engine: *Engine, now: time.Instant) Event {
         if (budget == 0 && (input_available(engine) != 0 || engine.input_eof)) {
             ret event(engine, EVENT_PENDING);
         }
-        if (input_available(engine) == 0 && engine.input_eof) {
-            if (engine.parser.header_length != 0 || engine.parser.remaining != 0) {
-                val eof_event: frame.Event = frame.feed(?engine.parser, nil, 0, true);
-                if (eof_event.kind == frame.EVENT_ERROR) {
-                    ret frame_error(engine, eof_event.error);
-                }
-            }
-            engine.state = DRAINING;
+        # a frame still open at the end is finished or refused as truncated by the feed below
+        if (input_available(engine) == 0 && engine.input_eof && engine.parser.header_length == 0) {
+            engine.state                = DRAINING;
+            engine.peer_closed_reported = true;
             ret event(engine, EVENT_PEER_CLOSED);
         }
         var input: *u8 = nil;
@@ -2700,10 +2717,15 @@ pub fun release_event(engine: *Engine, id: u32, generation: u64) bool {
     ret true;
 }
 
+# the connection owes its peer a WINDOW_UPDATE for consumed bytes
+fun connection_window_owed(engine: *Engine) bool {
+    ret engine.consumed_pending >= engine.configured.window_update_threshold
+        || (engine.recv_window == 0 && engine.consumed_pending != 0);
+}
+
 fun flush_window_update(engine: *Engine) {
     if (engine.control_count >= engine.control_capacity) { ret; }
-    if (engine.consumed_pending >= engine.configured.window_update_threshold
-        || (engine.recv_window == 0 && engine.consumed_pending != 0)) {
+    if (connection_window_owed(engine)) {
         val increment: u32 = engine.consumed_pending;
         if (queue_window(engine, 0, increment)) {
             engine.recv_window      = engine.recv_window + increment::i64;
@@ -2976,14 +2998,17 @@ pub fun set_writable(engine: *Engine, id: u32, ready: bool, now: time.Instant) b
     ret true;
 }
 
+# the scheduler can hand a stream the connection window and an idle writer
+fun scheduler_open(engine: *Engine) bool {
+    ret engine.send_window > 0 && output_idle(engine);
+}
+
 # smooth weighted round robin over the writable set only: every call adds each
 # member's weight to its credit, picks the highest credit (lowest id on a tie),
 # and charges the winner the set's total weight
 
 pub fun writable_stream(engine: *Engine) u32 {
-    if (engine == nil || !engine.initialized || engine.send_window <= 0
-        || engine.header_output_active || engine.write_length != 0
-        || engine.write_pending || engine.control_count != 0) { ret 0; }
+    if (engine == nil || !engine.initialized || !scheduler_open(engine)) { ret 0; }
     if (engine.scheduled_stream != 0) {
         val scheduled: *Stream = stream_for(engine, engine.scheduled_stream);
         if (scheduled != nil && schedulable(scheduled)) { ret scheduled.id; }
@@ -3011,9 +3036,7 @@ pub fun offer_data(engine: *Engine, id: u32, input: *u8,
     length: usize, end_stream: bool, now: time.Instant) Offer {
     if (engine == nil || !engine.initialized || (input == nil && length != 0)
         || !deadline.valid_now(now)
-        || (length == 0 && !end_stream)
-        || engine.write_length != 0 || engine.write_pending || engine.header_output_active
-        || engine.control_count != 0) {
+        || (length == 0 && !end_stream) || !output_idle(engine)) {
         ret Offer{status: OFFER_BLOCKED, consumed: 0, produced: 0,
             stream_id: id, error: ERROR_STATE};
     }
@@ -3209,15 +3232,47 @@ pub fun finish_graceful(engine: *Engine) bool {
     ret true;
 }
 
+# every output settled, and the connection failed or sent its final goaway with no stream left
+fun close_ready(engine: *Engine) bool {
+    ret !engine.close_pending && engine.state != CLOSED && output_idle(engine)
+        && (engine.state == FAILED || (engine.final_goaway_sent
+        && engine.active_local == 0 && engine.active_remote == 0));
+}
+
 pub fun progress_close(engine: *Engine) bool {
-    if (engine == nil || !engine.initialized || engine.close_pending
-        || engine.state == CLOSED || engine.write_pending || engine.write_length != 0
-        || engine.control_count != 0 || engine.header_output_active
-        || (engine.state != FAILED && (!engine.final_goaway_sent
-        || engine.active_local != 0 || engine.active_remote != 0))) { ret false; }
+    if (engine == nil || !engine.initialized || !close_ready(engine)) { ret false; }
     engine.state = CLOSING;
     submit_close(engine);
     ret engine.close_pending || engine.state == CLOSED;
+}
+
+# the next process would report an event or make progress without new input.
+# a failed engine only repeats its failure, a closing one waits only on its close,
+# and a held event is already the host's
+fun event_ready(engine: *Engine) bool {
+    if (engine.state == CLOSED || engine.state == CLOSING || engine.state == FAILED
+        || engine.held) { ret false; }
+    if (engine.ready_head != NO_SLOT) { ret true; }
+    # a refused payload buffer is retried before any input is parsed
+    if (engine.payload_wanted) { ret !engine.memory_blocked; }
+    ret input_available(engine) != 0 || (engine.input_eof && !engine.peer_closed_reported);
+}
+
+# whether the engine holds work its host must act on now, with no new input, no
+# completion and no time passing: a frame for submit_write, an event for process,
+# a stream writable_stream would name, or a close for progress_close. each is the
+# same predicate its own call gates on. work that needs a buffer reads false while
+# memory_blocked is set, since the account's wake drives it, not the host.
+# deadlines are next_deadline's. O(1), reading only
+pub fun pending_work(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized) { ret false; }
+    if (write_open(engine)
+        && (engine.write_length != 0 || (!engine.memory_blocked && frame_ready(engine)))) {
+        ret true;
+    }
+    ret event_ready(engine) || close_ready(engine)
+        || (!engine.memory_blocked && scheduler_open(engine)
+        && engine.lists[LIST_WRITABLE].head != NO_SLOT);
 }
 
 fun test_now(seconds: i64) time.Instant {
@@ -5520,5 +5575,233 @@ test "http.h2.connection: a drain the transport refuses still closes" {
         || fixture.engine.write_length != 0 || !fixture.engine.close_pending
         || fixture.engine.error != ERROR_HEADER_TIMEOUT) { ret 2; }
     if (!closes(?fixture)) { ret 3; }
+    ret 0;
+}
+
+test "http.h2.connection: pending work is output until it is written" {
+    var client: Fixture;
+    if (!make_fixture(?client, CLIENT, test_config())) { ret 1; }
+    # the client owes its preface and settings from init
+    if (!pending_work(?client.engine) || !drain_output(?client)
+        || pending_work(?client.engine)) { ret 2; }
+    if (receive_frame(?client, frame.FRAME_SETTINGS, 0, 0, nil, 0).kind != EVENT_SETTINGS
+        || !pending_work(?client.engine)) { ret 3; }
+    # a write in flight waits on its completion, not on the host
+    if (!submit_write(?client.engine, client.clock) || pending_work(?client.engine)) { ret 4; }
+    var completion: transport.Completion = transport.completed(
+        client.io.write_token, transport.WRITE, client.io.write_length);
+    if (complete_io(?client.engine, ?completion, client.clock).kind != EVENT_NONE
+        || pending_work(?client.engine)) { ret 5; }
+    var server: Fixture;
+    if (!make_fixture(?server, SERVER, test_config())) { ret 6; }
+    # a server writes nothing before the client preface, so its queued settings wait
+    if (server.engine.control_count == 0 || pending_work(?server.engine)) { ret 7; }
+    if (server_handshake(?server).kind != EVENT_SETTINGS || !pending_work(?server.engine)
+        || !drain_output(?server) || pending_work(?server.engine)) { ret 8; }
+    var opaque: [8]u8;
+    if (receive_frame(?server, frame.FRAME_PING, 0, 0, ?opaque[0], 8).kind != EVENT_PING
+        || !pending_work(?server.engine) || !drain_output(?server)
+        || pending_work(?server.engine)) { ret 9; }
+    ret 0;
+}
+
+test "http.h2.connection: pending work is an event process has not reported" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture) || pending_work(?fixture.engine)) { ret 1; }
+    var priority: [5]u8;
+    put_u32(?priority[0], 0);
+    priority[4] = 15;
+    var wire:   [28]u8;
+    var length: usize = test_frame(?wire[0], 28, frame.FRAME_PRIORITY, 0, 1, ?priority[0], 5);
+    length = length + test_frame(?wire[length], 28 - length, frame.FRAME_PRIORITY, 0, 3,
+        ?priority[0], 5);
+    # one read carries two frames, and the second waits in the buffer
+    if (receive_bytes(?fixture, ?wire[0], length, false).kind != EVENT_PRIORITY
+        || !pending_work(?fixture.engine)) { ret 2; }
+    if (process(?fixture.engine, fixture.clock).kind != EVENT_PRIORITY
+        || pending_work(?fixture.engine)
+        || process(?fixture.engine, fixture.clock).kind != EVENT_NEED_READ
+        || pending_work(?fixture.engine)) { ret 3; }
+    # the peer's end of stream behind a frame is news until process reports it, once
+    if (receive_bytes(?fixture, ?wire[0], 14, true).kind != EVENT_PRIORITY
+        || !pending_work(?fixture.engine)) { ret 4; }
+    if (process(?fixture.engine, fixture.clock).kind != EVENT_PEER_CLOSED
+        || pending_work(?fixture.engine)
+        || process(?fixture.engine, fixture.clock).kind != EVENT_PEER_CLOSED
+        || pending_work(?fixture.engine)) { ret 5; }
+    # a goaway retry waits on the ready queue
+    var client: Fixture;
+    if (!make_fixture(?client, CLIENT, test_config())
+        || client_handshake(?client).kind != EVENT_SETTINGS
+        || !drain_output(?client) || pending_work(?client.engine)) { ret 6; }
+    val first:  u32 = open_local(?client.engine, nil);
+    val second: u32 = open_local(?client.engine, nil);
+    var goaway: [8]u8;
+    put_u32(?goaway[0], first);
+    put_u32(?goaway[4], H2_NO_ERROR);
+    if (second == 0 || pending_work(?client.engine)
+        || receive_frame(?client, frame.FRAME_GOAWAY, 0, 0, ?goaway[0], 8).kind != EVENT_GOAWAY
+        || !pending_work(?client.engine)) { ret 7; }
+    if (process(?client.engine, client.clock).kind != EVENT_STREAM_RETRY
+        || pending_work(?client.engine)) { ret 8; }
+    # a borrowed event is the host's, and blocks every later one until released
+    var server: Fixture;
+    if (!served_handshake(?server)) { ret 9; }
+    var block: [6]u8;
+    request_block(?block[0]);
+    var request: [29]u8;
+    var total:   usize = test_frame(?request[0], 29, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 1, ?block[0], 6);
+    total = total + test_frame(?request[total], 29 - total, frame.FRAME_PRIORITY, 0, 3,
+        ?priority[0], 5);
+    if (total != 29) { ret 9; }
+    val headers: Event = receive_bytes(?server, ?request[0], total, false);
+    if (headers.kind != EVENT_REQUEST_HEADERS || pending_work(?server.engine)) { ret 10; }
+    var storage: ExchangeMemory;
+    if (!make_exchange(?storage, headers.generation, 1)
+        || !bind_exchange(?server.engine, 1, ?storage.exchange)
+        || !release_event(?server.engine, 1, headers.generation)
+        || !pending_work(?server.engine)
+        || process(?server.engine, server.clock).kind != EVENT_PRIORITY
+        || pending_work(?server.engine)) { ret 11; }
+    ret 0;
+}
+
+test "http.h2.connection: pending work is a window update owed or a stream that can send" {
+    var fixture:    Fixture;
+    var configured: Config = test_config();
+    configured.local.initial_window_size = 8;
+    configured.window_update_threshold   = 4;
+    var first: ExchangeMemory;
+    if (!make_fixture(?fixture, SERVER, configured)
+        || server_handshake(?fixture).kind != EVENT_SETTINGS || !drain_output(?fixture)
+        || !open_request(?fixture, 1, false, ?first) || pending_work(?fixture.engine)) { ret 1; }
+    var bytes: [6]u8;
+    if (receive_frame(?fixture, frame.FRAME_DATA, 0, 1, ?bytes[0], 6).kind != EVENT_DATA
+        || pending_work(?fixture.engine)) { ret 2; }
+    # consumed bytes past the threshold owe the peer a window update
+    if (!consume_data(?fixture.engine, 1, 6) || !pending_work(?fixture.engine)
+        || !drain_output(?fixture) || pending_work(?fixture.engine)
+        || stream_for(?fixture.engine, 1).consumed_pending != 0
+        || fixture.engine.consumed_pending != 0) { ret 3; }
+    # a writable stream counts only while its window lets it send
+    var zero: [6]u8;
+    zero[0] = 0;
+    zero[1] = frame.SETTINGS_INITIAL_WINDOW_SIZE::u8;
+    put_u32(?zero[2], 0);
+    var second: ExchangeMemory;
+    if (receive_frame(?fixture, frame.FRAME_SETTINGS, 0, 0, ?zero[0], 6).kind != EVENT_SETTINGS
+        || !drain_output(?fixture) || !open_request(?fixture, 3, true, ?second)
+        || !respond(?fixture, 3) || pending_work(?fixture.engine)) { ret 4; }
+    if (!set_writable(?fixture.engine, 3, true, fixture.clock)
+        || pending_work(?fixture.engine)) { ret 5; }
+    if (receive_window(?fixture, 3, 4).kind != EVENT_NEED_READ
+        || !pending_work(?fixture.engine)) { ret 6; }
+    var body: [4]u8;
+    if (offer_data(?fixture.engine, 3, ?body[0], 4, true, fixture.clock).status != OFFER_DONE
+        || !pending_work(?fixture.engine) || !drain_output(?fixture)
+        || pending_work(?fixture.engine)) { ret 7; }
+    ret 0;
+}
+
+test "http.h2.connection: pending work is a close progress_close would submit" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture) || !begin_graceful(?fixture.engine)
+        || !pending_work(?fixture.engine) || !drain_output(?fixture)) { ret 1; }
+    # the final goaway is the host's to send, so a drained connection waits on it
+    if (pending_work(?fixture.engine) || !finish_graceful(?fixture.engine)
+        || !pending_work(?fixture.engine) || !drain_output(?fixture)) { ret 2; }
+    if (!pending_work(?fixture.engine) || !progress_close(?fixture.engine)
+        || pending_work(?fixture.engine)) { ret 3; }
+    var closed: transport.Completion = transport.completed(
+        fixture.io.close_token, transport.CLOSE, 0);
+    if (complete_io(?fixture.engine, ?closed, fixture.clock).kind != EVENT_CLOSED
+        || pending_work(?fixture.engine)) { ret 4; }
+    # a failed engine drains its goaway and then owes its close
+    var failed: Fixture;
+    var bytes:  [1]u8;
+    if (!served_handshake(?failed)
+        || receive_frame(?failed, frame.FRAME_DATA, 0, 0, ?bytes[0], 1).kind != EVENT_ERROR
+        || !pending_work(?failed.engine) || !goaway_written(?failed, H2_PROTOCOL_ERROR)
+        || !pending_work(?failed.engine) || !progress_close(?failed.engine)
+        || pending_work(?failed.engine)) { ret 5; }
+    ret 0;
+}
+
+fun pending_script(fixture: *Fixture) bool {
+    if (!make_fixture(fixture, CLIENT, test_config())
+        || client_handshake(fixture).kind != EVENT_SETTINGS
+        || !drain_output(fixture) || !open_requests(fixture, 1, nil)) { ret false; }
+    var opaque: [8]u8;
+    var wire:   [34]u8;
+    var length: usize = test_frame(?wire[0], 34, frame.FRAME_PING, 0, 0, ?opaque[0], 8);
+    length = length + test_frame(?wire[length], 34 - length, frame.FRAME_PING, 0, 0,
+        ?opaque[0], 8);
+    ret receive_bytes(fixture, ?wire[0], length, false).kind == EVENT_PING;
+}
+
+test "http.h2.connection: asking about pending work changes nothing the engine does next" {
+    var asked: Fixture;
+    var plain: Fixture;
+    if (!pending_script(?asked) || !pending_script(?plain)) { ret 1; }
+    var before: [16384]u8;
+    if ($size_of(Engine) > 16384) { ret 2; }
+    memory.raw_copy(?before[0], (?asked.engine)::*u8, $size_of(Engine));
+    var i: usize = 0;
+    for (i < 4) {
+        if (!pending_work(?asked.engine)) { ret 3; }
+        i = i + 1;
+    }
+    if (!memory.raw_equal(?before[0], (?asked.engine)::*u8, $size_of(Engine))) { ret 4; }
+    # the next output and the next event are the same as an engine never asked
+    if (!submit_write(?asked.engine, asked.clock) || !submit_write(?plain.engine, plain.clock)
+        || asked.io.write_length != plain.io.write_length || asked.io.write_length == 0
+        || !memory.raw_equal(asked.io.write_buffer, plain.io.write_buffer,
+        asked.io.write_length)) { ret 5; }
+    val asked_event: Event = process(?asked.engine, asked.clock);
+    val plain_event: Event = process(?plain.engine, plain.clock);
+    if (asked_event.kind != EVENT_PING || plain_event.kind != EVENT_PING
+        || asked.engine.input_offset != plain.engine.input_offset) { ret 6; }
+    ret 0;
+}
+
+test "http.h2.connection: pending work that needs refused memory waits on the account" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, CLIENT, test_config())
+        || client_handshake(?fixture).kind != EVENT_SETTINGS
+        || !drain_output(?fixture)) { ret 1; }
+    fixture.account.budgets[1] = idle_bytes();
+    var opaque: [8]u8;
+    # the ping's payload is still unread, but only a buffer the account refused lets it on
+    if (receive_frame(?fixture, frame.FRAME_PING, 0, 0, ?opaque[0], 8).kind
+        != EVENT_MEMORY_BLOCKED || fixture.engine.input_offset == fixture.engine.input_length
+        || pending_work(?fixture.engine)) { ret 2; }
+    fixture.account.budgets[1] = idle_bytes() + round16(16384);
+    if (process(?fixture.engine, fixture.clock).kind != EVENT_PING
+        || !pending_work(?fixture.engine)) { ret 3; }
+    # the ack waits on a refused write buffer the same way
+    fixture.account.budgets[1] = idle_bytes();
+    if (submit_write(?fixture.engine, fixture.clock) || !fixture.engine.memory_blocked
+        || fixture.engine.control_count == 0 || pending_work(?fixture.engine)) { ret 4; }
+    fixture.account.budgets[1] = 1 << 25;
+    if (!drain_output(?fixture) || pending_work(?fixture.engine)) { ret 5; }
+    ret 0;
+}
+
+test "http.h2.connection: a frame that ends with the peer's stream is still handled" {
+    var fixture: Fixture;
+    if (!served_handshake(?fixture)) { ret 1; }
+    var opaque: [8]u8;
+    var wire:   [17]u8;
+    val length: usize = test_frame(?wire[0], 17, frame.FRAME_PING, 0, 0, ?opaque[0], 8);
+    if (receive_bytes(?fixture, ?wire[0], length, true).kind != EVENT_PING
+        || process(?fixture.engine, fixture.clock).kind != EVENT_PEER_CLOSED
+        || !submit_write(?fixture.engine, fixture.clock)
+        || fixture.io.write_buffer[3] != frame.FRAME_PING) { ret 2; }
+    # a frame cut short by the end is still refused as truncated
+    var truncated: Fixture;
+    if (!served_handshake(?truncated)
+        || receive_bytes(?truncated, ?wire[0], length - 1, true).kind != EVENT_ERROR
+        || truncated.engine.error != ERROR_FRAME) { ret 3; }
     ret 0;
 }
