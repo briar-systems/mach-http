@@ -1838,8 +1838,27 @@ fun prepare_header_output(engine: *Engine) bool {
     ret true;
 }
 
+# nothing is staged, in flight, or waiting to be framed
+fun output_idle(engine: *Engine) bool {
+    ret engine.write_length == 0 && !engine.write_pending
+        && !engine.header_output_active && engine.control_count == 0;
+}
+
+# the transport can take a write
+fun write_open(engine: *Engine) bool {
+    ret !engine.write_pending && !engine.close_pending
+        && engine.state != CLOSED && engine.state != CLOSING;
+}
+
+# prepare_output has a frame to build into an empty write buffer
+fun frame_ready(engine: *Engine) bool {
+    if (engine.role == CLIENT && engine.preface_offset < CLIENT_PREFACE_LENGTH) { ret true; }
+    ret engine.preface_received && (engine.control_count != 0 || engine.header_output_active
+        || connection_window_owed(engine) || engine.lists[LIST_WINDOW].head != NO_SLOT);
+}
+
 fun prepare_output(engine: *Engine) bool {
-    if (engine.write_pending || engine.write_length != 0) { ret false; }
+    if (engine.write_pending || engine.write_length != 0 || !frame_ready(engine)) { ret false; }
     if (engine.role == CLIENT && engine.preface_offset < CLIENT_PREFACE_LENGTH) {
         if (!acquire_write(engine)) { ret false; }
         val length: usize = CLIENT_PREFACE_LENGTH - engine.preface_offset;
@@ -1851,7 +1870,6 @@ fun prepare_output(engine: *Engine) bool {
         engine.write_end_stream = false;
         ret true;
     }
-    if (!engine.preface_received) { ret false; }
     flush_window_update(engine);
     if (engine.header_output_active && !engine.header_output_first) {
         ret prepare_header_output(engine);
@@ -1886,8 +1904,9 @@ pub fun submit_read(engine: *Engine) bool {
 }
 
 pub fun submit_write(engine: *Engine, now: time.Instant) bool {
-    if (engine == nil || !engine.initialized || engine.write_pending || !deadline.valid_now(now)
-        || engine.close_pending || engine.state == CLOSED || engine.state == CLOSING) { ret false; }
+    if (engine == nil || !engine.initialized || !write_open(engine) || !deadline.valid_now(now)) {
+        ret false;
+    }
     engine.now = deadline.latest(engine.now, now);
     if (engine.write_length == 0 && !prepare_output(engine)) { ret false; }
     val submitted: res[transport.Token, io_error.Error] = transport.write(
@@ -2695,10 +2714,15 @@ pub fun release_event(engine: *Engine, id: u32, generation: u64) bool {
     ret true;
 }
 
+# the connection owes its peer a WINDOW_UPDATE for consumed bytes
+fun connection_window_owed(engine: *Engine) bool {
+    ret engine.consumed_pending >= engine.configured.window_update_threshold
+        || (engine.recv_window == 0 && engine.consumed_pending != 0);
+}
+
 fun flush_window_update(engine: *Engine) {
     if (engine.control_count >= engine.control_capacity) { ret; }
-    if (engine.consumed_pending >= engine.configured.window_update_threshold
-        || (engine.recv_window == 0 && engine.consumed_pending != 0)) {
+    if (connection_window_owed(engine)) {
         val increment: u32 = engine.consumed_pending;
         if (queue_window(engine, 0, increment)) {
             engine.recv_window      = engine.recv_window + increment::i64;
@@ -2971,14 +2995,17 @@ pub fun set_writable(engine: *Engine, id: u32, ready: bool, now: time.Instant) b
     ret true;
 }
 
+# the scheduler can hand a stream the connection window and an idle writer
+fun scheduler_open(engine: *Engine) bool {
+    ret engine.send_window > 0 && output_idle(engine);
+}
+
 # smooth weighted round robin over the writable set only: every call adds each
 # member's weight to its credit, picks the highest credit (lowest id on a tie),
 # and charges the winner the set's total weight
 
 pub fun writable_stream(engine: *Engine) u32 {
-    if (engine == nil || !engine.initialized || engine.send_window <= 0
-        || engine.header_output_active || engine.write_length != 0
-        || engine.write_pending || engine.control_count != 0) { ret 0; }
+    if (engine == nil || !engine.initialized || !scheduler_open(engine)) { ret 0; }
     if (engine.scheduled_stream != 0) {
         val scheduled: *Stream = stream_for(engine, engine.scheduled_stream);
         if (scheduled != nil && schedulable(scheduled)) { ret scheduled.id; }
@@ -3006,9 +3033,7 @@ pub fun offer_data(engine: *Engine, id: u32, input: *u8,
     length: usize, end_stream: bool, now: time.Instant) Offer {
     if (engine == nil || !engine.initialized || (input == nil && length != 0)
         || !deadline.valid_now(now)
-        || (length == 0 && !end_stream)
-        || engine.write_length != 0 || engine.write_pending || engine.header_output_active
-        || engine.control_count != 0) {
+        || (length == 0 && !end_stream) || !output_idle(engine)) {
         ret Offer{status: OFFER_BLOCKED, consumed: 0, produced: 0,
             stream_id: id, error: ERROR_STATE};
     }
@@ -3204,12 +3229,15 @@ pub fun finish_graceful(engine: *Engine) bool {
     ret true;
 }
 
+# every output settled, and the connection failed or sent its final goaway with no stream left
+fun close_ready(engine: *Engine) bool {
+    ret !engine.close_pending && engine.state != CLOSED && output_idle(engine)
+        && (engine.state == FAILED || (engine.final_goaway_sent
+        && engine.active_local == 0 && engine.active_remote == 0));
+}
+
 pub fun progress_close(engine: *Engine) bool {
-    if (engine == nil || !engine.initialized || engine.close_pending
-        || engine.state == CLOSED || engine.write_pending || engine.write_length != 0
-        || engine.control_count != 0 || engine.header_output_active
-        || (engine.state != FAILED && (!engine.final_goaway_sent
-        || engine.active_local != 0 || engine.active_remote != 0))) { ret false; }
+    if (engine == nil || !engine.initialized || !close_ready(engine)) { ret false; }
     engine.state = CLOSING;
     submit_close(engine);
     ret engine.close_pending || engine.state == CLOSED;
