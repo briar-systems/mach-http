@@ -319,6 +319,7 @@ pub rec Engine {
     source:                    *buffers.Source;
     account:                   *buffers.Account;
     memory_blocked:            bool;
+    memory_budget:             bool;
     records:                   records.Records;
     stream_capacity:           usize;
     reserve:                   Stream;
@@ -612,19 +613,32 @@ fun buffer_request(bytes: usize, align: usize, lane: u8) buffers.Request {
     ret buffers.Request{bytes: bytes, align: align, lane: lane, secret: false};
 }
 
-# a transient refusal registers the account, so the host re-drives the
-# connection when the source reports the account ready
+# a transient refusal on the shared pool registers the account, so the host
+# re-drives the connection when the source reports the account ready. a refusal
+# by the account's own budget registers nothing, and the engine's next release
+# on the connection lane ends it instead
+fun transient_granted(engine: *Engine, got: buffers.Acquired) bool {
+    engine.memory_blocked = !granted(got);
+    engine.memory_budget  = engine.memory_blocked && sel got.reason.budget;
+    ret !engine.memory_blocked;
+}
+
 fun acquire_transient(engine: *Engine, bytes: usize, chunk: *buffers.Chunk) bool {
     val got: buffers.Acquired = buffers.source_acquire(engine.source, engine.account,
         buffer_request(bytes, 0, engine.configured.connection_lane), true);
-    engine.memory_blocked = !granted(got);
-    if (engine.memory_blocked) { ret false; }
+    if (!transient_granted(engine, got)) { ret false; }
     @chunk = got.chunk;
     ret true;
 }
 
-fun release_chunk(engine: *Engine, chunk: buffers.Chunk) {
+# every transient buffer is on the connection lane, so only a release there
+# can make room for the one the budget refused
+fun release_chunk(engine: *Engine, chunk: buffers.Chunk, lane: u8) {
     buffers.source_release(engine.source, engine.account, chunk);
+    if (engine.memory_budget && lane == engine.configured.connection_lane) {
+        engine.memory_blocked = false;
+        engine.memory_budget  = false;
+    }
 }
 
 fun acquire_write(engine: *Engine) bool {
@@ -640,7 +654,7 @@ fun acquire_write(engine: *Engine) bool {
 
 fun release_write(engine: *Engine) {
     if (!engine.write_held || engine.write_pending || engine.write_length != 0) { ret; }
-    release_chunk(engine, engine.write_chunk);
+    release_chunk(engine, engine.write_chunk, engine.configured.connection_lane);
     engine.write_held     = false;
     engine.write_buffer   = nil;
     engine.write_capacity = 0;
@@ -659,7 +673,7 @@ fun acquire_payload(engine: *Engine) bool {
 # a held DATA event still views the payload, so it waits for that event
 fun settle_payload(engine: *Engine) {
     if (!engine.payload_held || (engine.held && engine.held_kind == EVENT_DATA)) { ret; }
-    release_chunk(engine, engine.payload_chunk);
+    release_chunk(engine, engine.payload_chunk, engine.configured.connection_lane);
     engine.payload_held           = false;
     engine.frame_payload          = nil;
     engine.frame_payload_capacity = 0;
@@ -676,8 +690,7 @@ fun acquire_encoder(engine: *Engine) bool {
     };
     val got: buffers.Acquired = buffers.source_acquire_n(engine.source, engine.account,
         ?requests[0], 2, ?engine.encode_chunks[0], true);
-    engine.memory_blocked = !granted(got);
-    if (engine.memory_blocked) { ret false; }
+    if (!transient_granted(engine, got)) { ret false; }
     engine.header_output_held       = true;
     engine.header_output            = engine.encode_chunks[0].data;
     engine.header_output_capacity   = engine.configured.hpack.max_encoded_block_bytes;
@@ -688,8 +701,8 @@ fun acquire_encoder(engine: *Engine) bool {
 
 fun release_encoder(engine: *Engine) {
     if (!engine.header_output_held || engine.header_output_active) { ret; }
-    release_chunk(engine, engine.encode_chunks[1]);
-    release_chunk(engine, engine.encode_chunks[0]);
+    release_chunk(engine, engine.encode_chunks[1], engine.configured.connection_lane);
+    release_chunk(engine, engine.encode_chunks[0], engine.configured.connection_lane);
     engine.header_output_held       = false;
     engine.header_output            = nil;
     engine.header_output_capacity   = 0;
@@ -755,7 +768,7 @@ fun release_stream_memory(engine: *Engine, stream: *Stream) {
         var i: usize = STREAM_BUFFERS;
         for (i != 0) {
             i = i - 1;
-            release_chunk(engine, stream.memory.chunks[i]);
+            release_chunk(engine, stream.memory.chunks[i], engine.configured.stream_lane);
         }
     }
     var unbound: StreamMemory;
@@ -823,7 +836,7 @@ fun grow_streams(engine: *Engine) bool {
     engine.index          = chunks[1].data::*StreamIndexEntry;
     engine.index_capacity = size;
     index_rebuild(engine);
-    release_chunk(engine, old);
+    release_chunk(engine, old, engine.configured.connection_lane);
     ret true;
 }
 
@@ -1318,6 +1331,7 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     engine.source              = source;
     engine.account             = account;
     engine.memory_blocked      = false;
+    engine.memory_budget       = false;
     engine.refused_memory      = refused;
     engine.refused_memory.held = false;
     if (!records.make(?engine.records, $size_of(Stream), first_streams(configured))) {
@@ -1471,7 +1485,7 @@ fun release_all(engine: *Engine) {
     release_encoder(engine);
     release_write(engine);
     records.destroy(?engine.records, engine.source, engine.account);
-    release_chunk(engine, engine.index_chunk);
+    release_chunk(engine, engine.index_chunk, engine.configured.connection_lane);
     engine.stream_capacity = 0;
     engine.index           = nil;
     engine.index_capacity  = 0;
@@ -3265,7 +3279,8 @@ fun event_ready(engine: *Engine) bool {
 # completion and no time passing: a frame for submit_write, an event for process,
 # a stream writable_stream would name, or a close for progress_close. each is the
 # same predicate its own call gates on. work that needs a buffer reads false while
-# memory_blocked is set, since the account's wake drives it, not the host.
+# memory_blocked is set, since the account's wake or the engine's own release on
+# the connection lane ends it, not the host.
 # deadlines are next_deadline's. O(1), reading only
 pub fun pending_work(engine: *Engine) bool {
     if (engine == nil || !engine.initialized) { ret false; }
@@ -4772,6 +4787,64 @@ test "http.h2.connection: held data keeps its payload until consumed" {
     if (!consume_data(?fixture.engine, 1, 3) || !fixture.engine.payload_held
         || !consume_data(?fixture.engine, 1, 1) || fixture.engine.payload_held
         || fixture.account.used[1] != idle_bytes()) { ret 4; }
+    ret 0;
+}
+
+test "http.h2.connection: a budget refusal ends at the engine's own release" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, SERVER, test_config())
+        || server_handshake(?fixture).kind != EVENT_SETTINGS
+        || !drain_output(?fixture)) { ret 1; }
+    var opaque:  [8]u8;
+    var request: [6]u8;
+    request_block(?request[0]);
+    if (receive_frame(?fixture, frame.FRAME_PING, 0, 0, ?opaque[0], 8).kind != EVENT_PING) { ret 2; }
+    val headers: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
+        frame.FLAG_END_HEADERS, 1, ?request[0], 6);
+    var storage: ExchangeMemory;
+    if (headers.kind != EVENT_REQUEST_HEADERS
+        || !make_exchange(?storage, headers.generation, 1)
+        || !bind_exchange(?fixture.engine, 1, ?storage.exchange)
+        || !release_event(?fixture.engine, 1, headers.generation)) { ret 3; }
+    var body_bytes: [4]u8;
+    if (receive_frame(?fixture, frame.FRAME_DATA, 0, 1, ?body_bytes[0], 4).kind != EVENT_DATA
+        || !fixture.engine.payload_held) { ret 4; }
+    # the held payload fills the lane, so the queued PING ack cannot get a write buffer
+    fixture.account.budgets[1] = fixture.account.used[1];
+    if (submit_write(?fixture.engine, fixture.clock) || !fixture.engine.memory_blocked
+        || fixture.account.waiting || fixture.account.is_ready
+        || pending_work(?fixture.engine)) { ret 5; }
+    # the budget refusal registered no wake, so the engine's own release is what ends it
+    if (!consume_data(?fixture.engine, 1, 4) || fixture.engine.payload_held
+        || fixture.account.waiting || fixture.account.is_ready) { ret 6; }
+    if (fixture.engine.memory_blocked || !pending_work(?fixture.engine)) { ret 7; }
+    if (!submit_write(?fixture.engine, fixture.clock)
+        || fixture.io.write_buffer[3] != frame.FRAME_PING) { ret 8; }
+    ret 0;
+}
+
+test "http.h2.connection: a budget refusal outlasts a release on another lane" {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, CLIENT, test_config())
+        || client_handshake(?fixture).kind != EVENT_SETTINGS
+        || !drain_output(?fixture)) { ret 1; }
+    val first:  u32 = open_local(?fixture.engine, nil);
+    val second: u32 = open_local(?fixture.engine, nil);
+    if (first == 0 || second == 0) { ret 2; }
+    fixture.account.budgets[1] = fixture.account.used[1];
+    var request: [4]field.Field;
+    request_fields(?request[0]);
+    if (send_headers(?fixture.engine, second, ?request[0], 4, true, true).status != OFFER_BLOCKED
+        || !fixture.engine.memory_blocked) { ret 3; }
+    # the first stream's set is on the stream lane, which the refused buffer is not
+    val generation: u64 = stream_for(?fixture.engine, first).generation;
+    if (!cancel_stream(?fixture.engine, first, H2_CANCEL)
+        || !release_stream(?fixture.engine, first, generation, fixture.clock)
+        || fixture.account.used[0] != stream_set_bytes()) { ret 4; }
+    if (!fixture.engine.memory_blocked || pending_work(?fixture.engine)) { ret 5; }
+    fixture.account.budgets[1] = 1 << 25;
+    if (!drain_output(?fixture)
+        || send_headers(?fixture.engine, second, ?request[0], 4, true, true).status != OFFER_OUTPUT) { ret 6; }
     ret 0;
 }
 
