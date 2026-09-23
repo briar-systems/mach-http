@@ -153,6 +153,35 @@ loop:
 After a GOAWAY, `EVENT_STREAM_RETRY` events come out in the order the GOAWAY sweep
 found the streams, one per `process` call.
 
+### Pending work
+
+`pending_work(engine)` answers whether the engine holds work its host must act on
+now, with no new input, no transport completion and no time passing. It is O(1),
+allocates nothing and changes nothing, so asking never alters what the engine does
+next. A host's audit uses it to find a connection that holds work nobody will drive.
+Each part is the same predicate the call that does the work gates on, so the query
+and the engine cannot drift apart.
+
+| Work | Driven by | Pending when |
+| --- | --- | --- |
+| output | `submit_write` | a frame is staged, or one can be framed: the client preface, a queued control frame, a header block, or a connection or stream WINDOW_UPDATE owed, and no write or close is in flight |
+| an event | `process` | a GOAWAY retry is queued, unparsed input remains, or the peer's end of stream has not been reported yet, and the engine has neither failed nor submitted its close |
+| data | `writable_stream`, `offer_data` | a writable stream has window, the connection window is open and no output is waiting |
+| the close | `progress_close` | the engine failed, or sent its final GOAWAY with no active stream, and every output has settled |
+
+These do not count:
+
+- A failed engine's repeated failure event. Its drain and its close do.
+- An event the host still borrows. `process` returns only that event until the host
+  releases or consumes it.
+- Work that needs a buffer the account refused while `memory_blocked` is set: framing
+  a new frame, offering data, or retrying a refused payload buffer. The account's
+  wake-up drives it. A frame already staged needs no buffer and still counts.
+- Deadlines. `next_deadline` reports them and `tick` enforces them.
+- A scope cancelled elsewhere. `tick` finds it, and a host that cancels a scope it
+  owns calls `cancel_stream`.
+- `finish_graceful`, whose timing is the host's choice.
+
 ## Time
 
 Every `now` the engine takes is a `std.chrono.time.Instant`, read with
@@ -265,6 +294,7 @@ A GOAWAY retry detaches the exchange intact, so it carries no closure.
 | `writable_stream` | O(writable set) |
 | `tick` | O(1) for deadlines, then O(open exchange-bound streams) |
 | `next_deadline` | O(1) |
+| `pending_work` | O(1) |
 | joining a timed list | O(1) while every member shares one duration |
 | PRIORITY frame or HEADERS priority block, exclusive or not | O(1) |
 

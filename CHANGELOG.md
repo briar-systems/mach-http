@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- `h2.connection.pending_work(engine)` answers, without changing anything, whether the engine holds work its host must act on now: output `submit_write` would send, an event `process` has not reported, a stream `writable_stream` would name, or a close `progress_close` would submit. Work that needs a buffer reads false while `memory_blocked` is set, since the account's wake drives it, and deadlines stay with `next_deadline`. Each part is the predicate its own call gates on (#155).
+
 ### Fixed
 - An HTTP/2 frame whose last byte arrives with the peer's end of stream is handled. `process` used to drop it and report `EVENT_PEER_CLOSED` straight away, so the frame was lost whatever its type (#155).
 
