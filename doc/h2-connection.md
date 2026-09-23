@@ -58,7 +58,12 @@ A refusal never fails the connection:
 
 A transient refusal (write, payload, or encoder buffer) sets `memory_blocked`. If the
 pool was exhausted, or its backing refused, the account is also registered for one
-wake-up. After the source reports it ready, drive the connection again.
+wake-up. After the source reports it ready, drive the connection again. A refusal by
+the account's own budget registers nothing, since only the account's own releases
+can end it. The engine's next release on the connection lane clears `memory_blocked`,
+so `pending_work` reads true again for the work the refusal held back. A release on
+the stream lane leaves it set, since every transient buffer is on the connection lane.
+A host that raises the budget itself drives the connection again.
 
 The reserve is one inline stream. When the admitted-stream budget is full, or memory
 refuses a peer stream, the engine still decodes one refused header block
@@ -176,7 +181,9 @@ These do not count:
   releases or consumes it.
 - Work that needs a buffer the account refused while `memory_blocked` is set: framing
   a new frame, offering data, or retrying a refused payload buffer. The account's
-  wake-up drives it. A frame already staged needs no buffer and still counts.
+  wake-up drives it, or for a budget refusal the engine's own release on the
+  connection lane, which clears `memory_blocked`. A frame already staged needs no
+  buffer and still counts.
 - Deadlines. `next_deadline` reports them and `tick` enforces them.
 - A scope cancelled elsewhere. `tick` finds it, and a host that cancels a scope it
   owns calls `cancel_stream`.
