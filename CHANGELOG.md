@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-23
+
+### Changed
+- **Breaking.** Dependencies: mach-std `^8.0` pinned at v8.0.0 (was `^7.0` at v7.0.2), and mach `^5.12` (was `^5.9`), which std 8 requires. A consumer must move to std 8.x and mach 5.12 with it. Nothing in http's own source or public surface changes beyond the layout mach 5.12's formatter requires (#165).
+
+### Fixed
+- `h2.connection.process` on an engine whose close is submitted (`CLOSING`) returns `EVENT_NONE` and parses nothing. It used to resume parsing input left in the buffer, so a failed engine could fail a second time and overwrite its first error and code, and the host reported the wrong cause. `complete_io` on a `CLOSING` engine no longer fails it again either: a stale or refused completion, a failed read and an empty read each leave the first error and code in place and report that failure (#157).
+- An HTTP/2 engine refused a transient buffer by its account's own budget no longer stalls. The refusal registers no wake-up, and `memory_blocked` used to stay set until the next buffer request, so once the engine released memory on the connection lane `pending_work` still read false and nothing would drive it again. That release now clears `memory_blocked`. A refusal by an exhausted pool or a refused backing still waits for the source's wake-up (#158).
+
 ## [0.18.0] - 2026-09-23
 
 ### Added

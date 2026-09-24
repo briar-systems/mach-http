@@ -1165,8 +1165,8 @@ test "http.websocket: transport backpressure retains only connection buffers" {
         || !operation_ok(cancel.make_root(?control_scope, opt[time.Instant].none{}))) { ret 1; }
     var adapter_state: TestAdapter;
     var adapter:       transport.Adapter = transport.Adapter{
-        runtime: 1::*io_runtime.Runtime,
-        context: (?adapter_state)::ptr,
+        runtime:               1::*io_runtime.Runtime,
+        context:               (?adapter_state)::ptr,
         security:              transport.PLAINTEXT,
         submit_read:           test_read,
         submit_readable:       test_control,

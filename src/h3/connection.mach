@@ -1409,8 +1409,8 @@ pub fun init[T](engine: *Engine[T], role: Role, transport: Transport[T],
     engine.state           = STARTING;
     engine.configured      = configured;
     engine.peer            = Settings{qpack_max_table_capacity: 0,
-        max_field_section_size: (-1)::usize, qpack_blocked_streams: 0,
-        enable_connect_protocol:                                    false, h3_datagram: false};
+        max_field_section_size:  (-1)::usize, qpack_blocked_streams: 0,
+        enable_connect_protocol: false, h3_datagram: false};
     engine.transport                  = transport;
     engine.scope                      = scope;
     engine.index_tombstones           = 0;
@@ -1841,8 +1841,8 @@ fun apply_peer_settings[T](engine: *Engine[T], stream: *Stream) Event {
         ret fail_connection[T](engine, ERROR_PROTOCOL, H3_SETTINGS_ERROR);
     }
     var peer: Settings = Settings{qpack_max_table_capacity: 0,
-        max_field_section_size: (-1)::usize, qpack_blocked_streams: 0,
-        enable_connect_protocol:                                    false, h3_datagram: false};
+        max_field_section_size:  (-1)::usize, qpack_blocked_streams: 0,
+        enable_connect_protocol: false, h3_datagram: false};
     var i: usize = 0;
     for (i < stream.parser.settings_count) {
         val item: frame.Setting = stream.parser.settings[i];
