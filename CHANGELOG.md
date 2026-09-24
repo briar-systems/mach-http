@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-23
+
 ### Changed
 - **Breaking.** Dependencies: mach-std `^8.0` pinned at v8.0.0 (was `^7.0` at v7.0.2), and mach `^5.12` (was `^5.9`), which std 8 requires. A consumer must move to std 8.x and mach 5.12 with it. Nothing in http's own source or public surface changes beyond the layout mach 5.12's formatter requires (#165).
 
