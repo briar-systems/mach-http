@@ -221,9 +221,9 @@ fun validate_header(header: Header, limits: Limits, continuation_stream: u32) Er
 
 fun decode_header(bytes: *u8) Header {
     ret Header{
-        length: (bytes[0]::u32 << 16) | (bytes[1]::u32 << 8) | bytes[2]::u32,
-        typ:   bytes[3],
-        flags: bytes[4],
+        length:    (bytes[0]::u32 << 16) | (bytes[1]::u32 << 8) | bytes[2]::u32,
+        typ:       bytes[3],
+        flags:     bytes[4],
         stream_id: ((bytes[5]::u32 << 24) | (bytes[6]::u32 << 16)
             | (bytes[7]::u32 << 8) | bytes[8]::u32) & 0x7fffffff,
     };
