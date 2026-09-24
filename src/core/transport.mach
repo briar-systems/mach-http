@@ -1093,8 +1093,8 @@ test "http.core.transport: a readable wait completes at once over buffered plain
     state.plaintext[1] = 'i';
     state.buffered     = 2;
     val adapter: Adapter = Adapter{
-        runtime: ?runtime,
-        context: (?state)::ptr,
+        runtime:               ?runtime,
+        context:               (?state)::ptr,
         security:              SECURED,
         submit_read:           buffered_read,
         submit_readable:       buffered_readable,
@@ -1182,8 +1182,8 @@ test "http.core.transport: secured adapters hide internal read and write directi
     var state: SecureState;
     state.runtime = ?runtime;
     val adapter: Adapter = Adapter{
-        runtime: ?runtime,
-        context: (?state)::ptr,
+        runtime:               ?runtime,
+        context:               (?state)::ptr,
         security:              SECURED,
         submit_read:           secure_read,
         submit_readable:       secure_control,
