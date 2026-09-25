@@ -62,11 +62,10 @@ need = []
 [dep.http]
 path = "../.."
 
-# overrides quic, tls and crypto, which still require std ^7, until quic moves to std 8 (briar-systems/mach-std#912)
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v8.0.0"
+version = "^8.0"
 
 [dep.quic]
 git = "https://github.com/briar-systems/mach-quic"
-version = "^0.18"
+version = "^0.20"
