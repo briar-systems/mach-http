@@ -90,6 +90,7 @@ pub val EVENT_CANCELLED:              EventKind = 15;
 pub val EVENT_TIMED_OUT:              EventKind = 16;
 pub val EVENT_ERROR:                  EventKind = 17;
 pub val EVENT_MEMORY_BLOCKED:         EventKind = 18;
+pub val EVENT_REQUEST_REJECTED:       EventKind = 19;
 
 pub def Error: u8;
 pub val ERROR_NONE:            Error = 0;
@@ -178,6 +179,7 @@ pub rec Slot {
     disposition:       Disposition;
     drained:           u64;
     close_after:       bool;
+    rejected:          status.Status;
     upgrade_requested: bool;
     tunnel_ready:      bool;
     out_kind:          OutKind;
@@ -456,6 +458,7 @@ fun reset_slot(engine: *Engine, slot: *Slot) {
     slot.disposition             = BODY_DELIVER;
     slot.drained                 = 0;
     slot.close_after             = false;
+    slot.rejected                = 0;
     slot.upgrade_requested       = false;
     slot.tunnel_ready            = false;
     slot.out_kind                = OUT_NONE;
@@ -806,12 +809,74 @@ pub fun enqueue_request(engine: *Engine, version: message.Version,
     ret index;
 }
 
+# the status a rejected request head is answered with: 414 for a request line
+# or target past its limit, 431 for a field section past its limits, and 400
+# for anything else the request line or fields got wrong
+fun rejection_status(error: parser.Error) status.Status {
+    if (error == parser.ERROR_START_LINE_LIMIT || error == parser.ERROR_TARGET_LIMIT) {
+        ret status.URI_TOO_LONG;
+    }
+    if (error == parser.ERROR_HEADER_LINE_LIMIT || error == parser.ERROR_HEADER_BYTES_LIMIT
+        || error == parser.ERROR_STORAGE_LIMIT) {
+        ret status.REQUEST_HEADER_FIELDS_TOO_LARGE;
+    }
+    ret status.BAD_REQUEST;
+}
+
+# the version the head named, or HTTP/1.1 when it named none the parser took
+fun rejection_version(slot: *Slot) message.Version {
+    val named: message.Version = slot.parser.parsed.version;
+    if (message.valid_version(named) && named.wire == message.WIRE_H1) { ret named; }
+    ret message.version_h1(1, 1);
+}
+
+# the method frames the response the way the peer expects, so a HEAD stays
+# bodyless. a head whose method did not parse is framed as GET
+fun rejection_method(slot: *Slot) method.Kind {
+    val named: method.Kind = slot.parser.parsed.method.kind;
+    if (named >= method.GET && named <= method.EXTENSION) { ret named; }
+    ret method.GET;
+}
+
+# a rejected head gets a final error response that says the connection closes,
+# because the engine cannot find where the next request would begin
+fun rejection_answerable(slot: *Slot, code: status.Status, fields: *field.Fields) bool {
+    if (code < 400 || code >= 600 || fields == nil) { ret false; }
+    val plan: framing.Plan = framing.response(rejection_version(slot), code,
+        rejection_method(slot), fields);
+    ret !plan.keep_alive;
+}
+
+# a server that cannot parse a request head answers it and closes. the slot is
+# handed to the host with nothing parsed to trust and its input abandoned, and
+# `rejection` names the status it owes
+fun reject_head(engine: *Engine, index: usize) Event {
+    val slot: *Slot = ?engine.slots[index];
+    slot.rejected               = rejection_status(slot.parser.error);
+    slot.inbound_abandoned      = true;
+    slot.inbound_complete       = true;
+    slot.close_after            = true;
+    slot.header_deadline.active = false;
+    engine.receiving            = NO_SLOT;
+    engine.input_offset         = engine.input_length;
+    engine.state                = DRAINING;
+    ret slot_event(engine, EVENT_REQUEST_REJECTED, index);
+}
+
+# the status owed on a slot reported by EVENT_REQUEST_REJECTED, or 0 for a
+# slot whose request head parsed
+pub fun rejection(engine: *Engine, index: usize) status.Status {
+    if (!slot_live(engine, index)) { ret 0; }
+    ret engine.slots[index].rejected;
+}
+
 pub fun prepare_informational(engine: *Engine, index: usize, code: status.Status,
     reason: view.View, fields: *field.Fields, now: time.Instant) bool {
     if (!slot_live(engine, index) || engine.role != SERVER || engine.state == TUNNEL
         || code < 100 || code >= 200 || code == status.SWITCHING_PROTOCOLS
         || current_outbound(engine) != index || engine.slots[index].serializer_active
-        || engine.slots[index].final_prepared || !deadline.valid_now(now)) { ret false; }
+        || engine.slots[index].final_prepared || engine.slots[index].rejected != 0
+        || !deadline.valid_now(now)) { ret false; }
     val slot: *Slot = ?engine.slots[index];
     if (!serializer.init_response(?slot.serializer, slot.parser.parsed.version,
         slot.request_method.kind, code, reason, fields, nil,
@@ -834,8 +899,15 @@ pub fun prepare_response(engine: *Engine, index: usize, code: status.Status,
     val slot: *Slot = ?engine.slots[index];
     if (code == status.SWITCHING_PROTOCOLS
         && (!slot.upgrade_requested || !upgrade_requested(fields))) { ret false; }
-    if (!serializer.init_response(?slot.serializer, slot.parser.parsed.version,
-        slot.request_method.kind, code, reason, fields, trailers,
+    var version:     message.Version = slot.parser.parsed.version;
+    var method_kind: method.Kind     = slot.request_method.kind;
+    if (slot.rejected != 0) {
+        if (!rejection_answerable(slot, code, fields)) { ret false; }
+        version     = rejection_version(slot);
+        method_kind = rejection_method(slot);
+    }
+    if (!serializer.init_response(?slot.serializer, version,
+        method_kind, code, reason, fields, trailers,
         slot.memory.scratch, slot.memory.scratch_capacity)) { ret false; }
     slot.serializer_active = true;
     slot.final_prepared    = true;
@@ -1188,7 +1260,10 @@ pub fun process(engine: *Engine, now: time.Instant) Event {
         if (input_available(engine) != 0) { input = ?engine.read_buffer[engine.input_offset]; }
         val result: parser.Feed = parser.feed(?slot.parser, input, input_available(engine));
         engine.input_offset = engine.input_offset + result.consumed;
-        if (result.status == parser.PARSE_ERROR) { ret fail(engine, ERROR_PARSER); }
+        if (result.status == parser.PARSE_ERROR) {
+            if (engine.role == SERVER && !slot.headers_reported) { ret reject_head(engine, index); }
+            ret fail(engine, ERROR_PARSER);
+        }
         if (result.status == parser.PARSE_NEED_INPUT) {
             if (input_available(engine) != 0 || result.consumed == 0) {
                 ret fail(engine, ERROR_NO_PROGRESS);
@@ -2510,5 +2585,113 @@ test "http.h1.connection: a silent new connection owes its first request within 
     var client: Fixture;
     if (!make_fixture(?client, CLIENT, 1) || client.engine.wait_deadline.active
         || !deadline_at(next_deadline(?client.engine), 160)) { ret 2; }
+    ret 0;
+}
+
+# fields for an answer to a rejected head: an empty body and a closing connection
+rec RejectionFields {
+    items:  [2]field.Field;
+    fields: field.Fields;
+}
+
+fun rejection_fields(held: *RejectionFields) *field.Fields {
+    held.fields = field.init(?held.items[0], 2, field.limits(2, 64, 32, 16));
+    field.append(?held.fields, field.Field{name: view.view("Content-Length", 14),
+        value: view.view("0", 1), sensitive: false});
+    field.append(?held.fields, field.Field{name: view.view("Connection", 10),
+        value: view.view("close", 5), sensitive: false});
+    ret ?held.fields;
+}
+
+# the status a server engine owes for one request head sent on a fresh connection
+fun rejected_with(wire: str) status.Status {
+    var fixture: Fixture;
+    val now:     time.Instant = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    val event: Event = complete_read(?fixture, wire, false, now);
+    if (event.kind != EVENT_REQUEST_REJECTED) { ret 2; }
+    ret rejection(?fixture.engine, event.slot);
+}
+
+test "http.h1.connection: a malformed request head is answered and then the connection closes" {
+    var fixture: Fixture;
+    val now:     time.Instant = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 2)) { ret 1; }
+    val rejected: Event = complete_read(?fixture,
+        "GET /healthz?q=%ZZ HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n", false, now);
+    if (rejected.kind != EVENT_REQUEST_REJECTED || rejected.slot != 0 || rejected.sequence == 0
+        || rejection(?fixture.engine, rejected.slot) != status.BAD_REQUEST) { ret 2; }
+    # the rest of the input cannot be framed, so nothing more is read or parsed
+    if (fixture.engine.state != DRAINING || submit_read(?fixture.engine)
+        || process(?fixture.engine, now).kind != EVENT_NONE
+        || set_disposition(?fixture.engine, rejected.slot, BODY_DRAIN)) { ret 3; }
+    # the answer must be a final error whose framing tells the peer the
+    # connection closes, so a kept-alive length is refused
+    var no_fields:     field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
+    var held:          RejectionFields;
+    var length_item:   field.Field;
+    var length_fields: field.Fields = field.init(?length_item, 1, field.limits(1, 32, 16, 16));
+    field.append(?length_fields, field.Field{name: view.view("Content-Length", 14),
+        value: view.view("0", 1), sensitive: false});
+    if (prepare_informational(?fixture.engine, rejected.slot, status.EARLY_HINTS,
+        view.view("Early Hints", 11), ?no_fields, now)
+        || prepare_response(?fixture.engine, rejected.slot, status.NO_CONTENT,
+        view.view("No Content", 10), ?no_fields, nil, now)
+        || prepare_response(?fixture.engine, rejected.slot, status.BAD_REQUEST,
+        view.view("Bad Request", 11), ?length_fields, nil, now)) { ret 4; }
+    if (!prepare_response(?fixture.engine, rejected.slot, status.BAD_REQUEST,
+        view.view("Bad Request", 11), rejection_fields(?held), nil, now)) { ret 5; }
+    val offered: Offer = offer(?fixture.engine, rejected.slot, nil, 0, true);
+    if (offered.status != OFFER_OUTPUT || !submit_write(?fixture.engine)
+        || fixture.io.write_length < 26
+        || !memory.raw_equal(fixture.io.write_buffer, "HTTP/1.1 400 Bad Request\r\n", 26)) { ret 6; }
+    if (complete_write(?fixture, fixture.io.write_length, now).kind != EVENT_OUTBOUND_COMPLETE
+        || !release(?fixture.engine, rejected.slot, now) || fixture.engine.count != 0) { ret 7; }
+    if (!progress_close(?fixture.engine) || fixture.io.shutdown_calls != 1) { ret 8; }
+    var shutdown: transport.Completion = transport.completed(
+        fixture.io.shutdown_token, transport.SHUTDOWN_WRITE, 0);
+    if (complete_io(?fixture.engine, ?shutdown, now).kind != EVENT_NONE
+        || !progress_close(?fixture.engine) || fixture.io.close_calls != 1) { ret 9; }
+    ret 0;
+}
+
+test "http.h1.connection: a rejected pipelined head is answered after the requests before it" {
+    var fixture: Fixture;
+    val now:     time.Instant = test_now(100);
+    if (!make_fixture(?fixture, SERVER, 2)) { ret 1; }
+    val first: Event = complete_read(?fixture,
+        "GET /1 HTTP/1.1\r\nHost: x\r\n\r\nHEAD /%4 HTTP/1.1\r\nHost: x\r\n\r\n", false, now);
+    if (first.kind != EVENT_REQUEST_HEADERS || first.slot != 0
+        || process(?fixture.engine, now).kind != EVENT_REQUEST_COMPLETE) { ret 2; }
+    val rejected: Event = process(?fixture.engine, now);
+    if (rejected.kind != EVENT_REQUEST_REJECTED || rejected.slot != 1
+        || rejected.sequence <= first.sequence
+        || rejection(?fixture.engine, rejected.slot) != status.BAD_REQUEST
+        || rejection(?fixture.engine, first.slot) != 0) { ret 3; }
+    var held: RejectionFields;
+    if (!prepare_response(?fixture.engine, rejected.slot, status.BAD_REQUEST,
+        view.view("Bad Request", 11), rejection_fields(?held), nil, now)) { ret 4; }
+    if (offer(?fixture.engine, rejected.slot, nil, 0, true).status != OFFER_BLOCKED) { ret 5; }
+    if (!serve_no_content(?fixture, first.slot, now)
+        || !release(?fixture.engine, first.slot, now)) { ret 6; }
+    # the method parsed, so the answer is framed for HEAD and carries no body
+    if (fixture.slots[rejected.slot].serializer.plan.mode != framing.FRAME_NONE
+        || !flush_offer(?fixture, rejected.slot, nil, 0, true, now, false)
+        || !release(?fixture.engine, rejected.slot, now)
+        || !progress_close(?fixture.engine)) { ret 7; }
+    ret 0;
+}
+
+test "http.h1.connection: a rejected head owes the status its failure calls for" {
+    if (rejected_with("GET /a%ZZ HTTP/1.1\r\nHost: x\r\n\r\n") != status.BAD_REQUEST)  { ret 1; }
+    if (rejected_with("GET /a?%G1 HTTP/1.1\r\nHost: x\r\n\r\n") != status.BAD_REQUEST) { ret 2; }
+    if (rejected_with("GET /a HTTP/1.1\r\nBad Name: x\r\n\r\n") != status.BAD_REQUEST) { ret 3; }
+    if (rejected_with("GET /a HTTP/9.9\r\nHost: x\r\n\r\n") != status.BAD_REQUEST)     { ret 4; }
+    if (rejected_with("GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\nHost: x\r\n\r\n")
+        != status.URI_TOO_LONG) { ret 5; }
+    if (rejected_with("GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\nHost: x\r\n\r\n")
+        != status.URI_TOO_LONG) { ret 6; }
+    if (rejected_with("GET /a HTTP/1.1\r\nX: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n")
+        != status.REQUEST_HEADER_FIELDS_TOO_LARGE) { ret 7; }
     ret 0;
 }

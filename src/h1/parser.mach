@@ -61,6 +61,7 @@ pub val ERROR_INVALID_CHUNK_EXTENSION:  Error = 19;
 pub val ERROR_INVALID_CHUNK_TERMINATOR: Error = 20;
 pub val ERROR_INVALID_TRAILER:          Error = 21;
 pub val ERROR_INCOMPLETE:               Error = 22;
+pub val ERROR_TARGET_LIMIT:             Error = 23;
 
 pub rec Limits {
     max_start_line:    usize;
@@ -397,8 +398,11 @@ fun parse_request_line(parser: *Parser) bool {
         fail(parser, ERROR_STORAGE_LIMIT);
         ret false;
     }
-    if (raw_target.len > parser.limits.max_target_bytes
-        || !parse_target(raw_target, parser.parsed.method.kind, ?parser.parsed.target)) {
+    if (raw_target.len > parser.limits.max_target_bytes) {
+        fail(parser, ERROR_TARGET_LIMIT);
+        ret false;
+    }
+    if (!parse_target(raw_target, parser.parsed.method.kind, ?parser.parsed.target)) {
         fail(parser, ERROR_INVALID_TARGET);
         ret false;
     }
