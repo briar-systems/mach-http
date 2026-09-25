@@ -37,6 +37,46 @@ fun bounded(value: view.View, max_bytes: usize) bool {
     ret (value.len == 0 || value.data != nil) && value.len <= max_bytes;
 }
 
+fun hex_digit(c: u8) bool {
+    ret (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+}
+
+# the RFC 3986 grammar of a path (pchar and "/") or, when `query` is set, a query
+# (pchar, "/" and "?"): unreserved, sub-delims, ":", "@" and complete
+# percent escapes. an empty component is well formed
+pub fun component_valid(value: view.View, query: bool) bool {
+    if (value.len == 0)    { ret true; }
+    if (value.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val c:        u8   = value.data[i];
+        val ordinary: bool = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
+            || (c >= 'a' && c <= 'z') || c == '-' || c == '.' || c == '_'
+            || c == '~' || c == '!' || c == '$' || c == '&' || c == 39
+            || c == '(' || c == ')' || c == '*' || c == '+' || c == ','
+            || c == ';' || c == '=' || c == ':' || c == '@' || c == '/'
+            || (query && c == '?');
+        if (ordinary) {
+            i = i + 1;
+        }
+        or {
+            if (c != '%' || value.len - i < 3 || !hex_digit(value.data[i + 1])
+                || !hex_digit(value.data[i + 2])) { ret false; }
+            i = i + 3;
+        }
+    }
+    ret true;
+}
+
+# whether the path and query of a target follow the URI grammar. the h1 parser
+# holds a request line to it, and a host that builds a target from an HTTP/2 or
+# HTTP/3 `:path` checks the result with it. authority and asterisk forms carry
+# neither component
+pub fun well_formed(parsed: Target) bool {
+    if (parsed.form != ORIGIN && parsed.form != ABSOLUTE) { ret true; }
+    ret component_valid(parsed.path, false) && component_valid(parsed.query, true);
+}
+
 pub fun limits(max_raw_bytes: usize, max_scheme_bytes: usize, max_authority_bytes: usize,
     max_path_bytes: usize, max_query_bytes: usize) Limits {
     ret Limits{
@@ -132,5 +172,23 @@ test "http.core.target: forms and dimensions fail independently" {
     if (valid(origin(view.view("long-path", 9), view.view("/a", 2), view.view(nil, 0)), configured))                                            { ret 3; }
     if (valid(origin(view.view("/abcd", 5), view.view("/abcd", 5), view.view(nil, 0)), configured))                                             { ret 4; }
     if (valid(absolute(view.view("s://abcde", 9), view.view("s", 1), view.view("abcde", 5), view.view(nil, 0), view.view(nil, 0)), configured)) { ret 5; }
+    ret 0;
+}
+
+test "http.core.target: a path or query with a broken percent escape is not well formed" {
+    if (!component_valid(view.view("/a%20b/c", 8), false))                                         { ret 1; }
+    if (!component_valid(view.view("q=%7e&r=?/", 10), true))                                       { ret 2; }
+    if (!component_valid(view.view(nil, 0), true))                                                 { ret 3; }
+    if (component_valid(view.view("/a%ZZ", 5), false))                                             { ret 4; }
+    if (component_valid(view.view("/a%4", 4), false))                                              { ret 5; }
+    if (component_valid(view.view("q=%", 3), true))                                                { ret 6; }
+    if (component_valid(view.view("/a?b", 4), false))                                              { ret 7; }
+    if (component_valid(view.view("/a b", 4), false))                                              { ret 8; }
+    if (!well_formed(origin(view.view("/a?q=%41", 8), view.view("/a", 2), view.view("q=%41", 5)))) { ret 9; }
+    if (well_formed(origin(view.view("/a?q=%ZZ", 8), view.view("/a", 2), view.view("q=%ZZ", 5))))  { ret 10; }
+    if (well_formed(origin(view.view("/%ZZ", 4), view.view("/%ZZ", 4), view.view(nil, 0))))        { ret 11; }
+    if (well_formed(absolute(view.view("http://x/?%G0", 13), view.view("http", 4), view.view("x", 1),
+        view.view("/", 1), view.view("%G0", 3)))) { ret 12; }
+    if (!well_formed(asterisk())) { ret 13; }
     ret 0;
 }
