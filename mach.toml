@@ -1,7 +1,7 @@
 [project]
 id = "http"
 mach = "^5.12"
-version = "0.19.1"
+version = "0.19.2"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -53,7 +53,7 @@ float_reassoc = false
 
 [artifact.http]
 kind = "static"
-entry = "lib.mach"
+entry = "lib/http.mach"
 out = "lib/http"
 targets = ["*"]
 link = []
