@@ -89,6 +89,36 @@ The HTTP/1 engine does not bind `http.core.exchange.Exchange` into a slot. The
 owner maps an event identity to its application exchange and retains ownership of
 that exchange and its body operations.
 
+## Rejected request heads
+
+A server engine that cannot parse a request head (the request line or the header
+section) does not fail the connection. It reports `EVENT_REQUEST_REJECTED` on the
+slot the head arrived in, and `rejection(engine, slot)` names the status the host
+owes the peer:
+
+| Parser error | Status |
+| --- | --- |
+| `ERROR_START_LINE_LIMIT`, `ERROR_TARGET_LIMIT` | 414 |
+| `ERROR_HEADER_LINE_LIMIT`, `ERROR_HEADER_BYTES_LIMIT`, `ERROR_STORAGE_LIMIT` | 431 |
+| anything else | 400 |
+
+The rest of the input cannot be framed, so the engine stops reading, discards what
+it holds, and drains: the slot's inbound side is complete and abandoned, and no
+later request is parsed. Nothing in `parsed` for that slot is trustworthy.
+
+The host answers with `prepare_response` and `offer` as for any slot, and in wire
+order behind any request before it. The answer must be a final status of 400 or
+above whose framing does not keep the connection alive, such as one carrying
+`Connection: close` or a close-delimited body. A response the peer would read as
+persistent, a success, or an informational is refused. It is serialized in the
+version the head named, or HTTP/1.1 when the version did not parse, and framed for
+the method the head named, or GET when it did not parse, so the answer to a HEAD
+carries no body. After `release`, `progress_close` closes the connection as in a
+graceful shutdown.
+
+A parse failure after the head was reported, in the body or the trailers, still
+fails the connection with `ERROR_PARSER`. A client engine fails on any parse error.
+
 ## Teardown abandonment
 
 After connection failure or physical close begins teardown, an application exchange

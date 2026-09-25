@@ -44,6 +44,7 @@ pub val DISPATCH_METHOD:           DispatchStatus = 4;
 pub val DISPATCH_HOST:             DispatchStatus = 5;
 pub val DISPATCH_PATH:             DispatchStatus = 6;
 pub val DISPATCH_CAPTURE_CAPACITY: DispatchStatus = 7;
+pub val DISPATCH_TARGET:           DispatchStatus = 8;
 
 pub val NO_INDEX: usize = (-1)::usize;
 
@@ -822,6 +823,8 @@ pub fun dispatch_with_authority(router: *Router, request: *message.Request,
         if (!path_valid(path, router.configured.max_path_bytes)) {
             ret empty_dispatch(DISPATCH_PATH);
         }
+        # a routable path can still sit beside a query that is not a URI
+        if (!target.well_formed(request.target)) { ret empty_dispatch(DISPATCH_TARGET); }
     }
     var selected: usize = NO_INDEX;
     var i:        usize = 0;
@@ -974,6 +977,15 @@ test "http.router.router: parameters and catch alls preserve raw bounded views" 
     request.target = target.origin(view.view("/files/x/%00", 12),
         view.view("/files/x/%00", 12), view.view(nil, 0));
     if (dispatch(?router, ?request, ?captures[0], 2).status != DISPATCH_PATH) { ret 11; }
+    request.target = target.origin(view.view("/files/x/y?q=%ZZ", 16),
+        view.view("/files/x/y", 10), view.view("q=%ZZ", 5));
+    if (dispatch(?router, ?request, ?captures[0], 2).status != DISPATCH_TARGET) { ret 12; }
+    request.target = target.origin(view.view("/files/x/y?q=%4", 15),
+        view.view("/files/x/y", 10), view.view("q=%4", 4));
+    if (dispatch(?router, ?request, ?captures[0], 2).status != DISPATCH_TARGET) { ret 13; }
+    request.target = target.origin(view.view("/files/x/y?q=%41", 16),
+        view.view("/files/x/y", 10), view.view("q=%41", 5));
+    if (dispatch(?router, ?request, ?captures[0], 2).status != DISPATCH_MATCH) { ret 14; }
     ret 0;
 }
 
