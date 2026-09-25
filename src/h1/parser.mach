@@ -270,30 +270,6 @@ fun ascii_target(data: *u8, length: usize) bool {
     ret true;
 }
 
-fun uri_component(data: *u8, start: usize, finish: usize, query: bool) bool {
-    var i: usize = start;
-    for (i < finish) {
-        val c:        u8   = data[i];
-        val ordinary: bool = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
-            || (c >= 'a' && c <= 'z') || c == '-' || c == '.' || c == '_'
-            || c == '~' || c == '!' || c == '$' || c == '&' || c == 39
-            || c == '(' || c == ')' || c == '*' || c == '+' || c == ','
-            || c == ';' || c == '=' || c == ':' || c == '@' || c == '/'
-            || (query && c == '?');
-        if (ordinary) {
-            i = i + 1;
-        }
-        or {
-            var first:  u8;
-            var second: u8;
-            if (c != '%' || i + 2 >= finish || !hex(data[i + 1], ?first)
-                || !hex(data[i + 2], ?second)) { ret false; }
-            i = i + 3;
-        }
-    }
-    ret true;
-}
-
 fun subview(raw: view.View, start: usize, length: usize) view.View {
     if (length == 0) { ret view.view(nil, 0); }
     ret view.view(?raw.data[start], length);
@@ -340,15 +316,13 @@ fun parse_absolute(raw: view.View, parsed: *target.Target) bool {
     val path_end:    usize = query_at;
     val path_length: usize = path_end - authority_end;
     if (path_length != 0 && raw.data[authority_end] != '/') { ret false; }
-    if (!uri_component(raw.data, authority_end, path_end, false)
-        || (query_at != raw.len && !uri_component(raw.data, query_at + 1, raw.len, true))) { ret false; }
     var query_start: usize = query_at;
     if (query_at != raw.len) { query_start = query_start + 1; }
     @parsed = target.absolute(raw, subview(raw, 0, scheme_end),
         authority,
         subview(raw, authority_end, path_length),
         subview(raw, query_start, raw.len - query_start));
-    ret true;
+    ret target.well_formed(@parsed);
 }
 
 fun parse_target(raw: view.View, request_method: method.Kind, parsed: *target.Target) bool {
@@ -371,13 +345,11 @@ fun parse_target(raw: view.View, request_method: method.Kind, parsed: *target.Ta
             if (raw.data[i] == '?' && query_at == raw.len) { query_at = i; }
             i = i + 1;
         }
-        if (!uri_component(raw.data, 0, query_at, false)
-            || (query_at != raw.len && !uri_component(raw.data, query_at + 1, raw.len, true))) { ret false; }
         var query_start: usize = query_at;
         if (query_at != raw.len) { query_start = query_start + 1; }
         @parsed = target.origin(raw, subview(raw, 0, query_at),
             subview(raw, query_start, raw.len - query_start));
-        ret true;
+        ret target.well_formed(@parsed);
     }
     ret parse_absolute(raw, parsed);
 }
