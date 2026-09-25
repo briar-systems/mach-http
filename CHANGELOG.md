@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-09-25
+
 ### Changed
 
 - The library entry moved from `src/lib.mach` to `src/lib/http.mach`, the family layout for artifact entries (briar-systems/.github#107). Every module path is unchanged except the entry module itself, now `http.lib.http`, so `VERSION` is `http.lib.http.VERSION` where it was `http.lib.VERSION`. The version check in `.github/ci/verify.sh` reads the new path (#173).
