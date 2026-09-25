@@ -39,6 +39,7 @@ pub val ATTEMPT_CAPACITY: usize = 32;
 pub val SEND_SLOTS:       usize = 4;
 pub val OWNER_SLOTS:      usize = 8;
 pub val DATAGRAM_BYTES:   usize = 256;
+pub val MAX_UDP_PAYLOAD:  usize = 1500;
 
 val FRAME_STREAM:           u8 = 1;
 val FRAME_RESET:            u8 = 2;
@@ -369,6 +370,32 @@ fun core_ready(core: *Core) bool {
 # every chunk this core takes is lent to the stream manager, which retries on its own
 fun core_storage_ready(core: *Core) {}
 
+# what core_generate would answer for a buffer of MAX_UDP_PAYLOAD, with nothing
+# changed: control work first, then the first stream whose prepare succeeds,
+# and a control or stream error ends the scan as it ends generate. the peeks
+# need the manager's core lease, which only this call holds and gives back
+fun core_pending(core: *Core, now_ns: u64) bool {
+    if (core.closed || core.closing)                                  { ret false; }
+    if (core.owner_used[(core.next_owner % OWNER_SLOTS::u64)::usize]) { ret false; }
+    val source: u64 = core.manager.config.source;
+    if (!sm.lease_core(core.manager, source)) { ret false; }
+    val control: sm.Prepared = sm.peek_control_scoped(core.manager, source);
+    var pending: bool        = control.status == sm.STATUS_OK;
+    var done:    bool        = control.status != sm.STATUS_EMPTY;
+    var index:   usize       = 0;
+    for (!done && index < STREAM_CAPACITY) {
+        if (core.manager.storage.streams[index].active) {
+            val prepared: sm.Prepared = sm.peek_scoped(core.manager, source,
+                stream_handle(core, index), MAX_UDP_PAYLOAD - FRAME_OVERHEAD, false);
+            pending = prepared.status == sm.STATUS_OK;
+            done    = pending || prepared.status == sm.STATUS_ERROR;
+        }
+        index = index + 1;
+    }
+    sm.release_core(core.manager, source);
+    ret pending;
+}
+
 # the core owns the stream manager and the datagram queue, so releasing them is
 # its half of the close: the driver checks both are invalid on return and fails
 # the close if either still is. finishing twice is what a retry loop does after
@@ -459,8 +486,8 @@ pub fun init_endpoint(endpoint: *Endpoint, source: u64, client: bool,
         timeout:       core_timeout, generate: core_generate,
         complete_send: core_complete, begin_close: core_begin_close,
         close_ready:   core_ready, finish_close: core_finish, timer: core_timer,
-        storage_ready: core_storage_ready};
-    val config: qt.Config = qt.Config{source: source, max_udp_payload: 1500,
+        storage_ready: core_storage_ready, pending_output: core_pending};
+    val config: qt.Config = qt.Config{source: source, max_udp_payload: MAX_UDP_PAYLOAD,
         max_close_reason: 64};
     val storage: qt.Storage = qt.Storage{sends: ?endpoint.sends[0],
         send_capacity: SEND_SLOTS};
