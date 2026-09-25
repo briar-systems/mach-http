@@ -2,13 +2,15 @@
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-25
+
 ### Added
 - `core.target.component_valid` and `core.target.well_formed` hold the RFC 3986 grammar of a request target's path and query: unreserved characters, sub-delims, `:`, `@`, `/`, `?` in a query, and complete percent escapes. The h1 parser now checks request lines with it instead of a private copy, and a host that builds a target from an HTTP/2 or HTTP/3 `:path` can check it the same way (#178).
 - `h1.parser.ERROR_TARGET_LIMIT` reports a request target longer than `max_target_bytes`, which used to be reported as `ERROR_INVALID_TARGET` (#178).
 - `router.DISPATCH_TARGET` reports a target whose path routes but whose query is not well formed (#178).
 
 ### Fixed
-- A server `h1.connection` engine that cannot parse a request head no longer aborts the connection without a response. It reports the new `EVENT_REQUEST_REJECTED` on the head's slot, `rejection(engine, slot)` names the status owed (414 for a request line or target past its limit, 431 for a header section past its limits, 400 otherwise), and the host answers it with `prepare_response` before the engine closes. The answer must be a final 4xx or 5xx whose framing closes the connection. A host that does not handle the event leaves the slot unanswered until its request deadline, so every server host must answer it (#178).
+- **Breaking.** A server `h1.connection` engine that cannot parse a request head no longer aborts the connection without a response. It reports the new `EVENT_REQUEST_REJECTED` on the head's slot, `rejection(engine, slot)` names the status owed (414 for a request line or target past its limit, 431 for a header section past its limits, 400 otherwise), and the host answers it with `prepare_response` before the engine closes. The answer must be a final 4xx or 5xx whose framing closes the connection. A host that does not handle the event leaves the slot unanswered until its request deadline, so every server host must answer it (#178).
 - `router.dispatch` refuses a query with a broken percent escape, such as `?q=%ZZ`, as `DISPATCH_TARGET`. It used to check only the path, so an HTTP/2 or HTTP/3 request with a malformed query was routed as a normal one (#178).
 
 ## [0.19.2] - 2026-09-25
