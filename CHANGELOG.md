@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-09-25
+
+### Changed
+- `test/h3-quic` selects std `^8.0` and quic `^0.20` by version range, with its gitlinks at std v8.0.0, quic v0.20.0, tls v0.12.0 and crypto v0.22.0, and its loopback core answers the `pending_output` quic 0.19.0 added. The library itself is unchanged (#169).
+
 ## [0.19.0] - 2026-09-23
 
 ### Changed
