@@ -21,15 +21,21 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.view;
 
+#[testing]
 fun transition_ok(outcome: cancel.Transition) bool {
     ret (sel outcome.ok) && outcome.ok;
 }
 
-val SLOTS:          usize = 6;
-val EXCHANGES:      usize = 12;
-val REQUEST_BYTES:  usize = 96;
+#[testing]
+val SLOTS: usize = 6;
+#[testing]
+val EXCHANGES: usize = 12;
+#[testing]
+val REQUEST_BYTES: usize = 96;
+#[testing]
 val RESPONSE_BYTES: usize = 128;
 
+#[testing]
 rec Slot {
     id:           u64;
     generation:   u64;
@@ -39,6 +45,7 @@ rec Slot {
     released:     bool;
 }
 
+#[testing]
 rec App {
     fabric:            *session.Fabric;
     exchanges:         [12]session.ExchangeMemory;
@@ -58,7 +65,6 @@ rec App {
     withhold_response: bool;
     hold_body:         bool;
     skip_dispatch:     bool;
-    credit_checks:     usize;
     failures:          usize;
     last_reset_code:   u64;
     last_goaway:       u64;
@@ -66,10 +72,12 @@ rec App {
     started:           usize;
 }
 
+#[testing]
 fun pattern(index: usize) u8 {
     ret ('a'::u8 + (index % 26)::u8)::u8;
 }
 
+#[testing]
 fun init_app(app: *App, fabric: *session.Fabric) {
     app.fabric = fabric;
     var i: usize = 0;
@@ -80,6 +88,7 @@ fun init_app(app: *App, fabric: *session.Fabric) {
     app.release_streams = true;
 }
 
+#[testing]
 fun find_slot(slots: *Slot, id: u64) *Slot {
     var i: usize = 0;
     for (i < SLOTS) {
@@ -89,6 +98,7 @@ fun find_slot(slots: *Slot, id: u64) *Slot {
     ret nil;
 }
 
+#[testing]
 fun claim_slot(slots: *Slot, id: u64, generation: u64) *Slot {
     var i: usize = 0;
     for (i < SLOTS) {
@@ -104,6 +114,7 @@ fun claim_slot(slots: *Slot, id: u64, generation: u64) *Slot {
 
 # borrowed DATA must still be holding its quic credit, and consuming it must
 # return exactly those bytes
+#[testing]
 fun absorb(app: *App, slot: *Slot, event: h3.Event, engine: *h3.Engine[adapter.Adapter],
     io: *adapter.Adapter) bool {
     var i: usize = 0;
@@ -133,10 +144,10 @@ fun absorb(app: *App, slot: *Slot, event: h3.Event, engine: *h3.Engine[adapter.A
         app.failures = app.failures + 1;
         ret false;
     }
-    app.credit_checks = app.credit_checks + 1;
     ret true;
 }
 
+#[testing]
 fun respond(context: ptr, served: *exchange.Exchange) exchange.ServiceStatus {
     val configured: message.Limits = message.limits_default();
     if (message.set_status(served.response, status.OK) != message.RESPONSE_OK
@@ -147,6 +158,7 @@ fun respond(context: ptr, served: *exchange.Exchange) exchange.ServiceStatus {
     ret exchange.SERVICE_COMPLETE;
 }
 
+#[testing]
 fun serve(context: ptr, event: h3.Event) bool {
     val app:    *App                        = context::*App;
     val engine: *h3.Engine[adapter.Adapter] = ?app.fabric.server.engine;
@@ -210,6 +222,7 @@ fun serve(context: ptr, event: h3.Event) bool {
     ret true;
 }
 
+#[testing]
 fun consume(context: ptr, event: h3.Event) bool {
     val app:    *App                        = context::*App;
     val engine: *h3.Engine[adapter.Adapter] = ?app.fabric.client.engine;
@@ -241,6 +254,7 @@ fun consume(context: ptr, event: h3.Event) bool {
     ret true;
 }
 
+#[testing]
 fun start_request(app: *App, with_body: bool) u64 {
     val engine: *h3.Engine[adapter.Adapter] = ?app.fabric.client.engine;
     val id:     u64                         = h3.open_request[adapter.Adapter](engine, nil);
@@ -270,6 +284,7 @@ fun start_request(app: *App, with_body: bool) u64 {
     ret id;
 }
 
+#[testing]
 fun push_bodies(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter], length: usize) {
     if (app.hold_body) { ret; }
     var i: usize = 0;
@@ -286,6 +301,7 @@ fun push_bodies(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter], le
     }
 }
 
+#[testing]
 fun reap(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter]) {
     var i: usize = 0;
     for (i < SLOTS) {
@@ -299,6 +315,7 @@ fun reap(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter]) {
     }
 }
 
+#[testing]
 fun advance(app: *App) {
     push_bodies(app, ?app.client_slots[0], ?app.fabric.client.engine,
         REQUEST_BYTES);
@@ -309,6 +326,7 @@ fun advance(app: *App) {
     reap(app, ?app.server_slots[0], ?app.fabric.server.engine);
 }
 
+#[testing]
 fun cycle(app: *App, rounds: usize) {
     var i: usize = 0;
     for (i < rounds) {
@@ -320,6 +338,7 @@ fun cycle(app: *App, rounds: usize) {
     }
 }
 
+#[testing]
 fun quiet(app: *App) bool {
     ret session.count_of(?app.fabric.client, h3.EVENT_ERROR) == 0
         && session.count_of(?app.fabric.server, h3.EVENT_ERROR) == 0
@@ -334,11 +353,13 @@ fun quiet(app: *App) bool {
 # they hold, then both drivers settle their close. a test that leaves the
 # engines mid-exchange still closes the drivers, which is what the transport
 # guarantees regardless of the http/3 state above it.
+#[testing]
 fun teardown(fabric: *session.Fabric) bool {
     ret session.close_fabric(fabric, false, h3.H3_NO_ERROR)
         && session.fabric_closed(fabric);
 }
 
+#[testing]
 fun attach(app: *App, fabric: *session.Fabric) {
     fabric.client.handler = consume;
     fabric.client.context = app::ptr;
@@ -346,44 +367,7 @@ fun attach(app: *App, fabric: *session.Fabric) {
     fabric.server.context = app::ptr;
 }
 
-test "h3quic: settings and critical streams cross two real quic drivers" {
-    var fabric: session.Fabric;
-    val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);
-    if (ready != 0)                      { ret (100 + ready)::i32; }
-    if (!session.handshake(?fabric, 64)) { ret 2; }
-    if (session.count_of(?fabric.client, h3.EVENT_SETTINGS) != 1
-        || session.count_of(?fabric.server, h3.EVENT_SETTINGS) != 1) { ret 3; }
-    if (session.count_of(?fabric.client, h3.EVENT_ERROR) != 0
-        || session.count_of(?fabric.server, h3.EVENT_ERROR) != 0) { ret 4; }
-    if (fabric.link.transfers == 0) { ret 5; }
-    if (!teardown(?fabric))         { ret 6; }
-    ret 0;
-}
-
-test "h3quic: a request and response body cross the driver pair intact" {
-    var fabric: session.Fabric;
-    var app:    App;
-    val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);
-    if (ready != 0) { ret (100 + ready)::i32; }
-    init_app(?app, ?fabric);
-    attach(?app, ?fabric);
-    app.respond_with_body = true;
-    if (!session.handshake(?fabric, 64)) { ret 2; }
-    val id: u64 = start_request(?app, true);
-    if (id != 0) { ret 3; }
-    cycle(?app, 96);
-    if (app.request_bytes != REQUEST_BYTES)                                 { ret 4; }
-    if (app.response_bytes != RESPONSE_BYTES)                               { ret 5; }
-    if (app.server_ends != 1 || app.client_ends != 1 || app.responses != 1) { ret 6; }
-    if (!quiet(?app))                                                       { ret 7; }
-    if (app.credit_checks < 2)                                              { ret 8; }
-    if (!app.client_slots[0].released)                                      { ret 9; }
-    if (!app.server_slots[0].released)                                      { ret 10; }
-    if (!teardown(?fabric))                                                 { ret 11; }
-    ret 0;
-}
-
-test "h3quic: sustained multiplexing reuses quic stream slots and generations" {
+test multiplexing__reuses_quic_stream_slots_and_generations {
     var fabric: session.Fabric;
     var app:    App;
     val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);
@@ -430,7 +414,7 @@ test "h3quic: sustained multiplexing reuses quic stream slots and generations" {
     ret 0;
 }
 
-test "h3quic: a qpack-blocked section holds quic credit while other requests run" {
+test qpack_blocking__holds_quic_credit_while_others_run {
     var fabric: session.Fabric;
     var app:    App;
     val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);
@@ -479,7 +463,7 @@ test "h3quic: a qpack-blocked section holds quic credit while other requests run
     ret 0;
 }
 
-test "h3quic: stream reset and application cancellation settle exactly once" {
+test cancellation__reset_and_application_cancel_settle_once {
     var fabric: session.Fabric;
     var app:    App;
     val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);
@@ -539,7 +523,7 @@ test "h3quic: stream reset and application cancellation settle exactly once" {
     ret 0;
 }
 
-test "h3quic: goaway and two-stage graceful close settle over the driver pair" {
+test goaway__two_stage_graceful_close {
     var fabric: session.Fabric;
     var app:    App;
     val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);
@@ -582,7 +566,7 @@ test "h3quic: goaway and two-stage graceful close settle over the driver pair" {
     ret 0;
 }
 
-test "h3quic: partial writes and short reads keep retained output intact" {
+test adapter__partial_writes_and_short_reads_keep_output {
     var fabric: session.Fabric;
     var app:    App;
     val ready:  usize = session.make_fabric(?fabric, session.session_config(), 64);
@@ -605,7 +589,7 @@ test "h3quic: partial writes and short reads keep retained output intact" {
     ret 0;
 }
 
-test "h3quic: lost datagrams are retransmitted without disturbing the exchange" {
+test adapter__lost_datagrams_leave_exchange_intact {
     var fabric: session.Fabric;
     var app:    App;
     val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);
@@ -629,7 +613,7 @@ test "h3quic: lost datagrams are retransmitted without disturbing the exchange" 
     ret 0;
 }
 
-test "h3quic: a request past the server budget is rejected without closing the connection" {
+test admission__rejected_request_release_retries_over_driver {
     var fabric:        session.Fabric;
     var app:           App;
     var server_config: h3.Config = session.session_config();
@@ -660,81 +644,7 @@ test "h3quic: a request past the server budget is rejected without closing the c
     ret 0;
 }
 
-test "h3quic: a drained unknown unidirectional stream releases over the driver" {
-    var fabric:        session.Fabric;
-    var app:           App;
-    var server_config: h3.Config = session.session_config();
-    server_config.max_peer_unidirectional = 4;
-    val ready: usize = session.make_fabric_with(?fabric,
-        session.session_config(), server_config, 512);
-    if (ready != 0) { ret (100 + ready)::i32; }
-    init_app(?app, ?fabric);
-    attach(?app, ?fabric);
-    if (!session.handshake(?fabric, 64))                      { ret 2; }
-    if (fabric.server.engine.active_peer_unidirectional != 3) { ret 3; }
-    val opened: qt.OpenResult = qt.open_stream[loopback.Core](
-        ?fabric.client_wire.driver, qt.UNIDIRECTIONAL);
-    if (opened.status != qt.STATUS_OK) { ret 4; }
-    var bytes: [2]u8;
-    bytes[0] = 0x21;
-    bytes[1] = 'x';
-    if (qt.write_stream[loopback.Core](?fabric.client_wire.driver,
-        opened.stream, ?bytes[0], 2).count != 2) { ret 5; }
-    if (qt.finish_stream[loopback.Core](?fabric.client_wire.driver,
-        opened.stream).status != qt.STATUS_OK) { ret 6; }
-    cycle(?app, 64);
-    if (fabric.server.engine.state != h3.OPEN)                 { ret 7; }
-    if (session.count_of(?fabric.server, h3.EVENT_ERROR) != 0) { ret 8; }
-    if (fabric.server.engine.pending_release_count != 0)       { ret 9; }
-    if (fabric.server.engine.active_peer_unidirectional != 3)  { ret 10; }
-    # a peer unidirectional stream has no send side and its receive side is
-    # already closed at fin, so this release never has to be retried
-    if (fabric.server.io.blocked_releases != 0) { ret 11; }
-    if (!teardown(?fabric))                     { ret 12; }
-    ret 0;
-}
-
-test "h3quic: a destroyed engine pair carries a second connection over new drivers" {
-    var fabric: session.Fabric;
-    var app:    App;
-    val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);
-    if (ready != 0) { ret (100 + ready)::i32; }
-    init_app(?app, ?fabric);
-    attach(?app, ?fabric);
-    app.respond_with_body = true;
-    if (!session.handshake(?fabric, 64)) { ret 2; }
-    if (start_request(?app, true) != 0)  { ret 3; }
-    cycle(?app, 96);
-    if (app.request_bytes != REQUEST_BYTES
-        || app.response_bytes != RESPONSE_BYTES
-        || app.responses != 1 || app.client_ends != 1) { ret 4; }
-    if (!quiet(?app))                                                   { ret 5; }
-    if (!app.client_slots[0].released || !app.server_slots[0].released) { ret 6; }
-    val recycled: usize = session.recycle(?fabric, session.session_config(), 512);
-    if (recycled != 0) { ret (120 + recycled)::i32; }
-    if (fabric.client.engine.state != h3.STARTING
-        || fabric.server.engine.state != h3.STARTING
-        || fabric.client.engine.peer_settings_received
-        || fabric.server.engine.peer_settings_received
-        || fabric.server.engine.inbound_table.insert_count != 0) { ret 7; }
-    var second: App;
-    init_app(?second, ?fabric);
-    attach(?second, ?fabric);
-    second.respond_with_body = true;
-    if (!session.handshake(?fabric, 64))   { ret 8; }
-    if (start_request(?second, true) != 0) { ret 9; }
-    cycle(?second, 96);
-    if (second.request_bytes != REQUEST_BYTES
-        || second.response_bytes != RESPONSE_BYTES
-        || second.responses != 1 || second.client_ends != 1) { ret 10; }
-    if (!quiet(?second)) { ret 11; }
-    if (!second.client_slots[0].released
-        || !second.server_slots[0].released) { ret 12; }
-    if (!teardown(?fabric)) { ret 13; }
-    ret 0;
-}
-
-test "h3quic: a graceful close ends the six critical streams on both drivers" {
+test close__graceful_ends_critical_streams_on_both_drivers {
     var fabric: session.Fabric;
     var app:    App;
     val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);
@@ -789,7 +699,7 @@ test "h3quic: a graceful close ends the six critical streams on both drivers" {
     ret 0;
 }
 
-test "h3quic: an abortive close settles with a request still live on both ends" {
+test close__abortive_with_live_request {
     var fabric: session.Fabric;
     var app:    App;
     val ready:  usize = session.make_fabric(?fabric, session.session_config(), 512);

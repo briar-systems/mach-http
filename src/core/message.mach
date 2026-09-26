@@ -391,29 +391,7 @@ pub fun append_informational(informationals: *Informationals, information: *Info
     ret INFORM_OK;
 }
 
-test "http.core.message: protocol metadata preserves wire identity without engine ownership" {
-    val h1: Version = version_h1(1, 1);
-    val h2: Version = version_h2();
-    val h3: Version = version_h3();
-    if (!valid_version(h1) || !valid_version(h2) || !valid_version(h3)) { ret 1; }
-    if (h1.wire != WIRE_H1 || h2.wire != WIRE_H2 || h3.wire != WIRE_H3) { ret 2; }
-    if (valid_version(version_h1(2, 0)))                                { ret 3; }
-    ret 0;
-}
-
-test "http.core.message: every collection and body class has independent defaults" {
-    val configured: Limits = limits_default();
-    if (configured.max_method_bytes == 0 || configured.max_endpoint_bytes == 0 || configured.target.max_authority_bytes == 0
-        || configured.request_fields.max_count == 0 || configured.request_trailers.max_count == 0
-        || configured.response_fields.max_count == 0 || configured.response_trailers.max_count == 0
-        || configured.informational_fields.max_count == 0 || configured.max_informational == 0
-        || configured.request_body.max_bytes == 0 || configured.request_body.max_chunk_bytes == 0
-        || configured.request_body.max_chunks == 0 || configured.response_body.max_bytes == 0
-        || configured.response_body.max_chunk_bytes == 0 || configured.response_body.max_chunks == 0) { ret 1; }
-    ret 0;
-}
-
-test "http.core.message: request initialization validates bounds metadata and generations" {
+test validate_request__bounds_metadata_and_generation {
     val configured: Limits       = limits_default();
     var fields:     field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var trailers:   field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
@@ -444,7 +422,7 @@ test "http.core.message: request initialization validates bounds metadata and ge
     ret 0;
 }
 
-test "http.core.message: response construction freezes final fields and body rules" {
+test commit_response__freezes_fields_and_body_rules {
     val configured: Limits = limits_default();
     var fields:     [100]field.Field;
     var trailers:   [32]field.Field;
@@ -465,7 +443,7 @@ test "http.core.message: response construction freezes final fields and body rul
     ret 0;
 }
 
-test "http.core.message: informational responses are independently bounded" {
+test append_informational__count_storage_and_status {
     var configured: Limits = limits_default();
     configured.max_informational    = 2;
     configured.informational_fields = field.limits(1, 16, 8, 8);

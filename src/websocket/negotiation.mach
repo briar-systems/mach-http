@@ -15,6 +15,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
 
+#[testing]
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
 }
@@ -424,7 +425,7 @@ pub fun validate_extended_response(response: *message.Response, wire: message.Wi
         accept: view.view(nil, 0), protocol: selected};
 }
 
-test "http.websocket.negotiation: rfc accept key vector is exact" {
+test accept_key__rfc_vector {
     var output:   [29]u8;
     val accepted: view.View = accept_key(view.view("dGhlIHNhbXBsZSBub25jZQ==", 24),
         ?output[0], 29);
@@ -437,6 +438,7 @@ test "http.websocket.negotiation: rfc accept key vector is exact" {
     ret 0;
 }
 
+#[testing]
 fun test_metadata(version: message.Version) message.Metadata {
     ret message.Metadata{
         version:       version,
@@ -450,7 +452,7 @@ fun test_metadata(version: message.Version) message.Metadata {
     };
 }
 
-test "http.websocket.negotiation: h1 upgrade commits common exchange" {
+test server__h1_upgrade_commits_exchange {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
@@ -495,6 +497,7 @@ test "http.websocket.negotiation: h1 upgrade commits common exchange" {
     ret 0;
 }
 
+#[testing]
 fun extended_test(version: message.Version, generation: u64) i32 {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
@@ -532,7 +535,7 @@ fun extended_test(version: message.Version, generation: u64) i32 {
     ret 0;
 }
 
-test "http.websocket.negotiation: h2 and h3 extended connect share exchange" {
+test server__extended_connect_on_h2_and_h3 {
     if (extended_test(message.version_h2(), 92) != 0) { ret 1; }
     if (extended_test(message.version_h3(), 93) != 0) { ret 2; }
     ret 0;

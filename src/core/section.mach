@@ -278,11 +278,13 @@ pub fun informational(items: *field.Field, count: usize, inbound: bool) bool {
     ret code >= 100 && code < 200;
 }
 
+#[testing]
 fun named(name: *u8, length: usize, value: *u8, value_length: usize) field.Field {
     ret field.Field{name: view.view(name, length), value: view.view(value, value_length),
         sensitive: false};
 }
 
+#[testing]
 fun request_fields(items: *field.Field) {
     items[0] = named(":method", 7, "GET", 3);
     items[1] = named(":scheme", 7, "https", 5);
@@ -290,7 +292,7 @@ fun request_fields(items: *field.Field) {
     items[3] = named(":authority", 10, "h", 1);
 }
 
-test "http.core.section: a request section is shaped and bounded" {
+test validate__request_shape_and_bounds {
     var items: [6]field.Field;
     request_fields(?items[0]);
     items[4] = named("host", 4, "h", 1);
@@ -320,7 +322,7 @@ test "http.core.section: a request section is shaped and bounded" {
     ret 0;
 }
 
-test "http.core.section: connect shapes follow the negotiated protocol" {
+test validate__connect_follows_negotiated_protocol {
     var items: [5]field.Field;
     items[0] = named(":method", 7, "CONNECT", 7);
     items[1] = named(":authority", 10, "h:443", 5);
@@ -336,7 +338,7 @@ test "http.core.section: connect shapes follow the negotiated protocol" {
     ret 0;
 }
 
-test "http.core.section: responses and trailers keep their own rules" {
+test validate__response_informational_and_trailer_rules {
     var items: [3]field.Field;
     items[0] = named(":status", 7, "204", 3);
     items[1] = named("content-length", 14, "0", 1);
@@ -359,7 +361,7 @@ test "http.core.section: responses and trailers keep their own rules" {
     ret 0;
 }
 
-test "http.core.section: names are strict inbound and case-insensitive outbound" {
+test validate__names_strict_inbound_case_insensitive_outbound {
     var items: [5]field.Field;
     request_fields(?items[0]);
     items[4] = named("X-Custom", 8, "v", 1);

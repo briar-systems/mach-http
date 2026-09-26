@@ -33,8 +33,8 @@ sustained multiplexing across more requests than the initial stream and connecti
 windows allow, QPACK-blocked field sections holding QUIC credit while unrelated
 requests complete, stream reset and application cancellation settling exactly once,
 GOAWAY with two-stage graceful close, datagram loss with retransmission, partial
-writes with short reads under a small flow-control window, a request rejected past
-the server's budget, and a drained unknown unidirectional stream.
+writes with short reads under a small flow-control window, and a request rejected
+past the server's budget.
 
 Every test ends its connection by closing both drivers, so `finish_close` is
 reached from each of those states rather than only from a quiet one. Two tests

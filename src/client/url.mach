@@ -356,7 +356,7 @@ pub fun secure(value: URL) bool {
     ret value.scheme == policy.HTTPS;
 }
 
-test "http.client.url: schemes are case insensitive and exact URLs remain borrowed" {
+test parse__scheme_case_and_borrowed_views {
     val parsed: Parsed = parse(view.view(
         "HTTPS://Example.COM:8443/acme/new?x=1", 37), limits_default());
     if (parsed.status != URL_OK || parsed.url.scheme != policy.HTTPS
@@ -371,7 +371,7 @@ test "http.client.url: schemes are case insensitive and exact URLs remain borrow
     ret 0;
 }
 
-test "http.client.url: authority literals and unsafe forms are distinguished" {
+test parse__authority_literals_and_unsafe_forms {
     val literal: Parsed = parse(view.view("https://[2001:db8::1]/", 22),
         limits_default());
     if (literal.status != URL_OK || !literal.url.ipv6_literal

@@ -1,6 +1,6 @@
 [project]
 id = "h3quic"
-mach = "^5.12"
+mach = "^6"
 version = "0.0.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
@@ -64,8 +64,8 @@ path = "../.."
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^8.0"
+version = "^9.0"
 
 [dep.quic]
 git = "https://github.com/briar-systems/mach-quic"
-version = "^0.20"
+version = "^0.21"

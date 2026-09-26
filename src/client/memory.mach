@@ -34,7 +34,7 @@ pub fun overlap(first: ptr, first_size: usize,
     ret first::usize <= second_end && second::usize <= first_end;
 }
 
-test "http.client.memory: borrowed ranges reject wrapping arithmetic" {
+test range__rejects_wrapping_arithmetic {
     var bytes: [8]u8;
     if (!range((?bytes[0])::ptr, 8)
         || !range((~(0::usize))::ptr, 1)
