@@ -21,15 +21,21 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.view;
 
+#[testing]
 fun transition_ok(outcome: cancel.Transition) bool {
     ret (sel outcome.ok) && outcome.ok;
 }
 
-val SLOTS:          usize = 6;
-val EXCHANGES:      usize = 12;
-val REQUEST_BYTES:  usize = 96;
+#[testing]
+val SLOTS: usize = 6;
+#[testing]
+val EXCHANGES: usize = 12;
+#[testing]
+val REQUEST_BYTES: usize = 96;
+#[testing]
 val RESPONSE_BYTES: usize = 128;
 
+#[testing]
 rec Slot {
     id:           u64;
     generation:   u64;
@@ -39,6 +45,7 @@ rec Slot {
     released:     bool;
 }
 
+#[testing]
 rec App {
     fabric:            *session.Fabric;
     exchanges:         [12]session.ExchangeMemory;
@@ -65,10 +72,12 @@ rec App {
     started:           usize;
 }
 
+#[testing]
 fun pattern(index: usize) u8 {
     ret ('a'::u8 + (index % 26)::u8)::u8;
 }
 
+#[testing]
 fun init_app(app: *App, fabric: *session.Fabric) {
     app.fabric = fabric;
     var i: usize = 0;
@@ -79,6 +88,7 @@ fun init_app(app: *App, fabric: *session.Fabric) {
     app.release_streams = true;
 }
 
+#[testing]
 fun find_slot(slots: *Slot, id: u64) *Slot {
     var i: usize = 0;
     for (i < SLOTS) {
@@ -88,6 +98,7 @@ fun find_slot(slots: *Slot, id: u64) *Slot {
     ret nil;
 }
 
+#[testing]
 fun claim_slot(slots: *Slot, id: u64, generation: u64) *Slot {
     var i: usize = 0;
     for (i < SLOTS) {
@@ -103,6 +114,7 @@ fun claim_slot(slots: *Slot, id: u64, generation: u64) *Slot {
 
 # borrowed DATA must still be holding its quic credit, and consuming it must
 # return exactly those bytes
+#[testing]
 fun absorb(app: *App, slot: *Slot, event: h3.Event, engine: *h3.Engine[adapter.Adapter],
     io: *adapter.Adapter) bool {
     var i: usize = 0;
@@ -135,6 +147,7 @@ fun absorb(app: *App, slot: *Slot, event: h3.Event, engine: *h3.Engine[adapter.A
     ret true;
 }
 
+#[testing]
 fun respond(context: ptr, served: *exchange.Exchange) exchange.ServiceStatus {
     val configured: message.Limits = message.limits_default();
     if (message.set_status(served.response, status.OK) != message.RESPONSE_OK
@@ -145,6 +158,7 @@ fun respond(context: ptr, served: *exchange.Exchange) exchange.ServiceStatus {
     ret exchange.SERVICE_COMPLETE;
 }
 
+#[testing]
 fun serve(context: ptr, event: h3.Event) bool {
     val app:    *App                        = context::*App;
     val engine: *h3.Engine[adapter.Adapter] = ?app.fabric.server.engine;
@@ -208,6 +222,7 @@ fun serve(context: ptr, event: h3.Event) bool {
     ret true;
 }
 
+#[testing]
 fun consume(context: ptr, event: h3.Event) bool {
     val app:    *App                        = context::*App;
     val engine: *h3.Engine[adapter.Adapter] = ?app.fabric.client.engine;
@@ -239,6 +254,7 @@ fun consume(context: ptr, event: h3.Event) bool {
     ret true;
 }
 
+#[testing]
 fun start_request(app: *App, with_body: bool) u64 {
     val engine: *h3.Engine[adapter.Adapter] = ?app.fabric.client.engine;
     val id:     u64                         = h3.open_request[adapter.Adapter](engine, nil);
@@ -268,6 +284,7 @@ fun start_request(app: *App, with_body: bool) u64 {
     ret id;
 }
 
+#[testing]
 fun push_bodies(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter], length: usize) {
     if (app.hold_body) { ret; }
     var i: usize = 0;
@@ -284,6 +301,7 @@ fun push_bodies(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter], le
     }
 }
 
+#[testing]
 fun reap(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter]) {
     var i: usize = 0;
     for (i < SLOTS) {
@@ -297,6 +315,7 @@ fun reap(app: *App, slots: *Slot, engine: *h3.Engine[adapter.Adapter]) {
     }
 }
 
+#[testing]
 fun advance(app: *App) {
     push_bodies(app, ?app.client_slots[0], ?app.fabric.client.engine,
         REQUEST_BYTES);
@@ -307,6 +326,7 @@ fun advance(app: *App) {
     reap(app, ?app.server_slots[0], ?app.fabric.server.engine);
 }
 
+#[testing]
 fun cycle(app: *App, rounds: usize) {
     var i: usize = 0;
     for (i < rounds) {
@@ -318,6 +338,7 @@ fun cycle(app: *App, rounds: usize) {
     }
 }
 
+#[testing]
 fun quiet(app: *App) bool {
     ret session.count_of(?app.fabric.client, h3.EVENT_ERROR) == 0
         && session.count_of(?app.fabric.server, h3.EVENT_ERROR) == 0
@@ -332,11 +353,13 @@ fun quiet(app: *App) bool {
 # they hold, then both drivers settle their close. a test that leaves the
 # engines mid-exchange still closes the drivers, which is what the transport
 # guarantees regardless of the http/3 state above it.
+#[testing]
 fun teardown(fabric: *session.Fabric) bool {
     ret session.close_fabric(fabric, false, h3.H3_NO_ERROR)
         && session.fabric_closed(fabric);
 }
 
+#[testing]
 fun attach(app: *App, fabric: *session.Fabric) {
     fabric.client.handler = consume;
     fabric.client.context = app::ptr;
