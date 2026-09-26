@@ -31,6 +31,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.view;
 
+#[testing]
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
 }
@@ -40,6 +41,7 @@ fun scope_active(scope: *cancel.Scope) bool {
     ret sel reason.active;
 }
 
+#[testing]
 fun scope_cancelled(scope: *cancel.Scope) bool {
     val reason: cancel.Reason = cancel.reason(scope);
     ret sel reason.cancelled;
@@ -3293,10 +3295,12 @@ pub fun pending_work(engine: *Engine) bool {
         && engine.lists[LIST_WRITABLE].head != NO_SLOT);
 }
 
+#[testing]
 fun test_now(seconds: i64) time.Instant {
     ret time.Instant{sec: seconds, nsec: 0};
 }
 
+#[testing]
 rec TestIO {
     read_token:   transport.Token;
     read_buffer:  *u8;
@@ -3311,6 +3315,7 @@ rec TestIO {
     refuse_write: bool;
 }
 
+#[testing]
 fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
     buffer: *u8, length: usize) res[bool, io_error.Error] {
     val io: *TestIO = context::*TestIO;
@@ -3321,6 +3326,7 @@ fun test_read(context: ptr, token: transport.Token, scope: *cancel.Scope,
     ret res[bool, io_error.Error].ok{true};
 }
 
+#[testing]
 fun test_write(context: ptr, token: transport.Token, scope: *cancel.Scope,
     buffer: *u8, length: usize) res[bool, io_error.Error] {
     val io: *TestIO = context::*TestIO;
@@ -3334,11 +3340,13 @@ fun test_write(context: ptr, token: transport.Token, scope: *cancel.Scope,
     ret res[bool, io_error.Error].ok{true};
 }
 
+#[testing]
 fun test_shutdown(context: ptr, token: transport.Token,
     scope: *cancel.Scope) res[bool, io_error.Error] {
     ret res[bool, io_error.Error].ok{true};
 }
 
+#[testing]
 fun test_close(context: ptr, token: transport.Token,
     scope: *cancel.Scope) res[bool, io_error.Error] {
     val io: *TestIO = context::*TestIO;
@@ -3347,6 +3355,7 @@ fun test_close(context: ptr, token: transport.Token,
     ret res[bool, io_error.Error].ok{true};
 }
 
+#[testing]
 rec Fixture {
     runtime:               io_runtime.Runtime;
     operation_root:        cancel.Scope;
@@ -3379,6 +3388,7 @@ rec Fixture {
 
 # a std pool. with no size classes every chunk is exactly its request rounded to
 # 16 bytes, so the account's `held` counts bytes exactly
+#[testing]
 fun make_buffers(fixture: *Fixture, classes: *buffers.ClassConfig, class_count: usize) bool {
     val backed: err[allocator.Error] = page.make(?fixture.backing);
     if (sel backed.err) { ret false; }
@@ -3399,6 +3409,7 @@ fun make_buffers(fixture: *Fixture, classes: *buffers.ClassConfig, class_count: 
     ret sel opened.none;
 }
 
+#[testing]
 fun test_config() Config {
     var configured: Config = config_default();
     configured.max_streams                   = 4;
@@ -3421,11 +3432,13 @@ fun test_config() Config {
     ret configured;
 }
 
+#[testing]
 fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
     ret make_fixture_on(fixture, role, configured, nil, 0);
 }
 
 # a fixture whose pool has the given size classes
+#[testing]
 fun make_fixture_on(fixture: *Fixture, role: Role, configured: Config,
     classes: *buffers.ClassConfig, class_count: usize) bool {
     fixture.clock = test_now(100);
@@ -3448,6 +3461,7 @@ fun make_fixture_on(fixture: *Fixture, role: Role, configured: Config,
 
 # every argument but the connection is the fixture's own storage, so calling
 # this a second time is exactly what a pool does with a recycled engine
+#[testing]
 fun start_engine(fixture: *Fixture, connection: *transport.Transport,
     scope: *cancel.Scope, role: Role, configured: Config) bool {
     var refused: StreamMemory;
@@ -3466,6 +3480,7 @@ fun start_engine(fixture: *Fixture, connection: *transport.Transport,
         refused, configured, fixture.clock);
 }
 
+#[testing]
 fun test_frame(output: *u8, capacity: usize, typ: u8, flags: u8,
     stream_id: u32, payload: *u8, length: usize) usize {
     if (output == nil || capacity < length + 9 || length > 0xffffff
@@ -3480,6 +3495,7 @@ fun test_frame(output: *u8, capacity: usize, typ: u8, flags: u8,
     ret length + 9;
 }
 
+#[testing]
 fun receive_bytes(fixture: *Fixture, input: *u8,
     length: usize, eof: bool) Event {
     if (!submit_read(?fixture.engine) || length > fixture.io.read_length) {
@@ -3492,6 +3508,7 @@ fun receive_bytes(fixture: *Fixture, input: *u8,
     ret complete_io(?fixture.engine, ?completion, fixture.clock);
 }
 
+#[testing]
 fun receive_frame(fixture: *Fixture, typ: u8, flags: u8,
     stream_id: u32, payload: *u8, length: usize) Event {
     var wire:  [1024]u8;
@@ -3501,6 +3518,7 @@ fun receive_frame(fixture: *Fixture, typ: u8, flags: u8,
     ret receive_bytes(fixture, ?wire[0], total, false);
 }
 
+#[testing]
 fun finish_write(fixture: *Fixture, partial: bool) bool {
     if (!submit_write(?fixture.engine, fixture.clock)) { ret false; }
     var count: usize = fixture.io.write_length;
@@ -3517,6 +3535,7 @@ fun finish_write(fixture: *Fixture, partial: bool) bool {
     ret true;
 }
 
+#[testing]
 fun drain_output(fixture: *Fixture) bool {
     var count: usize = 0;
     for (submit_write(?fixture.engine, fixture.clock)) {
@@ -3530,6 +3549,7 @@ fun drain_output(fixture: *Fixture) bool {
     ret true;
 }
 
+#[testing]
 fun server_handshake(fixture: *Fixture) Event {
     var wire: [33]u8;
     memory.raw_copy(?wire[0], CLIENT_PREFACE, CLIENT_PREFACE_LENGTH);
@@ -3537,11 +3557,13 @@ fun server_handshake(fixture: *Fixture) Event {
     ret receive_bytes(fixture, ?wire[0], 33, false);
 }
 
+#[testing]
 fun client_handshake(fixture: *Fixture) Event {
     if (!drain_output(fixture)) { ret event(?fixture.engine, EVENT_ERROR); }
     ret receive_frame(fixture, frame.FRAME_SETTINGS, 0, 0, nil, 0);
 }
 
+#[testing]
 rec ExchangeMemory {
     scope:             cancel.Scope;
     request:           message.Request;
@@ -3553,17 +3575,20 @@ rec ExchangeMemory {
     exchange:          exchange.Exchange;
 }
 
+#[testing]
 rec PendingCancellation {
     finish_calls:   usize;
     complete_calls: usize;
     release_calls:  usize;
 }
 
+#[testing]
 fun pending_body_read(context: ptr, output: *u8, capacity: usize,
     trailers: *field.Fields) body.Progress {
     ret body.complete(body.REUSE_FORBIDDEN);
 }
 
+#[testing]
 fun pending_body_finish(context: ptr, mode: body.Mode,
     trailers: *field.Fields) body.Progress {
     val pending: *PendingCancellation = context::*PendingCancellation;
@@ -3574,6 +3599,7 @@ fun pending_body_finish(context: ptr, mode: body.Mode,
     ret body.pending(701);
 }
 
+#[testing]
 fun pending_body_complete(context: ptr, token: u64,
     trailers: *field.Fields) body.Progress {
     val pending: *PendingCancellation = context::*PendingCancellation;
@@ -3584,11 +3610,13 @@ fun pending_body_complete(context: ptr, token: u64,
     ret body.cancelled(body.REUSE_FORBIDDEN);
 }
 
+#[testing]
 fun pending_body_release(context: ptr) {
     val pending: *PendingCancellation = context::*PendingCancellation;
     pending.release_calls = pending.release_calls + 1;
 }
 
+#[testing]
 fun make_exchange(storage: *ExchangeMemory, generation: u64,
     stream_id: u32) bool {
     val configured: message.Limits = message.limits_default();
@@ -3615,6 +3643,7 @@ fun make_exchange(storage: *ExchangeMemory, generation: u64,
     ret true;
 }
 
+#[testing]
 fun make_pending_exchange(storage: *ExchangeMemory,
     pending: *PendingCancellation, generation: u64, stream_id: u32) bool {
     if (!make_exchange(storage, generation, stream_id)) { ret false; }
@@ -3626,6 +3655,7 @@ fun make_pending_exchange(storage: *ExchangeMemory,
     ret storage.reader.valid;
 }
 
+#[testing]
 fun test_service(context: ptr, served: *exchange.Exchange) exchange.ServiceStatus {
     val configured: message.Limits = message.limits_default();
     if (message.set_status(served.response, status.NO_CONTENT) != message.RESPONSE_OK
@@ -3639,6 +3669,7 @@ fun test_service(context: ptr, served: *exchange.Exchange) exchange.ServiceStatu
 # one complete server-side exchange whose request block inserts a field into the
 # inbound dynamic table, so a surviving table would decode the second connection
 # against state the peer does not share
+#[testing]
 fun pooled_exchange(fixture: *Fixture, storage: *ExchangeMemory) bool {
     var block: [6]u8;
     block[0] = 0x82;
@@ -3668,7 +3699,7 @@ fun pooled_exchange(fixture: *Fixture, storage: *ExchangeMemory) bool {
     ret release_stream(?fixture.engine, 1, request.generation, fixture.clock);
 }
 
-test "http.h2.connection: destroy returns pooled storage for a second connection" {
+test destroy__pooled_engine_restarts_clean {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     var second:  ExchangeMemory;
@@ -3714,30 +3745,7 @@ test "http.h2.connection: destroy returns pooled storage for a second connection
     ret 0;
 }
 
-test "http.h2.connection: preface settings and ping interoperate incrementally" {
-    var fixture: Fixture;
-    if (!make_fixture(?fixture, SERVER, test_config())
-        || submit_write(?fixture.engine, test_now(100))) { ret 1; }
-    val accepted: Event = server_handshake(?fixture);
-    if (accepted.kind != EVENT_SETTINGS || fixture.engine.state != OPEN
-        || !fixture.engine.peer_settings_received || !drain_output(?fixture)) { ret 2; }
-    var opaque: [8]u8;
-    var i:      usize = 0;
-    for (i < 8) {
-        opaque[i] = (i + 1)::u8;
-        i         = i + 1;
-    }
-    val ping: Event = receive_frame(?fixture, frame.FRAME_PING, 0, 0, ?opaque[0], 8);
-    if (ping.kind != EVENT_PING || !memory.raw_equal(?ping.opaque[0], ?opaque[0], 8)
-        || !submit_write(?fixture.engine, test_now(100)) || fixture.io.write_buffer[3] != frame.FRAME_PING
-        || (fixture.io.write_buffer[4] & frame.FLAG_ACK) == 0) { ret 3; }
-    var completion: transport.Completion = transport.completed(
-        fixture.io.write_token, transport.WRITE, fixture.io.write_length);
-    if (complete_io(?fixture.engine, ?completion, test_now(100)).kind == EVENT_ERROR) { ret 4; }
-    ret 0;
-}
-
-test "http.h2.connection: acknowledged settings change decoder and stream windows atomically" {
+test settings__ack_applies_table_size_and_window {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -3769,43 +3777,7 @@ test "http.h2.connection: acknowledged settings change decoder and stream window
     ret 0;
 }
 
-test "http.h2.connection: request stream binds and dispatches one common exchange" {
-    var fixture: Fixture;
-    if (!make_fixture(?fixture, SERVER, test_config())
-        || server_handshake(?fixture).kind != EVENT_SETTINGS
-        || !drain_output(?fixture)) { ret 1; }
-    var block: [6]u8;
-    block[0] = 0x82;
-    block[1] = 0x86;
-    block[2] = 0x84;
-    block[3] = 0x01;
-    block[4] = 0x01;
-    block[5] = 'x';
-    val request: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
-        frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 1, ?block[0], 6);
-    if (request.kind != EVENT_REQUEST_HEADERS || request.stream_id != 1
-        || request.headers.count != 4 || request.headers.regular_offset != 4
-        || !request.end_stream) { ret 2; }
-    var storage: ExchangeMemory;
-    if (!make_exchange(?storage, request.generation, 1)
-        || !bind_exchange(?fixture.engine, 1, ?storage.exchange)
-        || exchange_for(?fixture.engine, 1) != ?storage.exchange) { ret 3; }
-    val service: exchange.Service = exchange.Service{ctx: nil, serve: test_service};
-    if (dispatch(?fixture.engine, 1, ?service) != exchange.SERVICE_COMPLETE
-        || storage.exchange.state != exchange.COMPLETE_STATE
-        || !release_event(?fixture.engine, 1, request.generation)) { ret 4; }
-    var response: [1]field.Field;
-    response[0] = field.Field{name: view.view(":status", 7),
-        value: view.view("204", 3), sensitive: false};
-    val offered: Offer = send_headers(?fixture.engine, 1, ?response[0], 1,
-        true, true);
-    if (offered.status != OFFER_OUTPUT || !finish_write(?fixture, true)
-        || stream_for(?fixture.engine, 1).state != STREAM_CLOSED
-        || !release_stream(?fixture.engine, 1, request.generation, test_now(100))) { ret 5; }
-    ret 0;
-}
-
-test "http.h2.connection: teardown abandonment initiates cancellation" {
+test abandon_exchange__cancels_bound_exchange {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -3841,7 +3813,7 @@ test "http.h2.connection: teardown abandonment initiates cancellation" {
     ret 0;
 }
 
-test "http.h2.connection: teardown detaches pending exchange generation safely" {
+test abandon_exchange__stale_generation_detaches_nothing {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -3903,7 +3875,7 @@ test "http.h2.connection: teardown detaches pending exchange generation safely" 
     ret 0;
 }
 
-test "http.h2.connection: data backpressure replenishes both windows without deadlock" {
+test flow_control__consumption_replenishes_both_windows {
     var fixture:    Fixture;
     var configured: Config = test_config();
     configured.local.initial_window_size = 8;
@@ -3948,6 +3920,7 @@ test "http.h2.connection: data backpressure replenishes both windows without dea
     ret 0;
 }
 
+#[testing]
 fun request_fields(items: *field.Field) {
     items[0] = field.Field{name: view.view(":method", 7),
         value: view.view("GET", 3), sensitive: false};
@@ -3959,48 +3932,7 @@ fun request_fields(items: *field.Field) {
         value: view.view("x", 1), sensitive: false};
 }
 
-test "http.h2.connection: weighted scheduling is fair and priority signals only set weights" {
-    var fixture: Fixture;
-    if (!make_fixture(?fixture, CLIENT, test_config())
-        || client_handshake(?fixture).kind != EVENT_SETTINGS
-        || !drain_output(?fixture)) { ret 1; }
-    val first:   u32 = open_local(?fixture.engine, nil);
-    val second:  u32 = open_local(?fixture.engine, nil);
-    var headers: [4]field.Field;
-    request_fields(?headers[0]);
-    if (first != 1 || second != 3
-        || send_headers(?fixture.engine, first, ?headers[0], 4, false, true).status
-        != OFFER_OUTPUT
-        || !finish_write(?fixture, true)
-        || send_headers(?fixture.engine, second, ?headers[0], 4, false, true).status
-        != OFFER_OUTPUT
-        || !finish_write(?fixture, false)) { ret 2; }
-    if (!set_priority(?fixture.engine, first, 0, 4, false)
-        || !set_priority(?fixture.engine, second, first, 1, false)
-        || !set_priority(?fixture.engine, first, second, 4, true)
-        || set_priority(?fixture.engine, first, first, 8, false)
-        || stream_for(?fixture.engine, first).weight != 4
-        || stream_for(?fixture.engine, second).weight != 1) { ret 3; }
-    var high: usize = 0;
-    var low:  usize = 0;
-    var byte: [1]u8;
-    var i:    usize = 0;
-    for (i < 20) {
-        set_writable(?fixture.engine, first, true, test_now(100));
-        set_writable(?fixture.engine, second, true, test_now(100));
-        val selected: u32 = writable_stream(?fixture.engine);
-        if (selected == first)  { high = high + 1; }
-        or (selected == second) { low = low + 1; }
-        or                      { ret 4; }
-        if (offer_data(?fixture.engine, selected, ?byte[0], 1, false, test_now(100)).consumed != 1
-            || !finish_write(?fixture, i % 2 == 0)) { ret 5; }
-        i = i + 1;
-    }
-    if (high <= low || low == 0 || high + low != 20) { ret 6; }
-    ret 0;
-}
-
-test "http.h2.connection: goaway retry cancellation and graceful drain preserve lifetimes" {
+test goaway__retries_only_streams_past_last_id {
     var client: Fixture;
     if (!make_fixture(?client, CLIENT, test_config())
         || client_handshake(?client).kind != EVENT_SETTINGS
@@ -4024,19 +3956,10 @@ test "http.h2.connection: goaway retry cancellation and graceful drain preserve 
     if (!cancel_stream(?client.engine, first, H2_CANCEL)
         || !scope_cancelled(?first_exchange.scope)
         || stream_for(?client.engine, first).state != STREAM_CLOSED) { ret 5; }
-    var server: Fixture;
-    if (!make_fixture(?server, SERVER, test_config())
-        || server_handshake(?server).kind != EVENT_SETTINGS
-        || !drain_output(?server) || !begin_graceful(?server.engine)
-        || !finish_graceful(?server.engine) || !drain_output(?server)
-        || !progress_close(?server.engine) || server.io.close_calls != 1) { ret 6; }
-    var closed: transport.Completion = transport.completed(
-        server.io.close_token, transport.CLOSE, 0);
-    if (complete_io(?server.engine, ?closed, test_now(100)).kind != EVENT_CLOSED) { ret 7; }
     ret 0;
 }
 
-test "http.h2.connection: malformed headers reset one stream and compression errors fail closed" {
+test headers__malformed_resets_stream_and_compression_error_fails {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4093,7 +4016,7 @@ test "http.h2.connection: malformed headers reset one stream and compression err
     ret 0;
 }
 
-test "http.h2.connection: refused streams still advance shared compression state" {
+test hpack__refused_stream_still_updates_table {
     var fixture:    Fixture;
     var configured: Config = test_config();
     configured.max_streams = 1;
@@ -4137,7 +4060,7 @@ test "http.h2.connection: refused streams still advance shared compression state
     ret 0;
 }
 
-test "http.h2.connection: every byte fragmentation and continuation preserve one block" {
+test headers__byte_fragmentation_and_continuation_form_one_block {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())) { ret 1; }
     var preface_and_settings: [33]u8;
@@ -4169,7 +4092,7 @@ test "http.h2.connection: every byte fragmentation and continuation preserve one
     ret 0;
 }
 
-test "http.h2.connection: outbound continuation is atomic across queued control work" {
+test continuation__outbound_block_is_atomic {
     var fixture:    Fixture;
     var configured: Config = test_config();
     configured.max_frame_payload = 5;
@@ -4198,7 +4121,7 @@ test "http.h2.connection: outbound continuation is atomic across queued control 
     ret 0;
 }
 
-test "http.h2.connection: push promise uses reserved state and bounded hpack context" {
+test push_promise__reserved_state_in_both_roles {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4263,37 +4186,7 @@ test "http.h2.connection: push promise uses reserved state and bounded hpack con
     ret 0;
 }
 
-test "http.h2.connection: sustained multiplexing reuses bounded slots generation safely" {
-    var fixture: Fixture;
-    if (!make_fixture(?fixture, CLIENT, test_config())
-        || client_handshake(?fixture).kind != EVENT_SETTINGS
-        || !drain_output(?fixture)) { ret 1; }
-    var request: [4]field.Field;
-    request_fields(?request[0]);
-    var response: [1]u8;
-    response[0] = 0x89;
-    var prior_generation: u64   = 0;
-    var i:                usize = 0;
-    for (i < 64) {
-        val id: u32 = open_local(?fixture.engine, nil);
-        if (id == 0 || send_headers(?fixture.engine, id, ?request[0], 4,
-            true, true).status != OFFER_OUTPUT || !finish_write(?fixture, i % 2 == 0)) {
-            ret 2;
-        }
-        val headers: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
-            frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, id, ?response[0], 1);
-        if (headers.kind != EVENT_RESPONSE_HEADERS
-            || headers.generation <= prior_generation
-            || !release_event(?fixture.engine, id, headers.generation)
-            || !release_stream(?fixture.engine, id, headers.generation, test_now(100))) { ret 3; }
-        prior_generation = headers.generation;
-        i                = i + 1;
-    }
-    if (fixture.engine.active_streams != 0 || fixture.engine.active_local != 0) { ret 4; }
-    ret 0;
-}
-
-test "http.h2.connection: stale transport completion is terminal and closes once" {
+test transport__stale_completion_fails_and_closes_once {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4311,6 +4204,7 @@ test "http.h2.connection: stale transport completion is terminal and closes once
     ret 0;
 }
 
+#[testing]
 fun sized_config(max_streams: usize) Config {
     var configured: Config = test_config();
     configured.max_streams                  = max_streams;
@@ -4319,6 +4213,7 @@ fun sized_config(max_streams: usize) Config {
 }
 
 # opens client streams and completes their request header blocks
+#[testing]
 fun open_requests(fixture: *Fixture, count: usize, ids: *u32) bool {
     var request: [4]field.Field;
     request_fields(?request[0]);
@@ -4333,16 +4228,19 @@ fun open_requests(fixture: *Fixture, count: usize, ids: *u32) bool {
     ret true;
 }
 
+#[testing]
 fun receive_window(fixture: *Fixture, id: u32, increment: u32) Event {
     var payload: [4]u8;
     put_u32(?payload[0], increment);
     ret receive_frame(fixture, frame.FRAME_WINDOW_UPDATE, 0, id, ?payload[0], 4);
 }
 
+#[testing]
 val VISITS_FAILED: u64 = (-1)::u64;
 
 # slot visits across reads, a ping reply, write completions, tick and the
 # scheduler while count open streams sit idle
+#[testing]
 fun idle_visits(fixture: *Fixture, count: usize) u64 {
     if (!make_fixture(fixture, CLIENT, sized_config(120))
         || client_handshake(fixture).kind != EVENT_SETTINGS
@@ -4360,7 +4258,7 @@ fun idle_visits(fixture: *Fixture, count: usize) u64 {
     ret fixture.engine.slot_visits - before;
 }
 
-test "http.h2.connection: idle streams cost no slot visits on routine paths" {
+test slot_visits__idle_streams_cost_nothing {
     var small: Fixture;
     var large: Fixture;
     val few:   u64 = idle_visits(?small, 3);
@@ -4370,6 +4268,7 @@ test "http.h2.connection: idle streams cost no slot visits on routine paths" {
     ret 0;
 }
 
+#[testing]
 fun index_consistent(engine: *Engine) bool {
     var entries: usize = 0;
     var i:       usize = 0;
@@ -4388,7 +4287,7 @@ fun index_consistent(engine: *Engine) bool {
         && engine.index_tombstones <= engine.index_capacity / 4;
 }
 
-test "http.h2.connection: stream index survives tombstone churn and rebuilds" {
+test stream_index__tombstone_churn_rebuilds {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4426,7 +4325,7 @@ test "http.h2.connection: stream index survives tombstone churn and rebuilds" {
     ret 0;
 }
 
-test "http.h2.connection: window updates visit only the streams that owe one" {
+test slot_visits__window_updates_visit_only_owing_streams {
     var fixture: Fixture;
     var ids:     [20]u32;
     if (!make_fixture(?fixture, CLIENT, sized_config(24))
@@ -4472,7 +4371,7 @@ test "http.h2.connection: window updates visit only the streams that owe one" {
     ret 0;
 }
 
-test "http.h2.connection: weighted scheduling visits only the writable set" {
+test scheduler__weights_share_bandwidth_over_writable_set {
     var fixture: Fixture;
     var ids:     [6]u32;
     var zero:    [6]u8;
@@ -4492,6 +4391,10 @@ test "http.h2.connection: weighted scheduling visits only the writable set" {
         if (receive_window(?fixture, ids[i], 1000).kind != EVENT_NEED_READ)        { ret 3; }
         i = i + 1;
     }
+    # a dependency, even exclusive, only sets the weight, and a self dependency is refused
+    if (!set_priority(?fixture.engine, ids[1], ids[0], 2, true)
+        || set_priority(?fixture.engine, ids[0], ids[0], 8, false)
+        || stream_for(?fixture.engine, ids[0]).weight != 1) { ret 10; }
     if (!set_writable(?fixture.engine, ids[4], true, test_now(100))
         || fixture.engine.lists[LIST_WRITABLE].count != 0) { ret 4; }
     var counts: [3]usize;
@@ -4527,7 +4430,7 @@ test "http.h2.connection: weighted scheduling visits only the writable set" {
     ret 0;
 }
 
-test "http.h2.connection: pending reports budgeted work until it drains" {
+test pending__budgeted_work_until_drained {
     var fixture: Fixture;
     var ids:     [70]u32;
     if (!make_fixture(?fixture, CLIENT, sized_config(80))
@@ -4566,13 +4469,14 @@ test "http.h2.connection: pending reports budgeted work until it drains" {
     ret 0;
 }
 
+#[testing]
 fun priority_payload(output: *u8, dependency: u32, weight: u16, exclusive: bool) {
     put_u32(output, dependency);
     if (exclusive) { output[0] = output[0] | 0x80; }
     output[4] = (weight - 1)::u8;
 }
 
-test "http.h2.connection: exclusive priority visits only the named stream" {
+test slot_visits__exclusive_priority_touches_named_stream {
     var fixture: Fixture;
     var ids:     [100]u32;
     if (!make_fixture(?fixture, CLIENT, sized_config(120))
@@ -4604,7 +4508,7 @@ test "http.h2.connection: exclusive priority visits only the named stream" {
     ret 0;
 }
 
-test "http.h2.connection: self dependency is a stream error that keeps hpack in step" {
+test priority__self_dependency_is_stream_error_keeping_hpack {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4665,12 +4569,14 @@ test "http.h2.connection: self dependency is a stream error that keeps hpack in 
     ret 0;
 }
 
+#[testing]
 fun round16(bytes: usize) usize {
     ret (bytes + 15) & ~(15::usize);
 }
 
 # the decoder set one stream borrows, summed from the engine's own table. the
 # test pool has no classes, so each chunk is charged its request rounded to 16
+#[testing]
 fun stream_set_bytes() usize {
     var requests: [STREAM_BUFFERS]buffers.Request;
     if (!stream_requests(test_config(), ?requests[0])) { ret 0; }
@@ -4684,22 +4590,13 @@ fun stream_set_bytes() usize {
     ret total;
 }
 
-test "http.h2.connection: the stream request table is the set a stream acquires" {
-    var requests: [STREAM_BUFFERS]buffers.Request;
-    var bad:      Config = test_config();
-    bad.max_streams = 0;
-    if (stream_requests(bad, ?requests[0]) || stream_requests(test_config(), nil)) { ret 1; }
-    if (!stream_requests(test_config(), ?requests[0])
-        || requests[0].bytes != 512 || requests[1].bytes != 16 * $size_of(field.Field)
-        || requests[2].bytes != 512 || requests[3].bytes != 16 * $size_of(hpack.Entry)) { ret 2; }
-    ret 0;
-}
-
 # the first record chunk and the index an initialized engine holds
+#[testing]
 fun idle_bytes() usize {
     ret round16(4 * $size_of(Stream)) + round16(16 * $size_of(StreamIndexEntry));
 }
 
+#[testing]
 fun request_block(output: *u8) {
     output[0] = 0x82;
     output[1] = 0x86;
@@ -4709,7 +4606,7 @@ fun request_block(output: *u8) {
     output[5] = 'x';
 }
 
-test "http.h2.connection: an idle engine holds only its first records and a stream exactly its set" {
+test memory__idle_engine_and_stream_hold_exact_sets {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || fixture.account.held != idle_bytes() || fixture.account.used[0] != 0) { ret 1; }
@@ -4740,11 +4637,12 @@ test "http.h2.connection: an idle engine holds only its first records and a stre
 
 # a pool with one 1024 byte class, so the 512 byte chunks of a stream set are
 # charged more than their request and the footprint differs from the plain sum
+#[testing]
 fun stream_classes(classes: *buffers.ClassConfig) {
     classes[0] = buffers.ClassConfig{size: 1024, align: 0, secret: false, high_water: 4};
 }
 
-test "http.h2.connection: a stream's footprint is what a classed pool charges for its set" {
+test memory__stream_footprint_matches_classed_pool {
     var classes: [1]buffers.ClassConfig;
     stream_classes(?classes[0]);
     var fixture: Fixture;
@@ -4766,31 +4664,7 @@ test "http.h2.connection: a stream's footprint is what a classed pool charges fo
     ret 0;
 }
 
-test "http.h2.connection: held data keeps its payload until consumed" {
-    var fixture: Fixture;
-    if (!make_fixture(?fixture, SERVER, test_config())
-        || server_handshake(?fixture).kind != EVENT_SETTINGS
-        || !drain_output(?fixture)) { ret 1; }
-    var request: [6]u8;
-    request_block(?request[0]);
-    val headers: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
-        frame.FLAG_END_HEADERS, 1, ?request[0], 6);
-    var storage: ExchangeMemory;
-    if (headers.kind != EVENT_REQUEST_HEADERS
-        || !make_exchange(?storage, headers.generation, 1)
-        || !bind_exchange(?fixture.engine, 1, ?storage.exchange)
-        || !release_event(?fixture.engine, 1, headers.generation)) { ret 2; }
-    var body_bytes: [4]u8;
-    val data:       Event = receive_frame(?fixture, frame.FRAME_DATA, 0, 1, ?body_bytes[0], 4);
-    if (data.kind != EVENT_DATA || !fixture.engine.payload_held
-        || fixture.account.used[1] != idle_bytes() + round16(16384)) { ret 3; }
-    if (!consume_data(?fixture.engine, 1, 3) || !fixture.engine.payload_held
-        || !consume_data(?fixture.engine, 1, 1) || fixture.engine.payload_held
-        || fixture.account.used[1] != idle_bytes()) { ret 4; }
-    ret 0;
-}
-
-test "http.h2.connection: a budget refusal ends at the engine's own release" {
+test memory__budget_refusal_ends_at_own_release {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4814,8 +4688,11 @@ test "http.h2.connection: a budget refusal ends at the engine's own release" {
     if (submit_write(?fixture.engine, fixture.clock) || !fixture.engine.memory_blocked
         || fixture.account.waiting || fixture.account.is_ready
         || pending_work(?fixture.engine)) { ret 5; }
-    # the budget refusal registered no wake, so the engine's own release is what ends it
-    if (!consume_data(?fixture.engine, 1, 4) || fixture.engine.payload_held
+    # the budget refusal registered no wake, so the engine's own release is what ends it,
+    # and a payload stays held until every byte of it is consumed
+    if (!consume_data(?fixture.engine, 1, 3) || !fixture.engine.payload_held
+        || !fixture.engine.memory_blocked) { ret 9; }
+    if (!consume_data(?fixture.engine, 1, 1) || fixture.engine.payload_held
         || fixture.account.waiting || fixture.account.is_ready) { ret 6; }
     if (fixture.engine.memory_blocked || !pending_work(?fixture.engine)) { ret 7; }
     if (!submit_write(?fixture.engine, fixture.clock)
@@ -4823,7 +4700,7 @@ test "http.h2.connection: a budget refusal ends at the engine's own release" {
     ret 0;
 }
 
-test "http.h2.connection: a budget refusal outlasts a release on another lane" {
+test memory__budget_refusal_outlasts_other_lane_release {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4848,7 +4725,7 @@ test "http.h2.connection: a budget refusal outlasts a release on another lane" {
     ret 0;
 }
 
-test "http.h2.connection: a refused stream set refuses only that stream" {
+test memory__refused_stream_set_refuses_only_that_stream {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4883,7 +4760,7 @@ test "http.h2.connection: a refused stream set refuses only that stream" {
     ret 0;
 }
 
-test "http.h2.connection: a refused local stream or transient buffer blocks only that call" {
+test memory__refused_local_stream_or_buffer_blocks_only_that_call {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4917,7 +4794,7 @@ test "http.h2.connection: a refused local stream or transient buffer blocks only
     ret 0;
 }
 
-test "http.h2.connection: stream records grow in place and the index follows them" {
+test stream_records__grow_in_place_and_index_follows {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, sized_config(40))
         || client_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4968,7 +4845,7 @@ test "http.h2.connection: stream records grow in place and the index follows the
     ret 0;
 }
 
-test "http.h2.connection: an unbound request borrow ends once its stream closes" {
+test release_event__unbound_borrow_ends_at_stream_close {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -4985,7 +4862,7 @@ test "http.h2.connection: an unbound request borrow ends once its stream closes"
     ret 0;
 }
 
-test "http.h2.connection: a failed connection destroys with streams the host never released" {
+test destroy__failed_connection_with_unreleased_streams {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS
@@ -5016,15 +4893,18 @@ test "http.h2.connection: a failed connection destroys with streams the host nev
     ret 0;
 }
 
+#[testing]
 fun just_before(seconds: i64) time.Instant {
     ret time.Instant{sec: seconds - 1, nsec: 999999999};
 }
 
+#[testing]
 fun due_at(value: deadline.Deadline, at: time.Instant) bool {
     ret value.active && time.instant_equal(value.at, at);
 }
 
 # the reported deadline is quiet a nanosecond early and fails the connection at it
+#[testing]
 fun times_out_at(fixture: *Fixture, seconds: i64, error: Error) bool {
     if (!due_at(next_deadline(?fixture.engine), test_now(seconds))
         || tick(?fixture.engine, just_before(seconds)).kind != EVENT_NONE
@@ -5036,6 +4916,7 @@ fun times_out_at(fixture: *Fixture, seconds: i64, error: Error) bool {
 }
 
 # the reported deadline resets only its stream, and not a nanosecond early
+#[testing]
 fun resets_at(fixture: *Fixture, seconds: i64, id: u32, error: Error) bool {
     if (!due_at(next_deadline(?fixture.engine), test_now(seconds))
         || tick(?fixture.engine, just_before(seconds)).kind != EVENT_NONE) { ret false; }
@@ -5048,6 +4929,7 @@ fun resets_at(fixture: *Fixture, seconds: i64, id: u32, error: Error) bool {
         && fixture.engine.state != FAILED && fixture.engine.error == ERROR_NONE;
 }
 
+#[testing]
 fun ping_at(fixture: *Fixture, seconds: i64) bool {
     fixture.clock = test_now(seconds);
     var opaque: [8]u8;
@@ -5056,6 +4938,7 @@ fun ping_at(fixture: *Fixture, seconds: i64) bool {
 }
 
 # a request the host has bound and taken, at the fixture's clock
+#[testing]
 fun open_request(fixture: *Fixture, id: u32, end_stream: bool,
     storage: *ExchangeMemory) bool {
     var block: [6]u8;
@@ -5069,11 +4952,13 @@ fun open_request(fixture: *Fixture, id: u32, end_stream: bool,
         && release_event(?fixture.engine, id, reported.generation);
 }
 
+#[testing]
 fun served_handshake(fixture: *Fixture) bool {
     ret make_fixture(fixture, SERVER, test_config())
         && server_handshake(fixture).kind == EVENT_SETTINGS && drain_output(fixture);
 }
 
+#[testing]
 fun respond(fixture: *Fixture, id: u32) bool {
     var response: [1]field.Field;
     response[0] = field.Field{name: view.view(":status", 7),
@@ -5082,6 +4967,7 @@ fun respond(fixture: *Fixture, id: u32) bool {
         && drain_output(fixture) && stream_for(?fixture.engine, id).initial_headers_sent;
 }
 
+#[testing]
 fun goaway_written(fixture: *Fixture, code: u32) bool {
     var count: usize = 0;
     for (count < 8 && submit_write(?fixture.engine, fixture.clock)) {
@@ -5096,6 +4982,7 @@ fun goaway_written(fixture: *Fixture, code: u32) bool {
     ret false;
 }
 
+#[testing]
 fun closes(fixture: *Fixture) bool {
     if (!fixture.engine.close_pending && !progress_close(?fixture.engine)) { ret false; }
     var closed: transport.Completion = transport.completed(
@@ -5104,7 +4991,7 @@ fun closes(fixture: *Fixture) bool {
         && destroy(?fixture.engine) && fixture.account.held == 0;
 }
 
-test "http.h2.connection: a silent server connection times out at the header timeout" {
+test deadline__silent_connection_hits_header_timeout {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config()))                  { ret 1; }
     if (!times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT))              { ret 2; }
@@ -5115,7 +5002,7 @@ test "http.h2.connection: a silent server connection times out at the header tim
     ret 0;
 }
 
-test "http.h2.connection: a preface and settings alone owe a request within the header timeout" {
+test deadline__pings_never_extend_request_wait {
     var fixture: Fixture;
     if (!served_handshake(?fixture)) { ret 1; }
     # pings are not a request, so they never extend the wait
@@ -5125,7 +5012,7 @@ test "http.h2.connection: a preface and settings alone owe a request within the 
     ret 0;
 }
 
-test "http.h2.connection: a truncated first headers frame times out with the request wait" {
+test deadline__truncated_first_headers_keeps_request_wait {
     var fixture: Fixture;
     if (!served_handshake(?fixture)) { ret 1; }
     var block: [6]u8;
@@ -5139,7 +5026,7 @@ test "http.h2.connection: a truncated first headers frame times out with the req
     ret 0;
 }
 
-test "http.h2.connection: a truncated headers frame beside a live stream times out at the header timeout" {
+test deadline__truncated_headers_beside_live_stream_hits_header_timeout {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
@@ -5155,7 +5042,7 @@ test "http.h2.connection: a truncated headers frame beside a live stream times o
     ret 0;
 }
 
-test "http.h2.connection: a header block without its end times out from its first frame" {
+test deadline__continuation_never_extends_header_block {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
@@ -5171,7 +5058,7 @@ test "http.h2.connection: a header block without its end times out from its firs
     ret 0;
 }
 
-test "http.h2.connection: a finished header block stops its deadline" {
+test deadline__finished_header_block_stops_its_timer {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
@@ -5190,7 +5077,7 @@ test "http.h2.connection: a finished header block stops its deadline" {
     ret 0;
 }
 
-test "http.h2.connection: an idle connection closes at the idle timeout after a response" {
+test deadline__idle_timeout_after_response {
     var fixture: Fixture;
     var served:  ExchangeMemory;
     if (!served_handshake(?fixture)) { ret 1; }
@@ -5202,7 +5089,7 @@ test "http.h2.connection: an idle connection closes at the idle timeout after a 
     ret 0;
 }
 
-test "http.h2.connection: a request just inside the wait takes over with one timer" {
+test deadline__request_just_inside_wait_takes_over {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture)) { ret 1; }
@@ -5220,7 +5107,7 @@ test "http.h2.connection: a request just inside the wait takes over with one tim
     ret 0;
 }
 
-test "http.h2.connection: a request that stalls is reset alone" {
+test deadline__stalled_request_resets_alone {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     var second:  ExchangeMemory;
@@ -5253,7 +5140,7 @@ test "http.h2.connection: a request that stalls is reset alone" {
     ret 0;
 }
 
-test "http.h2.connection: a stream the peer never grants window is reset at the write timeout" {
+test deadline__stream_without_window_resets_at_write_timeout {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture)) { ret 1; }
@@ -5283,7 +5170,7 @@ test "http.h2.connection: a stream the peer never grants window is reset at the 
     ret 0;
 }
 
-test "http.h2.connection: a withdrawn stall stops its timer" {
+test deadline__withdrawn_stall_stops_its_timer {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture)) { ret 1; }
@@ -5302,7 +5189,7 @@ test "http.h2.connection: a withdrawn stall stops its timer" {
     ret 0;
 }
 
-test "http.h2.connection: a connection window that never reopens closes at the write timeout" {
+test deadline__connection_window_stall_closes_at_write_timeout {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)
@@ -5325,7 +5212,7 @@ test "http.h2.connection: a connection window that never reopens closes at the w
     ret 0;
 }
 
-test "http.h2.connection: a write the peer never takes closes at the write timeout" {
+test deadline__stuck_write_closes_at_write_timeout {
     var fixture:  Fixture;
     var first:    ExchangeMemory;
     var response: [1]field.Field;
@@ -5347,7 +5234,7 @@ test "http.h2.connection: a write the peer never takes closes at the write timeo
     ret 0;
 }
 
-test "http.h2.connection: a goaway drain the peer never reads still closes" {
+test deadline__unread_goaway_drain_still_closes {
     var fixture: Fixture;
     if (!served_handshake(?fixture)) { ret 1; }
     if (!times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)
@@ -5362,7 +5249,7 @@ test "http.h2.connection: a goaway drain the peer never reads still closes" {
     ret 0;
 }
 
-test "http.h2.connection: stream deadlines fire in deadline order whatever their duration" {
+test deadline__streams_fire_in_deadline_order {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     var second:  ExchangeMemory;
@@ -5386,19 +5273,7 @@ test "http.h2.connection: stream deadlines fire in deadline order whatever their
     ret 0;
 }
 
-test "http.h2.connection: a live stream keeps the connection until the total timeout" {
-    var fixture: Fixture;
-    var first:   ExchangeMemory;
-    if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
-    # the peer owes nothing and the host still holds the stream, so idle never runs
-    if (!ping_at(?fixture, 200) || fixture.engine.idle_deadline.active) { ret 2; }
-    if (!times_out_at(?fixture, 400, ERROR_TOTAL_TIMEOUT)
-        || first.exchange.state != exchange.TIMED_OUT_STATE) { ret 3; }
-    if (!goaway_written(?fixture, H2_NO_ERROR)) { ret 4; }
-    ret 0;
-}
-
-test "http.h2.connection: a client is idle from init until it opens a stream" {
+test deadline__client_idle_until_first_stream {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || fixture.engine.wait_deadline.active) { ret 1; }
@@ -5423,11 +5298,13 @@ test "http.h2.connection: a client is idle from init until it opens a stream" {
     ret 0;
 }
 
+#[testing]
 fun closure_is(storage: *ExchangeMemory, state: exchange.State, cause: exchange.Cause, code: u32) bool {
     val why: exchange.Closure = storage.exchange.completion.closure;
     ret storage.exchange.state == state && why.cause == cause && why.code == code::u64 && why.detail == 0;
 }
 
+#[testing]
 fun failing_write(fixture: *Fixture, seconds: i64) Event {
     var response: [1]field.Field;
     response[0] = field.Field{name: view.view(":status", 7),
@@ -5439,7 +5316,7 @@ fun failing_write(fixture: *Fixture, seconds: i64) Event {
     ret complete_io(?fixture.engine, ?reset, test_now(seconds + 1));
 }
 
-test "http.h2.connection: an exchange the engine closes carries the cause" {
+test closure__engine_close_carries_cause {
     # the peer reset the stream
     var peer_fixture: Fixture;
     var peer_storage: ExchangeMemory;
@@ -5467,9 +5344,10 @@ test "http.h2.connection: an exchange the engine closes carries the cause" {
     var total_fixture: Fixture;
     var total_storage: ExchangeMemory;
     if (!served_handshake(?total_fixture) || !open_request(?total_fixture, 1, true, ?total_storage)
-        || !ping_at(?total_fixture, 200)
+        || !ping_at(?total_fixture, 200) || total_fixture.engine.idle_deadline.active
         || !times_out_at(?total_fixture, 400, ERROR_TOTAL_TIMEOUT)
-        || !closure_is(?total_storage, exchange.TIMED_OUT_STATE, exchange.CAUSE_TIMEOUT, H2_NO_ERROR)) { ret 5; }
+        || !closure_is(?total_storage, exchange.TIMED_OUT_STATE, exchange.CAUSE_TIMEOUT, H2_NO_ERROR)
+        || !goaway_written(?total_fixture, H2_NO_ERROR)) { ret 5; }
     # the connection failed on a protocol error
     var protocol_fixture: Fixture;
     var protocol_storage: ExchangeMemory;
@@ -5506,7 +5384,7 @@ test "http.h2.connection: an exchange the engine closes carries the cause" {
     ret 0;
 }
 
-test "http.h2.connection: a cancelled connection closes without waiting on output it cannot write" {
+test close__cancelled_connection_skips_unwritable_output {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
@@ -5518,7 +5396,7 @@ test "http.h2.connection: a cancelled connection closes without waiting on outpu
     ret 0;
 }
 
-test "http.h2.connection: timeouts need valid instants and a later clock never moves a deadline back" {
+test clock__rejects_invalid_instants_and_never_moves_back {
     var fixture: Fixture;
     if (!served_handshake(?fixture)) { ret 1; }
     if (tick(?fixture.engine, time.Instant{sec: 1, nsec: 1000000000}).error != ERROR_STATE
@@ -5537,12 +5415,13 @@ test "http.h2.connection: timeouts need valid instants and a later clock never m
     ret 0;
 }
 
+#[testing]
 fun named(name: *u8, length: usize, value: *u8, value_length: usize) field.Field {
     ret field.Field{name: view.view(name, length), value: view.view(value, value_length),
         sensitive: false};
 }
 
-test "http.h2.connection: outgoing names in any case are sent lowercase" {
+test field_names__outgoing_sent_lowercase {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture) || !open_request(?fixture, 1, false, ?first)) { ret 1; }
@@ -5558,7 +5437,7 @@ test "http.h2.connection: outgoing names in any case are sent lowercase" {
     ret 0;
 }
 
-test "http.h2.connection: outgoing connection-specific names are refused in any case" {
+test field_names__outgoing_connection_specific_refused {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture) || !open_request(?fixture, 1, false, ?first)) { ret 1; }
@@ -5576,23 +5455,7 @@ test "http.h2.connection: outgoing connection-specific names are refused in any 
     ret 0;
 }
 
-test "http.h2.connection: a received uppercase name is still malformed" {
-    var fixture: Fixture;
-    if (!served_handshake(?fixture)) { ret 1; }
-    var block: [11]u8;
-    request_block(?block[0]);
-    block[6]  = 0x00;
-    block[7]  = 0x02;
-    block[8]  = 'X';
-    block[9]  = 'a';
-    block[10] = 0x00;
-    val reported: Event = receive_frame(?fixture, frame.FRAME_HEADERS,
-        frame.FLAG_END_HEADERS | frame.FLAG_END_STREAM, 1, ?block[0], 11);
-    if (reported.kind != EVENT_STREAM_ERROR || reported.code != H2_PROTOCOL_ERROR) { ret 2; }
-    ret 0;
-}
-
-test "http.h2.connection: a failed engine whose scope ends before the drain still closes" {
+test close__failed_engine_scope_end_skips_drain {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     if (!served_handshake(?fixture) || !open_request(?fixture, 1, true, ?first)) { ret 1; }
@@ -5616,7 +5479,7 @@ test "http.h2.connection: a failed engine whose scope ends before the drain stil
     ret 0;
 }
 
-test "http.h2.connection: a failed engine whose scope ends is closed by the next tick" {
+test close__failed_engine_scope_end_closes_on_tick {
     var fixture: Fixture;
     if (!served_handshake(?fixture) || !times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)
         || fixture.engine.control_count != 1) { ret 1; }
@@ -5627,7 +5490,7 @@ test "http.h2.connection: a failed engine whose scope ends is closed by the next
     ret 0;
 }
 
-test "http.h2.connection: a drain write cancelled by the scope still closes" {
+test close__cancelled_drain_write_still_closes {
     var fixture: Fixture;
     if (!served_handshake(?fixture) || !times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)
         || !submit_write(?fixture.engine, test_now(111))
@@ -5643,7 +5506,7 @@ test "http.h2.connection: a drain write cancelled by the scope still closes" {
     ret 0;
 }
 
-test "http.h2.connection: a drain the transport refuses still closes" {
+test close__refused_drain_still_closes {
     var fixture: Fixture;
     if (!served_handshake(?fixture) || !times_out_at(?fixture, 110, ERROR_HEADER_TIMEOUT)) { ret 1; }
     fixture.io.refuse_write = true;
@@ -5654,7 +5517,7 @@ test "http.h2.connection: a drain the transport refuses still closes" {
     ret 0;
 }
 
-test "http.h2.connection: a submitted close parses no leftover input and keeps the first error" {
+test close__failed_close_parses_no_leftover_input {
     var fixture: Fixture;
     if (!served_handshake(?fixture)) { ret 1; }
     var payload: [7]u8;
@@ -5677,7 +5540,7 @@ test "http.h2.connection: a submitted close parses no leftover input and keeps t
     ret 0;
 }
 
-test "http.h2.connection: a graceful close parses no leftover input once it is submitted" {
+test close__graceful_close_parses_no_leftover_input {
     var fixture: Fixture;
     if (!served_handshake(?fixture)) { ret 1; }
     var priority: [5]u8;
@@ -5700,6 +5563,7 @@ test "http.h2.connection: a graceful close parses no leftover input once it is s
 }
 
 # a failed server engine whose close is submitted while its read is still in flight
+#[testing]
 fun closing_with_read(fixture: *Fixture) bool {
     ret served_handshake(fixture) && submit_read(?fixture.engine)
         && times_out_at(fixture, 110, ERROR_HEADER_TIMEOUT) && drain_output(fixture)
@@ -5708,6 +5572,7 @@ fun closing_with_read(fixture: *Fixture) bool {
 }
 
 # the close cancels the read still in flight, which fails nothing again either
+#[testing]
 fun closes_after_read(fixture: *Fixture) bool {
     var cancelled: transport.Completion = transport.failed(fixture.io.read_token,
         transport.READ, 0, io_error.make(io_error.CANCELLED, io_error.OP_READ));
@@ -5715,61 +5580,49 @@ fun closes_after_read(fixture: *Fixture) bool {
         && !fixture.engine.read_pending && closes(fixture);
 }
 
+#[testing]
 fun kept_first_error(fixture: *Fixture, reported: Event) bool {
     ret reported.kind == EVENT_TIMED_OUT && reported.error == ERROR_HEADER_TIMEOUT
         && fixture.engine.state == CLOSING && fixture.engine.error == ERROR_HEADER_TIMEOUT
         && fixture.engine.h2_error == H2_NO_ERROR;
 }
 
-test "http.h2.connection: a stale completion after the close is submitted keeps the first error" {
-    var fixture: Fixture;
-    if (!closing_with_read(?fixture)) { ret 1; }
-    var stale: transport.Token = fixture.io.read_token;
+test close__late_completions_keep_first_error {
+    # a stale completion
+    var stale_fixture: Fixture;
+    if (!closing_with_read(?stale_fixture)) { ret 1; }
+    var stale: transport.Token = stale_fixture.io.read_token;
     stale.generation = stale.generation + 1;
-    var completion: transport.Completion = transport.completed(stale, transport.READ, 1);
-    if (!kept_first_error(?fixture, complete_io(?fixture.engine, ?completion, fixture.clock))) {
-        ret 2;
-    }
-    if (!closes_after_read(?fixture)) { ret 3; }
-    ret 0;
-}
-
-test "http.h2.connection: a completion the transport refuses after the close keeps the first error" {
-    var fixture: Fixture;
-    if (!closing_with_read(?fixture)) { ret 1; }
+    var stale_completion: transport.Completion = transport.completed(stale, transport.READ, 1);
+    if (!kept_first_error(?stale_fixture, complete_io(?stale_fixture.engine, ?stale_completion,
+        stale_fixture.clock)) || !closes_after_read(?stale_fixture)) { ret 2; }
     # a close never ends a stream, so the transport refuses this one and keeps the close in flight
-    var refused: transport.Completion = transport.end_of(fixture.io.close_token,
+    var refused_fixture: Fixture;
+    if (!closing_with_read(?refused_fixture)) { ret 3; }
+    var refused: transport.Completion = transport.end_of(refused_fixture.io.close_token,
         transport.CLOSE, 0);
-    if (!kept_first_error(?fixture, complete_io(?fixture.engine, ?refused, fixture.clock))) {
-        ret 2;
-    }
-    if (!closes_after_read(?fixture)) { ret 3; }
-    ret 0;
-}
-
-test "http.h2.connection: a read that fails after the close is submitted keeps the first error" {
-    var fixture: Fixture;
-    if (!closing_with_read(?fixture)) { ret 1; }
-    var completion: transport.Completion = transport.failed(fixture.io.read_token,
+    if (!kept_first_error(?refused_fixture, complete_io(?refused_fixture.engine, ?refused,
+        refused_fixture.clock)) || !closes_after_read(?refused_fixture)) { ret 4; }
+    # a read that fails
+    var failed_fixture: Fixture;
+    if (!closing_with_read(?failed_fixture)) { ret 5; }
+    var failed: transport.Completion = transport.failed(failed_fixture.io.read_token,
         transport.READ, 0, io_error.make(io_error.RESET, io_error.OP_READ));
-    if (!kept_first_error(?fixture, complete_io(?fixture.engine, ?completion, fixture.clock))
-        || fixture.engine.read_pending) { ret 2; }
-    if (!closes(?fixture)) { ret 3; }
-    ret 0;
-}
-
-test "http.h2.connection: an empty read after the close is submitted keeps the first error" {
-    var fixture: Fixture;
-    if (!closing_with_read(?fixture)) { ret 1; }
-    var completion: transport.Completion = transport.completed(fixture.io.read_token,
+    if (!kept_first_error(?failed_fixture, complete_io(?failed_fixture.engine, ?failed,
+        failed_fixture.clock)) || failed_fixture.engine.read_pending
+        || !closes(?failed_fixture)) { ret 6; }
+    # an empty read
+    var empty_fixture: Fixture;
+    if (!closing_with_read(?empty_fixture)) { ret 7; }
+    var empty: transport.Completion = transport.completed(empty_fixture.io.read_token,
         transport.READ, 0);
-    if (!kept_first_error(?fixture, complete_io(?fixture.engine, ?completion, fixture.clock))
-        || fixture.engine.read_pending) { ret 2; }
-    if (!closes(?fixture)) { ret 3; }
+    if (!kept_first_error(?empty_fixture, complete_io(?empty_fixture.engine, ?empty,
+        empty_fixture.clock)) || empty_fixture.engine.read_pending
+        || !closes(?empty_fixture)) { ret 8; }
     ret 0;
 }
 
-test "http.h2.connection: pending work is output until it is written" {
+test pending__output_until_written {
     var client: Fixture;
     if (!make_fixture(?client, CLIENT, test_config())) { ret 1; }
     # the client owes its preface and settings from init
@@ -5796,7 +5649,7 @@ test "http.h2.connection: pending work is output until it is written" {
     ret 0;
 }
 
-test "http.h2.connection: pending work is an event process has not reported" {
+test pending__unreported_event {
     var fixture: Fixture;
     if (!served_handshake(?fixture) || pending_work(?fixture.engine)) { ret 1; }
     var priority: [5]u8;
@@ -5858,7 +5711,7 @@ test "http.h2.connection: pending work is an event process has not reported" {
     ret 0;
 }
 
-test "http.h2.connection: pending work is a window update owed or a stream that can send" {
+test pending__window_update_or_sendable_stream {
     var fixture:    Fixture;
     var configured: Config = test_config();
     configured.local.initial_window_size = 8;
@@ -5895,7 +5748,7 @@ test "http.h2.connection: pending work is a window update owed or a stream that 
     ret 0;
 }
 
-test "http.h2.connection: pending work is a close progress_close would submit" {
+test pending__close_to_submit {
     var fixture: Fixture;
     if (!served_handshake(?fixture) || !begin_graceful(?fixture.engine)
         || !pending_work(?fixture.engine) || !drain_output(?fixture)) { ret 1; }
@@ -5919,44 +5772,7 @@ test "http.h2.connection: pending work is a close progress_close would submit" {
     ret 0;
 }
 
-fun pending_script(fixture: *Fixture) bool {
-    if (!make_fixture(fixture, CLIENT, test_config())
-        || client_handshake(fixture).kind != EVENT_SETTINGS
-        || !drain_output(fixture) || !open_requests(fixture, 1, nil)) { ret false; }
-    var opaque: [8]u8;
-    var wire:   [34]u8;
-    var length: usize = test_frame(?wire[0], 34, frame.FRAME_PING, 0, 0, ?opaque[0], 8);
-    length = length + test_frame(?wire[length], 34 - length, frame.FRAME_PING, 0, 0,
-        ?opaque[0], 8);
-    ret receive_bytes(fixture, ?wire[0], length, false).kind == EVENT_PING;
-}
-
-test "http.h2.connection: asking about pending work changes nothing the engine does next" {
-    var asked: Fixture;
-    var plain: Fixture;
-    if (!pending_script(?asked) || !pending_script(?plain)) { ret 1; }
-    var before: [16384]u8;
-    if ($size_of(Engine) > 16384) { ret 2; }
-    memory.raw_copy(?before[0], (?asked.engine)::*u8, $size_of(Engine));
-    var i: usize = 0;
-    for (i < 4) {
-        if (!pending_work(?asked.engine)) { ret 3; }
-        i = i + 1;
-    }
-    if (!memory.raw_equal(?before[0], (?asked.engine)::*u8, $size_of(Engine))) { ret 4; }
-    # the next output and the next event are the same as an engine never asked
-    if (!submit_write(?asked.engine, asked.clock) || !submit_write(?plain.engine, plain.clock)
-        || asked.io.write_length != plain.io.write_length || asked.io.write_length == 0
-        || !memory.raw_equal(asked.io.write_buffer, plain.io.write_buffer,
-        asked.io.write_length)) { ret 5; }
-    val asked_event: Event = process(?asked.engine, asked.clock);
-    val plain_event: Event = process(?plain.engine, plain.clock);
-    if (asked_event.kind != EVENT_PING || plain_event.kind != EVENT_PING
-        || asked.engine.input_offset != plain.engine.input_offset) { ret 6; }
-    ret 0;
-}
-
-test "http.h2.connection: pending work that needs refused memory waits on the account" {
+test pending__refused_memory_waits_on_account {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS
@@ -5979,7 +5795,7 @@ test "http.h2.connection: pending work that needs refused memory waits on the ac
     ret 0;
 }
 
-test "http.h2.connection: a frame that ends with the peer's stream is still handled" {
+test peer_close__trailing_frame_still_handled {
     var fixture: Fixture;
     if (!served_handshake(?fixture)) { ret 1; }
     var opaque: [8]u8;
@@ -5988,7 +5804,8 @@ test "http.h2.connection: a frame that ends with the peer's stream is still hand
     if (receive_bytes(?fixture, ?wire[0], length, true).kind != EVENT_PING
         || process(?fixture.engine, fixture.clock).kind != EVENT_PEER_CLOSED
         || !submit_write(?fixture.engine, fixture.clock)
-        || fixture.io.write_buffer[3] != frame.FRAME_PING) { ret 2; }
+        || fixture.io.write_buffer[3] != frame.FRAME_PING
+        || (fixture.io.write_buffer[4] & frame.FLAG_ACK) == 0) { ret 2; }
     # a frame cut short by the end is still refused as truncated
     var truncated: Fixture;
     if (!served_handshake(?truncated)
