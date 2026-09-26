@@ -1,6 +1,6 @@
 [project]
 id = "http"
-mach = "^5.12"
+mach = "^6"
 version = "0.20.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
@@ -62,4 +62,4 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^8.0"
+version = "^9.0"
