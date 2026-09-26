@@ -3314,6 +3314,7 @@ pub fun cancel_connection[T](engine: *Engine[T]) bool {
     ret true;
 }
 
+#[testing]
 rec TestWire {
     handle:            StreamHandle;
     input:             *u8;
@@ -3339,8 +3340,10 @@ rec TestWire {
     write_blocked:     bool;
 }
 
+#[testing]
 val TEST_SIGNALS: usize = 256;
 
+#[testing]
 rec TestTransport {
     secret:         ^u64;
     wires:          *TestWire;
@@ -3369,20 +3372,26 @@ rec TestTransport {
 }
 
 # the connection is gone: the named hook reports gone_status from now on
+#[testing]
 val GONE_READY: u8 = 1;
+#[testing]
 val GONE_READ:  u8 = 2;
+#[testing]
 val GONE_WRITE: u8 = 3;
 
+#[testing]
 fun test_gone(io: *TestTransport, hook: u8) bool {
     ret io.gone_hook == hook;
 }
 
+#[testing]
 fun test_call(io: *TestTransport) {
     io.calls = io.calls + 1;
 }
 
 # the fake's transport state changes only through the test, so every change is
 # reported here, exactly as a real adapter must
+#[testing]
 fun test_signal(io: *TestTransport, value: StreamHandle, readable: bool,
     writable: bool, reset: bool) {
     if (io.signal_count == TEST_SIGNALS) {
@@ -3396,6 +3405,7 @@ fun test_signal(io: *TestTransport, value: StreamHandle, readable: bool,
     io.signal_count = io.signal_count + 1;
 }
 
+#[testing]
 fun test_ready(context: *TestTransport) TransportReady {
     val io: *TestTransport = context;
     test_call(io);
@@ -3413,6 +3423,7 @@ fun test_ready(context: *TestTransport) TransportReady {
     ret report;
 }
 
+#[testing]
 fun wire_feed(io: *TestTransport, wire: *TestWire, input: *u8, length: usize,
     fin: bool) {
     wire.input        = input;
@@ -3422,21 +3433,25 @@ fun wire_feed(io: *TestTransport, wire: *TestWire, input: *u8, length: usize,
     test_signal(io, wire.handle, true, false, false);
 }
 
+#[testing]
 fun wire_reset(io: *TestTransport, wire: *TestWire, code: u64) {
     wire.reset             = true;
     wire.application_error = code;
     test_signal(io, wire.handle, false, false, true);
 }
 
+#[testing]
 fun wire_unblock(io: *TestTransport, wire: *TestWire) {
     wire.write_blocked = false;
     test_signal(io, wire.handle, false, true, false);
 }
 
+#[testing]
 fun no_handle() StreamHandle {
     ret StreamHandle{source: 0, index: 0, generation: 0, id: 0};
 }
 
+#[testing]
 fun test_wire(io: *TestTransport, value: StreamHandle) *TestWire {
     if (io == nil || value.source != io.source || value.index >= io.capacity) { ret nil; }
     val wire: *TestWire = ?io.wires[value.index];
@@ -3445,6 +3460,7 @@ fun test_wire(io: *TestTransport, value: StreamHandle) *TestWire {
     ret wire;
 }
 
+#[testing]
 fun test_claim(io: *TestTransport, id: u64) *TestWire {
     var i: usize = 0;
     for (i < io.capacity) {
@@ -3480,6 +3496,7 @@ fun test_claim(io: *TestTransport, id: u64) *TestWire {
     ret nil;
 }
 
+#[testing]
 fun test_open(context: *TestTransport, direction: u8) TransportOpen {
     val io: *TestTransport = context;
     test_call(io);
@@ -3498,6 +3515,7 @@ fun test_open(context: *TestTransport, direction: u8) TransportOpen {
         stream_limit_blocked: false, storage_blocked: false, error: 0};
 }
 
+#[testing]
 fun test_accept(context: *TestTransport) TransportOpen {
     val io: *TestTransport = context;
     test_call(io);
@@ -3515,6 +3533,7 @@ fun test_accept(context: *TestTransport) TransportOpen {
         stream_limit_blocked: false, storage_blocked: false, error: 0};
 }
 
+#[testing]
 fun test_read(context: *TestTransport, value: StreamHandle,
     output: *u8, capacity: usize) TransportRead {
     val io:   *TestTransport = context;
@@ -3553,6 +3572,7 @@ fun test_read(context: *TestTransport, value: StreamHandle,
         fin:        fin, error: 0};
 }
 
+#[testing]
 fun test_credit(context: *TestTransport, value: StreamHandle,
     count: usize) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
@@ -3565,6 +3585,7 @@ fun test_credit(context: *TestTransport, value: StreamHandle,
     ret TransportOperation{status: TRANSPORT_OK, error: 0};
 }
 
+#[testing]
 fun test_write(context: *TestTransport, value: StreamHandle,
     input: *u8, length: usize) TransportWrite {
     val io:   *TestTransport = context;
@@ -3598,6 +3619,7 @@ fun test_write(context: *TestTransport, value: StreamHandle,
         storage_blocked:    false, error: 0};
 }
 
+#[testing]
 fun test_finish(context: *TestTransport, value: StreamHandle) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
     test_call(context);
@@ -3609,6 +3631,7 @@ fun test_finish(context: *TestTransport, value: StreamHandle) TransportOperation
     ret TransportOperation{status: TRANSPORT_OK, error: 0};
 }
 
+#[testing]
 fun test_cancel_send(context: *TestTransport, value: StreamHandle,
     code: u64) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
@@ -3619,6 +3642,7 @@ fun test_cancel_send(context: *TestTransport, value: StreamHandle,
     ret TransportOperation{status: TRANSPORT_OK, error: 0};
 }
 
+#[testing]
 fun test_cancel_receive(context: *TestTransport, value: StreamHandle,
     code: u64) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
@@ -3631,6 +3655,7 @@ fun test_cancel_receive(context: *TestTransport, value: StreamHandle,
 
 # release means settled on the wire: both directions closed and any reset or
 # stop this side sent acknowledged by the peer
+#[testing]
 fun test_settled(wire: *TestWire) bool {
     val uni:         bool = (wire.handle.id & 2) != 0;
     val can_send:    bool = !uni || wire.local;
@@ -3649,6 +3674,7 @@ fun test_settled(wire: *TestWire) bool {
     ret send_done && receive_done;
 }
 
+#[testing]
 fun test_release(context: *TestTransport, value: StreamHandle) TransportOperation {
     val wire: *TestWire = test_wire(context, value);
     test_call(context);
@@ -3660,6 +3686,7 @@ fun test_release(context: *TestTransport, value: StreamHandle) TransportOperatio
     ret TransportOperation{status: TRANSPORT_OK, error: 0};
 }
 
+#[testing]
 fun test_close(context: *TestTransport, code: u64) TransportOperation {
     val io: *TestTransport = context;
     test_call(io);
@@ -3669,7 +3696,7 @@ fun test_close(context: *TestTransport, code: u64) TransportOperation {
     ret TransportOperation{status: TRANSPORT_OK, error: 0};
 }
 
-test "http.h3.connection: typed transport accepts a secret-welded context" {
+test regression__transport_carries_secret_welded_context {
     var io: TestTransport;
     io.secret = 7;
     val transport: Transport[TestTransport] = Transport[TestTransport]{
@@ -3685,8 +3712,10 @@ test "http.h3.connection: typed transport accepts a secret-welded context" {
     ret 0;
 }
 
+#[testing]
 val FIXTURE_WIRES: usize = 112;
 
+#[testing]
 rec Fixture {
     scope:               cancel.Scope;
     io:                  TestTransport;
@@ -3720,6 +3749,7 @@ rec Fixture {
     engine:              Engine[TestTransport];
 }
 
+#[testing]
 fun test_config() Config {
     var configured: Config = config_default();
     configured.max_requests                            = 3;
@@ -3750,6 +3780,7 @@ fun test_config() Config {
 
 # a std pool. with no size classes every chunk is exactly its request rounded to
 # 16 bytes, so the account's `used` counts bytes exactly
+#[testing]
 fun make_buffers(fixture: *Fixture, classes: *buffers.ClassConfig, class_count: usize) bool {
     val backed: err[allocator.Error] = page.make(?fixture.backing);
     if (sel backed.err) { ret false; }
@@ -3771,6 +3802,7 @@ fun make_buffers(fixture: *Fixture, classes: *buffers.ClassConfig, class_count: 
 }
 
 # a fresh transport, as a pooled engine gets for its next connection
+#[testing]
 fun reset_io(fixture: *Fixture, role: Role) {
     fixture.io.wires    = ?fixture.wires[0];
     fixture.io.capacity = FIXTURE_WIRES;
@@ -3808,11 +3840,13 @@ fun reset_io(fixture: *Fixture, role: Role) {
     }
 }
 
+#[testing]
 fun make_fixture(fixture: *Fixture, role: Role, configured: Config) bool {
     ret make_fixture_on(fixture, role, configured, nil, 0);
 }
 
 # a fixture whose pool has the given size classes
+#[testing]
 fun make_fixture_on(fixture: *Fixture, role: Role, configured: Config,
     classes: *buffers.ClassConfig, class_count: usize) bool {
     if (!operation_ok(cancel.make_root(?fixture.scope, opt[time.Instant].none{}))
@@ -3821,6 +3855,7 @@ fun make_fixture_on(fixture: *Fixture, role: Role, configured: Config,
     ret start_engine(fixture, role, configured);
 }
 
+#[testing]
 fun fixture_critical(fixture: *Fixture) CriticalMemory {
     var control: StreamMemory = unbound_memory();
     control.read             = ?fixture.control_read[0];
@@ -3844,6 +3879,7 @@ fun fixture_critical(fixture: *Fixture) CriticalMemory {
 
 # every argument is the fixture's own storage, so calling this a second time is
 # exactly what a pool does with a recycled engine
+#[testing]
 fun start_engine(fixture: *Fixture, role: Role, configured: Config) bool {
     val transport: Transport[TestTransport] = Transport[TestTransport]{
         context:     ?fixture.io,
@@ -3875,6 +3911,7 @@ fun start_engine(fixture: *Fixture, role: Role, configured: Config) bool {
     ret init[TestTransport](?fixture.engine, role, transport, ?fixture.scope, storage, configured);
 }
 
+#[testing]
 fun peer_stream(fixture: *Fixture, id: u64, input: *u8,
     length: usize, fin: bool) *TestWire {
     if ((input == nil && length != 0) || local_initiated[TestTransport](?fixture.engine, id)) {
@@ -3890,6 +3927,7 @@ fun peer_stream(fixture: *Fixture, id: u64, input: *u8,
     ret wire;
 }
 
+#[testing]
 fun drive(fixture: *Fixture, kind: EventKind, maximum: usize) Event {
     var i: usize = 0;
     for (i < maximum) {
@@ -3901,6 +3939,7 @@ fun drive(fixture: *Fixture, kind: EventKind, maximum: usize) Event {
     ret base_event[TestTransport](?fixture.engine, EVENT_NONE);
 }
 
+#[testing]
 fun server_handshake(fixture: *Fixture) Event {
     process[TestTransport](?fixture.engine);
     var control: [3]u8;
@@ -3913,6 +3952,7 @@ fun server_handshake(fixture: *Fixture) Event {
     ret drive(fixture, EVENT_SETTINGS, 64);
 }
 
+#[testing]
 fun client_handshake(fixture: *Fixture) Event {
     process[TestTransport](?fixture.engine);
     var control: [3]u8;
@@ -3925,6 +3965,7 @@ fun client_handshake(fixture: *Fixture) Event {
     ret drive(fixture, EVENT_SETTINGS, 64);
 }
 
+#[testing]
 fun append_frame(output: *u8, capacity: usize, typ: u64,
     payload: *u8, length: usize) usize {
     val prefix: usize = encode_frame_header(typ, length, output, capacity);
@@ -3934,6 +3975,7 @@ fun append_frame(output: *u8, capacity: usize, typ: u64,
     ret prefix + length;
 }
 
+#[testing]
 fun static_request(output: *u8, capacity: usize) usize {
     var block: [8]u8;
     block[0] = 0;
@@ -3947,6 +3989,7 @@ fun static_request(output: *u8, capacity: usize) usize {
     ret append_frame(output, capacity, frame.FRAME_HEADERS, ?block[0], 8);
 }
 
+#[testing]
 fun regular_request(output: *u8, capacity: usize) usize {
     var block: [9]u8;
     block[0] = 0;
@@ -3961,6 +4004,7 @@ fun regular_request(output: *u8, capacity: usize) usize {
     ret append_frame(output, capacity, frame.FRAME_HEADERS, ?block[0], 9);
 }
 
+#[testing]
 fun informational_response(output: *u8, capacity: usize) usize {
     var block: [3]u8;
     block[0] = 0;
@@ -3969,12 +4013,14 @@ fun informational_response(output: *u8, capacity: usize) usize {
     ret append_frame(output, capacity, frame.FRAME_HEADERS, ?block[0], 3);
 }
 
+#[testing]
 fun blocked_request(output: *u8, capacity: usize) usize {
     ret blocked_request_at(output, capacity, 2);
 }
 
 # the encoded required insert count 2 needs one insert, 3 needs two, and the
 # section references the newest entry it requires
+#[testing]
 fun blocked_request_at(output: *u8, capacity: usize, encoded_required: u8) usize {
     var block: [6]u8;
     block[0] = encoded_required;
@@ -3986,6 +4032,7 @@ fun blocked_request_at(output: *u8, capacity: usize, encoded_required: u8) usize
     ret append_frame(output, capacity, frame.FRAME_HEADERS, ?block[0], 6);
 }
 
+#[testing]
 rec ExchangeMemory {
     scope:             cancel.Scope;
     request:           message.Request;
@@ -3997,6 +4044,7 @@ rec ExchangeMemory {
     exchange:          exchange.Exchange;
 }
 
+#[testing]
 fun make_exchange(storage: *ExchangeMemory, generation: u64, id: u64) bool {
     val configured: message.Limits = message.limits_default();
     val none:       time.Instant   = time.Instant{sec: 0, nsec: 0};
@@ -4023,6 +4071,7 @@ fun make_exchange(storage: *ExchangeMemory, generation: u64, id: u64) bool {
     ret true;
 }
 
+#[testing]
 fun test_service(context: ptr, served: *exchange.Exchange) exchange.ServiceStatus {
     val configured: message.Limits = message.limits_default();
     if (message.set_status(served.response, status.NO_CONTENT) != message.RESPONSE_OK
@@ -4034,6 +4083,7 @@ fun test_service(context: ptr, served: *exchange.Exchange) exchange.ServiceStatu
 }
 
 # one complete server exchange over a request stream that the caller releases
+#[testing]
 fun pooled_exchange(fixture: *Fixture, storage: *ExchangeMemory) bool {
     var request_bytes:  [16]u8;
     val request_length: usize     = static_request(?request_bytes[0], 16);
@@ -4066,6 +4116,7 @@ fun pooled_exchange(fixture: *Fixture, storage: *ExchangeMemory) bool {
     ret release_stream[TestTransport](?fixture.engine, 0, request.generation);
 }
 
+#[testing]
 fun insert_peer_entry(fixture: *Fixture, id: u64) bool {
     var instructions: [6]u8;
     instructions[0] = frame.STREAM_QPACK_ENCODER::u8;
@@ -4083,7 +4134,7 @@ fun insert_peer_entry(fixture: *Fixture, id: u64) bool {
     ret fixture.engine.inbound_table.insert_count == 1;
 }
 
-test "http.h3.connection: destroy returns pooled storage for a second connection" {
+test destroy__recycles_storage_for_second_connection {
     var fixture: Fixture;
     var first:   ExchangeMemory;
     var second:  ExchangeMemory;
@@ -4126,7 +4177,7 @@ test "http.h3.connection: destroy returns pooled storage for a second connection
     ret 0;
 }
 
-test "http.h3.connection: settings and critical streams survive every-byte fragmentation" {
+test handshake__every_byte_fragmentation {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())) { ret 1; }
     fixture.io.read_limit  = 1;
@@ -4151,7 +4202,7 @@ test "http.h3.connection: settings and critical streams survive every-byte fragm
     ret 0;
 }
 
-test "http.h3.connection: duplicate and closed critical streams fail the connection" {
+test critical_stream__duplicate_or_closed_fails_connection {
     var duplicate: Fixture;
     if (!make_fixture(?duplicate, SERVER, test_config())
         || server_handshake(?duplicate).kind != EVENT_SETTINGS) { ret 1; }
@@ -4175,7 +4226,7 @@ test "http.h3.connection: duplicate and closed critical streams fail the connect
     ret 0;
 }
 
-test "http.h3.connection: request headers bind one exchange and data credit follows consumption" {
+test request__binds_exchange_and_credit_follows_consumption {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -4214,7 +4265,7 @@ test "http.h3.connection: request headers bind one exchange and data credit foll
     ret 0;
 }
 
-test "http.h3.connection: unknown request frames are ignored around header sections" {
+test request__unknown_frames_ignored {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -4235,7 +4286,7 @@ test "http.h3.connection: unknown request frames are ignored around header secti
     ret 0;
 }
 
-test "http.h3.connection: qpack blocking preserves credit while unrelated requests progress" {
+test qpack_blocking__holds_credit_while_others_progress {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -4274,7 +4325,7 @@ test "http.h3.connection: qpack blocking preserves credit while unrelated reques
     ret 0;
 }
 
-test "http.h3.connection: blocked-stream budget and malformed frame order fail closed" {
+test limits__blocked_streams_and_frame_order_fail_closed {
     var configured: Config = test_config();
     configured.local.qpack_blocked_streams       = 1;
     configured.inbound_qpack.max_blocked_streams = 1;
@@ -4306,7 +4357,7 @@ test "http.h3.connection: blocked-stream budget and malformed frame order fail c
     ret 0;
 }
 
-test "http.h3.connection: message collections enforce independent regular-field limits" {
+test limits__message_collections_independent {
     var request_config: Config = test_config();
     request_config.messages.request_fields.max_count = 0;
     var request_fixture: Fixture;
@@ -4359,7 +4410,7 @@ test "http.h3.connection: message collections enforce independent regular-field 
     ret 0;
 }
 
-test "http.h3.connection: informational response counts are bounded in both directions" {
+test limits__informational_count_both_directions {
     var client_config: Config = test_config();
     client_config.messages.max_informational = 1;
     var client: Fixture;
@@ -4411,7 +4462,7 @@ test "http.h3.connection: informational response counts are bounded in both dire
     ret 0;
 }
 
-test "http.h3.connection: body byte chunk and frame budgets are transactional" {
+test limits__body_chunks_and_frames_transactional {
     var inbound_config: Config = test_config();
     inbound_config.messages.request_body.max_chunk_bytes = 2;
     inbound_config.messages.request_body.max_chunks      = 1;
@@ -4476,7 +4527,7 @@ test "http.h3.connection: body byte chunk and frame budgets are transactional" {
     ret 0;
 }
 
-test "http.h3.connection: sustained multiplexing reuses bounded stream generations" {
+test multiplexing__reuses_stream_generations {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -4518,7 +4569,7 @@ test "http.h3.connection: sustained multiplexing reuses bounded stream generatio
     ret 0;
 }
 
-test "http.h3.connection: graceful goaway drains admitted service work before close" {
+test goaway__graceful_drains_admitted_work {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -4555,7 +4606,7 @@ test "http.h3.connection: graceful goaway drains admitted service work before cl
     ret 0;
 }
 
-test "http.h3.connection: peer goaway retries only requests at or above its boundary" {
+test goaway__peer_retries_at_or_above_boundary {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -4586,7 +4637,7 @@ test "http.h3.connection: peer goaway retries only requests at or above its boun
     ret 0;
 }
 
-test "http.h3.connection: request admission rejects overflow without closing peers" {
+test admission__overflow_rejected_without_closing {
     var configured: Config = test_config();
     configured.max_requests = 1;
     var fixture: Fixture;
@@ -4632,7 +4683,7 @@ test "http.h3.connection: request admission rejects overflow without closing pee
     ret 0;
 }
 
-test "http.h3.connection: a drained unknown unidirectional stream releases its slot" {
+test unidirectional__unknown_stream_released {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -4653,7 +4704,7 @@ test "http.h3.connection: a drained unknown unidirectional stream releases its s
     ret 0;
 }
 
-test "http.h3.connection: a refused request binding releases without failing the connection" {
+test open_request__refused_binding_releases {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -4685,7 +4736,7 @@ test "http.h3.connection: a refused request binding releases without failing the
     ret 0;
 }
 
-test "http.h3.connection: exhausting the pending release list fails as excessive load" {
+test pending_release__exhaustion_is_excessive_load {
     var configured: Config = test_config();
     configured.max_requests        = 1;
     configured.max_pending_release = 1;
@@ -4720,7 +4771,7 @@ test "http.h3.connection: exhausting the pending release list fails as excessive
     ret 0;
 }
 
-test "http.h3.connection: blocked reset and application cancellation settle once" {
+test cancellation__blocked_reset_and_application_cancel_settle_once {
     var blocked: Fixture;
     if (!make_fixture(?blocked, SERVER, test_config())
         || server_handshake(?blocked).kind != EVENT_SETTINGS) { ret 1; }
@@ -4756,19 +4807,21 @@ test "http.h3.connection: blocked reset and application cancellation settle once
     ret 0;
 }
 
+#[testing]
 fun closure_is(storage: *ExchangeMemory, cause: exchange.Cause, code: u64) bool {
     val why: exchange.Closure = storage.exchange.completion.closure;
     ret storage.exchange.state == exchange.CANCELLED_STATE
         && why.cause == cause && why.code == code && why.detail == 0;
 }
 
+#[testing]
 fun second_control(fixture: *Fixture) bool {
     var control: [1]u8;
     control[0] = frame.STREAM_CONTROL::u8;
     ret peer_stream(fixture, 6, ?control[0], 1, false) != nil;
 }
 
-test "http.h3.connection: an exchange the engine closes carries the cause" {
+test closure__carries_cause {
     # the peer reset the request stream
     var peer_fixture: Fixture;
     var peer_storage: ExchangeMemory;
@@ -4838,7 +4891,7 @@ test "http.h3.connection: an exchange the engine closes carries the cause" {
     ret 0;
 }
 
-test "http.h3.connection: a transport the peer already closed satisfies the close" {
+test close__peer_closed_transport_satisfies {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())) { ret 1; }
     fixture.io.close_override = true;
@@ -4858,6 +4911,7 @@ test "http.h3.connection: a transport the peer already closed satisfies the clos
 }
 
 # calls process until it stops reporting pending work
+#[testing]
 fun settle(fixture: *Fixture) bool {
     var i: usize = 0;
     for (i < 16) {
@@ -4870,6 +4924,7 @@ fun settle(fixture: *Fixture) bool {
 }
 
 # drains every queued stream until only a memory refusal remains
+#[testing]
 fun settle_blocked(fixture: *Fixture) bool {
     var i: usize = 0;
     for (i < 16) {
@@ -4881,55 +4936,7 @@ fun settle_blocked(fixture: *Fixture) bool {
     ret false;
 }
 
-# one process call over idle client requests with no transport news
-fun idle_process_cost(requests: usize, calls: *usize, visits: *usize,
-    reads: *usize) bool {
-    var configured: Config = test_config();
-    configured.max_requests = requests;
-    var fixture: Fixture;
-    if (!make_fixture(?fixture, CLIENT, configured)
-        || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret false; }
-    var i: usize = 0;
-    for (i < requests) {
-        if (open_request[TestTransport](?fixture.engine, nil) == NO_STREAM) { ret false; }
-        i = i + 1;
-    }
-    # each new stream reads once, finds nothing and parks
-    if (!settle(?fixture)) { ret false; }
-    i = 0;
-    for (i < 4) {
-        if (process[TestTransport](?fixture.engine).kind != EVENT_NONE) { ret false; }
-        i = i + 1;
-    }
-    if (fixture.engine.active_requests != requests || fixture.engine.state != OPEN) {
-        ret false;
-    }
-    val calls_before:  usize = fixture.io.calls;
-    val visits_before: usize = fixture.engine.slot_visits;
-    val reads_before:  usize = fixture.io.reads;
-    if (process[TestTransport](?fixture.engine).kind != EVENT_NONE) { ret false; }
-    @calls  = fixture.io.calls - calls_before;
-    @visits = fixture.engine.slot_visits - visits_before;
-    @reads  = fixture.io.reads - reads_before;
-    ret true;
-}
-
-test "http.h3.connection: an idle process call costs the same for few and many streams" {
-    var few_calls:   usize = 0;
-    var few_visits:  usize = 0;
-    var few_reads:   usize = 0;
-    var many_calls:  usize = 0;
-    var many_visits: usize = 0;
-    var many_reads:  usize = 0;
-    if (!idle_process_cost(3, ?few_calls, ?few_visits, ?few_reads))     { ret 1; }
-    if (!idle_process_cost(96, ?many_calls, ?many_visits, ?many_reads)) { ret 2; }
-    # one accept and one empty readiness poll, nothing per stream
-    if (few_calls != 2 || few_visits != 0 || few_reads != 0)                     { ret 3; }
-    if (many_calls != few_calls || many_visits != few_visits || many_reads != 0) { ret 4; }
-    ret 0;
-}
-
-test "http.h3.connection: the stream index survives tombstone churn and rebuilds" {
+test index__survives_tombstone_churn {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -4970,7 +4977,7 @@ test "http.h3.connection: the stream index survives tombstone churn and rebuilds
     ret 0;
 }
 
-test "http.h3.connection: readiness reports gate reads and tolerate noise" {
+test readiness__gates_reads_and_tolerates_noise {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -5031,7 +5038,7 @@ test "http.h3.connection: readiness reports gate reads and tolerate noise" {
     ret 0;
 }
 
-test "http.h3.connection: blocked output waits for a writable report" {
+test readiness__blocked_output_waits_for_writable {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -5074,7 +5081,7 @@ test "http.h3.connection: blocked output waits for a writable report" {
     ret 0;
 }
 
-test "http.h3.connection: a qpack insert wakes only the streams it satisfies" {
+test qpack_blocking__insert_wakes_only_satisfied_streams {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -5130,7 +5137,7 @@ test "http.h3.connection: a qpack insert wakes only the streams it satisfies" {
     ret 0;
 }
 
-test "http.h3.connection: streams with pending work are serviced round-robin" {
+test scheduling__round_robin {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -5173,7 +5180,7 @@ test "http.h3.connection: streams with pending work are serviced round-robin" {
 }
 
 # many client requests with partially written output, which services to NONE
-test "http.h3.connection: a budget-limited call reports pending until the queue drains" {
+test pending__budget_limited_call_until_queue_drains {
     var configured: Config = test_config();
     configured.max_requests = 96;
     var fixture: Fixture;
@@ -5221,7 +5228,7 @@ test "http.h3.connection: a budget-limited call reports pending until the queue 
     ret 0;
 }
 
-test "http.h3.connection: undrained readiness reports keep process pending" {
+test pending__undrained_readiness_reports {
     var configured: Config = test_config();
     configured.max_requests = 3;
     var fixture: Fixture;
@@ -5250,12 +5257,14 @@ test "http.h3.connection: undrained readiness reports keep process pending" {
     ret 0;
 }
 
+#[testing]
 fun round16(bytes: usize) usize {
     ret (bytes + 15) & ~(15::usize);
 }
 
 # the set one request borrows, summed from the engine's own table. the test pool
 # has no classes, so each chunk is charged its request rounded to 16
+#[testing]
 fun request_set_bytes() usize {
     var requests: [REQUEST_BUFFERS]buffers.Request;
     if (!request_requests(test_config(), ?requests[0])) { ret 0; }
@@ -5269,25 +5278,14 @@ fun request_set_bytes() usize {
     ret total;
 }
 
-test "http.h3.connection: the request table is the set a request acquires" {
-    var requests: [REQUEST_BUFFERS]buffers.Request;
-    var bad:      Config = test_config();
-    bad.max_requests = 0;
-    if (request_requests(bad, ?requests[0]) || request_requests(test_config(), nil)) { ret 1; }
-    if (!request_requests(test_config(), ?requests[0])
-        || requests[0].bytes != 128 || requests[1].bytes != 256
-        || requests[2].bytes != 16 * $size_of(field.Field) || requests[3].bytes != 512
-        || requests[4].bytes != 256 || requests[5].bytes != 512
-        || requests[6].bytes != 16 * $size_of(u64)) { ret 2; }
-    ret 0;
-}
-
 # the first record chunk and the index an initialized engine holds
+#[testing]
 fun idle_bytes(records_count: usize, index_count: usize) usize {
     ret round16(records_count * $size_of(Stream))
         + round16(index_count * $size_of(StreamIndexEntry));
 }
 
+#[testing]
 fun test_request_fields(items: *field.Field) {
     items[0] = field.Field{name: view.view(":method", 7), value: view.view("GET", 3),
         sensitive: false};
@@ -5301,11 +5299,12 @@ fun test_request_fields(items: *field.Field) {
 
 # a pool with one 1024 byte class, so the small chunks of a request set are
 # charged more than their request and the footprint differs from the plain sum
+#[testing]
 fun request_classes(classes: *buffers.ClassConfig) {
     classes[0] = buffers.ClassConfig{size: 1024, align: 0, secret: false, high_water: 4};
 }
 
-test "http.h3.connection: a request's footprint is what a classed pool charges for its set" {
+test memory__footprint_matches_classed_pool {
     var classes: [1]buffers.ClassConfig;
     request_classes(?classes[0]);
     var fixture: Fixture;
@@ -5327,7 +5326,7 @@ test "http.h3.connection: a request's footprint is what a classed pool charges f
     ret 0;
 }
 
-test "http.h3.connection: an idle engine holds only its first records and a request exactly its set" {
+test memory__idle_engine_and_request_set {
     var configured: Config = test_config();
     configured.max_peer_unidirectional = 4;
     var fixture: Fixture;
@@ -5381,7 +5380,7 @@ test "http.h3.connection: an idle engine holds only its first records and a requ
     ret 0;
 }
 
-test "http.h3.connection: a refused request set rejects only that request" {
+test memory__refused_request_set_rejects_only_that_request {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -5405,7 +5404,7 @@ test "http.h3.connection: a refused request set rejects only that request" {
     ret 0;
 }
 
-test "http.h3.connection: a refused client request opens no transport stream" {
+test memory__refused_client_request_opens_no_stream {
     var fixture: Fixture;
     if (!make_fixture(?fixture, CLIENT, test_config())
         || client_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -5427,7 +5426,7 @@ test "http.h3.connection: a refused client request opens no transport stream" {
     ret 0;
 }
 
-test "http.h3.connection: stream records grow in place and the index follows them" {
+test records__grow_in_place {
     var configured: Config = test_config();
     configured.max_requests    = 40;
     configured.initial_streams = 4;
@@ -5483,7 +5482,7 @@ test "http.h3.connection: stream records grow in place and the index follows the
     ret 0;
 }
 
-test "http.h3.connection: a refused record rejects a request and parks a unidirectional stream" {
+test memory__refused_record_parks_unidirectional {
     var configured: Config = test_config();
     configured.initial_streams = 1;
     var fixture: Fixture;
@@ -5515,7 +5514,7 @@ test "http.h3.connection: a refused record rejects a request and parks a unidire
     ret 0;
 }
 
-test "http.h3.connection: an exhausted pool registers a parked stream for a wake-up" {
+test memory__exhausted_pool_wakes_parked_stream {
     var configured: Config = test_config();
     configured.initial_streams = 1;
     var fixture: Fixture;
@@ -5549,7 +5548,7 @@ test "http.h3.connection: an exhausted pool registers a parked stream for a wake
     ret 0;
 }
 
-test "http.h3.connection: held data is consumed after the connection closes" {
+test close__held_data_consumed_after_close {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
@@ -5580,7 +5579,7 @@ test "http.h3.connection: held data is consumed after the connection closes" {
     ret 0;
 }
 
-test "http.h3.connection: a closed connection destroys with releases the transport still owed" {
+test destroy__with_releases_still_owed {
     var configured: Config = test_config();
     configured.max_requests = 1;
     var fixture: Fixture;
@@ -5615,6 +5614,7 @@ test "http.h3.connection: a closed connection destroys with releases the transpo
 # gone with the given status. returns the first failing check, 0 when the
 # engine fails once naming the transport's answer, cancels the request, closes
 # once, and tears down cleanly.
+#[testing]
 fun gone_under_request(hook: u8, gone: TransportStatus, gone_error: u64) u8 {
     var error: Error = ERROR_TRANSPORT;
     var code:  u64   = H3_INTERNAL_ERROR;
@@ -5681,7 +5681,7 @@ fun gone_under_request(hook: u8, gone: TransportStatus, gone_error: u64) u8 {
     ret 0;
 }
 
-test "http.h3.connection: a transport closed or failed under a live request fails once and tears down" {
+test transport_gone__under_live_request_fails_once {
     var code: u8 = gone_under_request(GONE_READ, TRANSPORT_CLOSED, 0);
     if (code != 0) { ret (16 + code)::i32; }
     code = gone_under_request(GONE_READ, TRANSPORT_ERROR, 7);
@@ -5697,7 +5697,7 @@ test "http.h3.connection: a transport closed or failed under a live request fail
     ret 0;
 }
 
-test "http.h3.connection: a failed engine reports the same failure on every later call" {
+test failure__repeats_on_every_later_call {
     var cancelled: Fixture;
     if (!make_fixture(?cancelled, SERVER, test_config())
         || server_handshake(?cancelled).kind != EVENT_SETTINGS) { ret 1; }
@@ -5732,11 +5732,13 @@ test "http.h3.connection: a failed engine reports the same failure on every late
     ret 0;
 }
 
+#[testing]
 fun named(name: *u8, length: usize, value: *u8, value_length: usize) field.Field {
     ret field.Field{name: view.view(name, length), value: view.view(value, value_length),
         sensitive: false};
 }
 
+#[testing]
 fun taken_request(fixture: *Fixture, storage: *ExchangeMemory) *TestWire {
     var request_bytes:  [16]u8;
     val request_length: usize     = static_request(?request_bytes[0], 16);
@@ -5750,27 +5752,7 @@ fun taken_request(fixture: *Fixture, storage: *ExchangeMemory) *TestWire {
     ret wire;
 }
 
-test "http.h3.connection: outgoing names in any case are sent lowercase" {
-    var fixture: Fixture;
-    var storage: ExchangeMemory;
-    if (!make_fixture(?fixture, SERVER, test_config())
-        || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
-    val wire: *TestWire = taken_request(?fixture, ?storage);
-    if (wire == nil) { ret 2; }
-    var response: [2]field.Field;
-    response[0] = named(":status", 7, "200", 3);
-    response[1] = named("Content-Type", 12, "text/x-demo", 11);
-    if (send_headers[TestTransport](?fixture.engine, 0, ?response[0], 2,
-        false, false).status != OFFER_OUTPUT) { ret 3; }
-    process[TestTransport](?fixture.engine);
-    # the static :status 200 entry, then the static content-type name with a literal value
-    if (wire.output_length < 8 || wire.output[0] != frame.FRAME_HEADERS::u8
-        || wire.output[2] != 0 || wire.output[3] != 0 || wire.output[4] != 0xd9
-        || wire.output[5] != 0x5f || wire.output[6] != 0x1d) { ret 4; }
-    ret 0;
-}
-
-test "http.h3.connection: outgoing connection-specific names are refused in any case" {
+test send_headers__connection_specific_names_refused {
     var fixture: Fixture;
     var storage: ExchangeMemory;
     if (!make_fixture(?fixture, SERVER, test_config())
@@ -5797,7 +5779,7 @@ test "http.h3.connection: outgoing connection-specific names are refused in any 
     ret 0;
 }
 
-test "http.h3.connection: a received uppercase name is still malformed" {
+test request__uppercase_name_malformed {
     var fixture: Fixture;
     if (!make_fixture(?fixture, SERVER, test_config())
         || server_handshake(?fixture).kind != EVENT_SETTINGS) { ret 1; }
