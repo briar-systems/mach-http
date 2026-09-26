@@ -75,12 +75,12 @@ pub fun is_idempotent(kind: Kind) bool {
 }
 
 test valid__canonical_and_extension_tokens {
-    if (!valid(from_kind(GET), 8) || !valid(from_kind(CONNECT), 8))  { ret 1; }
-    if (valid(Method{kind: GET, token: view.view("get", 3)}, 8))      { ret 2; }
-    if (!valid(extension(view.view("PURGE", 5)), 5))                  { ret 3; }
-    if (valid(extension(view.view("PURGE", 5)), 4))                   { ret 4; }
-    if (valid(extension(view.view("BAD METHOD", 10)), 16))            { ret 5; }
-    if (valid(extension(view.view("", 0)), 16))                       { ret 6; }
+    if (!valid(from_kind(GET), 8) || !valid(from_kind(CONNECT), 8))      { ret 1; }
+    if (valid(Method{kind: GET, token: view.view("get", 3)}, 8))         { ret 2; }
+    if (!valid(extension(view.view("PURGE", 5)), 5))                     { ret 3; }
+    if (valid(extension(view.view("PURGE", 5)), 4))                      { ret 4; }
+    if (valid(extension(view.view("BAD METHOD", 10)), 16))               { ret 5; }
+    if (valid(extension(view.view("", 0)), 16))                          { ret 6; }
     if (!is_idempotent(DELETE) || is_idempotent(PATCH) || is_safe(POST)) { ret 7; }
     ret 0;
 }

@@ -3375,7 +3375,7 @@ rec TestTransport {
 #[testing]
 val GONE_READY: u8 = 1;
 #[testing]
-val GONE_READ:  u8 = 2;
+val GONE_READ: u8 = 2;
 #[testing]
 val GONE_WRITE: u8 = 3;
 

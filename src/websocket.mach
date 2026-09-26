@@ -1239,7 +1239,7 @@ test feed__header_split_at_every_byte {
     frame[2] = 1;
     frame[3] = 2;
     frame[4] = 3;
-    i = 0;
+    i        = 0;
     for (i < 2) {
         val event: Event = feed(?borrowing, ?frame[i], 1, false);
         if (event.kind != EVENT_NEED_INPUT || event.consumed != 1) { ret 5; }
