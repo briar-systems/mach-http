@@ -126,6 +126,7 @@ pub fun destroy(records: *Records, source: *buffers.Source, account: *buffers.Ac
     records.capacity = 0;
 }
 
+#[testing]
 fun test_pool(pool: *buffers.Pool, backing: *allocator.Allocator, budget: usize) bool {
     val made: err[allocator.Error] = page.make(backing);
     if (sel made.err) { ret false; }
@@ -138,15 +139,17 @@ fun test_pool(pool: *buffers.Pool, backing: *allocator.Allocator, budget: usize)
     ret buffers.make(pool, config, backing);
 }
 
+#[testing]
 fun opened(reason: buffers.Reason) bool {
     ret sel reason.none;
 }
 
+#[testing]
 fun granted(got: buffers.Acquired) bool {
     ret sel got.status.ok;
 }
 
-test "http.core.records: growth leaves every live record where it was" {
+test grow__live_records_never_move {
     var backing: allocator.Allocator;
     var pool:    buffers.Pool;
     if (!test_pool(?pool, ?backing, 1 << 20)) { ret 1; }
@@ -190,7 +193,7 @@ test "http.core.records: growth leaves every live record where it was" {
     ret 0;
 }
 
-test "http.core.records: a refused chunk leaves the set unchanged" {
+test grow__refused_chunk_leaves_set_unchanged {
     var backing: allocator.Allocator;
     var pool:    buffers.Pool;
     if (!test_pool(?pool, ?backing, 1 << 20)) { ret 1; }

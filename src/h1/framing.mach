@@ -432,7 +432,7 @@ pub fun response(version: message.Version, code: status.Status, request_method: 
         transfer_coded: false, error: FRAME_OK};
 }
 
-test "http.h1.framing: requests reject ambiguous and duplicate lengths" {
+test request__rejects_ambiguous_and_duplicate_lengths {
     var items:  [2]field.Field;
     var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 128, 32, 64));
     field.append(?fields, field.Field{name: view.view("Content-Length", 14), value: view.view("5", 1), sensitive: false});
@@ -446,7 +446,7 @@ test "http.h1.framing: requests reject ambiguous and duplicate lengths" {
     ret 0;
 }
 
-test "http.h1.framing: response rules preserve bodyless and persistence semantics" {
+test response__bodyless_and_persistence_semantics {
     var items:  [2]field.Field;
     var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 128, 32, 64));
     field.append(?fields, field.Field{name: view.view("Content-Length", 14), value: view.view("10", 2), sensitive: false});
@@ -470,7 +470,7 @@ test "http.h1.framing: response rules preserve bodyless and persistence semantic
     ret 0;
 }
 
-test "http.h1.framing: transfer coding is strict and version aware" {
+test transfer_encoding__strict_and_version_aware {
     var item:   field.Field;
     var fields: field.Fields = field.init(?item, 1, field.limits(1, 128, 32, 64));
     field.append(?fields, field.Field{name: view.view("Transfer-Encoding", 17),
@@ -485,7 +485,7 @@ test "http.h1.framing: transfer coding is strict and version aware" {
     ret 0;
 }
 
-test "http.h1.framing: host authority is singular and syntax checked" {
+test request_host__singular_and_syntax_checked {
     var items:  [2]field.Field;
     var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 128, 32, 64));
     field.append(?fields, field.Field{name: view.view("Host", 4),

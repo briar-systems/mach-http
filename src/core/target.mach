@@ -156,26 +156,22 @@ pub fun asterisk() Target {
     };
 }
 
-test "http.core.target: all request-target forms are represented" {
+test valid_for_method__forms_and_dimensions {
     val configured: Limits = limits(128, 8, 64, 64, 32);
     if (!valid_for_method(origin(view.view("/a?q", 4), view.view("/a", 2), view.view("q", 1)), method.GET, configured))                                                     { ret 1; }
     if (!valid_for_method(absolute(view.view("https://x/a", 11), view.view("https", 5), view.view("x", 1), view.view("/a", 2), view.view(nil, 0)), method.GET, configured)) { ret 2; }
     if (!valid_for_method(authority(view.view("x:443", 5)), method.CONNECT, configured))                                                                                    { ret 3; }
     if (!valid_for_method(asterisk(), method.OPTIONS, configured))                                                                                                          { ret 4; }
+    if (valid_for_method(authority(view.view("x:1", 3)), method.GET, configured))                                                                                           { ret 5; }
+    if (valid_for_method(asterisk(), method.GET, configured))                                                                                                               { ret 6; }
+    val tight: Limits = limits(8, 5, 4, 3, 2);
+    if (valid(origin(view.view("long-path", 9), view.view("/a", 2), view.view(nil, 0)), tight))                                            { ret 7; }
+    if (valid(origin(view.view("/abcd", 5), view.view("/abcd", 5), view.view(nil, 0)), tight))                                             { ret 8; }
+    if (valid(absolute(view.view("s://abcde", 9), view.view("s", 1), view.view("abcde", 5), view.view(nil, 0), view.view(nil, 0)), tight)) { ret 9; }
     ret 0;
 }
 
-test "http.core.target: forms and dimensions fail independently" {
-    val configured: Limits = limits(8, 5, 4, 3, 2);
-    if (valid_for_method(authority(view.view("x:1", 3)), method.GET, configured))                                                               { ret 1; }
-    if (valid_for_method(asterisk(), method.GET, configured))                                                                                   { ret 2; }
-    if (valid(origin(view.view("long-path", 9), view.view("/a", 2), view.view(nil, 0)), configured))                                            { ret 3; }
-    if (valid(origin(view.view("/abcd", 5), view.view("/abcd", 5), view.view(nil, 0)), configured))                                             { ret 4; }
-    if (valid(absolute(view.view("s://abcde", 9), view.view("s", 1), view.view("abcde", 5), view.view(nil, 0), view.view(nil, 0)), configured)) { ret 5; }
-    ret 0;
-}
-
-test "http.core.target: a path or query with a broken percent escape is not well formed" {
+test component_valid__percent_escapes {
     if (!component_valid(view.view("/a%20b/c", 8), false))                                         { ret 1; }
     if (!component_valid(view.view("q=%7e&r=?/", 10), true))                                       { ret 2; }
     if (!component_valid(view.view(nil, 0), true))                                                 { ret 3; }

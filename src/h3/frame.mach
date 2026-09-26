@@ -590,7 +590,7 @@ pub fun stream_feed(parser: *StreamParser, input: *u8, length: usize,
         stream_type: parser.stream_type, push_id: parser.integer.value, error: ERROR_NONE};
 }
 
-test "http.h3.frame: quic varints and frame headers split at every byte" {
+test feed__varint_header_split_at_every_byte {
     var encoded: [16]u8;
     val first:   usize = encode_varint(FRAME_HEADERS, ?encoded[0], 16);
     val second:  usize = encode_varint(16384, ?encoded[first], 16 - first);
@@ -611,7 +611,7 @@ test "http.h3.frame: quic varints and frame headers split at every byte" {
     ret 0;
 }
 
-test "http.h3.frame: settings are incremental unique and bounded" {
+test settings__incremental_and_unique {
     var payload: [16]u8;
     val one:     usize = encode_setting(Setting{identifier: SETTING_QPACK_MAX_TABLE_CAPACITY,
         value: 4096}, ?payload[0], 16);
@@ -643,7 +643,7 @@ test "http.h3.frame: settings are incremental unique and bounded" {
     ret 0;
 }
 
-test "http.h3.frame: placement missing settings and exact payloads fail closed" {
+test feed__placement_missing_settings_and_exact_payloads_fail_closed {
     var settings: [4]Setting;
     var limits:   Limits = limits_default();
     limits.max_settings = 4;
@@ -675,7 +675,7 @@ test "http.h3.frame: placement missing settings and exact payloads fail closed" 
     ret 0;
 }
 
-test "http.h3.frame: critical stream types and push direction are enforced" {
+test stream_feed__critical_types_and_push_direction {
     val null_result: StreamEvent = stream_feed(nil, nil, 0, false);
     if (null_result.kind != STREAM_EVENT_ERROR
         || null_result.error != ERROR_STATE || null_result.consumed != 0) { ret 4; }
@@ -698,7 +698,7 @@ test "http.h3.frame: critical stream types and push direction are enforced" {
     ret 0;
 }
 
-test "http.h3.frame: writer preserves fragmented payload ownership" {
+test write__partial_output_keeps_sequence {
     var settings: [4]Setting;
     var limits:   Limits = limits_default();
     limits.max_settings = 4;
@@ -718,7 +718,7 @@ test "http.h3.frame: writer preserves fragmented payload ownership" {
     ret 0;
 }
 
-test "http.h3.frame: a data frame is not bounded by the payload cap but a headers frame is" {
+test feed__payload_cap_bounds_headers_not_data {
     var parser:   Parser;
     var settings: [4]Setting;
     var limits:   Limits = limits_default();

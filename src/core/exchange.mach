@@ -14,6 +14,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
 
+#[testing]
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
 }
@@ -336,6 +337,7 @@ pub fun dispatch(service: *Service, exchange: *Exchange) ServiceStatus {
     ret service.serve(service.ctx, exchange);
 }
 
+#[testing]
 rec TestBody {
     finish_mode: body.Mode;
     reuse:       body.Reuse;
@@ -344,18 +346,22 @@ rec TestBody {
     calls:       usize;
 }
 
+#[testing]
 fun test_body(reuse: body.Reuse, pending: bool) TestBody {
     ret TestBody{finish_mode: 0, reuse: reuse, releases: 0, pending: pending, calls: 0};
 }
 
+#[testing]
 fun test_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) body.Progress {
     ret body.complete(body.REUSE_ALLOWED);
 }
 
+#[testing]
 fun test_write(context: ptr, input: *u8, length: usize) body.Progress {
     ret body.data(length);
 }
 
+#[testing]
 fun test_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
     val state: *TestBody = context::*TestBody;
     state.finish_mode = mode;
@@ -367,6 +373,7 @@ fun test_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Pro
     ret body.complete(state.reuse);
 }
 
+#[testing]
 fun test_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progress {
     val state: *TestBody = context::*TestBody;
     if (state.finish_mode == body.CANCEL)  { ret body.cancelled(state.reuse); }
@@ -375,11 +382,13 @@ fun test_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progre
     ret body.complete(state.reuse);
 }
 
+#[testing]
 fun test_release(context: ptr) {
     val state: *TestBody = context::*TestBody;
     state.releases = state.releases + 1;
 }
 
+#[testing]
 fun metadata(version: message.Version) message.Metadata {
     ret message.Metadata{
         version:       version,
@@ -393,7 +402,7 @@ fun metadata(version: message.Version) message.Metadata {
     };
 }
 
-test "http.core.exchange: informational and final responses share one bounded generation" {
+test emit_informational__shares_the_final_generation {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
@@ -421,7 +430,7 @@ test "http.core.exchange: informational and final responses share one bounded ge
     ret 0;
 }
 
-test "http.core.exchange: protocol adapters decide reuse after body rejection" {
+test finish__reuse_after_body_rejection_follows_adapter {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
@@ -460,7 +469,7 @@ test "http.core.exchange: protocol adapters decide reuse after body rejection" {
     ret 0;
 }
 
-test "http.core.exchange: response streaming gates completion and accounts bytes" {
+test finish__waits_for_streamed_response_body {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
@@ -492,7 +501,7 @@ test "http.core.exchange: response streaming gates completion and accounts bytes
     ret 0;
 }
 
-test "http.core.exchange: post-commit field mutation fails closed" {
+test finish__post_commit_mutation_fails_closed {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
@@ -522,7 +531,7 @@ test "http.core.exchange: post-commit field mutation fails closed" {
     ret 0;
 }
 
-test "http.core.exchange: cancellation and timeout settle both body directions" {
+test cancel_exchange__settles_both_body_directions {
     val configured: message.Limits = message.limits_default();
     var scope:      cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
@@ -567,7 +576,7 @@ test "http.core.exchange: cancellation and timeout settle both body directions" 
     ret 0;
 }
 
-test "http.core.exchange: effective scope deadlines are request metadata" {
+test init__scope_deadline_must_match_request_metadata {
     val configured: message.Limits = message.limits_default();
     val deadline:   time.Instant   = time.Instant{sec: 5, nsec: 10};
     var scope:      cancel.Scope;

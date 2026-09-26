@@ -1101,12 +1101,13 @@ pub fun destroy(pool: *Pool) bool {
     ret true;
 }
 
+#[testing]
 fun test_route(host: *u8, len: usize) policy.Route {
     ret policy.Route{origin: policy.Origin{scheme: policy.HTTPS,
         host: view.view(host, len), port: 443}, proxy: policy.no_proxy()};
 }
 
-test "http.client.pool: multiplexed leases release exactly once" {
+test lease__multiplexed_release_exactly_once {
     var connections: [2]Connection;
     var leases:      [4]LeaseSlot;
     var value:       Pool;
@@ -1160,7 +1161,7 @@ test "http.client.pool: multiplexed leases release exactly once" {
     ret 0;
 }
 
-test "http.client.pool: routes and proxy identities isolate retention" {
+test route__proxy_identity_isolates_retention {
     var connections: [2]Connection;
     var leases:      [2]LeaseSlot;
     var value:       Pool;
@@ -1204,7 +1205,7 @@ test "http.client.pool: routes and proxy identities isolate retention" {
     ret 0;
 }
 
-test "http.client.pool: idle limits timeout and drain publish close once" {
+test idle__timeout_publishes_close_once {
     var connections: [2]Connection;
     var leases:      [2]LeaseSlot;
     var value:       Pool;
@@ -1238,7 +1239,7 @@ test "http.client.pool: idle limits timeout and drain publish close once" {
     ret 0;
 }
 
-test "http.client.pool: drain publishes connect cancellation and owns late drivers" {
+test drain__cancels_connects_and_owns_late_drivers {
     var connections: [1]Connection;
     var leases:      [1]LeaseSlot;
     var value:       Pool;
@@ -1272,7 +1273,7 @@ test "http.client.pool: drain publishes connect cancellation and owns late drive
     ret 0;
 }
 
-test "http.client.pool: proxy transport capabilities gate QUIC routes" {
+test reserve__proxy_transports_gate_quic_routes {
     var connections: [1]Connection;
     var leases:      [1]LeaseSlot;
     var value:       Pool;

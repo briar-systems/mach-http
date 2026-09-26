@@ -511,7 +511,7 @@ pub fun encode_window_update(increment: u32, output: *u8, capacity: usize) bool 
     ret true;
 }
 
-test "http.h2.frame: rfc header is incremental across every byte" {
+test feed__header_split_at_every_byte {
     var parser: Parser;
     if (!parser_init(?parser, limits_default())) { ret 1; }
     var bytes: [12]u8;
@@ -543,7 +543,7 @@ test "http.h2.frame: rfc header is incremental across every byte" {
     ret 0;
 }
 
-test "http.h2.frame: continuation and typed lengths fail closed" {
+test feed__continuation_and_typed_lengths_fail_closed {
     var parser: Parser;
     parser_init(?parser, limits_default());
     var headers: [9]u8;
@@ -570,7 +570,7 @@ test "http.h2.frame: continuation and typed lengths fail closed" {
     ret 0;
 }
 
-test "http.h2.frame: settings and flow control values are bounded" {
+test settings__values_are_bounded {
     var setting: [12]u8;
     if (!encode_setting(SETTINGS_MAX_FRAME_SIZE, 32768, ?setting[0], 12)
         || encode_setting(SETTINGS_INITIAL_WINDOW_SIZE, 0x80000000, ?setting[0], 12)
@@ -589,7 +589,7 @@ test "http.h2.frame: settings and flow control values are bounded" {
     ret 0;
 }
 
-test "http.h2.frame: writer preserves partial output and sequence" {
+test write__partial_output_keeps_sequence {
     var writer: Writer;
     if (!writer_init(?writer, limits_default())) { ret 1; }
     var output: [16]u8;
@@ -608,7 +608,7 @@ test "http.h2.frame: writer preserves partial output and sequence" {
     ret 0;
 }
 
-test "http.h2.frame: padding and window attacks fail at frame boundary" {
+test feed__padding_and_zero_window_increment_fail_at_frame_end {
     var parser: Parser;
     parser_init(?parser, limits_default());
     var header: [9]u8;
@@ -637,7 +637,7 @@ test "http.h2.frame: padding and window attacks fail at frame boundary" {
     ret 0;
 }
 
-test "http.h2.frame: oversized and truncated frames are distinguished" {
+test feed__oversized_truncated_and_extension_frames {
     var parser: Parser;
     parser_init(?parser, limits_default());
     var oversized: [9]u8;
@@ -665,7 +665,7 @@ test "http.h2.frame: oversized and truncated frames are distinguished" {
     ret 0;
 }
 
-test "http.h2.frame: self dependency is parsed for the engine and never written" {
+test priority__self_dependency_is_parsed_and_never_written {
     var parser: Parser;
     if (!parser_init(?parser, limits_default())) { ret 1; }
     var priority: [14]u8;

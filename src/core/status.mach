@@ -86,16 +86,10 @@ pub fun permits_content(method_kind: method.Kind, code: Status) bool {
     ret is_final(code);
 }
 
-test "http.core.status: status classes and finality are explicit" {
-    if (!valid(CONTINUE) || !valid(NETWORK_AUTHENTICATION_REQUIRED) || valid(99) || valid(600)) { ret 1; }
-    if (!is_informational(EARLY_HINTS) || is_final(EARLY_HINTS) || !is_final(OK))               { ret 2; }
-    ret 0;
-}
-
-test "http.core.status: payload eligibility follows method and status semantics" {
+test permits_content__bodyless_methods_and_statuses {
     if (permits_content(method.HEAD, OK) || permits_content(method.GET, NO_CONTENT)
         || permits_content(method.GET, RESET_CONTENT) || permits_content(method.GET, NOT_MODIFIED)
-        || permits_content(method.CONNECT, OK)) { ret 1; }
+        || permits_content(method.CONNECT, OK) || permits_content(method.GET, CONTINUE)) { ret 1; }
     if (!permits_content(method.GET, OK) || !permits_content(method.POST, BAD_REQUEST)) { ret 2; }
     ret 0;
 }

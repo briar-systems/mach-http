@@ -532,7 +532,7 @@ pub fun write(serializer: *Serializer, output: *u8, output_capacity: usize,
     ret write_result(serializer, WRITE_NEED_OUTPUT, written, consumed);
 }
 
-test "http.h1.serializer: fixed requests drain one byte at a time" {
+test write__fixed_request_drains_one_byte_at_a_time {
     var items:  [2]field.Field;
     var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 64, 32, 32));
     field.append(?fields, field.Field{name: view.view("Host", 4),
@@ -564,7 +564,7 @@ test "http.h1.serializer: fixed requests drain one byte at a time" {
     ret 0;
 }
 
-test "http.h1.serializer: chunked responses stream trailers canonically" {
+test write__chunked_response_streams_trailers_canonically {
     var items:  [2]field.Field;
     var fields: field.Fields = field.init(?items[0], 2, field.limits(2, 64, 32, 32));
     field.append(?fields, field.Field{name: view.view("Transfer-Encoding", 17),
@@ -597,7 +597,7 @@ test "http.h1.serializer: chunked responses stream trailers canonically" {
     ret 0;
 }
 
-test "http.h1.serializer: splitting and framing violations never reach the wire" {
+test serializer__splitting_and_length_violations_never_reach_the_wire {
     var bad_item: field.Field = field.Field{name: view.view("X-Test", 6),
         value: view.view("ok\r\nInjected: yes", 17), sensitive: false};
     var bad_fields: field.Fields = field.Fields{items: ?bad_item, len: 1, capacity: 1,
@@ -636,7 +636,7 @@ test "http.h1.serializer: splitting and framing violations never reach the wire"
     ret 0;
 }
 
-test "http.h1.serializer: http 1.0 close responses complete on the caller boundary" {
+test write__http10_close_response_ends_on_the_caller_boundary {
     var fields:     field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var scratch:    [128]u8;
     var serializer: Serializer;
