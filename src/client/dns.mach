@@ -927,11 +927,13 @@ pub fun destroy(cache: *Cache) bool {
     ret true;
 }
 
+#[testing]
 fun test_key(host: *u8, len: usize, port: u16) Key {
     ret Key{host: view.view(host, len), port: port,
         transport: policy.TRANSPORT_TCP};
 }
 
+#[testing]
 fun test_completion(query: Query, endpoints: *ip.Endpoint,
     len: usize) resolver.Completion {
     ret resolver.Completion{token: resolver.Token{index: 7, generation: 3},
@@ -942,7 +944,7 @@ fun test_completion(query: Query, endpoints: *ip.Endpoint,
     }, has_error: false, error: no_error()};
 }
 
-test "http.client.dns: refresh copies ordered results and retains temporary stale data" {
+test cache__refresh_orders_results_and_keeps_stale_on_temporary_failure {
     var entries:    [1]Entry;
     var storage:    [4]ip.Endpoint;
     var cache:      Cache;
@@ -997,7 +999,7 @@ test "http.client.dns: refresh copies ordered results and retains temporary stal
     ret 0;
 }
 
-test "http.client.dns: capacity output and cancellation stay bounded" {
+test cache__saturation_and_drain_cancellation {
     var entries:    [1]Entry;
     var storage:    [2]ip.Endpoint;
     var cache:      Cache;
@@ -1032,7 +1034,7 @@ test "http.client.dns: capacity output and cancellation stay bounded" {
     ret 0;
 }
 
-test "http.client.dns: completion descriptors cannot alias cache storage" {
+test complete__rejects_descriptors_aliasing_cache_storage {
     var entries:    [1]Entry;
     var aliased:    resolver.Completion;
     var cache:      Cache;

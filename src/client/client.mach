@@ -2071,11 +2071,13 @@ pub fun destroy(client: *Client) bool {
     ret true;
 }
 
+#[testing]
 fun test_route(host: *u8, host_len: usize) policy.Route {
     ret policy.Route{origin: policy.Origin{scheme: policy.HTTPS,
         host: view.view(host, host_len), port: 443}, proxy: policy.no_proxy()};
 }
 
+#[testing]
 fun test_request(request: *message.Request, reader: *body.Reader,
     generation: u64, deadline: opt[time.Instant],
     configured: message.Limits) bool {
@@ -2096,6 +2098,7 @@ fun test_request(request: *message.Request, reader: *body.Reader,
         fields, trailers, reader, generation, configured);
 }
 
+#[testing]
 fun test_response(response: *message.Response, generation: u64,
     code: status.Status, configured: message.Limits) bool {
     ret message.init_response(response, nil, 0, nil, 0, generation,
@@ -2105,16 +2108,19 @@ fun test_response(response: *message.Response, generation: u64,
         == message.RESPONSE_OK;
 }
 
+#[testing]
 fun test_retry_body_read(context: ptr, output: *u8, capacity: usize,
     trailers: *field.Fields) body.Progress {
     ret body.complete(body.REUSE_ALLOWED);
 }
 
+#[testing]
 fun test_retry_body_write(context: ptr, input: *u8,
     length: usize) body.Progress {
     ret body.data(length);
 }
 
+#[testing]
 fun test_retry_body_finish(context: ptr, mode: body.Mode,
     trailers: *field.Fields) body.Progress {
     if (mode == body.CANCEL)  { ret body.cancelled(body.REUSE_FORBIDDEN); }
@@ -2123,14 +2129,16 @@ fun test_retry_body_finish(context: ptr, mode: body.Mode,
     ret body.complete(body.REUSE_ALLOWED);
 }
 
+#[testing]
 fun test_retry_body_complete(context: ptr, token: u64,
     trailers: *field.Fields) body.Progress {
     ret body.complete(body.REUSE_ALLOWED);
 }
 
+#[testing]
 fun test_retry_body_release(context: ptr) {}
 
-test "http.client.client: authorities replay claims and redirect trailers are exact" {
+test request_route_valid__authority_replay_and_redirect_trailers {
     val configured: message.Limits = message.limits_default();
     var reader:     body.Reader;
     var request:    message.Request;
@@ -2201,14 +2209,7 @@ test "http.client.client: authorities replay claims and redirect trailers are ex
     ret 0;
 }
 
-test "http.client.client: hostile aliases and capacity overflow are transactional" {
-    var bytes: [8]u8;
-    if (!memory.overlap((?bytes[0])::ptr, 4,
-        (?bytes[3])::ptr, 2)
-        || memory.overlap((?bytes[0])::ptr, 4,
-        (?bytes[4])::ptr, 2)
-        || memory.overlap((~(0::usize))::ptr, 2,
-        (?bytes[0])::ptr, 1)) { ret 1; }
+test init_submit__hostile_aliases_and_capacity_overflow {
     var one_entry:      dns.Entry;
     var one_endpoint:   ip.Endpoint;
     var overflow_cache: dns.Cache;
@@ -2329,6 +2330,7 @@ test "http.client.client: hostile aliases and capacity overflow are transactiona
     ret 0;
 }
 
+#[testing]
 fun test_publish_resolution(client: *Client, token: Token, action: Action,
     endpoint: ip.Endpoint, resolver_token: resolver.Token,
     now: time.Instant) bool {
@@ -2345,6 +2347,7 @@ fun test_publish_resolution(client: *Client, token: Token, action: Action,
     ret complete_resolution(client, ?completion, now) == dns.COMPLETE_OK;
 }
 
+#[testing]
 fun test_shutdown(client: *Client, cache: *dns.Cache,
     connections: *pool.Pool, parent: *cancellation.Scope,
     now: time.Instant) bool {
@@ -2364,7 +2367,7 @@ fun test_shutdown(client: *Client, cache: *dns.Cache,
     ret true;
 }
 
-test "http.client.client: dns alpn exchange and graceful drain preserve ownership" {
+test request__dns_alpn_exchange_and_drain_preserve_ownership {
     var cache_entries:   [2]dns.Entry;
     var cache_endpoints: [4]ip.Endpoint;
     var cache:           dns.Cache;
@@ -2539,7 +2542,7 @@ test "http.client.client: dns alpn exchange and graceful drain preserve ownershi
     ret 0;
 }
 
-test "http.client.client: request deadlines settle before transport publication" {
+test expire_request__settles_before_transport_publication {
     var cache_entries:   [1]dns.Entry;
     var cache_endpoints: [1]ip.Endpoint;
     var cache:           dns.Cache;
@@ -2593,7 +2596,7 @@ test "http.client.client: request deadlines settle before transport publication"
     ret 0;
 }
 
-test "http.client.client: multi-origin saturation resumes after exact lease release" {
+test pool_wait__resumes_after_exact_lease_release {
     var cache_entries:   [2]dns.Entry;
     var cache_endpoints: [2]ip.Endpoint;
     var cache:           dns.Cache;
@@ -2682,7 +2685,7 @@ test "http.client.client: multi-origin saturation resumes after exact lease rele
     ret 0;
 }
 
-test "http.client.client: cross-origin redirects require rewritten safe requests" {
+test follow_redirect__cross_origin_requires_rewritten_safe_request {
     var cache_entries:   [2]dns.Entry;
     var cache_endpoints: [2]ip.Endpoint;
     var cache:           dns.Cache;
@@ -2804,7 +2807,7 @@ test "http.client.client: cross-origin redirects require rewritten safe requests
     ret 0;
 }
 
-test "http.client.client: retries publish replay and never buffer streams" {
+test retry__publishes_replay_and_never_buffers_streams {
     var cache_entries:   [1]dns.Entry;
     var cache_endpoints: [1]ip.Endpoint;
     var cache:           dns.Cache;
@@ -3092,7 +3095,7 @@ test "http.client.client: retries publish replay and never buffer streams" {
     ret 0;
 }
 
-test "http.client.client: temporary dns failures wait for cache retry time" {
+test resolve__temporary_failure_waits_for_cache_retry_time {
     var cache_entries:   [1]dns.Entry;
     var cache_endpoints: [1]ip.Endpoint;
     var cache:           dns.Cache;
@@ -3163,7 +3166,7 @@ test "http.client.client: temporary dns failures wait for cache retry time" {
     ret 0;
 }
 
-test "http.client.client: cancellation wins connect and exchange races" {
+test cancel_request__wins_connect_and_exchange_races {
     var cache_entries:   [1]dns.Entry;
     var cache_endpoints: [1]ip.Endpoint;
     var cache:           dns.Cache;
@@ -3344,7 +3347,7 @@ test "http.client.client: cancellation wins connect and exchange races" {
     ret 0;
 }
 
-test "http.client.client: hostile ownership and lifecycle inputs stay transactional" {
+test lifecycle__hostile_ownership_inputs_are_transactional {
     var cache_entries:   [1]dns.Entry;
     var cache_endpoints: [1]ip.Endpoint;
     var cache:           dns.Cache;

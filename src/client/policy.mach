@@ -574,7 +574,7 @@ pub fun retry(configured: RetryPolicy, replay: Replay, failure: Failure,
         delay_ns: failure.retry_after_ns, consume_budget: true};
 }
 
-test "http.client.policy: alpn and prior knowledge select only allowed wires" {
+test select__alpn_and_prior_knowledge_allow_only_configured_wires {
     val configured: ProtocolPolicy = protocols_default();
     var offered:    [3]view.View;
     if (offers(configured, TRANSPORT_TCP, ?offered[0], 3) != 2
@@ -598,7 +598,7 @@ test "http.client.policy: alpn and prior knowledge select only allowed wires" {
     ret 0;
 }
 
-test "http.client.policy: redirects preserve replay and origin security" {
+test redirect__preserves_replay_and_origin_security {
     val secure: Route = Route{origin: Origin{scheme: HTTPS,
         host: view.view("example.com", 11), port: 443}, proxy: no_proxy()};
     val other: Route = Route{origin: Origin{scheme: HTTPS,
@@ -629,7 +629,7 @@ test "http.client.policy: redirects preserve replay and origin security" {
     ret 0;
 }
 
-test "http.client.policy: retries require explicit and unambiguous replay safety" {
+test retry__requires_explicit_unambiguous_replay_safety {
     val configured: RetryPolicy = retry_policy_default();
     val safe:       Replay      = Replay{explicit: true, body: BODY_REWINDABLE};
     val streaming:  Replay      = Replay{explicit: true, body: BODY_STREAMING};
@@ -662,7 +662,7 @@ test "http.client.policy: retries require explicit and unambiguous replay safety
     ret 0;
 }
 
-test "http.client.policy: failure_from_closure maps engine closures to retry reasons" {
+test failure_from_closure__maps_engine_closures_to_retry_reasons {
     val refused_h2: Failure = failure_from_closure(
         exchange.closure(exchange.CAUSE_PEER_RESET, H2_REFUSED_STREAM, 0), message.WIRE_H2, false, false);
     val refused_h3: Failure = failure_from_closure(
