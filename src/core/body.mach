@@ -9,6 +9,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.view;
 
+#[testing]
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
 }
@@ -719,6 +720,7 @@ pub fun writer_terminal_state(writer: *Writer) bool {
     ret writer != nil && writer.valid && terminal(writer.terminal_status);
 }
 
+#[testing]
 rec TestAdapter {
     read_calls:    usize;
     write_calls:   usize;
@@ -732,6 +734,7 @@ rec TestAdapter {
     emit_trailer:  bool;
 }
 
+#[testing]
 fun test_adapter(reuse: Reuse, pending_once: bool) TestAdapter {
     ret TestAdapter{
         read_calls:    0,
@@ -747,6 +750,7 @@ fun test_adapter(reuse: Reuse, pending_once: bool) TestAdapter {
     };
 }
 
+#[testing]
 fun test_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) Progress {
     val adapter: *TestAdapter = context::*TestAdapter;
     adapter.read_calls = adapter.read_calls + 1;
@@ -762,6 +766,7 @@ fun test_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Field
     ret complete(REUSE_ALLOWED);
 }
 
+#[testing]
 fun test_write(context: ptr, input: *u8, length: usize) Progress {
     val adapter: *TestAdapter = context::*TestAdapter;
     adapter.write_calls = adapter.write_calls + 1;
@@ -769,15 +774,18 @@ fun test_write(context: ptr, input: *u8, length: usize) Progress {
     ret data(length);
 }
 
+#[testing]
 fun test_endless_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) Progress {
     if (capacity == 0) { ret data(1); }
     ret data(capacity);
 }
 
+#[testing]
 fun test_overread(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) Progress {
     ret data(capacity + 1);
 }
 
+#[testing]
 fun test_finish(context: ptr, mode: Mode, trailers: *field.Fields) Progress {
     val adapter: *TestAdapter = context::*TestAdapter;
     adapter.finish_calls = adapter.finish_calls + 1;
@@ -789,6 +797,7 @@ fun test_finish(context: ptr, mode: Mode, trailers: *field.Fields) Progress {
     ret complete(adapter.finish_reuse);
 }
 
+#[testing]
 fun test_complete(context: ptr, token: u64, trailers: *field.Fields) Progress {
     val adapter: *TestAdapter = context::*TestAdapter;
     if (token == 42 || token == 43)     { ret data(2); }
@@ -799,12 +808,13 @@ fun test_complete(context: ptr, token: u64, trailers: *field.Fields) Progress {
     ret complete(adapter.finish_reuse);
 }
 
+#[testing]
 fun test_release(context: ptr) {
     val adapter: *TestAdapter = context::*TestAdapter;
     adapter.release_calls = adapter.release_calls + 1;
 }
 
-test "http.core.body: readers stream exact declared lengths and release once" {
+test read__exact_declared_length_releases_once {
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
@@ -820,7 +830,7 @@ test "http.core.body: readers stream exact declared lengths and release once" {
     ret 0;
 }
 
-test "http.core.body: reader completion publishes bounded trailers" {
+test read__completion_publishes_trailers {
     var scope: cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
     var slots:   [1]field.Field;
@@ -836,7 +846,7 @@ test "http.core.body: reader completion publishes bounded trailers" {
     ret 0;
 }
 
-test "http.core.body: pending reads and writes require matching completion tokens" {
+test complete__requires_matching_pending_token {
     var scope: cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
     var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
@@ -861,7 +871,7 @@ test "http.core.body: pending reads and writes require matching completion token
     ret 0;
 }
 
-test "http.core.body: drain and reject are retry-safe exclusive dispositions" {
+test drain__and_reject_are_exclusive {
     var scope: cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
     var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
@@ -882,7 +892,7 @@ test "http.core.body: drain and reject are retry-safe exclusive dispositions" {
     ret 0;
 }
 
-test "http.core.body: drained readers complete without a declared-length check" {
+test drain__skips_declared_length_check {
     var scope: cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
     var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
@@ -903,7 +913,7 @@ test "http.core.body: drained readers complete without a declared-length check" 
     ret 0;
 }
 
-test "http.core.body: cancellation scopes preserve cancelled and timed out outcomes" {
+test read__scope_cancel_and_timeout_settle_outcome {
     var scope: cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
     var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
@@ -924,7 +934,7 @@ test "http.core.body: cancellation scopes preserve cancelled and timed out outco
     ret 0;
 }
 
-test "http.core.body: cancellation preempts pending drain and finish operations" {
+test drain__cancel_preempts_pending_operation {
     var scope: cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
     var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
@@ -946,21 +956,7 @@ test "http.core.body: cancellation preempts pending drain and finish operations"
     ret 0;
 }
 
-test "http.core.body: readers enforce chunk counts bytes and producer counts" {
-    var scope: cancel.Scope;
-    cancel.make_root(?scope, opt[time.Instant].none{});
-    var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
-    var adapter: TestAdapter  = test_adapter(REUSE_ALLOWED, false);
-    var reader:  Reader       = init_reader(?adapter, test_read, test_finish, test_complete, test_release,
-        OWNER_ENGINE, 12, false, 0, limits(2, 2, 1), ?fields, ?scope);
-    var output: [8]u8;
-    if (read(?reader, ?output[0], 8).status != DATA || reader.transferred != 2 || reader.chunks != 1) { ret 1; }
-    if (read(?reader, ?output[0], 8).status != COMPLETE)                                              { ret 2; }
-    if (!operation_ok(cancel.destroy(?scope)))                                                        { ret 3; }
-    ret 0;
-}
-
-test "http.core.body: limit exhaustion and adapter violations settle ownership" {
+test read__limits_and_adapter_violations_release {
     var scope: cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
     var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
@@ -991,7 +987,7 @@ test "http.core.body: limit exhaustion and adapter violations settle ownership" 
     ret 0;
 }
 
-test "http.core.body: writers bound chunks and require exact completion" {
+test write__bounded_chunks_and_exact_completion {
     var scope: cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
     var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
@@ -1011,7 +1007,7 @@ test "http.core.body: writers bound chunks and require exact completion" {
     ret 0;
 }
 
-test "http.core.body: body endpoint ownership requires one release authority" {
+test init_reader__requires_release_authority {
     var scope: cancel.Scope;
     cancel.make_root(?scope, opt[time.Instant].none{});
     var fields:  field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));

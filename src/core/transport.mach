@@ -21,6 +21,7 @@ fun lifecycle_ok(outcome: err[lifecycle.StateError]) bool {
     ret sel outcome.ok;
 }
 
+#[testing]
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
 }
@@ -710,7 +711,7 @@ pub fun make_runtime_adapter(adapter: *Adapter, stream: *RuntimeStream,
     ret true;
 }
 
-test "http.core.transport: tokens retain full runtime context" {
+test context_token__round_trips_full_token {
     val original: Token = Token{index: 0xfedcba98, generation: 0x89abcdef};
     var decoded:  Token;
     if (!context_token(token_context(original), ?decoded) || !token_equal(original, decoded)) { ret 1; }
@@ -718,6 +719,7 @@ test "http.core.transport: tokens retain full runtime context" {
     ret 0;
 }
 
+#[testing]
 rec TestRuntime {
     runtime:       *io_runtime.Runtime;
     last_read:     io_runtime.Token;
@@ -732,6 +734,7 @@ rec TestRuntime {
     closes:        usize;
 }
 
+#[testing]
 fun test_runtime_submit(state: *TestRuntime, scope: *cancel.Scope, kind: io_runtime.Kind,
     buffer: *u8, length: usize, context: usize) res[io_runtime.Token, io_error.Error] {
     val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped(
@@ -751,6 +754,7 @@ fun test_runtime_submit(state: *TestRuntime, scope: *cancel.Scope, kind: io_runt
     ret submitted;
 }
 
+#[testing]
 fun test_runtime_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val state: *TestRuntime = context::*TestRuntime;
@@ -758,6 +762,7 @@ fun test_runtime_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: u
     ret test_runtime_submit(state, scope, io_runtime.READ, buffer, length, token_context);
 }
 
+#[testing]
 fun test_runtime_readable(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val state: *TestRuntime = context::*TestRuntime;
@@ -765,6 +770,7 @@ fun test_runtime_readable(context: ptr, scope: *cancel.Scope,
     ret test_runtime_submit(state, scope, io_runtime.READABLE, nil, 0, token_context);
 }
 
+#[testing]
 fun test_runtime_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val state: *TestRuntime = context::*TestRuntime;
@@ -772,6 +778,7 @@ fun test_runtime_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: 
     ret test_runtime_submit(state, scope, io_runtime.WRITE, buffer, length, token_context);
 }
 
+#[testing]
 fun test_runtime_shutdown(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val state: *TestRuntime = context::*TestRuntime;
@@ -779,6 +786,7 @@ fun test_runtime_shutdown(context: ptr, scope: *cancel.Scope,
     ret test_runtime_submit(state, scope, io_runtime.SHUTDOWN, nil, 0, token_context);
 }
 
+#[testing]
 fun test_runtime_close(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
     val state: *TestRuntime = context::*TestRuntime;
@@ -786,6 +794,7 @@ fun test_runtime_close(context: ptr, scope: *cancel.Scope,
     ret test_runtime_submit(state, scope, io_runtime.CLOSE, nil, 0, token_context);
 }
 
+#[testing]
 rec Fixture {
     allocator:      allocator.Allocator;
     runtime:        io_runtime.Runtime;
@@ -798,26 +807,30 @@ rec Fixture {
     transport:      Transport;
 }
 
+#[testing]
 fun refused(outcome: err[io_error.Error]) bool {
     ret sel outcome.err;
 }
 
+#[testing]
 fun page_refused(outcome: err[allocator.Error]) bool {
     ret sel outcome.err;
 }
 
+#[testing]
 fun close_refused(outcome: res[bool, io_error.Error]) bool {
     ret sel outcome.err;
 }
 
+#[testing]
 fun submit_refused(outcome: res[Token, io_error.Error]) bool {
     ret sel outcome.err;
 }
 
+#[testing]
 fun make_fixture(fixture: *Fixture, security: Security) bool {
     if (page_refused(page.make(?fixture.allocator)))                        { ret false; }
     if (refused(io_runtime.make(?fixture.runtime, ?fixture.allocator, 16))) { ret false; }
-    val none: time.Instant = time.Instant{sec: 0, nsec: 0};
     if (!operation_ok(cancel.make_root(?fixture.operation_root, opt[time.Instant].none{}))
         || !operation_ok(cancel.make_root(?fixture.control_root, opt[time.Instant].none{}))) { ret false; }
     fixture.state.runtime                = ?fixture.runtime;
@@ -833,6 +846,7 @@ fun make_fixture(fixture: *Fixture, security: Security) bool {
         ?fixture.control_root, ?fixture.slots[0], 3);
 }
 
+#[testing]
 fun destroy_fixture(fixture: *Fixture) bool {
     if (io_runtime.pending(?fixture.runtime) != 0)                                                                      { ret false; }
     if (!operation_ok(cancel.destroy(?fixture.operation_root)) || !operation_ok(cancel.destroy(?fixture.control_root))) { ret false; }
@@ -840,12 +854,14 @@ fun destroy_fixture(fixture: *Fixture) bool {
     ret !refused(io_runtime.destroy(?fixture.runtime));
 }
 
+#[testing]
 fun take_runtime(runtime: *io_runtime.Runtime, completion: *io_runtime.Completion) bool {
     val polled: res[usize, io_error.Error] = io_runtime.poll(runtime, completion, 1);
     ret (sel polled.ok)
         && polled.ok == 1;
 }
 
+#[testing]
 fun finish_runtime(fixture: *Fixture, lower: io_runtime.Token, bytes: usize,
     eof: bool, completion: *Completion) bool {
     if (refused(io_runtime.complete(
@@ -855,7 +871,7 @@ fun finish_runtime(fixture: *Fixture, lower: io_runtime.Token, bytes: usize,
         && complete_runtime(?fixture.transport, ?native, completion);
 }
 
-test "http.core.transport: plaintext runtime preserves partial completion and ownership" {
+test read__one_pending_per_direction_and_partial_completion {
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     var bytes:     [8]u8;
@@ -876,30 +892,10 @@ test "http.core.transport: plaintext runtime preserves partial completion and ow
     ret 0;
 }
 
-test "http.core.transport: write backpressure remains one stable pending operation" {
-    var fixture: Fixture;
-    if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
-    var bytes:     [4]u8;
-    val submitted: res[Token, io_error.Error] = write(
-        ?fixture.transport, ?fixture.operation_root, ?bytes[0], 4, 9);
-    if ((sel submitted.err)) { ret 2; }
-    val token: Token = submitted.ok;
-    if (!submit_refused(write(
-        ?fixture.transport, ?fixture.operation_root, ?bytes[0], 4, 10))) { ret 3; }
-    val current: Snapshot = snapshot(?fixture.transport);
-    if (current.lifecycle.outstanding != 1 || !operation_snapshot(?fixture.transport, token).active) { ret 4; }
-    var completion: Completion;
-    if (!finish_runtime(?fixture, fixture.state.last_write, 2, false, ?completion)
-        || completion.count != 2 || completion.context != 9) { ret 5; }
-    if (!destroy_fixture(?fixture)) { ret 6; }
-    ret 0;
-}
-
-test "http.core.transport: child deadline becomes one timed out completion" {
+test complete_runtime__child_deadline_times_out_once {
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     var scope: cancel.Scope;
-    val none:  time.Instant = time.Instant{sec: 0, nsec: 0};
     if (!operation_ok(cancel.make_child(?scope, ?fixture.operation_root, opt[time.Instant].none{}))) { ret 2; }
     var bytes:     [1]u8;
     val submitted: res[Token, io_error.Error] = read(?fixture.transport, ?scope, ?bytes[0], 1, 8);
@@ -914,11 +910,10 @@ test "http.core.transport: child deadline becomes one timed out completion" {
     ret 0;
 }
 
-test "http.core.transport: cancellation retains the buffer until completion dequeue" {
+test complete_runtime__cancellation_retains_buffer_until_dequeue {
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     var scope: cancel.Scope;
-    val none:  time.Instant = time.Instant{sec: 0, nsec: 0};
     if (!operation_ok(cancel.make_child(?scope, ?fixture.operation_root, opt[time.Instant].none{}))) { ret 2; }
     var bytes:     [4]u8;
     val submitted: res[Token, io_error.Error] = write(?fixture.transport, ?scope, ?bytes[0], 4, 5);
@@ -935,7 +930,7 @@ test "http.core.transport: cancellation retains the buffer until completion dequ
     ret 0;
 }
 
-test "http.core.transport: write half-close leaves reads available" {
+test half_close__each_direction_closes_alone {
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     val submitted: res[Token, io_error.Error] = shutdown_write(
@@ -954,30 +949,24 @@ test "http.core.transport: write half-close leaves reads available" {
     val current: Snapshot = snapshot(?fixture.transport);
     if (current.write != ENDPOINT_CLOSED || current.read != ENDPOINT_OPEN) { ret 7; }
     if (!destroy_fixture(?fixture))                                        { ret 8; }
-    ret 0;
-}
-
-test "http.core.transport: eof closes only the read half" {
-    var fixture: Fixture;
-    if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
-    var bytes:   [3]u8;
-    val reading: res[Token, io_error.Error] = read(
-        ?fixture.transport, ?fixture.operation_root, ?bytes[0], 3, 0);
-    if ((sel reading.err)) { ret 2; }
-    var completion: Completion;
-    if (!finish_runtime(?fixture, fixture.state.last_read, 2, true, ?completion)
-        || completion.status != IO_END || completion.count != 2) { ret 3; }
+    var eof_fixture: Fixture;
+    if (!make_fixture(?eof_fixture, PLAINTEXT)) { ret 9; }
+    val eof_read: res[Token, io_error.Error] = read(
+        ?eof_fixture.transport, ?eof_fixture.operation_root, ?bytes[0], 2, 0);
+    if ((sel eof_read.err)) { ret 10; }
+    if (!finish_runtime(?eof_fixture, eof_fixture.state.last_read, 1, true, ?completion)
+        || completion.status != IO_END || completion.count != 1) { ret 11; }
     if (!submit_refused(read(
-        ?fixture.transport, ?fixture.operation_root, ?bytes[0], 3, 0))) { ret 4; }
+        ?eof_fixture.transport, ?eof_fixture.operation_root, ?bytes[0], 2, 0))) { ret 12; }
     val writing: res[Token, io_error.Error] = write(
-        ?fixture.transport, ?fixture.operation_root, ?bytes[0], 3, 0);
-    if ((sel writing.err)) { ret 5; }
-    if (!finish_runtime(?fixture, fixture.state.last_write, 3, false, ?completion)
-        || !destroy_fixture(?fixture)) { ret 6; }
+        ?eof_fixture.transport, ?eof_fixture.operation_root, ?bytes[0], 2, 0);
+    if ((sel writing.err)) { ret 13; }
+    if (!finish_runtime(?eof_fixture, eof_fixture.state.last_write, 2, false, ?completion)
+        || !destroy_fixture(?eof_fixture)) { ret 14; }
     ret 0;
 }
 
-test "http.core.transport: a readable wait holds no buffer and shares the read direction" {
+test readable__holds_no_buffer_and_shares_read_direction {
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     val waiting: res[Token, io_error.Error] = readable(
@@ -1010,6 +999,7 @@ test "http.core.transport: a readable wait holds no buffer and shares the read d
 }
 
 # a secured adapter that holds decrypted plaintext above the socket
+#[testing]
 rec BufferedState {
     runtime:      *io_runtime.Runtime;
     plaintext:    [16]u8;
@@ -1020,6 +1010,7 @@ rec BufferedState {
     last_wait:    io_runtime.Token;
 }
 
+#[testing]
 fun buffered_submit(state: *BufferedState, scope: *cancel.Scope, kind: io_runtime.Kind,
     buffer: *u8, length: usize, token: Token) res[io_runtime.Token, io_error.Error] {
     ret io_runtime.submit_scoped(state.runtime, scope, io_runtime.Operation{kind: kind,
@@ -1027,6 +1018,7 @@ fun buffered_submit(state: *BufferedState, scope: *cancel.Scope, kind: io_runtim
         context:  token_context(token)});
 }
 
+#[testing]
 fun buffered_read(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
     length: usize) res[bool, io_error.Error] {
     val state: *BufferedState = context::*BufferedState;
@@ -1050,6 +1042,7 @@ fun buffered_read(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
 }
 
 # completes at once while plaintext is held, otherwise waits on the socket
+#[testing]
 fun buffered_readable(context: ptr, token: Token,
     scope: *cancel.Scope) res[bool, io_error.Error] {
     val state:     *BufferedState                        = context::*BufferedState;
@@ -1067,22 +1060,23 @@ fun buffered_readable(context: ptr, token: Token,
     ret res[bool, io_error.Error].ok{true};
 }
 
+#[testing]
 fun buffered_write(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
     length: usize) res[bool, io_error.Error] {
     ret res[bool, io_error.Error].ok{false};
 }
 
+#[testing]
 fun buffered_control(context: ptr, token: Token,
     scope: *cancel.Scope) res[bool, io_error.Error] {
     ret res[bool, io_error.Error].ok{false};
 }
 
-test "http.core.transport: a readable wait completes at once over buffered plaintext" {
+test readable__completes_at_once_over_buffered_plaintext {
     var backing: allocator.Allocator;
     if (page_refused(page.make(?backing))) { ret 1; }
     var runtime: io_runtime.Runtime;
     if (refused(io_runtime.make(?runtime, ?backing, 4))) { ret 1; }
-    val none:       time.Instant = time.Instant{sec: 0, nsec: 0};
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
     if (!operation_ok(cancel.make_root(?operations, opt[time.Instant].none{}))
@@ -1129,6 +1123,7 @@ test "http.core.transport: a readable wait completes at once over buffered plain
     ret 0;
 }
 
+#[testing]
 rec SecureState {
     runtime:         *io_runtime.Runtime;
     token:           Token;
@@ -1139,6 +1134,7 @@ rec SecureState {
     closes:          usize;
 }
 
+#[testing]
 fun secure_read(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
     length: usize) res[bool, io_error.Error] {
     val state: *SecureState = context::*SecureState;
@@ -1150,6 +1146,7 @@ fun secure_read(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
     ret res[bool, io_error.Error].ok{length > 0};
 }
 
+#[testing]
 fun secure_write(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
     length: usize) res[bool, io_error.Error] {
     val state: *SecureState = context::*SecureState;
@@ -1161,6 +1158,7 @@ fun secure_write(context: ptr, token: Token, scope: *cancel.Scope, buffer: *u8,
     ret res[bool, io_error.Error].ok{length > 0};
 }
 
+#[testing]
 fun secure_control(context: ptr, token: Token,
     scope: *cancel.Scope) res[bool, io_error.Error] {
     val state: *SecureState = context::*SecureState;
@@ -1170,12 +1168,11 @@ fun secure_control(context: ptr, token: Token,
     ret res[bool, io_error.Error].ok{true};
 }
 
-test "http.core.transport: secured adapters hide internal read and write direction" {
+test write__secured_adapter_hides_internal_directions {
     var backing: allocator.Allocator;
     if (page_refused(page.make(?backing))) { ret 1; }
     var runtime: io_runtime.Runtime;
     if (refused(io_runtime.make(?runtime, ?backing, 2))) { ret 1; }
-    val none:       time.Instant = time.Instant{sec: 0, nsec: 0};
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
     if (!operation_ok(cancel.make_root(?operations, opt[time.Instant].none{})) || !operation_ok(cancel.make_root(?controls, opt[time.Instant].none{}))) { ret 2; }
@@ -1209,60 +1206,33 @@ test "http.core.transport: secured adapters hide internal read and write directi
     ret 0;
 }
 
-test "http.core.transport: reused slots reject stale generations" {
-    var backing: allocator.Allocator;
-    if (page_refused(page.make(?backing))) { ret 1; }
-    var runtime: io_runtime.Runtime;
-    if (refused(io_runtime.make(?runtime, ?backing, 4))) { ret 1; }
-    val none:       time.Instant = time.Instant{sec: 0, nsec: 0};
-    var operations: cancel.Scope;
-    var controls:   cancel.Scope;
-    if (!operation_ok(cancel.make_root(?operations, opt[time.Instant].none{})) || !operation_ok(cancel.make_root(?controls, opt[time.Instant].none{}))) { ret 2; }
-    var state: TestRuntime;
-    state.runtime = ?runtime;
-    var stream: RuntimeStream;
-    stream.runtime               = ?runtime;
-    stream.context               = (?state)::ptr;
-    stream.submit_read           = test_runtime_read;
-    stream.submit_readable       = test_runtime_readable;
-    stream.submit_write          = test_runtime_write;
-    stream.submit_shutdown_write = test_runtime_shutdown;
-    stream.submit_close          = test_runtime_close;
-    var adapter: Adapter;
-    if (!make_runtime_adapter(?adapter, ?stream, PLAINTEXT)) { ret 3; }
-    var slots:     [3]Slot;
-    var transport: Transport;
-    if (!init(?transport, adapter, ?operations, ?controls, ?slots[0], 3)) { ret 4; }
+test complete__stale_generation_is_rejected {
+    var fixture: Fixture;
+    if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     var byte:         u8;
-    val first_result: res[Token, io_error.Error] = read(?transport, ?operations, ?byte, 1, 0);
-    if ((sel first_result.err)) { ret 5; }
+    var completion:   Completion;
+    val first_result: res[Token, io_error.Error] = read(?fixture.transport, ?fixture.operation_root, ?byte, 1, 0);
+    if ((sel first_result.err)) { ret 2; }
     val first: Token = first_result.ok;
-    if (refused(io_runtime.complete(?runtime, state.last_read, 1, 0, false))) { ret 6; }
-    var native:     io_runtime.Completion;
-    var completion: Completion;
-    if (!take_runtime(?runtime, ?native) || !complete_runtime(?transport, ?native, ?completion)) { ret 7; }
-    var second_result: res[Token, io_error.Error] = read(?transport, ?operations, ?byte, 1, 0);
-    if ((sel second_result.err)
-        || refused(io_runtime.complete(?runtime, state.last_read, 1, 0, false))
-        || !take_runtime(?runtime, ?native) || !complete_runtime(?transport, ?native, ?completion)) { ret 8; }
-    second_result = read(?transport, ?operations, ?byte, 1, 0);
-    if ((sel second_result.err)
-        || refused(io_runtime.complete(?runtime, state.last_read, 1, 0, false))
-        || !take_runtime(?runtime, ?native) || !complete_runtime(?transport, ?native, ?completion)) { ret 9; }
-    second_result = read(?transport, ?operations, ?byte, 1, 0);
-    if ((sel second_result.err)) { ret 10; }
+    if (!finish_runtime(?fixture, fixture.state.last_read, 1, false, ?completion)) { ret 3; }
+    var round: usize = 0;
+    for (round < 2) {
+        if (submit_refused(read(?fixture.transport, ?fixture.operation_root, ?byte, 1, 0))
+            || !finish_runtime(?fixture, fixture.state.last_read, 1, false, ?completion)) { ret 4; }
+        round = round + 1;
+    }
+    val second_result: res[Token, io_error.Error] = read(?fixture.transport, ?fixture.operation_root, ?byte, 1, 0);
+    if ((sel second_result.err)) { ret 5; }
     val second: Token      = second_result.ok;
     var stale:  Completion = completed(first, READ, 1);
-    if (first.index != second.index || first.generation == second.generation || complete(?transport, ?stale)) { ret 11; }
-    if (refused(io_runtime.complete(?runtime, state.last_read, 1, 0, false))
-        || !take_runtime(?runtime, ?native) || !complete_runtime(?transport, ?native, ?completion)) { ret 12; }
-    if (!operation_ok(cancel.destroy(?operations)) || !operation_ok(cancel.destroy(?controls))
-        || close_refused(io_runtime.close(?runtime))
-        || refused(io_runtime.destroy(?runtime))) { ret 13; }
+    if (first.index != second.index || first.generation == second.generation
+        || complete(?fixture.transport, ?stale)) { ret 6; }
+    if (!finish_runtime(?fixture, fixture.state.last_read, 1, false, ?completion)
+        || !destroy_fixture(?fixture)) { ret 7; }
     ret 0;
 }
 
-test "http.core.transport: close completion and cancellation settle in any order" {
+test close__settles_with_cancellations_in_any_order {
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     var input:  [2]u8;
@@ -1304,7 +1274,7 @@ test "http.core.transport: close completion and cancellation settle in any order
     ret 0;
 }
 
-test "http.core.transport: dequeued completion wins a later close cancellation" {
+test close__dequeued_completion_wins {
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     var byte: u8;
@@ -1335,7 +1305,7 @@ test "http.core.transport: dequeued completion wins a later close cancellation" 
     ret 0;
 }
 
-test "http.core.transport: adapter violations become terminal I/O errors" {
+test complete_runtime__adapter_violations_are_terminal {
     var fixture: Fixture;
     if (!make_fixture(?fixture, PLAINTEXT)) { ret 1; }
     var bytes: [2]u8;

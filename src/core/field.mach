@@ -223,7 +223,7 @@ pub fun reset(fields: *Fields) bool {
     ret true;
 }
 
-test "http.core.field: collections enforce every limit independently" {
+test append__each_limit_fails_independently {
     var items:  [3]Field;
     var fields: Fields = init(?items[0], 3, limits(2, 12, 5, 7));
     if (append(?fields, Field{name: view.view("alpha", 5), value: view.view("1234567", 7), sensitive: false}) != ADD_OK) { ret 1; }
@@ -234,10 +234,17 @@ test "http.core.field: collections enforce every limit independently" {
     if (append(?fields, Field{name: view.view("a", 1), value: view.view("1", 1), sensitive: false}) != ADD_OK
         || append(?fields, Field{name: view.view("b", 1), value: view.view("2", 1), sensitive: false}) != ADD_OK
         || append(?fields, Field{name: view.view("c", 1), value: view.view("3", 1), sensitive: false}) != ADD_COUNT_LIMIT) { ret 5; }
+    var item:    Field;
+    var invalid: Fields = init(nil, 1, limits(1, 8, 4, 4));
+    if (append(?invalid, item) != ADD_INVALID) { ret 6; }
+    var one:     [1]Field;
+    var storage: Fields = init(?one[0], 1, limits(2, 8, 4, 4));
+    if (append(?storage, Field{name: view.view("name", 4), value: view.view("data", 4), sensitive: false}) != ADD_OK)      { ret 7; }
+    if (append(?storage, Field{name: view.view("x", 1), value: view.view("y", 1), sensitive: false}) != ADD_STORAGE_LIMIT) { ret 8; }
     ret 0;
 }
 
-test "http.core.field: syntax and trailer policy reject unsafe fields" {
+test append__syntax_and_trailer_policy {
     var items:  [2]Field;
     var fields: Fields = init(?items[0], 2, limits(2, 64, 32, 32));
     if (append(?fields, Field{name: view.view("bad name", 8), value: view.view("x", 1), sensitive: false}) != ADD_INVALID)                          { ret 1; }
@@ -249,18 +256,7 @@ test "http.core.field: syntax and trailer policy reject unsafe fields" {
     ret 0;
 }
 
-test "http.core.field: physical storage and policy capacity are distinct" {
-    var item:    Field;
-    var invalid: Fields = init(nil, 1, limits(1, 8, 4, 4));
-    if (append(?invalid, item) != ADD_INVALID) { ret 1; }
-    var one:    [1]Field;
-    var fields: Fields = init(?one[0], 1, limits(2, 8, 4, 4));
-    if (append(?fields, Field{name: view.view("name", 4), value: view.view("data", 4), sensitive: false}) != ADD_OK)      { ret 2; }
-    if (append(?fields, Field{name: view.view("x", 1), value: view.view("y", 1), sensitive: false}) != ADD_STORAGE_LIMIT) { ret 3; }
-    ret 0;
-}
-
-test "http.core.field: validation detects direct mutation and weaker limits" {
+test validate__detects_mutation_and_weaker_limits {
     var items:  [1]Field;
     var fields: Fields = init(?items[0], 1, limits(1, 8, 4, 4));
     if (append(?fields, Field{name: view.view("name", 4), value: view.view("data", 4), sensitive: false}) != ADD_OK) { ret 1; }

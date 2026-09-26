@@ -53,7 +53,7 @@ pub fun latest(first: time.Instant, second: time.Instant) time.Instant {
     ret first;
 }
 
-test "http.core.deadline: expiry is inclusive and saturates" {
+test deadline__expiry_is_inclusive_and_saturates {
     val start: time.Instant = time.Instant{sec: 10, nsec: 999999999};
     val at:    Deadline     = after(start, 1);
     if (!at.active || at.at.sec != 11 || at.at.nsec != 0) { ret 1; }
