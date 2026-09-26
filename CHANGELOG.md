@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-26
+
+http builds on mach 6 and mach-std 9.0.0 (#183). Its protocol surface is unchanged.
+
+### Changed
+
+- Breaking: requires mach 6 (`mach = "^6"`), with `[dep.std] version = "^9.0"` realized at v9.0.0 and committed as a gitlink. Resolution is flat, so a consumer of http moves to mach 6 and std 9 with it. The `test/h3-quic` subproject moves to `[dep.quic] version = "^0.21"`, which brings tls 0.13.0 and crypto 0.24.0, and CI seeds mach v6.0.0 (#183).
+- Every test is named by identifier (`test subject__case`), as mach 6 requires. Test-only helpers and fixtures are `#[testing]`, so ordinary builds omit them, including the `test/h3-quic` harness fixtures (#183).
+- The suite is pruned to mach's test policy, from 307 tests to 268 (the library from 294 to 259, `test/h3-quic` from 13 to 9). One case per protocol rule and known attack shape (smuggling, limits, malformed framing) stays. Tests that restated constants or defaults, the exported version format (CI checks it against the manifest), the HPACK and QPACK static-table round trips, the idle `process` cost check and four h3-quic tests that repeated other coverage are gone, and near-duplicate deadline, scheduling, method, target, field, transport and websocket tests fold into one test per rule. The h1 smuggling corpus keeps one case per rule, 22 of its 24 entries (#183).
+
 ## [0.20.0] - 2026-09-25
 
 ### Added
