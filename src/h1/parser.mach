@@ -1050,6 +1050,8 @@ test feed__hostile_framing_and_smuggling_corpus_is_rejected {
     if (!rejected_request("GET / HTTP/1.1\r\nHost: ::1\r\n\r\n"))                                                            { ret 20; }
     if (!rejected_request("GET http://x:99999/ HTTP/1.1\r\nHost: x\r\n\r\n"))                                                { ret 21; }
     if (!rejected_request("CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n"))                                      { ret 22; }
+    if (!rejected_request("GET / HTTP/1.0\r\nHost: a.example\r\nHost: b.example\r\n\r\n"))                                   { ret 23; }
+    if (!rejected_request("GET / HTTP/1.0\r\nHost: bad host\r\n\r\n"))                                                       { ret 24; }
     ret 0;
 }
 
