@@ -20,6 +20,8 @@ use http.h1.framing;
 use http.h1.parser;
 use A: std.allocator;
 use std.allocator.page;
+use std.chrono.date;
+use chrono_format: std.chrono.format;
 use std.chrono.time;
 use io_error:  std.io.error;
 use io_handle: std.io.handle;
@@ -301,9 +303,13 @@ rec Connection {
     has_pending:  bool;
     pending_slot: usize;
     # a request answered without the handler
-    rejecting:        bool;
-    rejected_slot:    usize;
-    rejection_items:  [2]field.Field;
+    rejecting:       bool;
+    rejected_slot:   usize;
+    rejection_items: [3]field.Field;
+    # the head on the wire: the handler's fields and the Date the server adds
+    wire_items:       *field.Field;
+    wire_fields:      field.Fields;
+    date_text:        [32]u8;
     rejection_fields: field.Fields;
     body_deadline:    deadline.Deadline;
 }
@@ -337,6 +343,10 @@ pub rec Server {
     connections:      *Connection;
     engine_slots:     *h1.Slot;
     field_storage:    *field.Field;
+    wire_storage:     *field.Field;
+    date_text:        [32]u8;
+    date_len:         usize;
+    date_second:      i64;
     trailer_storage:  *field.Field;
     inform_storage:   *message.Informational;
     live:             usize;
@@ -534,6 +544,10 @@ fun release_storage(server: *Server) {
         A.deallocate[field.Field](?server.allocator, server.field_storage,
             n * server.configured.limits.response_fields.max_count);
     }
+    if (server.wire_storage != nil) {
+        A.deallocate[field.Field](?server.allocator, server.wire_storage,
+            n * (server.configured.limits.response_fields.max_count + 1));
+    }
     if (server.trailer_storage != nil) {
         A.deallocate[field.Field](?server.allocator, server.trailer_storage,
             n * server.configured.limits.response_trailers.max_count);
@@ -547,6 +561,7 @@ fun release_storage(server: *Server) {
     server.connections     = nil;
     server.engine_slots    = nil;
     server.field_storage   = nil;
+    server.wire_storage    = nil;
     server.trailer_storage = nil;
     server.inform_storage  = nil;
     server.waiting         = nil;
@@ -569,6 +584,10 @@ fun allocate_storage(server: *Server) bool {
         n * fields);
     if (sel field_items.err) { ret false; }
     server.field_storage = field_items.ok;
+    val wire_items: res[*field.Field, A.Error] = A.zallocate[field.Field](?server.allocator,
+        n * (fields + 1));
+    if (sel wire_items.err) { ret false; }
+    server.wire_storage = wire_items.ok;
     if (trailers != 0) {
         val trailer_items: res[*field.Field, A.Error] = A.zallocate[field.Field](
             ?server.allocator, n * trailers);
@@ -595,6 +614,7 @@ fun allocate_storage(server: *Server) bool {
         conn.phase           = CONN_FREE;
         conn.slots           = ?server.engine_slots[i * pipeline];
         conn.response_fields = ?server.field_storage[i * fields];
+        conn.wire_items      = ?server.wire_storage[i * (fields + 1)];
         if (trailers != 0) { conn.response_trailers = ?server.trailer_storage[i * trailers]; }
         if (informs != 0)  { conn.informationals = ?server.inform_storage[i * informs]; }
         i = i + 1;
@@ -1126,11 +1146,60 @@ fun abort_connection(conn: *Connection, why: exchange.Cause) Step {
     ret STEP_DONE;
 }
 
+# the current second as an IMF-fixdate, formatted once per second the server sees
+fun http_date(server: *Server) view.View {
+    val wall: time.Time = wall_now();
+    if (server.date_len == 0 || wall.sec != server.date_second) {
+        var scratch: [32]u8;
+        # rfc 2822 at offset zero is the IMF-fixdate up to its zone
+        if (chrono_format.rfc2822(date.datetime_from_time(wall), ?scratch[0], 32) != 31) {
+            ret view.view(nil, 0);
+        }
+        memory.raw_copy(?server.date_text[0], ?scratch[0], 26);
+        memory.raw_copy(?server.date_text[26], "GMT", 3);
+        server.date_len    = 29;
+        server.date_second = wall.sec;
+    }
+    ret view.view(?server.date_text[0], server.date_len);
+}
+
+# the connection's own copy of the date, since the serializer borrows a head's
+# fields until the head is written and the server's copy moves every second
+fun date_field(conn: *Connection) field.Field {
+    val current: view.View = http_date(conn.server);
+    memory.raw_copy(?conn.date_text[0], current.data, current.len);
+    ret field.Field{name: view.view(field.DATE, str_len(field.DATE)),
+        value: view.view(?conn.date_text[0], current.len), sensitive: false};
+}
+
+# the handler's fields with Date added, as an origin server with a clock must
+# send it (RFC 9110 section 6.6.1). a Date the handler set is kept
+fun wire_fields(conn: *Connection) *field.Fields {
+    val handler: *field.Fields = ?conn.response.fields;
+    val named:   view.View     = view.view(field.DATE, str_len(field.DATE));
+    val dated:   field.Field   = date_field(conn);
+    if (field.find_first(handler, named) != nil || dated.value.len == 0) { ret handler; }
+    var limits: field.Limits = handler.limits;
+    limits.max_count = limits.max_count + 1;
+    limits.max_bytes = limits.max_bytes + dated.name.len + dated.value.len;
+    conn.wire_fields = field.init(conn.wire_items, handler.len + 1, limits);
+    var i: usize = 0;
+    for (i < handler.len) {
+        if (field.append(?conn.wire_fields, handler.items[i]) != field.ADD_OK) { ret nil; }
+        i = i + 1;
+    }
+    if (field.append(?conn.wire_fields, dated) != field.ADD_OK) { ret nil; }
+    ret ?conn.wire_fields;
+}
+
 fun begin_response(conn: *Connection, now: time.Instant) bool {
     var trailers: *field.Fields = nil;
     if (conn.response.trailers.len != 0) { trailers = ?conn.response.trailers; }
-    if (!h1.prepare_response(?conn.engine, conn.active_slot, conn.response.status,
-        reason_for(conn.response.status), ?conn.response.fields, trailers, now)) { ret false; }
+    val fields: *field.Fields = wire_fields(conn);
+    if (fields == nil || !h1.prepare_response(?conn.engine, conn.active_slot,
+        conn.response.status, reason_for(conn.response.status), fields, trailers, now)) {
+        ret false;
+    }
     conn.response_started = true;
     ret true;
 }
@@ -1178,7 +1247,7 @@ fun run_handler(conn: *Connection) Step {
 fun begin_answer(conn: *Connection, slot: usize, code: status.Status, now: time.Instant) Step {
     val server: *Server = conn.server;
     conn.has_pending      = false;
-    conn.rejection_fields = field.init(?conn.rejection_items[0], 2,
+    conn.rejection_fields = field.init(?conn.rejection_items[0], 3,
         server.configured.limits.response_fields);
     if (h1.rejection(?conn.engine, slot) == 0 && !conn.slots[slot].inbound_complete) {
         h1.set_disposition(?conn.engine, slot, h1.BODY_REJECT);
@@ -1191,6 +1260,7 @@ fun begin_answer(conn: *Connection, slot: usize, code: status.Status, now: time.
         name:  view.view(field.CONNECTION, str_len(field.CONNECTION)),
         value: view.view("close", 5), sensitive: false
     }) != field.ADD_OK
+        || field.append(?conn.rejection_fields, date_field(conn)) != field.ADD_OK
         || !h1.prepare_response(?conn.engine, slot, code, reason_for(code),
         ?conn.rejection_fields, nil, now)) {
         ret abort_connection(conn, exchange.CAUSE_CONNECTION);
@@ -2283,6 +2353,10 @@ fun keep_alive_scenario(harness: *Harness) i64 {
     have = 0;
     if (!send_text(?stream, "GET /b HTTP/1.1\r\nHost: x\r\n\r\nGET /c HTTP/1.1\r\nHost: x\r\n\r\n")
         || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n/c")) { ret 3; }
+    # every response carries its own Date, as an origin server with a clock must
+    if (find(?buffer[0], have, "\r\ndate: ") == NO_SLOT || find(?buffer[0], have, " GMT\r\n") == NO_SLOT) {
+        ret 6;
+    }
     val second: usize = find(?buffer[0], have, "\r\n\r\n/b");
     if (second == NO_SLOT || second > find(?buffer[0], have, "\r\n\r\n/c")) { ret 4; }
     # the drain closes the idle keep-alive connection without a byte more
