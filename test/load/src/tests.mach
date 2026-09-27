@@ -62,8 +62,6 @@ rec Load {
     spawned:     bool;
     workers:     [8]Worker;
     result:      i32;
-    warm_live:   usize;
-    steady_live: usize;
     elapsed_ns:  i64;
 }
 
@@ -198,13 +196,11 @@ fun coordinate(argument: *u8) {
     }
     load.result = 2;
     if (phase(load, WARMUP)) {
-        load.warm_live = heap.live_bytes(?load.heap);
         val started: i64 = instant_ns();
         load.result = 3;
         if (phase(load, SUSTAINED)) {
-            load.elapsed_ns  = instant_ns() - started;
-            load.steady_live = heap.live_bytes(?load.heap);
-            load.result      = 0;
+            load.elapsed_ns = instant_ns() - started;
+            load.result     = 0;
         }
     }
     i = 0;
@@ -238,7 +234,8 @@ test load__sustained_keep_alive_holds_memory_steady {
     configured.max_exchanges        = CONNECTIONS;
     configured.memory_bytes         = 16777216;
     configured.request_memory_bytes = $size_of(Body);
-    var hooks: server.Hooks = server.no_hooks();
+    val baseline: usize        = heap.live_bytes(?load.heap);
+    var hooks:    server.Hooks = server.no_hooks();
     hooks.ctx   = (?load)::ptr;
     hooks.ready = ready;
     val handler: server.Handler = server.Handler{ctx: (?load)::ptr, serve: serve_ok, abandon: nil};
@@ -253,14 +250,15 @@ test load__sustained_keep_alive_holds_memory_steady {
     if (load.elapsed_ns > 0) { per_second = sustained * 1000000000 / load.elapsed_ns::u64; }
     print.printlnf("load: {} requests over {} connections in {} ms, {} requests/s",
         sustained, CONNECTIONS, load.elapsed_ns / 1000000, per_second);
-    print.printlnf("load: heap {} bytes after warmup, {} after the sustained run, {} buffer allocations",
-        load.warm_live, load.steady_live, report.backing_allocations);
+    val remaining: usize = heap.live_bytes(?load.heap);
+    print.printlnf("load: {} buffer allocations, heap {} bytes before make and {} after destroy",
+        report.backing_allocations, baseline, remaining);
     if (report.failure != server.FAILURE_NONE || report.served != requests
         || report.accepted != CONNECTIONS::u64 || report.closed != CONNECTIONS::u64
         || report.unsettled != 0) { ret 4; }
-    # nothing is still borrowed, nothing grew once warm, and the pool reached its
-    # backing only for the buffers one warm connection set holds at once
-    if (report.memory_live != 0 || load.steady_live > load.warm_live
-        || report.backing_allocations > (CONNECTIONS * 16)::u64) { ret 5; }
+    # nothing is still borrowed, the pool reached its backing only for the buffers
+    # one warm connection set holds at once, and nothing outlives destroy
+    if (report.memory_live != 0 || report.backing_allocations > (CONNECTIONS * 16)::u64
+        || remaining != baseline) { ret 5; }
     ret 0;
 }
