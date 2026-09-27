@@ -1811,8 +1811,10 @@ fun step(conn: *Connection, now: time.Instant) Step {
     if (conn.tunnel_reported && !conn.tunnel_open) { ret begin_tunnel(conn, now); }
     if (conn.rejecting)                            { ret pump_rejection(conn, now); }
     if (conn.has_pending)                          { ret start_slot(conn, conn.pending_slot, now); }
-    # a draining engine answers what it already read, then closes instead of reading again
-    if (engine.state == h1.DRAINING && engine.input_offset == engine.input_length
+    # a draining engine answers what it already read, then closes instead of reading again.
+    # only a graceful drain still serves requests it holds, and other input is discarded
+    if (engine.state == h1.DRAINING
+        && (engine.input_offset == engine.input_length || !engine.graceful_requested)
         && h1.progress_close(engine)) { ret STEP_PROGRESS; }
     ret pump_inbound(conn, now);
 }
@@ -2205,9 +2207,10 @@ fun force(server: *Server, now: time.Instant) {
             server.report.abandoned_exchanges = server.report.abandoned_exchanges + 1;
         }
         if (conn.tunnel_live) { server.report.abandoned_tunnels = server.report.abandoned_tunnels + 1; }
+        # a connection lingering after its last response has nothing left to abandon
         val state: h1.State = conn.engine.state;
         if (conn.phase == CONN_ACTIVE && state != h1.CLOSED && state != h1.FAILED
-            && state != h1.CLOSING) {
+            && state != h1.CLOSING && !conn.engine.shutdown_done) {
             server.report.abandoned_connections = server.report.abandoned_connections + 1;
         }
         abort_connection(conn, exchange.CAUSE_CONNECTION);
@@ -3179,6 +3182,49 @@ test serve__drain_finishes_a_stream_and_abandons_parked_ones {
     # the parked body is cancelled, the pending handler abandoned, and all three settle
     if (harness.cancels != 1 || harness.abandons != 1 || harness.stops != 1
         || harness.settles != 3 || harness.settled != 1) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+val LINGER_CHUNKS: usize = 128;
+
+# a client still sending past a refused head reads the whole answer, since the
+# server discards what follows instead of closing it unread under a reset
+#[testing]
+fun linger_scenario(harness: *Harness) i64 {
+    var stream: tcp.Stream;
+    var buffer: [2048]u8;
+    var filler: [4096]u8;
+    var have:   usize = 0;
+    memory.raw_fill(?filler[0], 'a', 4096);
+    if (!connect_to(harness, ?stream)
+        || !send_text(?stream, "POST / HTTP/1.1\r\nHost: x\r\nBad Name: x\r\nContent-Length: 524288\r\n\r\n")) {
+        ret 1;
+    }
+    var i: usize = 0;
+    for (i < LINGER_CHUNKS) {
+        if (!send_bytes(?stream, ?filler[0], 4096)) { ret 2; }
+        i = i + 1;
+    }
+    if (!read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n")
+        || find(?buffer[0], have, "HTTP/1.1 400 ") != 0
+        || find(?buffer[0], have, "\r\ncontent-length: 0\r\n") == NO_SLOT
+        || find(?buffer[0], have, "\r\n\r\n") + 4 != have) { ret 3; }
+    # the response ends in the server's end of stream, never a reset
+    val end: res[usize, io_error.Error] = tcp.stream_read(?stream, ?buffer[0], 2048);
+    if (sel end.err) { ret 4; }
+    if (end.ok != 0) { ret 5; }
+    tcp.stream_close(?stream);
+    ret 0;
+}
+
+test serve__a_refused_client_still_sending_reads_the_whole_answer {
+    var harness: Harness;
+    var report:  Report;
+    if (!run_scenario(?harness, test_config(), linger_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                              { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.accepted != 1 || report.rejected != 1
+        || report.closed != 1 || report.timed_out != 0 || report.memory_live != 0) { ret 2; }
     ret 0;
 }
 

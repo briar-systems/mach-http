@@ -155,6 +155,23 @@ finish. Failure shutdown uses `cancel_connection`, drains exact transport
 completions, abandons any nonterminal slot identities, then calls `destroy` only
 after all independent owners have settled.
 
+`progress_close` first shuts down the write side. A server engine then lingers
+before it closes, as RFC 9112 section 9.6 asks: it keeps reading and discards
+whatever the peer still sends, such as the rest of a refused request body or
+pipelined requests after a close. Closing with that input unread would make the
+peer's stack reset the connection, and the peer could lose the response it has not
+read yet. Input the engine held when the write side shut is discarded too.
+
+The linger ends at the first of the peer's end of stream, `max_linger_bytes`
+discarded, or `linger_timeout_ns` after the shutdown completed. A
+`linger_timeout_ns` of zero closes right after the shutdown, and a client engine
+never lingers. While lingering, `progress_close` submits the reads, `complete_io`
+discards what they return, and `process` reports nothing. `next_deadline` includes
+the linger deadline, and `tick` at it ends the linger, so the next `progress_close`
+closes with any wait still pending. A refused read buffer is retried when the
+account is ready, and the linger deadline still applies meanwhile. The total
+deadline and cancellation fail the engine as usual.
+
 ## Tunnels
 
 After a 101, or a 2xx to a CONNECT, has been written and its request read, the
