@@ -12,6 +12,7 @@ use http.core.deadline;
 use http.core.exchange;
 use http.core.field;
 use http.core.message;
+use http.core.method;
 use http.core.status;
 use http.core.target;
 use http.core.transport;
@@ -2429,9 +2430,13 @@ rec Harness {
     tunnels_cut:  i64;
 }
 
-# a /ws exchange's scratch: its handshake, then the websocket echoing what it reads
+# a /ws exchange's scratch: its handshake, then the websocket echoing what it
+# reads. a CONNECT's tunnel echoes raw bytes instead
 #[testing]
 rec TestSocket {
+    raw:          bool;
+    raw_offset:   usize;
+    raw_length:   usize;
     accept:       [32]u8;
     socket:       ws.Connection;
     open:         bool;
@@ -2579,6 +2584,18 @@ fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
     val state:   *TestBody          = call.memory::*TestBody;
     val path:    view.View          = active.request.target.path;
     if (path_is(path, "/fail")) { ret exchange.SERVICE_FAILED; }
+    # a CONNECT to deny:443 is refused, and any other is tunnelled
+    if (active.request.method.kind == method.CONNECT) {
+        var code: status.Status = status.OK;
+        val host: view.View     = active.request.target.authority;
+        if (host.len == 8 && memory.raw_equal(host.data, "deny:443", 8)) { code = status.FORBIDDEN; }
+        (call.memory::*TestSocket).raw = code == status.OK;
+        if (message.set_status(active.response, code) != message.RESPONSE_OK
+            || exchange.commit(active, active.limits) != message.RESPONSE_OK) {
+            ret exchange.SERVICE_FAILED;
+        }
+        ret exchange.SERVICE_COMPLETE;
+    }
     if (path_is(path, "/ws")) {
         val socket: *TestSocket = call.memory::*TestSocket;
         if (negotiation.server(active, view.view(nil, 0), view.view(nil, 0), ?socket.accept[0],
@@ -2661,6 +2678,55 @@ fun socket_queue(state: *TestSocket, draining: bool) bool {
         && ws.offer(socket, ?state.closing[0], length).status == ws.WRITE_DONE;
 }
 
+# write out what the raw tunnel holds, or read more
+#[testing]
+fun raw_submit(state: *TestSocket, tunnel: *Tunnel) bool {
+    var submitted: res[transport.Token, io_error.Error];
+    if (state.raw_offset < state.raw_length) {
+        submitted = transport.write(tunnel.transport, tunnel.scope, ?state.writing[state.raw_offset],
+            state.raw_length - state.raw_offset, 0);
+    }
+    or {
+        submitted = transport.read(tunnel.transport, tunnel.scope, ?state.reading[0], 256, 0);
+    }
+    ret sel submitted.ok;
+}
+
+# echoes the bytes a CONNECT tunnel carries, one operation at a time, until the
+# client half-closes
+#[testing]
+fun raw_drive(harness: *Harness, state: *TestSocket, tunnel: *Tunnel,
+    completion: *transport.Completion) TunnelStatus {
+    if (completion == nil) {
+        if (state.open) { ret TUNNEL_PENDING; }
+        state.open = true;
+        if (tunnel.input_length > 256) { ret TUNNEL_FAILED; }
+        memory.raw_copy(?state.writing[0], tunnel.input, tunnel.input_length);
+        state.raw_length = tunnel.input_length;
+    }
+    or {
+        if (!transport.complete(tunnel.transport, completion)) { ret TUNNEL_FAILED; }
+        if (completion.kind == transport.WRITE) {
+            if (completion.status != transport.IO_COMPLETE) { ret TUNNEL_FAILED; }
+            state.raw_offset = state.raw_offset + completion.count;
+        }
+        or {
+            if (completion.status != transport.IO_COMPLETE && completion.status != transport.IO_END) {
+                ret TUNNEL_FAILED;
+            }
+            memory.raw_copy(?state.writing[0], ?state.reading[0], completion.count);
+            state.raw_offset = 0;
+            state.raw_length = completion.count;
+            if (completion.status == transport.IO_END || completion.count == 0) {
+                harness.tunnels_done = harness.tunnels_done + 1;
+                ret TUNNEL_DONE;
+            }
+        }
+    }
+    if (!raw_submit(state, tunnel)) { ret TUNNEL_FAILED; }
+    ret TUNNEL_PENDING;
+}
+
 # echoes each message the client sends, and closes the handshake either side began
 #[testing]
 fun socket_drive(context: ptr, tunnel: *Tunnel, completion: *transport.Completion) TunnelStatus {
@@ -2668,6 +2734,7 @@ fun socket_drive(context: ptr, tunnel: *Tunnel, completion: *transport.Completio
     val state:   *TestSocket    = tunnel.memory::*TestSocket;
     val socket:  *ws.Connection = ?state.socket;
     var event:   ws.Event;
+    if (state.raw) { ret raw_drive(harness, state, tunnel, completion); }
     if (!state.open) {
         if (!ws.connection_init(socket, ws.SERVER, ws.limits_default(), tunnel.transport,
             tunnel.scope, ?state.reading[0], 256, ?state.writing[0], 256, ?state.control[0], 125)
@@ -3267,5 +3334,52 @@ test serve__drain_closes_websockets_and_cuts_the_silent_one {
         || report.abandoned_connections != 1 || report.abandoned_exchanges != 0
         || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
     if (harness.tunnels_done != 1 || harness.tunnels_cut != 1 || harness.settles != 2) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+fun connect_scenario(harness: *Harness) i64 {
+    var stream: tcp.Stream;
+    var buffer: [2048]u8;
+    var have:   usize = 0;
+    # the first bytes ride in with the request, so they reach the tunnel as input
+    if (!connect_to(harness, ?stream)
+        || !send_text(?stream, "CONNECT allow:443 HTTP/1.1\r\nHost: allow:443\r\n\r\nping")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n")
+        || find(?buffer[0], have, "HTTP/1.1 200 ") != 0) { ret 1; }
+    val start: usize = find(?buffer[0], have, "\r\n\r\n") + 4;
+    if (!read_at_least(?stream, ?buffer[0], 2048, ?have, start + 4)
+        || !memory.raw_equal(?buffer[start], "ping", 4)) { ret 2; }
+    if (!send_text(?stream, "pong!") || !read_at_least(?stream, ?buffer[0], 2048, ?have, start + 9)
+        || !memory.raw_equal(?buffer[start + 4], "pong!", 5)) { ret 3; }
+    # the client half-closes, the owner is done, and the server closes after it
+    var extra: u64 = 0;
+    if (!io_done(tcp.stream_shutdown(?stream, 1)) || !read_to_end(?stream, ?extra) || extra != 0) {
+        ret 4;
+    }
+    tcp.stream_close(?stream);
+    # a refused CONNECT is an ordinary answer, and the connection serves on
+    var refused: tcp.Stream;
+    have = 0;
+    if (!connect_to(harness, ?refused)
+        || !send_text(?refused, "CONNECT deny:443 HTTP/1.1\r\nHost: deny:443\r\n\r\n")
+        || !read_until(?refused, ?buffer[0], 2048, ?have, "\r\n\r\n")
+        || find(?buffer[0], have, "HTTP/1.1 403 ") != 0) { ret 5; }
+    have = 0;
+    if (!send_text(?refused, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?refused, ?buffer[0], 2048, ?have, "\r\n\r\n/a")) { ret 6; }
+    tcp.stream_close(?refused);
+    ret 0;
+}
+
+test serve__connect_tunnels_on_2xx_only {
+    var harness: Harness;
+    var report:  Report;
+    if (!run_scenario(?harness, test_config(), connect_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                               { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.served != 3 || report.tunnels != 1
+        || report.abandoned_tunnels != 0 || report.timed_out != 0 || report.closed != 2
+        || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    if (harness.tunnels_done != 1 || harness.tunnels_cut != 0) { ret 3; }
     ret 0;
 }
