@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-27
+
+### Added
+
+- `server.Handler.tunnel`: after a 101 (such as a WebSocket upgrade) or a 2xx to a CONNECT is written and the exchange settles, the runner hands the connection to this `TunnelOwner` as a raw duplex `server.Tunnel` instead of closing it. The tunnel carries the transport, a scope to submit under, the bytes the client sent past the request, the upgrading exchange's scratch, a waker and `wake_at`. `drive` returns `TUNNEL_PENDING`, `TUNNEL_DONE` (graceful close) or `TUNNEL_FAILED` (abortive close), and `abandon` is called once when the server cuts a running tunnel (#191).
+- `server.Config.tunnel_timeout_ns` (default 60s), rearmed by each tunnel read or write that moves bytes. At the drain deadline a live tunnel is cut (#191).
+- `server.Report.tunnels` counts handoffs, and `server.Report.abandoned_tunnels` counts tunnels cut at the drain deadline (#191).
+- `server.Config.response_timeout_ns` (default 30s): a response is bounded by its progress, armed once the request is in and rearmed by each response write the client accepts (#193).
+- `h1.end_tunnel`, so a host ends a tunnel it ran over the engine and the engine closes gracefully (#191).
+- `deadline.optional_valid` and `deadline.after_optional`, for durations where zero is no deadline (#193).
+
+### Changed
+
+- Breaking: `server.Handler` has a `tunnel` field, so a `Handler` literal must name it (`TunnelOwner{ctx: nil, drive: nil, abandon: nil}` for none, which aborts an upgraded or tunnelled connection) (#191).
+- The h1 engine accepts a zero `request_timeout_ns`, `write_timeout_ns` or `total_timeout_ns` as no such deadline. `server.config_default` turns all three off, so a streamed response lives until it ends, stalls past `response_timeout_ns`, or the drain deadline. `connection.request_timeout_ns` remains available as an absolute cap (#193).
+
+### Fixed
+
+- A streamed server response was cut by the whole-exchange request deadline however much progress it made (#193).
+
 ## [0.23.0] - 2026-09-27
 
 ### Added
