@@ -106,24 +106,33 @@ pub rec Waker {
 # memory:       request_memory_bytes of zeroed scratch owned by this exchange, nil when 0
 # memory_bytes: the scratch size
 # waker:        wakes this exchange from any thread
+# wake_at:      set before returning SERVICE_PENDING to be entered again at that
+#               monotonic instant if nothing wakes the exchange first. cleared
+#               before every entry
 pub rec Call {
     exchange:     *exchange.Exchange;
     memory:       *u8;
     memory_bytes: usize;
     waker:        Waker;
+    wake_at:      opt[time.Instant];
 }
 
-# serve is entered once per exchange and again after each wake while it returns
-# SERVICE_PENDING. SERVICE_COMPLETE means the response is committed, and its body
-# reader, if any, is then pulled by the server. abandon is called exactly once for
-# an exchange that goes away while serve last returned SERVICE_PENDING, and may be nil
+# serve is entered once per exchange and again after each wake, request body
+# progress or wake_at while it returns SERVICE_PENDING. SERVICE_COMPLETE means the
+# response is committed, and its body reader, if any, is then pulled by the server.
+# abandon is called exactly once for an exchange that goes away while serve last
+# returned SERVICE_PENDING. settle is called exactly once for every exchange serve
+# was entered for, once it is terminal, with its completion final and its scratch
+# still valid. abandon and settle may be nil
 pub def ServeFun:   fun(ptr, *Call) exchange.ServiceStatus;
 pub def AbandonFun: fun(ptr, *Call);
+pub def SettleFun:  fun(ptr, *Call);
 
 pub rec Handler {
     ctx:     ptr;
     serve:   ServeFun;
     abandon: AbandonFun;
+    settle:  SettleFun;
 }
 
 # ---
@@ -275,6 +284,8 @@ rec Connection {
     exchange_scope_live: bool;
     active_slot:         usize;
     service_pending:     bool;
+    entered:             bool;
+    wake_deadline:       deadline.Deadline;
     head_ready:          bool;
     response_started:    bool;
     body_done:           bool;
@@ -1066,6 +1077,7 @@ fun make_exchange(conn: *Connection, slot: usize, now: time.Instant) status.Stat
         memory:       scratch,
         memory_bytes: server.configured.request_memory_bytes,
         waker:        Waker{server: server, index: conn.index, generation: generation},
+        wake_at:      opt[time.Instant].none{},
     };
     conn.exchange_live = true;
     ret 0;
@@ -1084,8 +1096,15 @@ fun release_exchange_memory(conn: *Connection) {
     conn.stage_offset = 0;
 }
 
-# the exchange is terminal: its memory, scope and capacity go back
+# the exchange is terminal: the handler settles it, then its memory, scope and
+# capacity go back
 fun end_exchange(conn: *Connection) {
+    val server: *Server = conn.server;
+    if (conn.entered) {
+        conn.entered = false;
+        if (server.handler.settle != nil) { server.handler.settle(server.handler.ctx, ?conn.call); }
+    }
+    conn.wake_deadline.active = false;
     release_exchange_memory(conn);
     if (conn.exchange_scope_live) {
         operation_ok(cancel.destroy(?conn.exchange_scope));
@@ -1100,7 +1119,7 @@ fun end_exchange(conn: *Connection) {
     conn.body_notified           = false;
     conn.body_deadline.active    = false;
     conn.request_body.connection = nil;
-    release_capacity(conn.server);
+    release_capacity(server);
 }
 
 # settle an exchange whose cancellation waits on its handler's response body
@@ -1227,10 +1246,16 @@ fun fail_exchange(conn: *Connection, code: status.Status) Step {
 
 fun run_handler(conn: *Connection) Step {
     val server: *Server = conn.server;
-    conn.stirred = false;
+    conn.stirred              = false;
+    conn.entered              = true;
+    conn.wake_deadline.active = false;
+    conn.call.wake_at         = opt[time.Instant].none{};
     val served: exchange.ServiceStatus = server.handler.serve(server.handler.ctx, ?conn.call);
     if (served == exchange.SERVICE_PENDING) {
         conn.service_pending = true;
+        if (sel conn.call.wake_at.some) {
+            conn.wake_deadline = deadline.Deadline{active: true, at: conn.call.wake_at.some};
+        }
         ret STEP_BLOCKED;
     }
     conn.service_pending = false;
@@ -1664,6 +1689,8 @@ fun open_connection(server: *Server, conn: *Connection, stream: tcp.Stream,
     atomic.store(?conn.woken, 0);
     conn.engine_live          = true;
     conn.exchange_live        = false;
+    conn.entered              = false;
+    conn.wake_deadline        = deadline.none();
     conn.exchange_scope_live  = false;
     conn.cancelling           = false;
     conn.has_pending          = false;
@@ -1770,6 +1797,12 @@ fun expire(server: *Server, now: time.Instant) {
         val conn: *Connection = ?server.connections[i];
         i = i + 1;
         if (conn.phase != CONN_ACTIVE || !conn.engine_live) { cnt; }
+        # a pending handler asked for a turn at this instant
+        if (conn.service_pending && deadline.expired(conn.wake_deadline, now)) {
+            conn.wake_deadline.active = false;
+            conn.stirred              = true;
+            schedule(conn);
+        }
         if (deadline.expired(conn.body_deadline, now)) {
             conn.body_deadline.active = false;
             server.report.timed_out   = server.report.timed_out + 1;
@@ -1983,6 +2016,7 @@ fun earliest_deadline(server: *Server, now: time.Instant) deadline.Deadline {
         if (conn.phase == CONN_ACTIVE && conn.engine_live) {
             earliest = deadline.earlier(earliest, h1.next_deadline(?conn.engine));
             earliest = deadline.earlier(earliest, conn.body_deadline);
+            if (conn.service_pending) { earliest = deadline.earlier(earliest, conn.wake_deadline); }
         }
         i = i + 1;
     }
@@ -2067,6 +2101,9 @@ rec Harness {
     abandons: i64;
     drains:   i64;
     stops:    i64;
+    settles:  i64;
+    settled:  i64;
+    late:     i64;
 }
 
 # the response body a test exchange streams, kept in the exchange's own scratch
@@ -2084,6 +2121,8 @@ rec TestBody {
     token:    u64;
     output:   *u8;
     capacity: usize;
+    wake_at:  time.Instant;
+    parked:   bool;
 }
 
 #[testing]
@@ -2178,13 +2217,34 @@ fun path_is(target: view.View, text: str) bool {
     ret target.len == length && memory.raw_equal(target.data, text, length);
 }
 
-# answers with its own path, or streams /stream and /endless
+#[testing]
+fun test_now() time.Instant {
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.err) { ret time.Instant{sec: 0, nsec: 0}; }
+    ret clock.ok;
+}
+
+# answers with its own path, or streams /stream and /endless. /fail fails, /hold
+# pends with no deadline, and /park pends until the deadline it asked to be woken at
 #[testing]
 fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
     val harness: *Harness           = context::*Harness;
     val active:  *exchange.Exchange = call.exchange;
     val state:   *TestBody          = call.memory::*TestBody;
     val path:    view.View          = active.request.target.path;
+    if (path_is(path, "/fail")) { ret exchange.SERVICE_FAILED; }
+    if (path_is(path, "/hold")) { ret exchange.SERVICE_PENDING; }
+    if (path_is(path, "/park")) {
+        if (!state.parked) {
+            state.parked  = true;
+            state.wake_at = time.instant_add(test_now(), 100000000);
+        }
+        if (time.instant_before(test_now(), state.wake_at)) {
+            call.wake_at = opt[time.Instant].some{state.wake_at};
+            ret exchange.SERVICE_PENDING;
+        }
+        harness.late = harness.late + 1;
+    }
     state.harness  = harness;
     state.waker    = call.waker;
     state.text     = path.data;
@@ -2219,6 +2279,16 @@ fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
 fun test_abandon(context: ptr, call: *Call) {
     val harness: *Harness = context::*Harness;
     harness.abandons = harness.abandons + 1;
+}
+
+# the completion is final here, so settled counts the exchanges that ended OK
+#[testing]
+fun test_settle(context: ptr, call: *Call) {
+    val harness: *Harness = context::*Harness;
+    harness.settles = harness.settles + 1;
+    if (call.exchange.completion.outcome == exchange.OUTCOME_OK) {
+        harness.settled = harness.settled + 1;
+    }
 }
 
 #[testing]
@@ -2274,7 +2344,8 @@ fun run_scenario(harness: *Harness, configured: Config, scenario: Scenario, repo
     if (sel backed.err) { ret false; }
     val hooks: Hooks = Hooks{ctx: harness::ptr, start: nil, ready: ready_hook,
         drain: drain_hook, stop: stop_hook};
-    val handler: Handler = Handler{ctx: harness::ptr, serve: test_serve, abandon: test_abandon};
+    val handler: Handler = Handler{ctx: harness::ptr, serve: test_serve, abandon: test_abandon,
+        settle: test_settle};
     if (!make(?harness.server, configured, handler, hooks, ?harness.backing)) { ret false; }
     @report = serve(?harness.server);
     if (harness.spawned) { thread.join(?harness.client); }
@@ -2376,7 +2447,34 @@ test serve__keep_alive_pipelined_client_then_drain {
         || report.closed != 1 || report.cancelled != 0 || report.drain_connections != 1
         || report.abandoned_connections != 0 || report.unsettled != 0) { ret 2; }
     if (harness.drains != 1 || harness.stops != 1 || !report.drain_hook_finished
-        || report.memory_live != 0) { ret 3; }
+        || report.memory_live != 0 || harness.settles != 3 || harness.settled != 3) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+fun pending_scenario(harness: *Harness) i64 {
+    var stream: tcp.Stream;
+    var buffer: [2048]u8;
+    var have:   usize = 0;
+    # nothing wakes /park but the deadline it asked for
+    if (!connect_to(harness, ?stream)
+        || !send_text(?stream, "GET /park HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n/park")) { ret 1; }
+    have = 0;
+    if (!send_text(?stream, "GET /fail HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "HTTP/1.1 500 ")) { ret 2; }
+    tcp.stream_close(?stream);
+    ret 0;
+}
+
+test serve__pending_handler_wakes_at_its_deadline_and_every_exchange_settles {
+    var harness: Harness;
+    var report:  Report;
+    if (!run_scenario(?harness, test_config(), pending_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                               { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.served != 2 || report.failed != 1
+        || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    if (harness.late != 1 || harness.settles != 2 || harness.abandons != 0) { ret 3; }
     ret 0;
 }
 
@@ -2446,6 +2544,10 @@ fun drain_scenario(harness: *Harness) i64 {
     if (!connect_to(harness, ?endless)
         || !send_text(?endless, "GET /endless HTTP/1.1\r\nHost: x\r\n\r\n")
         || !read_until(?endless, ?buffer[0], 2048, ?have, "\r\n\r\n")) { ret 1; }
+    var held: tcp.Stream;
+    if (!connect_to(harness, ?held) || !send_text(?held, "GET /hold HTTP/1.1\r\nHost: x\r\n\r\n")) {
+        ret 5;
+    }
     have = 0;
     if (!connect_to(harness, ?stream)
         || !send_text(?stream, "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -2456,23 +2558,26 @@ fun drain_scenario(harness: *Harness) i64 {
     var received: u64   = (have - head)::u64;
     if (!read_to_end(?stream, ?received) || received != STREAM_BYTES) { ret 3; }
     var ignored: u64 = 0;
-    if (!read_to_end(?endless, ?ignored)) { ret 4; }
+    if (!read_to_end(?endless, ?ignored) || !read_to_end(?held, ?ignored)) { ret 4; }
     tcp.stream_close(?stream);
     tcp.stream_close(?endless);
+    tcp.stream_close(?held);
     ret 0;
 }
 
-test serve__drain_finishes_a_stream_and_abandons_a_parked_one {
+test serve__drain_finishes_a_stream_and_abandons_parked_ones {
     var harness:    Harness;
     var report:     Report;
     var configured: Config = test_config();
     configured.drain_timeout_ns = 2000000000;
     if (!run_scenario(?harness, configured, drain_scenario, ?report)) { ret 1; }
     if (harness.result != 0)                                          { ret 10 + harness.result::i32; }
-    if (report.failure != FAILURE_NONE || report.accepted != 2 || report.served != 1
-        || report.drain_connections != 2 || report.drain_exchanges != 2
-        || report.abandoned_exchanges != 1 || report.abandoned_connections != 1
-        || report.cancelled != 1 || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
-    if (harness.cancels != 1 || harness.abandons != 0 || harness.stops != 1) { ret 3; }
+    if (report.failure != FAILURE_NONE || report.accepted != 3 || report.served != 1
+        || report.drain_connections != 3 || report.drain_exchanges != 3
+        || report.abandoned_exchanges != 2 || report.abandoned_connections != 2
+        || report.cancelled != 2 || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    # the parked body is cancelled, the pending handler abandoned, and all three settle
+    if (harness.cancels != 1 || harness.abandons != 1 || harness.stops != 1
+        || harness.settles != 3 || harness.settled != 1) { ret 3; }
     ret 0;
 }
