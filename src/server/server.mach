@@ -106,24 +106,33 @@ pub rec Waker {
 # memory:       request_memory_bytes of zeroed scratch owned by this exchange, nil when 0
 # memory_bytes: the scratch size
 # waker:        wakes this exchange from any thread
+# wake_at:      set before returning SERVICE_PENDING to be entered again at that
+#               monotonic instant if nothing wakes the exchange first. cleared
+#               before every entry
 pub rec Call {
     exchange:     *exchange.Exchange;
     memory:       *u8;
     memory_bytes: usize;
     waker:        Waker;
+    wake_at:      opt[time.Instant];
 }
 
-# serve is entered once per exchange and again after each wake while it returns
-# SERVICE_PENDING. SERVICE_COMPLETE means the response is committed, and its body
-# reader, if any, is then pulled by the server. abandon is called exactly once for
-# an exchange that goes away while serve last returned SERVICE_PENDING, and may be nil
+# serve is entered once per exchange and again after each wake, request body
+# progress or wake_at while it returns SERVICE_PENDING. SERVICE_COMPLETE means the
+# response is committed, and its body reader, if any, is then pulled by the server.
+# abandon is called exactly once for an exchange that goes away while serve last
+# returned SERVICE_PENDING. settle is called exactly once for every exchange serve
+# was entered for, once it is terminal, with its completion final and its scratch
+# still valid. abandon and settle may be nil
 pub def ServeFun:   fun(ptr, *Call) exchange.ServiceStatus;
 pub def AbandonFun: fun(ptr, *Call);
+pub def SettleFun:  fun(ptr, *Call);
 
 pub rec Handler {
     ctx:     ptr;
     serve:   ServeFun;
     abandon: AbandonFun;
+    settle:  SettleFun;
 }
 
 # ---
@@ -206,6 +215,8 @@ val MAX_STEPS:       usize = 64;
 val PEER_BYTES:      usize = 64;
 val BATCH:           usize = 64;
 val NO_SLOT:         usize = (-1)::usize;
+# the fields the server may add to a handler's response: Date and one framing field
+val WIRE_FIELDS: usize = 2;
 
 val CONTEXT_CONNECTION: u8 = 1;
 val CONTEXT_ACCEPT:     u8 = 2;
@@ -275,6 +286,8 @@ rec Connection {
     exchange_scope_live: bool;
     active_slot:         usize;
     service_pending:     bool;
+    entered:             bool;
+    wake_deadline:       deadline.Deadline;
     head_ready:          bool;
     response_started:    bool;
     body_done:           bool;
@@ -310,6 +323,7 @@ rec Connection {
     wire_items:       *field.Field;
     wire_fields:      field.Fields;
     date_text:        [32]u8;
+    length_text:      [24]u8;
     rejection_fields: field.Fields;
     body_deadline:    deadline.Deadline;
 }
@@ -585,7 +599,7 @@ fun allocate_storage(server: *Server) bool {
     if (sel field_items.err) { ret false; }
     server.field_storage = field_items.ok;
     val wire_items: res[*field.Field, A.Error] = A.zallocate[field.Field](?server.allocator,
-        n * (fields + 1));
+        n * (fields + WIRE_FIELDS));
     if (sel wire_items.err) { ret false; }
     server.wire_storage = wire_items.ok;
     if (trailers != 0) {
@@ -614,7 +628,7 @@ fun allocate_storage(server: *Server) bool {
         conn.phase           = CONN_FREE;
         conn.slots           = ?server.engine_slots[i * pipeline];
         conn.response_fields = ?server.field_storage[i * fields];
-        conn.wire_items      = ?server.wire_storage[i * (fields + 1)];
+        conn.wire_items      = ?server.wire_storage[i * (fields + WIRE_FIELDS)];
         if (trailers != 0) { conn.response_trailers = ?server.trailer_storage[i * trailers]; }
         if (informs != 0)  { conn.informationals = ?server.inform_storage[i * informs]; }
         i = i + 1;
@@ -1066,6 +1080,7 @@ fun make_exchange(conn: *Connection, slot: usize, now: time.Instant) status.Stat
         memory:       scratch,
         memory_bytes: server.configured.request_memory_bytes,
         waker:        Waker{server: server, index: conn.index, generation: generation},
+        wake_at:      opt[time.Instant].none{},
     };
     conn.exchange_live = true;
     ret 0;
@@ -1084,8 +1099,15 @@ fun release_exchange_memory(conn: *Connection) {
     conn.stage_offset = 0;
 }
 
-# the exchange is terminal: its memory, scope and capacity go back
+# the exchange is terminal: the handler settles it, then its memory, scope and
+# capacity go back
 fun end_exchange(conn: *Connection) {
+    val server: *Server = conn.server;
+    if (conn.entered) {
+        conn.entered = false;
+        if (server.handler.settle != nil) { server.handler.settle(server.handler.ctx, ?conn.call); }
+    }
+    conn.wake_deadline.active = false;
     release_exchange_memory(conn);
     if (conn.exchange_scope_live) {
         operation_ok(cancel.destroy(?conn.exchange_scope));
@@ -1100,7 +1122,7 @@ fun end_exchange(conn: *Connection) {
     conn.body_notified           = false;
     conn.body_deadline.active    = false;
     conn.request_body.connection = nil;
-    release_capacity(conn.server);
+    release_capacity(server);
 }
 
 # settle an exchange whose cancellation waits on its handler's response body
@@ -1172,23 +1194,82 @@ fun date_field(conn: *Connection) field.Field {
         value: view.view(?conn.date_text[0], current.len), sensitive: false};
 }
 
-# the handler's fields with Date added, as an origin server with a clock must
-# send it (RFC 9110 section 6.6.1). a Date the handler set is kept
+fun named(fields: *field.Fields, name: str) bool {
+    ret field.find_first(fields, view.view(name, str_len(name))) != nil;
+}
+
+# the framing a response the handler left unframed needs: its declared length,
+# chunked for an unsized body to an HTTP/1.1 client, and a zero length for no
+# body. the name is empty when the response is framed already, carries no
+# content, or can only be close-delimited
+fun framing_field(conn: *Connection) field.Field {
+    val response: *message.Response = ?conn.response;
+    var framing:  field.Field       = field.Field{name: view.view(nil, 0), value: view.view(nil, 0),
+        sensitive: false};
+    if (named(?response.fields, field.CONTENT_LENGTH) || named(?response.fields, field.TRANSFER_ENCODING)
+        || !status.permits_content(conn.request.method.kind, response.status)) { ret framing; }
+    val length_name: view.View = view.view(field.CONTENT_LENGTH, str_len(field.CONTENT_LENGTH));
+    if (response.body_kind == message.BODY_NONE) {
+        conn.length_text[0] = '0';
+        ret field.Field{name: length_name, value: view.view(?conn.length_text[0], 1), sensitive: false};
+    }
+    if (response.body_kind != message.BODY_READER) { ret framing; }
+    val reader: *body.Reader = response.body_reader;
+    if (reader.has_length) {
+        var digits: [24]u8;
+        var count:  usize = 0;
+        var rest:   u64   = reader.declared_length;
+        for (count == 0 || rest != 0) {
+            digits[count] = '0' + (rest % 10)::u8;
+            rest          = rest / 10;
+            count         = count + 1;
+        }
+        var i: usize = 0;
+        for (i < count) {
+            conn.length_text[i] = digits[count - 1 - i];
+            i                   = i + 1;
+        }
+        ret field.Field{name: length_name, value: view.view(?conn.length_text[0], count), sensitive: false};
+    }
+    val version: message.Version = conn.request.metadata.version;
+    if (version.major == 1 && version.minor >= 1) {
+        ret field.Field{name: view.view(field.TRANSFER_ENCODING, str_len(field.TRANSFER_ENCODING)),
+            value: view.view("chunked", 7), sensitive: false};
+    }
+    ret framing;
+}
+
+# the handler's fields with what an origin server adds: a Date, as one with a
+# clock must send it (RFC 9110 section 6.6.1), and the framing a response the
+# handler left unframed needs, so it is not close-delimited. fields the handler
+# set are kept
 fun wire_fields(conn: *Connection) *field.Fields {
     val handler: *field.Fields = ?conn.response.fields;
-    val named:   view.View     = view.view(field.DATE, str_len(field.DATE));
-    val dated:   field.Field   = date_field(conn);
-    if (field.find_first(handler, named) != nil || dated.value.len == 0) { ret handler; }
+    var dated:   field.Field   = date_field(conn);
+    if (named(handler, field.DATE)) { dated.value = view.view(nil, 0); }
+    val framing: field.Field = framing_field(conn);
+    var added:   usize       = 0;
+    var bytes:   usize       = 0;
+    if (dated.value.len != 0) {
+        added = added + 1;
+        bytes = bytes + dated.name.len + dated.value.len;
+    }
+    if (framing.name.len != 0) {
+        added = added + 1;
+        bytes = bytes + framing.name.len + framing.value.len;
+    }
+    if (added == 0) { ret handler; }
     var limits: field.Limits = handler.limits;
-    limits.max_count = limits.max_count + 1;
-    limits.max_bytes = limits.max_bytes + dated.name.len + dated.value.len;
-    conn.wire_fields = field.init(conn.wire_items, handler.len + 1, limits);
+    limits.max_count = limits.max_count + added;
+    limits.max_bytes = limits.max_bytes + bytes;
+    conn.wire_fields = field.init(conn.wire_items, handler.len + added, limits);
     var i: usize = 0;
     for (i < handler.len) {
         if (field.append(?conn.wire_fields, handler.items[i]) != field.ADD_OK) { ret nil; }
         i = i + 1;
     }
-    if (field.append(?conn.wire_fields, dated) != field.ADD_OK) { ret nil; }
+    if (dated.value.len != 0 && field.append(?conn.wire_fields, dated) != field.ADD_OK)    { ret nil; }
+    if (framing.name.len != 0 && field.append(?conn.wire_fields, framing) != field.ADD_OK) { ret nil; }
     ret ?conn.wire_fields;
 }
 
@@ -1227,10 +1308,16 @@ fun fail_exchange(conn: *Connection, code: status.Status) Step {
 
 fun run_handler(conn: *Connection) Step {
     val server: *Server = conn.server;
-    conn.stirred = false;
+    conn.stirred              = false;
+    conn.entered              = true;
+    conn.wake_deadline.active = false;
+    conn.call.wake_at         = opt[time.Instant].none{};
     val served: exchange.ServiceStatus = server.handler.serve(server.handler.ctx, ?conn.call);
     if (served == exchange.SERVICE_PENDING) {
         conn.service_pending = true;
+        if (sel conn.call.wake_at.some) {
+            conn.wake_deadline = deadline.Deadline{active: true, at: conn.call.wake_at.some};
+        }
         ret STEP_BLOCKED;
     }
     conn.service_pending = false;
@@ -1664,6 +1751,8 @@ fun open_connection(server: *Server, conn: *Connection, stream: tcp.Stream,
     atomic.store(?conn.woken, 0);
     conn.engine_live          = true;
     conn.exchange_live        = false;
+    conn.entered              = false;
+    conn.wake_deadline        = deadline.none();
     conn.exchange_scope_live  = false;
     conn.cancelling           = false;
     conn.has_pending          = false;
@@ -1770,6 +1859,12 @@ fun expire(server: *Server, now: time.Instant) {
         val conn: *Connection = ?server.connections[i];
         i = i + 1;
         if (conn.phase != CONN_ACTIVE || !conn.engine_live) { cnt; }
+        # a pending handler asked for a turn at this instant
+        if (conn.service_pending && deadline.expired(conn.wake_deadline, now)) {
+            conn.wake_deadline.active = false;
+            conn.stirred              = true;
+            schedule(conn);
+        }
         if (deadline.expired(conn.body_deadline, now)) {
             conn.body_deadline.active = false;
             server.report.timed_out   = server.report.timed_out + 1;
@@ -1983,6 +2078,7 @@ fun earliest_deadline(server: *Server, now: time.Instant) deadline.Deadline {
         if (conn.phase == CONN_ACTIVE && conn.engine_live) {
             earliest = deadline.earlier(earliest, h1.next_deadline(?conn.engine));
             earliest = deadline.earlier(earliest, conn.body_deadline);
+            if (conn.service_pending) { earliest = deadline.earlier(earliest, conn.wake_deadline); }
         }
         i = i + 1;
     }
@@ -2067,6 +2163,9 @@ rec Harness {
     abandons: i64;
     drains:   i64;
     stops:    i64;
+    settles:  i64;
+    settled:  i64;
+    late:     i64;
 }
 
 # the response body a test exchange streams, kept in the exchange's own scratch
@@ -2084,6 +2183,8 @@ rec TestBody {
     token:    u64;
     output:   *u8;
     capacity: usize;
+    wake_at:  time.Instant;
+    parked:   bool;
 }
 
 #[testing]
@@ -2178,13 +2279,40 @@ fun path_is(target: view.View, text: str) bool {
     ret target.len == length && memory.raw_equal(target.data, text, length);
 }
 
-# answers with its own path, or streams /stream and /endless
+#[testing]
+fun test_now() time.Instant {
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.err) { ret time.Instant{sec: 0, nsec: 0}; }
+    ret clock.ok;
+}
+
+# answers with its own path, or streams /stream and /endless. /fail fails, /hold
+# pends with no deadline, and /park pends until the deadline it asked to be woken at
 #[testing]
 fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
     val harness: *Harness           = context::*Harness;
     val active:  *exchange.Exchange = call.exchange;
     val state:   *TestBody          = call.memory::*TestBody;
     val path:    view.View          = active.request.target.path;
+    if (path_is(path, "/fail")) { ret exchange.SERVICE_FAILED; }
+    if (path_is(path, "/hold")) { ret exchange.SERVICE_PENDING; }
+    if (path_is(path, "/park")) {
+        if (!state.parked) {
+            state.parked  = true;
+            state.wake_at = time.instant_add(test_now(), 100000000);
+        }
+        if (time.instant_before(test_now(), state.wake_at)) {
+            call.wake_at = opt[time.Instant].some{state.wake_at};
+            ret exchange.SERVICE_PENDING;
+        }
+        harness.late = harness.late + 1;
+    }
+    # /empty, /sized and /unsized leave their framing to the server
+    if (path_is(path, "/empty")) {
+        if (exchange.commit(active, active.limits) != message.RESPONSE_OK) { ret exchange.SERVICE_FAILED; }
+        ret exchange.SERVICE_COMPLETE;
+    }
+    val framed: bool = !path_is(path, "/sized") && !path_is(path, "/unsized");
     state.harness  = harness;
     state.waker    = call.waker;
     state.text     = path.data;
@@ -2196,7 +2324,7 @@ fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
         state.endless  = path_is(path, "/endless");
         state.stalling = !state.endless;
     }
-    if (!state.endless) {
+    if (!state.endless && framed) {
         val count: usize = digits_of(state.length, ?state.digits[0]);
         if (message.add_field(active.response, field.Field{
             name:  view.view(field.CONTENT_LENGTH, str_len(field.CONTENT_LENGTH)),
@@ -2206,7 +2334,8 @@ fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
         }
     }
     state.reader = body.init_reader(state::ptr, test_read, test_finish, test_complete,
-        test_release, body.OWNER_APPLICATION, active.generation, !state.endless, state.length,
+        test_release, body.OWNER_APPLICATION, active.generation,
+        !state.endless && !path_is(path, "/unsized"), state.length,
         active.limits.response_body, nil, active.scope);
     if (message.set_body_reader(active.response, ?state.reader, active.limits) != message.RESPONSE_OK
         || exchange.commit(active, active.limits) != message.RESPONSE_OK) {
@@ -2219,6 +2348,16 @@ fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
 fun test_abandon(context: ptr, call: *Call) {
     val harness: *Harness = context::*Harness;
     harness.abandons = harness.abandons + 1;
+}
+
+# the completion is final here, so settled counts the exchanges that ended OK
+#[testing]
+fun test_settle(context: ptr, call: *Call) {
+    val harness: *Harness = context::*Harness;
+    harness.settles = harness.settles + 1;
+    if (call.exchange.completion.outcome == exchange.OUTCOME_OK) {
+        harness.settled = harness.settled + 1;
+    }
 }
 
 #[testing]
@@ -2274,7 +2413,8 @@ fun run_scenario(harness: *Harness, configured: Config, scenario: Scenario, repo
     if (sel backed.err) { ret false; }
     val hooks: Hooks = Hooks{ctx: harness::ptr, start: nil, ready: ready_hook,
         drain: drain_hook, stop: stop_hook};
-    val handler: Handler = Handler{ctx: harness::ptr, serve: test_serve, abandon: test_abandon};
+    val handler: Handler = Handler{ctx: harness::ptr, serve: test_serve, abandon: test_abandon,
+        settle: test_settle};
     if (!make(?harness.server, configured, handler, hooks, ?harness.backing)) { ret false; }
     @report = serve(?harness.server);
     if (harness.spawned) { thread.join(?harness.client); }
@@ -2376,7 +2516,71 @@ test serve__keep_alive_pipelined_client_then_drain {
         || report.closed != 1 || report.cancelled != 0 || report.drain_connections != 1
         || report.abandoned_connections != 0 || report.unsettled != 0) { ret 2; }
     if (harness.drains != 1 || harness.stops != 1 || !report.drain_hook_finished
-        || report.memory_live != 0) { ret 3; }
+        || report.memory_live != 0 || harness.settles != 3 || harness.settled != 3) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+fun pending_scenario(harness: *Harness) i64 {
+    var stream: tcp.Stream;
+    var buffer: [2048]u8;
+    var have:   usize = 0;
+    # nothing wakes /park but the deadline it asked for
+    if (!connect_to(harness, ?stream)
+        || !send_text(?stream, "GET /park HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n/park")) { ret 1; }
+    have = 0;
+    if (!send_text(?stream, "GET /fail HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "HTTP/1.1 500 ")) { ret 2; }
+    tcp.stream_close(?stream);
+    ret 0;
+}
+
+test serve__pending_handler_wakes_at_its_deadline_and_every_exchange_settles {
+    var harness: Harness;
+    var report:  Report;
+    if (!run_scenario(?harness, test_config(), pending_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                               { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.served != 2 || report.failed != 1
+        || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    if (harness.late != 1 || harness.settles != 2 || harness.abandons != 0) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+fun framing_scenario(harness: *Harness) i64 {
+    var stream: tcp.Stream;
+    var buffer: [2048]u8;
+    var have:   usize = 0;
+    if (!connect_to(harness, ?stream)
+        || !send_text(?stream, "GET /sized HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n/sized")
+        || find(?buffer[0], have, "\r\ncontent-length: 6\r\n") == NO_SLOT) { ret 1; }
+    have = 0;
+    if (!send_text(?stream, "GET /unsized HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n0\r\n\r\n")
+        || find(?buffer[0], have, "\r\ntransfer-encoding: chunked\r\n") == NO_SLOT
+        || find(?buffer[0], have, "\r\n8\r\n/unsized\r\n") == NO_SLOT) { ret 2; }
+    have = 0;
+    if (!send_text(?stream, "GET /empty HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\ncontent-length: 0\r\n\r\n")) {
+        ret 3;
+    }
+    # the connection outlived all three
+    have = 0;
+    if (!send_text(?stream, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n/a")) { ret 4; }
+    tcp.stream_close(?stream);
+    ret 0;
+}
+
+test serve__frames_what_the_handler_left_unframed {
+    var harness: Harness;
+    var report:  Report;
+    if (!run_scenario(?harness, test_config(), framing_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                               { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.accepted != 1 || report.served != 4
+        || report.closed != 1) { ret 2; }
     ret 0;
 }
 
@@ -2446,6 +2650,10 @@ fun drain_scenario(harness: *Harness) i64 {
     if (!connect_to(harness, ?endless)
         || !send_text(?endless, "GET /endless HTTP/1.1\r\nHost: x\r\n\r\n")
         || !read_until(?endless, ?buffer[0], 2048, ?have, "\r\n\r\n")) { ret 1; }
+    var held: tcp.Stream;
+    if (!connect_to(harness, ?held) || !send_text(?held, "GET /hold HTTP/1.1\r\nHost: x\r\n\r\n")) {
+        ret 5;
+    }
     have = 0;
     if (!connect_to(harness, ?stream)
         || !send_text(?stream, "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -2456,23 +2664,26 @@ fun drain_scenario(harness: *Harness) i64 {
     var received: u64   = (have - head)::u64;
     if (!read_to_end(?stream, ?received) || received != STREAM_BYTES) { ret 3; }
     var ignored: u64 = 0;
-    if (!read_to_end(?endless, ?ignored)) { ret 4; }
+    if (!read_to_end(?endless, ?ignored) || !read_to_end(?held, ?ignored)) { ret 4; }
     tcp.stream_close(?stream);
     tcp.stream_close(?endless);
+    tcp.stream_close(?held);
     ret 0;
 }
 
-test serve__drain_finishes_a_stream_and_abandons_a_parked_one {
+test serve__drain_finishes_a_stream_and_abandons_parked_ones {
     var harness:    Harness;
     var report:     Report;
     var configured: Config = test_config();
     configured.drain_timeout_ns = 2000000000;
     if (!run_scenario(?harness, configured, drain_scenario, ?report)) { ret 1; }
     if (harness.result != 0)                                          { ret 10 + harness.result::i32; }
-    if (report.failure != FAILURE_NONE || report.accepted != 2 || report.served != 1
-        || report.drain_connections != 2 || report.drain_exchanges != 2
-        || report.abandoned_exchanges != 1 || report.abandoned_connections != 1
-        || report.cancelled != 1 || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
-    if (harness.cancels != 1 || harness.abandons != 0 || harness.stops != 1) { ret 3; }
+    if (report.failure != FAILURE_NONE || report.accepted != 3 || report.served != 1
+        || report.drain_connections != 3 || report.drain_exchanges != 3
+        || report.abandoned_exchanges != 2 || report.abandoned_connections != 2
+        || report.cancelled != 2 || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    # the parked body is cancelled, the pending handler abandoned, and all three settle
+    if (harness.cancels != 1 || harness.abandons != 1 || harness.stops != 1
+        || harness.settles != 3 || harness.settled != 1) { ret 3; }
     ret 0;
 }
