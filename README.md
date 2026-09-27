@@ -239,7 +239,8 @@ proxy, cancellation-race, and graceful-drain contracts.
 
 `http.server.server` serves one handler over the service exchange: it listens,
 accepts up to a connection cap, drives the HTTP/1 engine over each socket with
-keep-alive and pipelining, bounds in-flight exchanges and buffer memory, enforces
+keep-alive and pipelining, hands upgraded (WebSocket) and CONNECT connections to the
+handler as raw duplex streams, bounds in-flight exchanges and buffer memory, enforces
 header, body, idle and response progress timeouts, and drains gracefully to a deadline, reporting
 what it abandoned. Lifecycle hooks around start, ready, drain and stop let a framework
 drive its own lifecycle. It is plaintext, meant to sit behind a TLS-terminating

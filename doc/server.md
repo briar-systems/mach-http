@@ -7,8 +7,8 @@ one `http.core.exchange.Exchange`. It plays the role hyper's server plays under 
 a framework supplies the handler and drives its own lifecycle through the hooks,
 and the server knows nothing of routing or application structure.
 
-It is plaintext HTTP/1.1 with keep-alive and pipelining, meant to run behind a
-reverse proxy that terminates TLS. TLS, HTTP/2 and HTTP/3 are hedge's job.
+It is plaintext HTTP/1.1 with keep-alive, pipelining, protocol upgrades such as
+WebSocket, and CONNECT, meant to run behind a reverse proxy that terminates TLS. TLS, HTTP/2 and HTTP/3 are hedge's job.
 
 ## Running
 
@@ -37,6 +37,7 @@ when it does.
 pub def ServeFun:   fun(ptr, *Call) exchange.ServiceStatus;
 pub def AbandonFun: fun(ptr, *Call);
 pub def SettleFun:  fun(ptr, *Call);
+pub rec Handler { ctx: ptr; serve: ServeFun; abandon: AbandonFun; settle: SettleFun; tunnel: TunnelOwner; }
 ```
 
 `serve` is entered once per exchange. The `Call` carries the exchange in HANDLING
@@ -81,7 +82,8 @@ exchange, its scratch and its connection until it completes after a wake.
 exchange is terminal: its response written and its request body settled, or its
 cancellation settled. `call.exchange.completion` is final, and the scratch is still
 valid, so this is where a framework releases what it held for the request and
-records its outcome. After `settle` returns, the scratch goes back to the pool. A
+records its outcome. After `settle` returns, the scratch goes back to the pool, unless
+the exchange left a tunnel, which keeps it (see Tunnels). A
 request answered without the handler (400, 413, 414, 431) never reaches either. A
 connection counted in `Report.unsettled` never settles its exchange. `abandon` and
 `settle` may each be nil.
@@ -102,6 +104,49 @@ pub fun wake(waker: Waker) bool;
 wake that arrives after its exchange settled is ignored. A waker is valid until the
 exchange settles, that is until its bodies are terminal and released, and the server
 must outlive every waker it handed out.
+
+A tunnel's waker works the same way, and names the tunnel, not the exchange that
+made it.
+
+## Tunnels
+
+```mach
+pub def TunnelFun:        fun(ptr, *Tunnel, *transport.Completion) TunnelStatus;
+pub def TunnelAbandonFun: fun(ptr, *Tunnel);
+pub rec TunnelOwner { ctx: ptr; drive: TunnelFun; abandon: TunnelAbandonFun; }
+```
+
+A handler that answers an upgrade with 101, for example through
+`http.websocket.negotiation.server`, or a CONNECT with a 2xx, gets the connection
+afterwards as a raw duplex stream. Once that response is written and the exchange
+has settled, the connection is handed to `Handler.tunnel` as a `Tunnel`:
+
+- `transport` is the connection's `http.core.transport.Transport`, and `scope` the
+  scope to submit its operations under. The owner reads and writes through it, and
+  settles every completion it is handed with `transport.complete`, as
+  `http.websocket.Connection.complete_io` does. Only the server shuts it down or
+  closes it.
+- `input` holds the bytes the client sent past the request, valid while the tunnel
+  lives, which `http.websocket.adopt_input` takes as they are.
+- `memory` is the upgrading exchange's scratch as `serve` and `settle` left it, so
+  what the handler decided while negotiating carries over.
+- `waker` and `wake_at` work as they do for an exchange.
+
+`drive` is entered at the handoff, again with each completion of an operation the
+owner submitted, and after each wake, `wake_at`, or the start of the drain, with a
+nil completion. It returns `TUNNEL_PENDING` while it runs. `TUNNEL_DONE` hands the
+connection back, with nothing of the owner's in flight, and the server closes it
+gracefully. `TUNNEL_FAILED` closes it abortively. `abandon` is called exactly once
+for a tunnel the server cuts while `drive` last returned `TUNNEL_PENDING`: its
+timeout, a connection failure, or the drain deadline. What the owner left in flight
+is then cancelled and settled by the server, and the connection's record, with the
+scratch, is released only once it has. With no `tunnel.drive` a connection closes
+after its 101.
+
+A tunnel holds its connection, its scratch and the engine's read buffer, all within
+`max_connections` and `memory_bytes`, but no exchange capacity. `Report.tunnels`
+counts the handoffs. The owner is one contract, so the server can run a protocol of
+its own over it as well.
 
 ## Bounds
 
@@ -133,7 +178,8 @@ while one that stalls is closed.
 | `connection.request_timeout_ns` | the optional absolute cap over a whole exchange, request and response. 0, the default, is none |
 | `connection.idle_timeout_ns` | while a keep-alive connection holds no request |
 | `connection.write_timeout_ns` | optional, from a response head to the end of the response. 0, the default, is none |
-| `connection.total_timeout_ns` | optional, over a connection's whole life. 0, the default, is none |
+| `connection.total_timeout_ns` | optional, over a connection's whole life until a tunnel takes it. 0, the default, is none |
+| `tunnel_timeout_ns` | from a tunnel's handoff, and again from each of its reads or writes that moves bytes, to the next |
 
 `response_timeout_ns` also bounds a handler that has not answered: its clock starts
 when the request is in, and nothing but an accepted write moves it, so a pending
@@ -150,10 +196,13 @@ is abandoned as above. `Report.timed_out` counts them.
 deadline (`drain_timeout_ns` from now), and every connection finishes gracefully:
 an idle keep-alive connection closes at once, requests the engine already read are
 answered, and a response in flight, however long, keeps streaming. Each connection
-closes after its last response.
+closes after its last response. A tunnel is entered with `draining` set and the
+deadline in `drain_at`, so its owner winds down on its own terms, a WebSocket with a
+1001 close for instance, and the connection closes once the owner is done.
 
-At the deadline, every exchange still in flight is abandoned and every connection
-still open is closed abortively (`Report.abandoned_exchanges`,
+At the deadline, every exchange still in flight is abandoned, every tunnel still
+running is cut, and every connection still open is closed abortively
+(`Report.abandoned_exchanges`, `Report.abandoned_tunnels`,
 `Report.abandoned_connections`). What that leaves settling gets `stop_timeout_ns`;
 a connection that has not settled by then is counted in `Report.unsettled` and keeps
 its record. The stop hook is called once everything has closed, or the stop timeout
