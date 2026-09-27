@@ -235,6 +235,17 @@ ownership. Its event-loop actions bind directly to the system resolver, connecto
 and HTTP version engines. See [doc/client.md](doc/client.md) for memory, replay,
 proxy, cancellation-race, and graceful-drain contracts.
 
+## HTTP/1.1 server
+
+`http.server.server` serves one handler over the service exchange: it listens,
+accepts up to a connection cap, drives the HTTP/1 engine over each socket with
+keep-alive and pipelining, bounds in-flight exchanges and buffer memory, enforces
+header, body, idle and write timeouts, and drains gracefully to a deadline, reporting
+what it abandoned. Lifecycle hooks around start, ready, drain and stop let a framework
+drive its own lifecycle. It is plaintext, meant to sit behind a TLS-terminating
+proxy. See [doc/server.md](doc/server.md) for the handler, wake, bound, timeout and
+drain contracts.
+
 ## Layout
 
 ```text
@@ -243,7 +254,7 @@ src/
   h1/         strict incremental HTTP/1 framing, parsing, and serialization
   h2/         HTTP/2 frames, HPACK, flow control, and connection state
   h3/         HTTP/3 frames, QPACK, control streams, and connection state
-  server/     server configuration and lifecycle state
+  server/     the HTTP/1.1 server runner: listen, accept, serve, drain
   client/     client configuration and lifecycle state
   router/     compiled routing, captures, dispatch, and handler invocation
   websocket   negotiation, framing, and completion-driven connection state
