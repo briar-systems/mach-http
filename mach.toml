@@ -1,7 +1,7 @@
 [project]
 id = "http"
 mach = "^6"
-version = "0.23.0"
+version = "0.24.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
