@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-27
+
+### Added
+
+- `server.Handler.settle`, called exactly once for every exchange `serve` was entered for, once the exchange is terminal: its response written and request body settled, or its cancellation settled. `call.exchange.completion` is final and the scratch still valid, so a framework releases per-request state and records the outcome there (#198).
+- `server.Call.wake_at`: a handler that sets it before returning `SERVICE_PENDING` is entered again at that monotonic instant if nothing woke it first, so a framework enforces its own per-request deadline without a timer of its own. It is cleared before every entry (#198).
+
+### Changed
+
+- Breaking: `server.Handler` has a `settle` field, so a `Handler` literal must name it (`settle: nil` for none) (#198).
+
+### Fixed
+
+- A handler response with neither `Content-Length` nor `Transfer-Encoding` was close-delimited, ending the keep-alive connection. The runner now frames it as it adds `Date`: the reader's declared length, `Transfer-Encoding: chunked` for an unsized body to an HTTP/1.1 client, or `Content-Length: 0` with no body. Framing the handler set is kept (#200).
+
 ## [0.22.0] - 2026-09-27
 
 ### Added
