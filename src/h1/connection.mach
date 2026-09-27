@@ -1484,6 +1484,18 @@ pub fun progress_close(engine: *Engine) bool {
     ret false;
 }
 
+# the host is done with a tunnel it ran over this engine's transport. input the
+# engine still held is dropped, and the engine closes like a draining one, through
+# progress_close. a total deadline still applies to that close
+pub fun end_tunnel(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized || engine.state != TUNNEL) { ret false; }
+    engine.input_offset         = engine.input_length;
+    engine.idle_deadline.active = false;
+    engine.wait_deadline.active = false;
+    engine.state                = DRAINING;
+    ret true;
+}
+
 pub fun cancel_connection(engine: *Engine) bool {
     if (engine == nil || !engine.initialized || engine.state == CLOSED) { ret false; }
     cancel.cancel(engine.scope);
@@ -2113,6 +2125,10 @@ test server__informationals_and_upgrade_preserve_wire_order {
     val tunnel: Event = process(?fixture.engine, now);
     if (tunnel.kind != EVENT_TUNNEL || tunnel.slot != headers.slot || tunnel.body_length != 3
         || !memory.raw_equal(tunnel.body, "xyz", 3)) { ret 5; }
+    # the host's tunnel ends and the engine closes gracefully, the tunnel bytes unparsed
+    if (!release(?fixture.engine, headers.slot, now) || !end_tunnel(?fixture.engine)
+        || end_tunnel(?fixture.engine) || !progress_close(?fixture.engine)
+        || !fixture.engine.shutdown_pending) { ret 6; }
     ret 0;
 }
 

@@ -154,3 +154,14 @@ Graceful shutdown uses `begin_graceful` and `progress_close` after admitted mess
 finish. Failure shutdown uses `cancel_connection`, drains exact transport
 completions, abandons any nonterminal slot identities, then calls `destroy` only
 after all independent owners have settled.
+
+## Tunnels
+
+After a 101, or a 2xx to a CONNECT, has been written and its request read, the
+engine enters `TUNNEL` and `process` reports `EVENT_TUNNEL` once, with the bytes it
+had read past the request as the event body. Those bytes stay in the engine's read
+buffer, which it keeps, and the engine submits nothing more. The host runs the
+tunnel over the same transport, and completions of its own operations never go to
+`complete_io`. When the host is done with the tunnel, `end_tunnel` drops what input
+the engine held and turns it into a draining engine, so `progress_close` shuts the
+connection down gracefully. `cancel_connection` closes it abortively instead.

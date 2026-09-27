@@ -12,12 +12,15 @@ use http.core.deadline;
 use http.core.exchange;
 use http.core.field;
 use http.core.message;
+use http.core.method;
 use http.core.status;
 use http.core.target;
 use http.core.transport;
 use h1: http.h1.connection;
 use http.h1.framing;
 use http.h1.parser;
+use ws: http.websocket;
+use http.websocket.negotiation;
 use A: std.allocator;
 use std.allocator.page;
 use std.chrono.date;
@@ -128,11 +131,64 @@ pub def ServeFun:   fun(ptr, *Call) exchange.ServiceStatus;
 pub def AbandonFun: fun(ptr, *Call);
 pub def SettleFun:  fun(ptr, *Call);
 
+# what a tunnel owner reports. a pending tunnel is entered again later
+pub def TunnelStatus: u8;
+pub val TUNNEL_PENDING: TunnelStatus = 1;
+pub val TUNNEL_DONE:    TunnelStatus = 2;
+pub val TUNNEL_FAILED:  TunnelStatus = 3;
+
+# a connection's byte stream once a 101, or a 2xx to a CONNECT, is on the wire.
+# valid until its owner finishes it or the server cuts it
+# ---
+# transport:    the connection's transport. the owner reads and writes through it,
+#               and settles each completion it is handed with transport.complete.
+#               only the server shuts it down or closes it
+# scope:        the scope every operation is submitted under
+# input:        bytes the client sent past the request, nil when none. they stay
+#               valid while the tunnel lives
+# input_length: the input size
+# memory:       the upgrading exchange's scratch, as serve and settle left it
+# memory_bytes: the scratch size
+# waker:        wakes this tunnel from any thread
+# wake_at:      as Call.wake_at
+# draining:     set once the server drains, when the owner should wind down
+# drain_at:     the drain deadline, once draining is set
+pub rec Tunnel {
+    transport:    *transport.Transport;
+    scope:        *cancel.Scope;
+    input:        *u8;
+    input_length: usize;
+    memory:       *u8;
+    memory_bytes: usize;
+    waker:        Waker;
+    wake_at:      opt[time.Instant];
+    draining:     bool;
+    drain_at:     time.Instant;
+}
+
+# drive is entered at the handoff, again with each completion of an operation the
+# owner submitted, and after each wake, wake_at or the start of the drain, with a
+# nil completion. TUNNEL_DONE and TUNNEL_FAILED leave no operation in flight and
+# hand the connection back, to be closed gracefully or abortively. abandon is
+# called exactly once for a tunnel the server cuts while drive last returned
+# TUNNEL_PENDING, and the server settles what the owner left in flight
+pub def TunnelFun:        fun(ptr, *Tunnel, *transport.Completion) TunnelStatus;
+pub def TunnelAbandonFun: fun(ptr, *Tunnel);
+
+# who runs a connection's tunnel. with no drive the connection closes after its 101
+pub rec TunnelOwner {
+    ctx:     ptr;
+    drive:   TunnelFun;
+    abandon: TunnelAbandonFun;
+}
+
+# tunnel: runs the connection an exchange upgraded or tunnelled with CONNECT
 pub rec Handler {
     ctx:     ptr;
     serve:   ServeFun;
     abandon: AbandonFun;
     settle:  SettleFun;
+    tunnel:  TunnelOwner;
 }
 
 # ---
@@ -150,6 +206,8 @@ pub rec Handler {
 # body_timeout_ns:      from a request head to the end of its body
 # response_timeout_ns:  from the end of a request body, and again from each response
 #                       write the client accepts, to the next one or the response's end
+# tunnel_timeout_ns:    from a tunnel's handoff, and again from each of its reads or
+#                       writes that moves bytes, to the next
 # drain_timeout_ns:     from the drain to abandoning what is left
 # stop_timeout_ns:      how long abandoned work may take to settle, and the stop hook
 # hook_poll_ns:         how often a pending hook is called again
@@ -164,6 +222,7 @@ pub rec Config {
     limits:               message.Limits;
     body_timeout_ns:      u64;
     response_timeout_ns:  u64;
+    tunnel_timeout_ns:    u64;
     drain_timeout_ns:     u64;
     stop_timeout_ns:      u64;
     hook_poll_ns:         u64;
@@ -184,6 +243,8 @@ pub rec Config {
 # drain_exchanges:       exchanges in flight when the drain began
 # abandoned_exchanges:   exchanges still in flight at the drain deadline
 # abandoned_connections: connections closed abortively at the drain deadline
+# tunnels:               connections handed to a tunnel owner
+# abandoned_tunnels:     tunnels cut at the drain deadline while their owner ran them
 # unsettled:             connections whose teardown had not settled when serve ended
 # drain_hook_finished:   whether the drain hook finished before the deadline
 # memory_live:           buffer bytes still borrowed when serve ended
@@ -204,6 +265,8 @@ pub rec Report {
     drain_exchanges:       usize;
     abandoned_exchanges:   u64;
     abandoned_connections: u64;
+    tunnels:               u64;
+    abandoned_tunnels:     u64;
     unsettled:             usize;
     drain_hook_finished:   bool;
     memory_live:           usize;
@@ -332,6 +395,19 @@ rec Connection {
     body_deadline:    deadline.Deadline;
     # the response's progress deadline, rearmed by each write the client accepts
     response_deadline: deadline.Deadline;
+    # the tunnel an upgrade or CONNECT leaves: its owner, set once the upgrading
+    # exchange is written, the engine's report of it, the handoff, and whether the
+    # owner still runs it
+    tunnel_owner:      TunnelOwner;
+    tunnel_reported:   bool;
+    tunnel_open:       bool;
+    tunnel_live:       bool;
+    tunnel_stirred:    bool;
+    tunnel_scope:      cancel.Scope;
+    tunnel_scope_live: bool;
+    tunnel:            Tunnel;
+    tunnel_wake:       deadline.Deadline;
+    tunnel_deadline:   deadline.Deadline;
 }
 
 pub rec Server {
@@ -459,6 +535,7 @@ pub fun config_default(address: ip.Endpoint) Config {
         limits:               message.limits_default(),
         body_timeout_ns:      30000000000,
         response_timeout_ns:  30000000000,
+        tunnel_timeout_ns:    60000000000,
         drain_timeout_ns:     30000000000,
         stop_timeout_ns:      5000000000,
         hook_poll_ns:         10000000,
@@ -478,6 +555,7 @@ pub fun config_valid(configured: Config) bool {
         && h1.config_valid(configured.connection, configured.connection.max_pipeline)
         && deadline.duration_valid(configured.body_timeout_ns)
         && deadline.duration_valid(configured.response_timeout_ns)
+        && deadline.duration_valid(configured.tunnel_timeout_ns)
         && deadline.duration_valid(configured.drain_timeout_ns)
         && deadline.duration_valid(configured.stop_timeout_ns)
         && deadline.duration_valid(configured.hook_poll_ns);
@@ -1100,11 +1178,15 @@ fun make_exchange(conn: *Connection, slot: usize, now: time.Instant) status.Stat
     ret 0;
 }
 
-fun release_exchange_memory(conn: *Connection) {
+fun release_stage(conn: *Connection) {
     if (conn.stage_held) {
         release_chunk(conn, conn.stage);
         conn.stage_held = false;
     }
+}
+
+fun release_exchange_memory(conn: *Connection) {
+    release_stage(conn);
     if (conn.arena_held) {
         release_chunk(conn, conn.arena);
         conn.arena_held = false;
@@ -1114,7 +1196,7 @@ fun release_exchange_memory(conn: *Connection) {
 }
 
 # the exchange is terminal: the handler settles it, then its memory, scope and
-# capacity go back
+# capacity go back. a tunnel's owner keeps the scratch
 fun end_exchange(conn: *Connection) {
     val server: *Server = conn.server;
     if (conn.entered) {
@@ -1122,7 +1204,8 @@ fun end_exchange(conn: *Connection) {
         if (server.handler.settle != nil) { server.handler.settle(server.handler.ctx, ?conn.call); }
     }
     conn.wake_deadline.active = false;
-    release_exchange_memory(conn);
+    if (conn.tunnel_owner.drive != nil) { release_stage(conn); }
+    or                                  { release_exchange_memory(conn); }
     if (conn.exchange_scope_live) {
         operation_ok(cancel.destroy(?conn.exchange_scope));
         conn.exchange_scope_live = false;
@@ -1173,8 +1256,19 @@ fun abort_exchange(conn: *Connection, why: exchange.Cause) {
     }
 }
 
+# the server cuts a tunnel its owner still runs
+fun abandon_tunnel(conn: *Connection) {
+    if (!conn.tunnel_live) { ret; }
+    conn.tunnel_live            = false;
+    conn.tunnel_wake.active     = false;
+    conn.tunnel_deadline.active = false;
+    val owner: TunnelOwner = conn.tunnel_owner;
+    if (owner.abandon != nil) { owner.abandon(owner.ctx, ?conn.tunnel); }
+}
+
 fun abort_connection(conn: *Connection, why: exchange.Cause) Step {
     abort_exchange(conn, why);
+    abandon_tunnel(conn);
     val state: h1.State = conn.engine.state;
     if (state != h1.CLOSED && state != h1.FAILED && state != h1.CLOSING) {
         h1.cancel_connection(?conn.engine);
@@ -1461,7 +1555,14 @@ fun apply(conn: *Connection, event: h1.Event, now: time.Instant) Step {
     }
     # the peer sent all it will. what was admitted is still answered, then the engine closes
     if (kind == h1.EVENT_PEER_CLOSED) { ret STEP_BLOCKED; }
-    if (kind == h1.EVENT_TUNNEL)      { ret abort_connection(conn, exchange.CAUSE_CONNECTION); }
+    # reported once, with what the client sent past the request. the handoff follows
+    # once the upgrading exchange has settled
+    if (kind == h1.EVENT_TUNNEL) {
+        conn.tunnel_reported     = true;
+        conn.tunnel.input        = event.body;
+        conn.tunnel.input_length = event.body_length;
+        ret STEP_PROGRESS;
+    }
     if (kind == h1.EVENT_CLOSED || kind == h1.EVENT_ERROR || kind == h1.EVENT_TIMED_OUT
         || kind == h1.EVENT_CANCELLED) {
         if (conn.phase == CONN_ACTIVE && kind == h1.EVENT_TIMED_OUT) {
@@ -1578,6 +1679,8 @@ fun settle_exchange(conn: *Connection, now: time.Instant) Step {
     if (exchange.finish(?conn.exchange) != exchange.FINISH_OK) {
         ret abort_connection(conn, exchange.CAUSE_CONNECTION);
     }
+    # a written 101, or 2xx to a CONNECT, leaves the connection to the handler's tunnel
+    if (conn.engine.state == h1.TUNNEL) { conn.tunnel_owner = server.handler.tunnel; }
     val slot: usize = conn.active_slot;
     end_exchange(conn);
     conn.active_slot     = NO_SLOT;
@@ -1623,6 +1726,62 @@ fun pump_response(conn: *Connection, now: time.Instant) Step {
     ret settle_exchange(conn, now);
 }
 
+# one turn of the tunnel's owner. once it is done the engine closes the connection
+fun drive_tunnel(conn: *Connection, completion: *transport.Completion, now: time.Instant) Step {
+    val owner: TunnelOwner = conn.tunnel_owner;
+    conn.tunnel.wake_at     = opt[time.Instant].none{};
+    conn.tunnel_wake.active = false;
+    val driven: TunnelStatus = owner.drive(owner.ctx, ?conn.tunnel, completion);
+    if (driven == TUNNEL_PENDING) {
+        if (sel conn.tunnel.wake_at.some) {
+            conn.tunnel_wake = deadline.Deadline{active: true, at: conn.tunnel.wake_at.some};
+        }
+        ret STEP_BLOCKED;
+    }
+    conn.tunnel_live            = false;
+    conn.tunnel_deadline.active = false;
+    if (driven == TUNNEL_DONE && h1.end_tunnel(?conn.engine)) { ret STEP_PROGRESS; }
+    ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+}
+
+# hand the connection to the tunnel owner the upgrading exchange left
+fun begin_tunnel(conn: *Connection, now: time.Instant) Step {
+    val server: *Server = conn.server;
+    conn.tunnel_open = true;
+    if (conn.tunnel_owner.drive == nil || !operation_ok(cancel.make_child(?conn.tunnel_scope,
+        ?conn.operation_root, opt[time.Instant].none{}))) {
+        ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+    }
+    conn.tunnel_scope_live = true;
+    server.next_exchange   = server.next_exchange + 1;
+    var scratch: *u8 = nil;
+    if (conn.arena_held) { scratch = conn.arena.data; }
+    conn.tunnel = Tunnel{
+        transport:    ?conn.channel,
+        scope:        ?conn.tunnel_scope,
+        input:        conn.tunnel.input,
+        input_length: conn.tunnel.input_length,
+        memory:       scratch,
+        memory_bytes: server.configured.request_memory_bytes,
+        waker:        Waker{server: server, index: conn.index, generation: server.next_exchange},
+        wake_at:      opt[time.Instant].none{},
+        draining:     server.state == DRAINING,
+        drain_at:     server.drain_deadline.at,
+    };
+    conn.tunnel_live      = true;
+    conn.tunnel_deadline  = deadline.after(now, server.configured.tunnel_timeout_ns);
+    server.report.tunnels = server.report.tunnels + 1;
+    ret drive_tunnel(conn, nil, now);
+}
+
+# whether a completion is for an operation the engine submitted, not the tunnel
+fun engine_owns(engine: *h1.Engine, token: transport.Token) bool {
+    ret (engine.read_pending && transport.token_equal(engine.read_token, token))
+        || (engine.write_pending && transport.token_equal(engine.write_token, token))
+        || (engine.shutdown_pending && transport.token_equal(engine.shutdown_token, token))
+        || (engine.close_pending && transport.token_equal(engine.close_token, token));
+}
+
 fun step(conn: *Connection, now: time.Instant) Step {
     val engine: *h1.Engine = ?conn.engine;
     if (conn.exchange_live && conn.cancelling) {
@@ -1631,8 +1790,14 @@ fun step(conn: *Connection, now: time.Instant) Step {
     }
     if (conn.phase != CONN_ACTIVE || engine.state == h1.CLOSED || engine.state == h1.FAILED) {
         abort_exchange(conn, exchange.CAUSE_CONNECTION);
+        abandon_tunnel(conn);
         conn.phase = CONN_CLOSING;
         ret STEP_DONE;
+    }
+    if (conn.tunnel_live) {
+        if (!conn.tunnel_stirred) { ret STEP_BLOCKED; }
+        conn.tunnel_stirred = false;
+        ret drive_tunnel(conn, nil, now);
     }
     if (conn.exchange_live) {
         if (conn.service_pending && conn.stirred) {
@@ -1643,8 +1808,9 @@ fun step(conn: *Connection, now: time.Instant) Step {
         if (pumped == STEP_PROGRESS || pumped == STEP_DONE) { ret pumped; }
         ret pump_inbound(conn, now);
     }
-    if (conn.rejecting)   { ret pump_rejection(conn, now); }
-    if (conn.has_pending) { ret start_slot(conn, conn.pending_slot, now); }
+    if (conn.tunnel_reported && !conn.tunnel_open) { ret begin_tunnel(conn, now); }
+    if (conn.rejecting)                            { ret pump_rejection(conn, now); }
+    if (conn.has_pending)                          { ret start_slot(conn, conn.pending_slot, now); }
     # a draining engine answers what it already read, then closes instead of reading again
     if (engine.state == h1.DRAINING && engine.input_offset == engine.input_length
         && h1.progress_close(engine)) { ret STEP_PROGRESS; }
@@ -1668,8 +1834,11 @@ fun finalize(conn: *Connection) {
         abort_exchange(conn, exchange.CAUSE_CONNECTION);
         if (conn.exchange_live) { ret; }
     }
+    abandon_tunnel(conn);
     if (engine.state != h1.CLOSED || engine.read_pending || engine.write_pending
         || engine.shutdown_pending || engine.close_pending) { ret; }
+    # what a tunnel left in flight settles before its buffers go back
+    if (conn.tunnel_open && transport.snapshot(?conn.channel).lifecycle.outstanding != 0) { ret; }
     abandon_slots(conn);
     if (!h1.destroy(engine)) {
         conn.phase = CONN_STUCK;
@@ -1687,6 +1856,10 @@ fun finalize(conn: *Connection) {
     if (conn.account_open) {
         buffers.source_close_account(?server.source, ?conn.account);
         conn.account_open = false;
+    }
+    if (conn.tunnel_scope_live) {
+        operation_ok(cancel.destroy(?conn.tunnel_scope));
+        conn.tunnel_scope_live = false;
     }
     operation_ok(cancel.destroy(?conn.operation_root));
     operation_ok(cancel.destroy(?conn.control_scope));
@@ -1717,6 +1890,12 @@ fun advance(conn: *Connection, now: time.Instant) {
 
 fun signal_drain(conn: *Connection) {
     if (conn.engine_live && conn.engine.state == h1.OPEN) { h1.begin_graceful(?conn.engine); }
+    # a tunnel is told, and winds down on its owner's terms before the deadline
+    if (conn.tunnel_live) {
+        conn.tunnel.draining = true;
+        conn.tunnel.drain_at = conn.server.drain_deadline.at;
+        conn.tunnel_stirred  = true;
+    }
     schedule(conn);
 }
 
@@ -1786,6 +1965,14 @@ fun open_connection(server: *Server, conn: *Connection, stream: tcp.Stream,
     conn.active_slot              = NO_SLOT;
     conn.body_deadline.active     = false;
     conn.response_deadline.active = false;
+    conn.tunnel_owner             = TunnelOwner{ctx: nil, drive: nil, abandon: nil};
+    conn.tunnel_reported          = false;
+    conn.tunnel_open              = false;
+    conn.tunnel_live              = false;
+    conn.tunnel_stirred           = false;
+    conn.tunnel_scope_live        = false;
+    conn.tunnel_wake.active       = false;
+    conn.tunnel_deadline.active   = false;
     conn.phase                    = CONN_ACTIVE;
     server.live                   = server.live + 1;
     ret true;
@@ -1843,6 +2030,20 @@ fun dispatch(server: *Server, completion: *io_runtime.Completion, now: time.Inst
     if (conn == nil || !conn.engine_live) { ret; }
     var settled: transport.Completion;
     if (!translate(?settled, completion, context.token_context)) { ret; }
+    # a tunnel's own operations go to its owner, or settle here once it is gone
+    if (conn.tunnel_open && !engine_owns(?conn.engine, settled.token)) {
+        if (conn.tunnel_live) {
+            if (settled.status == transport.IO_COMPLETE && settled.count != 0) {
+                conn.tunnel_deadline = deadline.after(now, conn.server.configured.tunnel_timeout_ns);
+            }
+            drive_tunnel(conn, ?settled, now);
+        }
+        or {
+            transport.complete(?conn.channel, ?settled);
+        }
+        schedule(conn);
+        ret;
+    }
     if (conn.response_deadline.active && settled.kind == transport.WRITE
         && settled.status == transport.IO_COMPLETE && settled.count != 0) {
         arm_response(conn, now);
@@ -1859,6 +2060,10 @@ fun collect_wakes(server: *Server) {
         val named: i64         = atomic.exchange(?conn.woken, 0);
         if (named != 0 && conn.exchange_live && named::u64 == conn.exchange_generation) {
             conn.stirred = true;
+            schedule(conn);
+        }
+        if (named != 0 && conn.tunnel_live && named::u64 == conn.tunnel.waker.generation) {
+            conn.tunnel_stirred = true;
             schedule(conn);
         }
         i = i + 1;
@@ -1891,6 +2096,17 @@ fun expire(server: *Server, now: time.Instant) {
             conn.wake_deadline.active = false;
             conn.stirred              = true;
             schedule(conn);
+        }
+        if (conn.tunnel_live && deadline.expired(conn.tunnel_wake, now)) {
+            conn.tunnel_wake.active = false;
+            conn.tunnel_stirred     = true;
+            schedule(conn);
+        }
+        if (conn.tunnel_live && deadline.expired(conn.tunnel_deadline, now)) {
+            server.report.timed_out = server.report.timed_out + 1;
+            abort_connection(conn, exchange.CAUSE_TIMEOUT);
+            schedule(conn);
+            cnt;
         }
         # a request body or a response that stopped moving closes the connection
         if (deadline.expired(conn.body_deadline, now)
@@ -1988,6 +2204,7 @@ fun force(server: *Server, now: time.Instant) {
         if (conn.exchange_live && !conn.cancelling) {
             server.report.abandoned_exchanges = server.report.abandoned_exchanges + 1;
         }
+        if (conn.tunnel_live) { server.report.abandoned_tunnels = server.report.abandoned_tunnels + 1; }
         val state: h1.State = conn.engine.state;
         if (conn.phase == CONN_ACTIVE && state != h1.CLOSED && state != h1.FAILED
             && state != h1.CLOSING) {
@@ -2109,6 +2326,10 @@ fun earliest_deadline(server: *Server, now: time.Instant) deadline.Deadline {
             earliest = deadline.earlier(earliest, h1.next_deadline(?conn.engine));
             earliest = deadline.earlier(earliest, conn.body_deadline);
             earliest = deadline.earlier(earliest, conn.response_deadline);
+            if (conn.tunnel_live) {
+                earliest = deadline.earlier(earliest, conn.tunnel_deadline);
+                earliest = deadline.earlier(earliest, conn.tunnel_wake);
+            }
             if (conn.service_pending) { earliest = deadline.earlier(earliest, conn.wake_deadline); }
         }
         i = i + 1;
@@ -2204,6 +2425,31 @@ rec Harness {
     # the /trickle exchange and the chunks its client has asked for
     trickle: Waker;
     nudges:  i64;
+    # websocket tunnels run to their close, and cut by the server
+    tunnels_done: i64;
+    tunnels_cut:  i64;
+}
+
+# a /ws exchange's scratch: its handshake, then the websocket echoing what it
+# reads. a CONNECT's tunnel echoes raw bytes instead
+#[testing]
+rec TestSocket {
+    raw:          bool;
+    raw_offset:   usize;
+    raw_length:   usize;
+    accept:       [32]u8;
+    socket:       ws.Connection;
+    open:         bool;
+    peer_closed:  bool;
+    close_sent:   bool;
+    echo_pending: bool;
+    echo:         [64]u8;
+    echo_length:  usize;
+    echo_opcode:  u8;
+    closing:      [2]u8;
+    reading:      [256]u8;
+    writing:      [256]u8;
+    control:      [125]u8;
 }
 
 # the response body a test exchange streams, kept in the exchange's own scratch
@@ -2338,6 +2584,24 @@ fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
     val state:   *TestBody          = call.memory::*TestBody;
     val path:    view.View          = active.request.target.path;
     if (path_is(path, "/fail")) { ret exchange.SERVICE_FAILED; }
+    # a CONNECT to deny:443 is refused, and any other is tunnelled
+    if (active.request.method.kind == method.CONNECT) {
+        var code: status.Status = status.OK;
+        val host: view.View     = active.request.target.authority;
+        if (host.len == 8 && memory.raw_equal(host.data, "deny:443", 8)) { code = status.FORBIDDEN; }
+        (call.memory::*TestSocket).raw = code == status.OK;
+        if (message.set_status(active.response, code) != message.RESPONSE_OK
+            || exchange.commit(active, active.limits) != message.RESPONSE_OK) {
+            ret exchange.SERVICE_FAILED;
+        }
+        ret exchange.SERVICE_COMPLETE;
+    }
+    if (path_is(path, "/ws")) {
+        val socket: *TestSocket = call.memory::*TestSocket;
+        if (negotiation.server(active, view.view(nil, 0), view.view(nil, 0), ?socket.accept[0],
+            32).status != negotiation.NEGOTIATED) { ret exchange.SERVICE_FAILED; }
+        ret exchange.SERVICE_COMPLETE;
+    }
     if (path_is(path, "/hold")) { ret exchange.SERVICE_PENDING; }
     if (path_is(path, "/park")) {
         if (!state.parked) {
@@ -2393,6 +2657,130 @@ fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
     ret exchange.SERVICE_COMPLETE;
 }
 
+# the next frame the socket owes: an echo, or its close once the peer closed or
+# the server drains
+#[testing]
+fun socket_queue(state: *TestSocket, draining: bool) bool {
+    val socket: *ws.Connection = ?state.socket;
+    if (socket.write_pending || socket.write_length != 0) { ret true; }
+    if (state.echo_pending) {
+        state.echo_pending = false;
+        ret ws.begin_frame(socket, true, state.echo_opcode, state.echo_length::u64, nil).status
+            != ws.WRITE_ERROR
+            && ws.offer(socket, ?state.echo[0], state.echo_length).status == ws.WRITE_DONE;
+    }
+    if (state.close_sent || (!state.peer_closed && !draining)) { ret true; }
+    var code: u16 = 1000;
+    if (!state.peer_closed) { code = 1001; }
+    state.close_sent = true;
+    val length: usize = ws.close_payload(code, nil, 0, ?state.closing[0], 2);
+    ret ws.begin_frame(socket, true, ws.OPCODE_CLOSE, length::u64, nil).status != ws.WRITE_ERROR
+        && ws.offer(socket, ?state.closing[0], length).status == ws.WRITE_DONE;
+}
+
+# write out what the raw tunnel holds, or read more
+#[testing]
+fun raw_submit(state: *TestSocket, tunnel: *Tunnel) bool {
+    var submitted: res[transport.Token, io_error.Error];
+    if (state.raw_offset < state.raw_length) {
+        submitted = transport.write(tunnel.transport, tunnel.scope, ?state.writing[state.raw_offset],
+            state.raw_length - state.raw_offset, 0);
+    }
+    or {
+        submitted = transport.read(tunnel.transport, tunnel.scope, ?state.reading[0], 256, 0);
+    }
+    ret sel submitted.ok;
+}
+
+# echoes the bytes a CONNECT tunnel carries, one operation at a time, until the
+# client half-closes
+#[testing]
+fun raw_drive(harness: *Harness, state: *TestSocket, tunnel: *Tunnel,
+    completion: *transport.Completion) TunnelStatus {
+    if (completion == nil) {
+        if (state.open) { ret TUNNEL_PENDING; }
+        state.open = true;
+        if (tunnel.input_length > 256) { ret TUNNEL_FAILED; }
+        memory.raw_copy(?state.writing[0], tunnel.input, tunnel.input_length);
+        state.raw_length = tunnel.input_length;
+    }
+    or {
+        if (!transport.complete(tunnel.transport, completion)) { ret TUNNEL_FAILED; }
+        if (completion.kind == transport.WRITE) {
+            if (completion.status != transport.IO_COMPLETE) { ret TUNNEL_FAILED; }
+            state.raw_offset = state.raw_offset + completion.count;
+        }
+        or {
+            if (completion.status != transport.IO_COMPLETE && completion.status != transport.IO_END) {
+                ret TUNNEL_FAILED;
+            }
+            memory.raw_copy(?state.writing[0], ?state.reading[0], completion.count);
+            state.raw_offset = 0;
+            state.raw_length = completion.count;
+            if (completion.status == transport.IO_END || completion.count == 0) {
+                harness.tunnels_done = harness.tunnels_done + 1;
+                ret TUNNEL_DONE;
+            }
+        }
+    }
+    if (!raw_submit(state, tunnel)) { ret TUNNEL_FAILED; }
+    ret TUNNEL_PENDING;
+}
+
+# echoes each message the client sends, and closes the handshake either side began
+#[testing]
+fun socket_drive(context: ptr, tunnel: *Tunnel, completion: *transport.Completion) TunnelStatus {
+    val harness: *Harness       = context::*Harness;
+    val state:   *TestSocket    = tunnel.memory::*TestSocket;
+    val socket:  *ws.Connection = ?state.socket;
+    var event:   ws.Event;
+    if (state.raw) { ret raw_drive(harness, state, tunnel, completion); }
+    if (!state.open) {
+        if (!ws.connection_init(socket, ws.SERVER, ws.limits_default(), tunnel.transport,
+            tunnel.scope, ?state.reading[0], 256, ?state.writing[0], 256, ?state.control[0], 125)
+            || (tunnel.input_length != 0
+            && !ws.adopt_input(socket, tunnel.input, tunnel.input_length, false))) {
+            ret TUNNEL_FAILED;
+        }
+        state.open = true;
+        event      = ws.poll(socket);
+    }
+    or (completion != nil) { event = ws.complete_io(socket, completion); }
+    or                     { event = ws.poll(socket); }
+    for (event.kind != ws.EVENT_NONE && event.kind != ws.EVENT_NEED_INPUT) {
+        if (event.kind == ws.EVENT_ERROR) { ret TUNNEL_FAILED; }
+        if (event.kind == ws.EVENT_DATA) {
+            if (event.data_length > 64 || !event.message_final) { ret TUNNEL_FAILED; }
+            memory.raw_copy(?state.echo[0], event.data, event.data_length);
+            state.echo_length  = event.data_length;
+            state.echo_opcode  = event.opcode;
+            state.echo_pending = true;
+        }
+        if (event.kind == ws.EVENT_CLOSE) { state.peer_closed = true; }
+        ws.release_event(socket);
+        event = ws.poll(socket);
+    }
+    if (!socket_queue(state, tunnel.draining)) { ret TUNNEL_FAILED; }
+    if (socket.write_length != 0 && !socket.write_pending && !ws.submit_write(socket)) {
+        ret TUNNEL_FAILED;
+    }
+    if (state.peer_closed && state.close_sent && !socket.write_pending
+        && socket.write_length == 0) {
+        harness.tunnels_done = harness.tunnels_done + 1;
+        ret TUNNEL_DONE;
+    }
+    if (!state.peer_closed && !socket.read_pending && !ws.submit_read(socket)) {
+        ret TUNNEL_FAILED;
+    }
+    ret TUNNEL_PENDING;
+}
+
+#[testing]
+fun socket_abandon(context: ptr, tunnel: *Tunnel) {
+    val harness: *Harness = context::*Harness;
+    harness.tunnels_cut = harness.tunnels_cut + 1;
+}
+
 #[testing]
 fun test_abandon(context: ptr, call: *Call) {
     val harness: *Harness = context::*Harness;
@@ -2443,10 +2831,13 @@ fun stop_hook(context: ptr, report: *Report) HookStatus {
 #[testing]
 fun test_config() Config {
     var configured: Config = config_default(ip.endpoint(127, 0, 0, 1, 0));
-    configured.max_connections              = 4;
-    configured.max_exchanges                = 4;
-    configured.memory_bytes                 = 8388608;
-    configured.request_memory_bytes         = $size_of(TestBody);
+    configured.max_connections      = 4;
+    configured.max_exchanges        = 4;
+    configured.memory_bytes         = 8388608;
+    configured.request_memory_bytes = $size_of(TestBody);
+    if ($size_of(TestSocket) > configured.request_memory_bytes) {
+        configured.request_memory_bytes = $size_of(TestSocket);
+    }
     configured.connection.max_pipeline      = 4;
     configured.connection.header_timeout_ns = 10000000000;
     configured.drain_timeout_ns             = 10000000000;
@@ -2463,7 +2854,8 @@ fun run_scenario(harness: *Harness, configured: Config, scenario: Scenario, repo
     val hooks: Hooks = Hooks{ctx: harness::ptr, start: nil, ready: ready_hook,
         drain: drain_hook, stop: stop_hook};
     val handler: Handler = Handler{ctx: harness::ptr, serve: test_serve, abandon: test_abandon,
-        settle: test_settle};
+        settle:  test_settle, tunnel: TunnelOwner{ctx: harness::ptr, drive: socket_drive,
+        abandon: socket_abandon}};
     if (!make(?harness.server, configured, handler, hooks, ?harness.backing)) { ret false; }
     @report = serve(?harness.server);
     if (harness.spawned) { thread.join(?harness.client); }
@@ -2787,5 +3179,207 @@ test serve__drain_finishes_a_stream_and_abandons_parked_ones {
     # the parked body is cancelled, the pending handler abandoned, and all three settle
     if (harness.cancels != 1 || harness.abandons != 1 || harness.stops != 1
         || harness.settles != 3 || harness.settled != 1) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+val UPGRADE: str = "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+
+#[testing]
+fun send_bytes(stream: *tcp.Stream, bytes: *u8, length: usize) bool {
+    var offset: usize = 0;
+    for (offset < length) {
+        val sent: res[usize, io_error.Error] = tcp.stream_write(stream, ?bytes[offset], length - offset);
+        if (sel sent.err) { ret false; }
+        if (sent.ok == 0) { ret false; }
+        offset = offset + sent.ok;
+    }
+    ret true;
+}
+
+# a masked client frame, as a client must send it
+#[testing]
+fun client_frame(opcode: u8, payload: *u8, length: usize, output: *u8) usize {
+    output[0] = 0x80 | opcode;
+    output[1] = 0x80 | length::u8;
+    var i: usize = 0;
+    for (i < 4) {
+        output[2 + i] = (i + 1)::u8;
+        i             = i + 1;
+    }
+    i = 0;
+    for (i < length) {
+        output[6 + i] = payload[i] ^ (i % 4 + 1)::u8;
+        i             = i + 1;
+    }
+    ret 6 + length;
+}
+
+#[testing]
+fun read_at_least(stream: *tcp.Stream, buffer: *u8, capacity: usize, have: *usize,
+    want: usize) bool {
+    for (@have < want) {
+        if (@have == capacity) { ret false; }
+        val got: res[usize, io_error.Error] = tcp.stream_read(stream, ?buffer[@have], capacity - @have);
+        if (sel got.err) { ret false; }
+        if (got.ok == 0) { ret false; }
+        @have = @have + got.ok;
+    }
+    ret true;
+}
+
+# open a websocket and return where the frames begin in buffer, or NO_SLOT
+#[testing]
+fun open_socket(harness: *Harness, stream: *tcp.Stream, buffer: *u8, have: *usize,
+    first: *u8, first_length: usize) usize {
+    var request: [512]u8;
+    val head:    usize = str_len(UPGRADE);
+    memory.raw_copy(?request[0], UPGRADE, head);
+    if (first_length != 0) { memory.raw_copy(?request[head], first, first_length); }
+    if (!connect_to(harness, stream) || !send_bytes(stream, ?request[0], head + first_length)
+        || !read_until(stream, buffer, 2048, have, "\r\n\r\n")
+        || find(buffer, @have, "HTTP/1.1 101 ") != 0
+        || find(buffer, @have, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") == NO_SLOT) { ret NO_SLOT; }
+    ret find(buffer, @have, "\r\n\r\n") + 4;
+}
+
+# the server's unmasked close frame with its code
+#[testing]
+fun read_close(stream: *tcp.Stream, buffer: *u8, have: *usize, at: usize, code: u16) bool {
+    ret read_at_least(stream, buffer, 2048, have, at + 4) && buffer[at] == 0x88
+        && buffer[at + 1] == 2 && buffer[at + 2] == (code >> 8)::u8 && buffer[at + 3] == code::u8;
+}
+
+#[testing]
+fun echo_scenario(harness: *Harness) i64 {
+    var stream: tcp.Stream;
+    var buffer: [2048]u8;
+    var frame:  [32]u8;
+    var have:   usize = 0;
+    # the first message rides in with the upgrade request, so it reaches the tunnel as input
+    val sent:  usize = client_frame(ws.OPCODE_TEXT, "hello", 5, ?frame[0]);
+    val start: usize = open_socket(harness, ?stream, ?buffer[0], ?have, ?frame[0], sent);
+    if (start == NO_SLOT) { ret 1; }
+    if (!read_at_least(?stream, ?buffer[0], 2048, ?have, start + 7) || buffer[start] != 0x81
+        || buffer[start + 1] != 5 || !memory.raw_equal(?buffer[start + 2], "hello", 5)) { ret 2; }
+    val again: usize = client_frame(ws.OPCODE_TEXT, "again", 5, ?frame[0]);
+    if (!send_bytes(?stream, ?frame[0], again)
+        || !read_at_least(?stream, ?buffer[0], 2048, ?have, start + 14)
+        || !memory.raw_equal(?buffer[start + 9], "again", 5)) { ret 3; }
+    var code: [2]u8;
+    code[0] = 0x03;
+    code[1] = 0xe8;
+    val closing: usize = client_frame(ws.OPCODE_CLOSE, ?code[0], 2, ?frame[0]);
+    if (!send_bytes(?stream, ?frame[0], closing)
+        || !read_close(?stream, ?buffer[0], ?have, start + 14, 1000)) { ret 4; }
+    # the owner is done, and the server closes the connection after its last frame
+    var extra: u64 = 0;
+    if (!read_to_end(?stream, ?extra) || extra != 0) { ret 5; }
+    tcp.stream_close(?stream);
+    ret 0;
+}
+
+test serve__websocket_echo_through_a_tunnel {
+    var harness: Harness;
+    var report:  Report;
+    if (!run_scenario(?harness, test_config(), echo_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                            { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.served != 1 || report.tunnels != 1
+        || report.abandoned_tunnels != 0 || report.timed_out != 0 || report.closed != 1
+        || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    if (harness.tunnels_done != 1 || harness.tunnels_cut != 0 || harness.settled != 1) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+fun socket_drain_scenario(harness: *Harness) i64 {
+    var polite:        tcp.Stream;
+    var silent:        tcp.Stream;
+    var polite_buffer: [2048]u8;
+    var silent_buffer: [2048]u8;
+    var polite_have:   usize = 0;
+    var silent_have:   usize = 0;
+    val polite_start:  usize = open_socket(harness, ?polite, ?polite_buffer[0], ?polite_have, nil, 0);
+    val silent_start:  usize = open_socket(harness, ?silent, ?silent_buffer[0], ?silent_have, nil, 0);
+    if (polite_start == NO_SLOT || silent_start == NO_SLOT) { ret 1; }
+    # the drain asks both to close. one answers and closes, the other never does
+    shutdown(?harness.server);
+    if (!read_close(?polite, ?polite_buffer[0], ?polite_have, polite_start, 1001)
+        || !read_close(?silent, ?silent_buffer[0], ?silent_have, silent_start, 1001)) { ret 2; }
+    var frame: [16]u8;
+    var code:  [2]u8;
+    code[0] = 0x03;
+    code[1] = 0xe9;
+    val closing: usize = client_frame(ws.OPCODE_CLOSE, ?code[0], 2, ?frame[0]);
+    var extra:   u64   = 0;
+    if (!send_bytes(?polite, ?frame[0], closing) || !read_to_end(?polite, ?extra) || extra != 0) {
+        ret 3;
+    }
+    # the silent one is cut at the drain deadline
+    if (!read_to_end(?silent, ?extra)) { ret 4; }
+    tcp.stream_close(?polite);
+    tcp.stream_close(?silent);
+    ret 0;
+}
+
+test serve__drain_closes_websockets_and_cuts_the_silent_one {
+    var harness:    Harness;
+    var report:     Report;
+    var configured: Config = test_config();
+    configured.drain_timeout_ns = 1000000000;
+    if (!run_scenario(?harness, configured, socket_drain_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                                 { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.served != 2 || report.tunnels != 2
+        || report.drain_connections != 2 || report.abandoned_tunnels != 1
+        || report.abandoned_connections != 1 || report.abandoned_exchanges != 0
+        || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    if (harness.tunnels_done != 1 || harness.tunnels_cut != 1 || harness.settles != 2) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+fun connect_scenario(harness: *Harness) i64 {
+    var stream: tcp.Stream;
+    var buffer: [2048]u8;
+    var have:   usize = 0;
+    # the first bytes ride in with the request, so they reach the tunnel as input
+    if (!connect_to(harness, ?stream)
+        || !send_text(?stream, "CONNECT allow:443 HTTP/1.1\r\nHost: allow:443\r\n\r\nping")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n")
+        || find(?buffer[0], have, "HTTP/1.1 200 ") != 0) { ret 1; }
+    val start: usize = find(?buffer[0], have, "\r\n\r\n") + 4;
+    if (!read_at_least(?stream, ?buffer[0], 2048, ?have, start + 4)
+        || !memory.raw_equal(?buffer[start], "ping", 4)) { ret 2; }
+    if (!send_text(?stream, "pong!") || !read_at_least(?stream, ?buffer[0], 2048, ?have, start + 9)
+        || !memory.raw_equal(?buffer[start + 4], "pong!", 5)) { ret 3; }
+    # the client half-closes, the owner is done, and the server closes after it
+    var extra: u64 = 0;
+    if (!io_done(tcp.stream_shutdown(?stream, 1)) || !read_to_end(?stream, ?extra) || extra != 0) {
+        ret 4;
+    }
+    tcp.stream_close(?stream);
+    # a refused CONNECT is an ordinary answer, and the connection serves on
+    var refused: tcp.Stream;
+    have = 0;
+    if (!connect_to(harness, ?refused)
+        || !send_text(?refused, "CONNECT deny:443 HTTP/1.1\r\nHost: deny:443\r\n\r\n")
+        || !read_until(?refused, ?buffer[0], 2048, ?have, "\r\n\r\n")
+        || find(?buffer[0], have, "HTTP/1.1 403 ") != 0) { ret 5; }
+    have = 0;
+    if (!send_text(?refused, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?refused, ?buffer[0], 2048, ?have, "\r\n\r\n/a")) { ret 6; }
+    tcp.stream_close(?refused);
+    ret 0;
+}
+
+test serve__connect_tunnels_on_2xx_only {
+    var harness: Harness;
+    var report:  Report;
+    if (!run_scenario(?harness, test_config(), connect_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                               { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.served != 3 || report.tunnels != 1
+        || report.abandoned_tunnels != 0 || report.timed_out != 0 || report.closed != 2
+        || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    if (harness.tunnels_done != 1 || harness.tunnels_cut != 0) { ret 3; }
     ret 0;
 }
