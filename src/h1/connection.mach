@@ -1201,6 +1201,8 @@ pub fun process(engine: *Engine, now: time.Instant) Event {
     }
     val checked: Event = tick(engine, now);
     if (checked.kind != EVENT_NONE) { ret checked; }
+    # a closing engine only waits for its close, and input it holds is never parsed
+    if (engine.state == CLOSING) { ret empty_event(engine, EVENT_NONE); }
     if (engine.state == TUNNEL) {
         if (engine.tunnel_reported) { ret empty_event(engine, EVENT_NONE); }
         engine.tunnel_reported = true;
@@ -2066,6 +2068,10 @@ test server__keep_alive_and_graceful_close_reuse_bounded_storage {
         fixture.io.shutdown_token, transport.SHUTDOWN_WRITE, 0);
     if (complete_io(?fixture.engine, ?shutdown, now).kind != EVENT_NONE
         || !progress_close(?fixture.engine) || fixture.io.close_calls != 1) { ret 6; }
+    # a peer end of stream seen while closing never reopens the engine
+    fixture.engine.input_eof = true;
+    if (process(?fixture.engine, now).kind != EVENT_NONE
+        || fixture.engine.state != CLOSING) { ret 9; }
     var closed: transport.Completion = transport.completed(
         fixture.io.close_token, transport.CLOSE, 0);
     if (complete_io(?fixture.engine, ?closed, now).kind != EVENT_CLOSED
