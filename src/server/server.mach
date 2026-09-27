@@ -1,28 +1,2404 @@
-use limits: http.h1.parser;
+# a plaintext HTTP/1.1 server that serves one handler over the service exchange
+#
+# the server listens on one address, accepts connections up to a cap, and drives
+# `http.h1.connection` over each socket through std's completion runtime. every
+# request becomes one `http.core.exchange.Exchange` handed to the handler. it is
+# the small runner that sits behind a reverse proxy terminating TLS, and knows
+# nothing of routing or application structure. see doc/server.md for the handler,
+# wake, drain and lifecycle contract.
 
+use http.core.body;
+use http.core.deadline;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.core.status;
+use http.core.target;
+use http.core.transport;
+use h1: http.h1.connection;
+use http.h1.framing;
+use http.h1.parser;
+use A: std.allocator;
+use std.allocator.page;
+use std.chrono.time;
+use io_error:  std.io.error;
+use io_handle: std.io.handle;
+use std.io.lifecycle;
+use io_runtime: std.io.runtime;
+use std.memory;
+use std.memory.buffers;
+use net_async: std.net.async;
+use std.net.ip;
+use std.net.tcp;
+use std.sync.atomic;
+use std.sync.cancel;
+use std.sync.thread;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view;
 
-pub val SERVER_NEW:      u8 = 1;
-pub val SERVER_RUNNING:  u8 = 2;
-pub val SERVER_DRAINING: u8 = 3;
-pub val SERVER_STOPPED:  u8 = 4;
+pub def State: u8;
+pub val NEW:      State = 1;
+pub val STARTING: State = 2;
+pub val READY:    State = 3;
+pub val DRAINING: State = 4;
+pub val STOPPING: State = 5;
+pub val STOPPED:  State = 6;
 
+# what a hook reports. a pending hook is called again on a later turn
+pub def HookStatus: u8;
+pub val HOOK_DONE:    HookStatus = 1;
+pub val HOOK_PENDING: HookStatus = 2;
+pub val HOOK_FAILED:  HookStatus = 3;
+
+# why serve ended early, or FAILURE_NONE
+pub def Failure: u8;
+pub val FAILURE_NONE:  Failure = 0;
+pub val FAILURE_STATE: Failure = 1;
+pub val FAILURE_START: Failure = 2;
+pub val FAILURE_BIND:  Failure = 3;
+pub val FAILURE_READY: Failure = 4;
+pub val FAILURE_DRAIN: Failure = 5;
+pub val FAILURE_STOP:  Failure = 6;
+
+pub val MAX_CONNECTIONS: usize = 1048576;
+
+# the hooks a framework drives its lifecycle through. any may be nil, which is done
+# ---
+# start: before the listener binds. a failure ends serve without calling stop
+# ready: after the listener binds, with its address. accepting begins once it is done
+# drain: once the drain begins, with its deadline, until done or the deadline
+# stop:  once every connection is closed or abandoned, with the final report
+pub def StartFun: fun(ptr) HookStatus;
+pub def ReadyFun: fun(ptr, ip.Endpoint) HookStatus;
+pub def DrainFun: fun(ptr, time.Instant) HookStatus;
+pub def StopFun:  fun(ptr, *Report) HookStatus;
+
+pub rec Hooks {
+    ctx:   ptr;
+    start: StartFun;
+    ready: ReadyFun;
+    drain: DrainFun;
+    stop:  StopFun;
+}
+
+# names one exchange, so work finishing elsewhere can give its handler a turn.
+# valid until the exchange settles. a stale waker is ignored
+pub rec Waker {
+    server:     *Server;
+    index:      usize;
+    generation: u64;
+}
+
+# what the handler is given for one exchange
+# ---
+# exchange:     the request and the response to build, in HANDLING state
+# memory:       request_memory_bytes of zeroed scratch owned by this exchange, nil when 0
+# memory_bytes: the scratch size
+# waker:        wakes this exchange from any thread
+pub rec Call {
+    exchange:     *exchange.Exchange;
+    memory:       *u8;
+    memory_bytes: usize;
+    waker:        Waker;
+}
+
+# serve is entered once per exchange and again after each wake while it returns
+# SERVICE_PENDING. SERVICE_COMPLETE means the response is committed, and its body
+# reader, if any, is then pulled by the server. abandon is called exactly once for
+# an exchange that goes away while serve last returned SERVICE_PENDING, and may be nil
+pub def ServeFun:   fun(ptr, *Call) exchange.ServiceStatus;
+pub def AbandonFun: fun(ptr, *Call);
+
+pub rec Handler {
+    ctx:     ptr;
+    serve:   ServeFun;
+    abandon: AbandonFun;
+}
+
+# ---
+# address:              the address to listen on, port 0 for any
+# backlog:              the listen backlog, where connections past the cap wait
+# max_connections:      connections served at once, the rest wait in the backlog
+# max_exchanges:        exchanges in flight at once, the rest wait in arrival order
+# memory_bytes:         every buffer the server borrows at once, across connections
+# request_memory_bytes: the handler scratch each exchange carries, 0 for none
+# connection:           the HTTP/1 engine: parser limits, pipeline depth, buffer
+#                       sizes and the header, request, idle, write and total timeouts.
+#                       its lanes are the server's own
+# limits:               the exchange limits. the request head side follows the parser
+# body_timeout_ns:      from a request head to the end of its body
+# drain_timeout_ns:     from the drain to abandoning what is left
+# stop_timeout_ns:      how long abandoned work may take to settle, and the stop hook
+# hook_poll_ns:         how often a pending hook is called again
 pub rec Config {
-    request_limits:     limits.Limits;
-    max_connections:    usize;
-    max_pipeline:       usize;
-    request_timeout_ns: u64;
-    idle_timeout_ns:    u64;
-    drain_timeout_ns:   u64;
+    address:              ip.Endpoint;
+    backlog:              i32;
+    max_connections:      usize;
+    max_exchanges:        usize;
+    memory_bytes:         usize;
+    request_memory_bytes: usize;
+    connection:           h1.Config;
+    limits:               message.Limits;
+    body_timeout_ns:      u64;
+    drain_timeout_ns:     u64;
+    stop_timeout_ns:      u64;
+    hook_poll_ns:         u64;
+}
+
+# what serve did, returned when it ends and handed to the stop hook
+# ---
+# endpoint:              the address the listener bound
+# accepted:              connections accepted
+# accept_errors:         accepts that failed or could not be served
+# closed:                connections closed and released
+# served:                exchanges completed with a response
+# failed:                exchanges whose handler failed
+# rejected:              requests answered without the handler (400, 413, 414, 431)
+# cancelled:             exchanges ended before completing
+# timed_out:             connections closed by a deadline
+# drain_connections:     connections open when the drain began
+# drain_exchanges:       exchanges in flight when the drain began
+# abandoned_exchanges:   exchanges still in flight at the drain deadline
+# abandoned_connections: connections closed abortively at the drain deadline
+# unsettled:             connections whose teardown had not settled when serve ended
+# drain_hook_finished:   whether the drain hook finished before the deadline
+# memory_live:           buffer bytes still borrowed when serve ended
+# memory_peak:           the most buffer bytes borrowed at once
+# backing_allocations:   buffer allocations that reached the backing allocator
+pub rec Report {
+    failure:               Failure;
+    endpoint:              ip.Endpoint;
+    accepted:              u64;
+    accept_errors:         u64;
+    closed:                u64;
+    served:                u64;
+    failed:                u64;
+    rejected:              u64;
+    cancelled:             u64;
+    timed_out:             u64;
+    drain_connections:     usize;
+    drain_exchanges:       usize;
+    abandoned_exchanges:   u64;
+    abandoned_connections: u64;
+    unsettled:             usize;
+    drain_hook_finished:   bool;
+    memory_live:           usize;
+    memory_peak:           usize;
+    backing_allocations:   u64;
+}
+
+val LANE_REQUEST:    u8    = 0;
+val LANE_CONNECTION: u8    = 1;
+val LANES:           u8    = 2;
+val TRANSPORT_SLOTS: usize = 3;
+val MAX_STEPS:       usize = 64;
+val PEER_BYTES:      usize = 64;
+val BATCH:           usize = 64;
+val NO_SLOT:         usize = (-1)::usize;
+
+val CONTEXT_CONNECTION: u8 = 1;
+val CONTEXT_ACCEPT:     u8 = 2;
+val CONTEXT_LISTENER:   u8 = 3;
+val CONTEXT_DISCARD:    u8 = 4;
+
+def Step: u8;
+val STEP_PROGRESS: Step = 1;
+val STEP_BLOCKED:  Step = 2;
+val STEP_DONE:     Step = 3;
+val STEP_IDLE:     Step = 4;
+
+def Phase: u8;
+val CONN_FREE:    Phase = 0;
+val CONN_ACTIVE:  Phase = 1;
+val CONN_CLOSING: Phase = 2;
+val CONN_STUCK:   Phase = 3;
+
+# the runtime completion context of one operation
+rec IoContext {
+    kind:          u8;
+    connection:    *Connection;
+    token_context: usize;
+}
+
+# the request body reader the handler pulls, backed by the bytes the engine holds
+rec RequestBody {
+    connection:       *Connection;
+    slot:             usize;
+    reader:           body.Reader;
+    pending_token:    u64;
+    next_token:       u64;
+    pending_output:   *u8;
+    pending_capacity: usize;
+}
+
+rec Connection {
+    server:         *Server;
+    index:          usize;
+    phase:          Phase;
+    scheduled:      bool;
+    queued:         bool;
+    reserved:       bool;
+    stream:         tcp.Stream;
+    peer:           ip.Endpoint;
+    peer_text:      [64]u8;
+    peer_len:       usize;
+    local:          ip.Endpoint;
+    local_text:     [64]u8;
+    local_len:      usize;
+    contexts:       [3]IoContext;
+    runtime_stream: transport.RuntimeStream;
+    adapter:        transport.Adapter;
+    channel:        transport.Transport;
+    channel_slots:  [3]transport.Slot;
+    operation_root: cancel.Scope;
+    control_scope:  cancel.Scope;
+    engine:         h1.Engine;
+    engine_live:    bool;
+    slots:          *h1.Slot;
+    account:        buffers.Account;
+    account_open:   bool;
+    # the exchange in flight, one at a time so responses stay in wire order
+    exchange_live:       bool;
+    exchange_generation: u64;
+    exchange_scope:      cancel.Scope;
+    exchange_scope_live: bool;
+    active_slot:         usize;
+    service_pending:     bool;
+    head_ready:          bool;
+    response_started:    bool;
+    body_done:           bool;
+    cancelling:          bool;
+    # something the handler may wait on moved: a wake, or request body progress
+    stirred:       bool;
+    body_notified: bool;
+    # the generation a wake named, written from any thread
+    woken:               i64;
+    informationals_sent: usize;
+    request_body:        RequestBody;
+    request:             message.Request;
+    response:            message.Response;
+    exchange:            exchange.Exchange;
+    response_fields:     *field.Field;
+    response_trailers:   *field.Field;
+    informationals:      *message.Informational;
+    call:                Call;
+    arena:               buffers.Chunk;
+    arena_held:          bool;
+    stage:               buffers.Chunk;
+    stage_held:          bool;
+    stage_length:        usize;
+    stage_offset:        usize;
+    # a request head waiting behind the exchange in flight or for capacity
+    has_pending:  bool;
+    pending_slot: usize;
+    # a request answered without the handler
+    rejecting:        bool;
+    rejected_slot:    usize;
+    rejection_items:  [2]field.Field;
+    rejection_fields: field.Fields;
+    body_deadline:    deadline.Deadline;
 }
 
 pub rec Server {
-    state:              u8;
-    active_connections: usize;
+    made:             bool;
+    state:            State;
+    configured:       Config;
+    handler:          Handler;
+    hooks:            Hooks;
+    allocator:        A.Allocator;
+    runtime:          io_runtime.Runtime;
+    driver:           net_async.Driver;
+    root:             cancel.Scope;
+    pool:             buffers.Pool;
+    source:           buffers.Source;
+    classes:          [32]buffers.ClassConfig;
+    class_count:      usize;
+    budgets:          buffers.Budgets;
+    listener:         tcp.Listener;
+    listening:        bool;
+    accept_tracked:   bool;
+    accept_pending:   bool;
+    accept_paused:    bool;
+    listener_closing: bool;
+    accept_peer:      ip.Endpoint;
+    accept_context:   IoContext;
+    listener_context: IoContext;
+    discard_context:  IoContext;
+    discards:         usize;
+    connections:      *Connection;
+    engine_slots:     *h1.Slot;
+    field_storage:    *field.Field;
+    trailer_storage:  *field.Field;
+    inform_storage:   *message.Informational;
+    live:             usize;
+    exchanges_live:   usize;
+    waiting:          *usize;
+    waiting_head:     usize;
+    waiting_count:    usize;
+    scheduled:        *usize;
+    scheduled_head:   usize;
+    scheduled_count:  usize;
+    next_exchange:    u64;
+    stop_requested:   i64;
+    wakes:            i64;
+    started:          bool;
+    drain_deadline:   deadline.Deadline;
+    stop_deadline:    deadline.Deadline;
+    forced:           bool;
+    report:           Report;
 }
 
-pub fun init() Server {
-    var s: Server;
-    s.state = SERVER_NEW;
-    ret s;
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
+
+fun granted(got: buffers.Acquired) bool {
+    ret sel got.status.ok;
+}
+
+fun instant_now() time.Instant {
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.ok) { ret clock.ok; }
+    ret time.Instant{sec: 0, nsec: 0};
+}
+
+fun wall_now() time.Time {
+    val clock: time.Clock = time.now();
+    if (sel clock.ok) { ret clock.ok; }
+    ret time.Time{sec: 0, nsec: 0};
+}
+
+fun round16(bytes: usize) usize {
+    ret (bytes + 15) & ~(15::usize);
+}
+
+fun line_bytes(limits: parser.Limits) usize {
+    var bytes: usize = limits.max_start_line;
+    if (bytes < limits.max_header_line) { bytes = limits.max_header_line; }
+    if (bytes < limits.max_chunk_line)  { bytes = limits.max_chunk_line; }
+    ret bytes;
+}
+
+fun product(a: usize, b: usize, output: *usize) bool {
+    if (a != 0 && b > (-1)::usize / a) { ret false; }
+    @output = a * b;
+    ret true;
+}
+
+# the request side of the exchange limits follows the parser, the one authority on
+# what a request head may hold, so a head the engine admits is never refused again
+fun request_limits(configured: Config) message.Limits {
+    val parsing: parser.Limits  = configured.connection.parser;
+    var limits:  message.Limits = configured.limits;
+    limits.max_method_bytes = parsing.max_method_bytes;
+    if (limits.max_endpoint_bytes < PEER_BYTES) { limits.max_endpoint_bytes = PEER_BYTES; }
+    limits.target = target.limits(parsing.max_target_bytes, 16, parsing.max_target_bytes,
+        parsing.max_target_bytes, parsing.max_target_bytes);
+    limits.request_fields = field.limits(parsing.max_headers, parsing.max_header_bytes,
+        parsing.max_header_line, parsing.max_header_line);
+    limits.request_trailers = field.limits(parsing.max_trailers, parsing.max_trailer_bytes,
+        parsing.max_header_line, parsing.max_header_line);
+    ret limits;
+}
+
+# a configuration any server takes, listening on `address`
+pub fun config_default(address: ip.Endpoint) Config {
+    ret Config{
+        address:              address,
+        backlog:              128,
+        max_connections:      256,
+        max_exchanges:        256,
+        memory_bytes:         67108864,
+        request_memory_bytes: 16384,
+        connection:           h1.config_default(),
+        limits:               message.limits_default(),
+        body_timeout_ns:      30000000000,
+        drain_timeout_ns:     30000000000,
+        stop_timeout_ns:      5000000000,
+        hook_poll_ns:         10000000,
+    };
+}
+
+pub fun config_valid(configured: Config) bool {
+    var fields: usize = 0;
+    ret configured.backlog > 0 && configured.max_connections != 0
+        && configured.max_connections <= MAX_CONNECTIONS && configured.max_exchanges != 0
+        && configured.memory_bytes != 0
+        && configured.limits.response_fields.max_count != 0
+        && product(configured.max_connections, configured.connection.max_pipeline, ?fields)
+        && product(configured.max_connections, configured.limits.response_fields.max_count, ?fields)
+        && product(configured.max_connections, configured.limits.response_trailers.max_count, ?fields)
+        && product(configured.max_connections, configured.limits.max_informational, ?fields)
+        && h1.config_valid(configured.connection, configured.connection.max_pipeline)
+        && deadline.duration_valid(configured.body_timeout_ns)
+        && deadline.duration_valid(configured.drain_timeout_ns)
+        && deadline.duration_valid(configured.stop_timeout_ns)
+        && deadline.duration_valid(configured.hook_poll_ns);
+}
+
+pub fun no_hooks() Hooks {
+    var hooks: Hooks;
+    ret hooks;
+}
+
+# a size class per distinct buffer size, so a released chunk serves the next request
+fun add_class(server: *Server, bytes: usize, high_water: usize) {
+    if (bytes == 0) { ret; }
+    val size: usize = round16(bytes);
+    var i:    usize = 0;
+    for (i < server.class_count) {
+        if (server.classes[i].size == size) {
+            server.classes[i].high_water = server.classes[i].high_water + high_water;
+            ret;
+        }
+        i = i + 1;
+    }
+    var at: usize = server.class_count;
+    for (at > 0 && server.classes[at - 1].size > size) {
+        server.classes[at] = server.classes[at - 1];
+        at                 = at - 1;
+    }
+    server.classes[at] = buffers.ClassConfig{size: size, align: 0, secret: false,
+        high_water: high_water};
+    server.class_count = server.class_count + 1;
+}
+
+fun request_of(bytes: usize, lane: u8) buffers.Request {
+    ret buffers.Request{bytes: bytes, align: 0, lane: lane, secret: false};
+}
+
+fun measure(server: *Server, bytes: usize, lane: u8) usize {
+    if (bytes == 0) { ret 0; }
+    ret buffers.source_measure(?server.source, request_of(bytes, lane));
+}
+
+fun make_pool(server: *Server) bool {
+    val configured:  h1.Config = server.configured.connection;
+    val connections: usize     = server.configured.max_connections;
+    val per_slot:    usize     = connections * configured.max_pipeline;
+    val field_bytes: usize     = $size_of(field.Field);
+    add_class(server, line_bytes(configured.parser), per_slot);
+    add_class(server, configured.slot_storage_bytes, per_slot);
+    add_class(server, configured.parser.max_headers * field_bytes, per_slot);
+    add_class(server, configured.parser.max_trailers * field_bytes, per_slot);
+    add_class(server, configured.slot_scratch_bytes, per_slot);
+    add_class(server, configured.read_bytes, connections);
+    add_class(server, configured.write_bytes, connections * 2);
+    add_class(server, server.configured.request_memory_bytes, connections);
+    var pool_config: buffers.Config;
+    pool_config.classes       = ?server.classes[0];
+    pool_config.class_count   = server.class_count;
+    pool_config.lanes         = LANES;
+    pool_config.global_budget = server.configured.memory_bytes;
+    pool_config.initial_slots = connections * 4;
+    if (!buffers.make(?server.pool, pool_config, ?server.allocator)) { ret false; }
+    server.source = buffers.source(?server.pool);
+    val slot_set: usize = measure(server, line_bytes(configured.parser), LANE_REQUEST)
+        + measure(server, configured.slot_storage_bytes, LANE_REQUEST)
+        + measure(server, configured.parser.max_headers * field_bytes, LANE_REQUEST)
+        + measure(server, configured.parser.max_trailers * field_bytes, LANE_REQUEST)
+        + measure(server, configured.slot_scratch_bytes, LANE_REQUEST);
+    val request_lane: usize = configured.max_pipeline * slot_set
+        + measure(server, server.configured.request_memory_bytes, LANE_REQUEST);
+    val connection_lane: usize = measure(server, configured.read_bytes, LANE_CONNECTION)
+        + 2 * measure(server, configured.write_bytes, LANE_CONNECTION);
+    server.budgets.lanes                  = LANES::usize;
+    server.budgets.bytes[LANE_REQUEST]    = request_lane;
+    server.budgets.bytes[LANE_CONNECTION] = connection_lane;
+    # one connection's whole set must fit, or no request could ever be served
+    if (slot_set == 0 || connection_lane == 0
+        || slot_set + connection_lane > server.configured.memory_bytes) {
+        buffers.destroy(?server.pool);
+        ret false;
+    }
+    ret true;
+}
+
+fun release_storage(server: *Server) {
+    val n: usize = server.configured.max_connections;
+    if (server.connections != nil) { A.deallocate[Connection](?server.allocator, server.connections, n); }
+    if (server.engine_slots != nil) {
+        A.deallocate[h1.Slot](?server.allocator, server.engine_slots,
+            n * server.configured.connection.max_pipeline);
+    }
+    if (server.field_storage != nil) {
+        A.deallocate[field.Field](?server.allocator, server.field_storage,
+            n * server.configured.limits.response_fields.max_count);
+    }
+    if (server.trailer_storage != nil) {
+        A.deallocate[field.Field](?server.allocator, server.trailer_storage,
+            n * server.configured.limits.response_trailers.max_count);
+    }
+    if (server.inform_storage != nil) {
+        A.deallocate[message.Informational](?server.allocator, server.inform_storage,
+            n * server.configured.limits.max_informational);
+    }
+    if (server.waiting != nil)   { A.deallocate[usize](?server.allocator, server.waiting, n); }
+    if (server.scheduled != nil) { A.deallocate[usize](?server.allocator, server.scheduled, n); }
+    server.connections     = nil;
+    server.engine_slots    = nil;
+    server.field_storage   = nil;
+    server.trailer_storage = nil;
+    server.inform_storage  = nil;
+    server.waiting         = nil;
+    server.scheduled       = nil;
+}
+
+fun allocate_storage(server: *Server) bool {
+    val n:           usize                     = server.configured.max_connections;
+    val pipeline:    usize                     = server.configured.connection.max_pipeline;
+    val fields:      usize                     = server.configured.limits.response_fields.max_count;
+    val trailers:    usize                     = server.configured.limits.response_trailers.max_count;
+    val informs:     usize                     = server.configured.limits.max_informational;
+    val connections: res[*Connection, A.Error] = A.zallocate[Connection](?server.allocator, n);
+    if (sel connections.err) { ret false; }
+    server.connections = connections.ok;
+    val slots: res[*h1.Slot, A.Error] = A.zallocate[h1.Slot](?server.allocator, n * pipeline);
+    if (sel slots.err) { ret false; }
+    server.engine_slots = slots.ok;
+    val field_items: res[*field.Field, A.Error] = A.zallocate[field.Field](?server.allocator,
+        n * fields);
+    if (sel field_items.err) { ret false; }
+    server.field_storage = field_items.ok;
+    if (trailers != 0) {
+        val trailer_items: res[*field.Field, A.Error] = A.zallocate[field.Field](
+            ?server.allocator, n * trailers);
+        if (sel trailer_items.err) { ret false; }
+        server.trailer_storage = trailer_items.ok;
+    }
+    if (informs != 0) {
+        val inform_items: res[*message.Informational, A.Error] = A.zallocate[message.Informational](
+            ?server.allocator, n * informs);
+        if (sel inform_items.err) { ret false; }
+        server.inform_storage = inform_items.ok;
+    }
+    val waiting: res[*usize, A.Error] = A.zallocate[usize](?server.allocator, n);
+    if (sel waiting.err) { ret false; }
+    server.waiting = waiting.ok;
+    val scheduled: res[*usize, A.Error] = A.zallocate[usize](?server.allocator, n);
+    if (sel scheduled.err) { ret false; }
+    server.scheduled = scheduled.ok;
+    var i: usize = 0;
+    for (i < n) {
+        val conn: *Connection = ?server.connections[i];
+        conn.server          = server;
+        conn.index           = i;
+        conn.phase           = CONN_FREE;
+        conn.slots           = ?server.engine_slots[i * pipeline];
+        conn.response_fields = ?server.field_storage[i * fields];
+        if (trailers != 0) { conn.response_trailers = ?server.trailer_storage[i * trailers]; }
+        if (informs != 0)  { conn.informationals = ?server.inform_storage[i * informs]; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# prepare a server in caller-owned storage. every record it will use is allocated
+# here from `a`, which must outlive the server, so serving allocates nothing
+# beyond the buffers `memory_bytes` bounds
+pub fun make(server: *Server, configured: Config, handler: Handler, hooks: Hooks,
+    a: *A.Allocator) bool {
+    if (server == nil || a == nil || server.made || handler.serve == nil
+        || !config_valid(configured)) { ret false; }
+    var cleared: Server;
+    @server                                      = cleared;
+    server.configured                            = configured;
+    server.configured.connection.slot_lane       = LANE_REQUEST;
+    server.configured.connection.connection_lane = LANE_CONNECTION;
+    server.configured.limits                     = request_limits(configured);
+    server.handler                               = handler;
+    server.hooks                                 = hooks;
+    server.allocator                             = @a;
+    if (!allocate_storage(server)) {
+        release_storage(server);
+        ret false;
+    }
+    if (!make_pool(server)) {
+        release_storage(server);
+        ret false;
+    }
+    val runtime_slots: usize               = configured.max_connections * TRANSPORT_SLOTS + 8;
+    val made_runtime:  err[io_error.Error] = io_runtime.make(?server.runtime, ?server.allocator,
+        runtime_slots);
+    if (sel made_runtime.err) {
+        buffers.destroy(?server.pool);
+        release_storage(server);
+        ret false;
+    }
+    val made_driver: err[io_error.Error] = net_async.make(?server.driver, ?server.runtime);
+    if (sel made_driver.err || !operation_ok(cancel.make_root(?server.root,
+        opt[time.Instant].none{}))) {
+        io_runtime.close(?server.runtime);
+        io_runtime.destroy(?server.runtime);
+        buffers.destroy(?server.pool);
+        release_storage(server);
+        ret false;
+    }
+    server.accept_context   = IoContext{kind: CONTEXT_ACCEPT, connection: nil, token_context: 0};
+    server.listener_context = IoContext{kind: CONTEXT_LISTENER, connection: nil, token_context: 0};
+    server.discard_context  = IoContext{kind: CONTEXT_DISCARD, connection: nil, token_context: 0};
+    server.state            = NEW;
+    server.made             = true;
+    ret true;
+}
+
+# release everything make took. refused while serve runs or a connection has not settled
+pub fun destroy(server: *Server) bool {
+    if (server == nil || !server.made || (server.state != NEW && server.state != STOPPED)) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < server.configured.max_connections) {
+        if (server.connections[i].phase != CONN_FREE) { ret false; }
+        i = i + 1;
+    }
+    if (server.listening && !server.accept_tracked) { tcp.listener_close(?server.listener); }
+    server.listening = false;
+    io_runtime.close(?server.runtime);
+    var completions: [64]io_runtime.Completion;
+    for (io_runtime.pending(?server.runtime) > 0) {
+        val waited: res[usize, io_error.Error] = io_runtime.wait(?server.runtime,
+            ?completions[0], BATCH, -1);
+        if (sel waited.err) { brk; }
+    }
+    net_async.destroy(?server.driver);
+    io_runtime.destroy(?server.runtime);
+    operation_ok(cancel.destroy(?server.root));
+    buffers.destroy(?server.pool);
+    release_storage(server);
+    server.made = false;
+    ret true;
+}
+
+# begin the drain from any thread, including a handler or a hook
+pub fun shutdown(server: *Server) bool {
+    if (server == nil || !server.made) { ret false; }
+    atomic.store(?server.stop_requested, 1);
+    io_runtime.wake(?server.runtime);
+    ret true;
+}
+
+# give the exchange a waker names another turn, from any thread
+pub fun wake(waker: Waker) bool {
+    val server: *Server = waker.server;
+    if (server == nil || !server.made || waker.index >= server.configured.max_connections
+        || waker.generation == 0 || waker.generation > 0x7fffffffffffffff) { ret false; }
+    val slot:       *i64 = ?server.connections[waker.index].woken;
+    val generation: i64  = waker.generation::i64;
+    var current:    i64  = atomic.load(slot);
+    for (current < generation) {
+        if (atomic.cas(slot, ?current, generation)) { brk; }
+    }
+    atomic.store(?server.wakes, 1);
+    io_runtime.wake(?server.runtime);
+    ret true;
+}
+
+fun schedule(conn: *Connection) {
+    val server: *Server = conn.server;
+    if (conn.scheduled || conn.phase == CONN_FREE || conn.phase == CONN_STUCK) { ret; }
+    conn.scheduled = true;
+    val n: usize = server.configured.max_connections;
+    server.scheduled[(server.scheduled_head + server.scheduled_count) % n] = conn.index;
+    server.scheduled_count                                                 = server.scheduled_count + 1;
+}
+
+fun enqueue(conn: *Connection) {
+    val server: *Server = conn.server;
+    if (conn.queued) { ret; }
+    conn.queued = true;
+    val n: usize = server.configured.max_connections;
+    server.waiting[(server.waiting_head + server.waiting_count) % n] = conn.index;
+    server.waiting_count                                             = server.waiting_count + 1;
+}
+
+fun dequeue(conn: *Connection) {
+    val server: *Server = conn.server;
+    if (!conn.queued) { ret; }
+    conn.queued = false;
+    val n:    usize = server.configured.max_connections;
+    var i:    usize = 0;
+    var kept: usize = 0;
+    for (i < server.waiting_count) {
+        val entry: usize = server.waiting[(server.waiting_head + i) % n];
+        if (entry != conn.index) {
+            server.waiting[(server.waiting_head + kept) % n] = entry;
+            kept                                             = kept + 1;
+        }
+        i = i + 1;
+    }
+    server.waiting_count = kept;
+}
+
+# a freed exchange capacity goes to the connection that has waited longest
+fun release_capacity(server: *Server) {
+    server.exchanges_live = server.exchanges_live - 1;
+    if (server.waiting_count == 0) { ret; }
+    val n:    usize       = server.configured.max_connections;
+    val next: *Connection = ?server.connections[server.waiting[server.waiting_head]];
+    server.waiting_head   = (server.waiting_head + 1) % n;
+    server.waiting_count  = server.waiting_count - 1;
+    next.queued           = false;
+    next.reserved         = true;
+    server.exchanges_live = server.exchanges_live + 1;
+    schedule(next);
+}
+
+fun invalid_token(operation: io_error.Operation) res[io_runtime.Token, io_error.Error] {
+    ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.INVALID, operation)};
+}
+
+# the completion context of the transport operation token_context names
+fun io_slot(conn: *Connection, token_context: usize) *IoContext {
+    var token: transport.Token;
+    if (!transport.context_token(token_context, ?token)
+        || token.index::usize >= TRANSPORT_SLOTS) { ret nil; }
+    val context: *IoContext = ?conn.contexts[token.index::usize];
+    context.kind          = CONTEXT_CONNECTION;
+    context.connection    = conn;
+    context.token_context = token_context;
+    ret context;
+}
+
+fun stream_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val conn: *Connection = context::*Connection;
+    val slot: *IoContext  = io_slot(conn, token_context);
+    if (slot == nil) { ret invalid_token(io_error.OP_READ); }
+    ret net_async.submit_read(?conn.server.driver, scope, ?conn.stream, buffer, length,
+        slot::usize);
+}
+
+fun stream_readable(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val conn: *Connection = context::*Connection;
+    val slot: *IoContext  = io_slot(conn, token_context);
+    if (slot == nil) { ret invalid_token(io_error.OP_READ); }
+    ret net_async.submit_readable(?conn.server.driver, scope, ?conn.stream, slot::usize);
+}
+
+fun stream_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val conn: *Connection = context::*Connection;
+    val slot: *IoContext  = io_slot(conn, token_context);
+    if (slot == nil) { ret invalid_token(io_error.OP_WRITE); }
+    ret net_async.submit_write(?conn.server.driver, scope, ?conn.stream, buffer, length,
+        slot::usize);
+}
+
+fun stream_shutdown(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val conn: *Connection = context::*Connection;
+    val slot: *IoContext  = io_slot(conn, token_context);
+    if (slot == nil) { ret invalid_token(io_error.OP_SHUTDOWN); }
+    ret net_async.submit_shutdown_write(?conn.server.driver, scope, ?conn.stream, slot::usize);
+}
+
+fun stream_close(context: ptr, scope: *cancel.Scope,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    val conn: *Connection = context::*Connection;
+    val slot: *IoContext  = io_slot(conn, token_context);
+    if (slot == nil) { ret invalid_token(io_error.OP_CLOSE); }
+    ret net_async.submit_stream_close(?conn.server.driver, scope, ?conn.stream,
+        lifecycle.ABORTIVE, slot::usize);
+}
+
+fun logical_kind(kind: io_runtime.Kind) transport.Kind {
+    if (kind == io_runtime.READ)     { ret transport.READ; }
+    if (kind == io_runtime.READABLE) { ret transport.READABLE; }
+    if (kind == io_runtime.WRITE)    { ret transport.WRITE; }
+    if (kind == io_runtime.SHUTDOWN) { ret transport.SHUTDOWN_WRITE; }
+    if (kind == io_runtime.CLOSE)    { ret transport.CLOSE; }
+    ret 0;
+}
+
+# a runtime completion as the transport completion the engine settles itself
+fun translate(settled: *transport.Completion, source: *io_runtime.Completion,
+    token_context: usize) bool {
+    var token: transport.Token;
+    if (!transport.context_token(token_context, ?token)) { ret false; }
+    val kind: transport.Kind = logical_kind(source.kind);
+    if (kind == 0) { ret false; }
+    if (source.has_error) {
+        @settled = transport.failed(token, kind, source.bytes, source.error);
+        ret true;
+    }
+    if (source.end_of_stream) {
+        if (kind == transport.READ || kind == transport.READABLE) {
+            @settled = transport.end_of(token, kind, source.bytes);
+            ret true;
+        }
+        @settled = transport.failed(token, kind, 0, io_error.make(io_error.CLOSED, io_error.OP_WRITE));
+        ret true;
+    }
+    @settled = transport.completed(token, kind, source.bytes);
+    ret true;
+}
+
+fun reason_for(code: status.Status) view.View {
+    if (code == status.CONTINUE)                        { ret view.view("Continue", 8); }
+    if (code == status.EARLY_HINTS)                     { ret view.view("Early Hints", 11); }
+    if (code == status.OK)                              { ret view.view("OK", 2); }
+    if (code == status.CREATED)                         { ret view.view("Created", 7); }
+    if (code == status.ACCEPTED)                        { ret view.view("Accepted", 8); }
+    if (code == status.NO_CONTENT)                      { ret view.view("No Content", 10); }
+    if (code == status.PARTIAL_CONTENT)                 { ret view.view("Partial Content", 15); }
+    if (code == status.MOVED_PERMANENTLY)               { ret view.view("Moved Permanently", 17); }
+    if (code == status.FOUND)                           { ret view.view("Found", 5); }
+    if (code == status.SEE_OTHER)                       { ret view.view("See Other", 9); }
+    if (code == status.NOT_MODIFIED)                    { ret view.view("Not Modified", 12); }
+    if (code == status.TEMPORARY_REDIRECT)              { ret view.view("Temporary Redirect", 18); }
+    if (code == status.PERMANENT_REDIRECT)              { ret view.view("Permanent Redirect", 18); }
+    if (code == status.BAD_REQUEST)                     { ret view.view("Bad Request", 11); }
+    if (code == status.UNAUTHORIZED)                    { ret view.view("Unauthorized", 12); }
+    if (code == status.FORBIDDEN)                       { ret view.view("Forbidden", 9); }
+    if (code == status.NOT_FOUND)                       { ret view.view("Not Found", 9); }
+    if (code == status.METHOD_NOT_ALLOWED)              { ret view.view("Method Not Allowed", 18); }
+    if (code == status.CONTENT_TOO_LARGE)               { ret view.view("Content Too Large", 17); }
+    if (code == status.URI_TOO_LONG)                    { ret view.view("URI Too Long", 12); }
+    if (code == status.TOO_MANY_REQUESTS)               { ret view.view("Too Many Requests", 17); }
+    if (code == status.REQUEST_HEADER_FIELDS_TOO_LARGE) { ret view.view("Request Header Fields Too Large", 31); }
+    if (code == status.INTERNAL_SERVER_ERROR)           { ret view.view("Internal Server Error", 21); }
+    if (code == status.NOT_IMPLEMENTED)                 { ret view.view("Not Implemented", 15); }
+    if (code == status.BAD_GATEWAY)                     { ret view.view("Bad Gateway", 11); }
+    if (code == status.SERVICE_UNAVAILABLE)             { ret view.view("Service Unavailable", 19); }
+    if (code == status.GATEWAY_TIMEOUT)                 { ret view.view("Gateway Timeout", 15); }
+    ret view.view(nil, 0);
+}
+
+fun body_state(context: ptr) *RequestBody {
+    val state: *RequestBody = context::*RequestBody;
+    if (state == nil || state.connection == nil) { ret nil; }
+    ret state;
+}
+
+fun request_body_read(context: ptr, output: *u8, capacity: usize,
+    trailers: *field.Fields) body.Progress {
+    val state: *RequestBody = body_state(context);
+    if (state == nil) { ret body.failed("request body has no connection", body.REUSE_FORBIDDEN); }
+    val conn:   *Connection = state.connection;
+    val engine: *h1.Engine  = ?conn.engine;
+    if (engine.held_slot == state.slot && engine.held_length != 0) {
+        var count: usize = engine.held_length;
+        if (count > capacity) { count = capacity; }
+        memory.raw_copy(output, engine.held_body, count);
+        if (!h1.consume_body(engine, state.slot, count)) {
+            ret body.failed("request body consumption was refused", body.REUSE_FORBIDDEN);
+        }
+        state.pending_output   = nil;
+        state.pending_capacity = 0;
+        conn.body_notified     = false;
+        ret body.data(count);
+    }
+    if (conn.slots[state.slot].inbound_complete) {
+        state.pending_output   = nil;
+        state.pending_capacity = 0;
+        ret body.complete(body.REUSE_ALLOWED);
+    }
+    state.pending_output   = output;
+    state.pending_capacity = capacity;
+    state.next_token       = state.next_token + 1;
+    state.pending_token    = state.next_token;
+    ret body.pending(state.pending_token);
+}
+
+fun request_body_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
+    val state: *RequestBody = body_state(context);
+    if (state == nil) { ret body.failed("request body has no connection", body.REUSE_FORBIDDEN); }
+    val conn: *Connection = state.connection;
+    state.pending_output   = nil;
+    state.pending_capacity = 0;
+    if (mode == body.CANCEL)  { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    if (mode == body.REJECT) {
+        h1.set_disposition(?conn.engine, state.slot, h1.BODY_REJECT);
+        ret body.rejected(body.REUSE_FORBIDDEN);
+    }
+    h1.set_disposition(?conn.engine, state.slot, h1.BODY_DRAIN);
+    if (conn.slots[state.slot].inbound_complete) { ret body.complete(body.REUSE_ALLOWED); }
+    state.next_token    = state.next_token + 1;
+    state.pending_token = state.next_token;
+    ret body.pending(state.pending_token);
+}
+
+fun request_body_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progress {
+    val state: *RequestBody = body_state(context);
+    if (state == nil || token != state.pending_token) {
+        ret body.failed("unknown request body completion", body.REUSE_FORBIDDEN);
+    }
+    val kind:     body.Operation = state.reader.pending_kind;
+    val output:   *u8            = state.pending_output;
+    val capacity: usize          = state.pending_capacity;
+    state.pending_token    = 0;
+    state.pending_output   = nil;
+    state.pending_capacity = 0;
+    if (kind == body.OP_FINISH) {
+        if (state.connection.slots[state.slot].inbound_complete) {
+            ret body.complete(body.REUSE_ALLOWED);
+        }
+        state.next_token    = state.next_token + 1;
+        state.pending_token = state.next_token;
+        ret body.pending(state.pending_token);
+    }
+    ret request_body_read(context, output, capacity, trailers);
+}
+
+fun request_body_release(context: ptr) {}
+
+fun request_status(result: message.RequestStatus) status.Status {
+    if (result == message.REQUEST_FIELDS || result == message.REQUEST_TRAILERS) {
+        ret status.REQUEST_HEADER_FIELDS_TOO_LARGE;
+    }
+    if (result == message.REQUEST_BODY) { ret status.CONTENT_TOO_LARGE; }
+    ret status.BAD_REQUEST;
+}
+
+fun release_chunk(conn: *Connection, chunk: buffers.Chunk) {
+    buffers.source_release(?conn.server.source, ?conn.account, chunk);
+}
+
+# build the exchange for one parsed request head, or name the status that refuses it
+fun make_exchange(conn: *Connection, slot: usize, now: time.Instant) status.Status {
+    val server: *Server        = conn.server;
+    val limits: message.Limits = server.configured.limits;
+    val parsed: *parser.Parsed = h1.parsed(?conn.engine, slot);
+    if (parsed == nil) { ret status.BAD_REQUEST; }
+    server.next_exchange = server.next_exchange + 1;
+    val generation: u64 = server.next_exchange;
+    if (!operation_ok(cancel.make_child(?conn.exchange_scope, ?conn.operation_root,
+        opt[time.Instant].none{}))) { ret status.INTERNAL_SERVER_ERROR; }
+    conn.exchange_scope_live           = true;
+    conn.request_body.connection       = conn;
+    conn.request_body.slot             = slot;
+    conn.request_body.pending_token    = 0;
+    conn.request_body.next_token       = 0;
+    conn.request_body.pending_output   = nil;
+    conn.request_body.pending_capacity = 0;
+    # the parser resolved the framing, so it is the one authority on length
+    val length_known: bool = parsed.plan.mode == framing.FRAME_NONE
+        || parsed.plan.mode == framing.FRAME_LENGTH;
+    var declared: u64 = 0;
+    if (parsed.plan.mode == framing.FRAME_LENGTH) { declared = parsed.plan.length; }
+    conn.request_body.reader = body.init_reader((?conn.request_body)::ptr, request_body_read,
+        request_body_finish, request_body_complete, request_body_release,
+        body.OWNER_APPLICATION, generation, length_known, declared, limits.request_body,
+        nil, ?conn.exchange_scope);
+    var refused: status.Status = 0;
+    if (!conn.request_body.reader.valid) { refused = status.CONTENT_TOO_LARGE; }
+    val metadata: message.Metadata = message.Metadata{
+        version:    parsed.version,
+        secure:     false,
+        early_data: false,
+        peer:       message.endpoint(message.ENDPOINT_IP,
+            view.view(?conn.peer_text[0], conn.peer_len), conn.peer.port),
+        local: message.endpoint(message.ENDPOINT_IP,
+            view.view(?conn.local_text[0], conn.local_len), conn.local.port),
+        received_at:   wall_now(),
+        deadline:      opt[time.Instant].none{},
+        request_index: generation,
+    };
+    if (refused == 0 && !message.init_request(?conn.request, parsed.method, parsed.target,
+        metadata, parsed.fields, parsed.trailers, ?conn.request_body.reader, generation,
+        limits)) {
+        refused = request_status(message.validate_request_status(?conn.request, limits));
+    }
+    if (refused == 0 && (!message.init_response(?conn.response, conn.response_fields,
+        limits.response_fields.max_count, conn.response_trailers,
+        limits.response_trailers.max_count, generation, limits)
+        || !exchange.init(?conn.exchange, ?conn.request, ?conn.response, conn.informationals,
+        limits.max_informational, ?conn.exchange_scope, generation, limits)
+        || !exchange.begin(?conn.exchange))) {
+        refused = status.INTERNAL_SERVER_ERROR;
+    }
+    if (refused != 0) {
+        operation_ok(cancel.destroy(?conn.exchange_scope));
+        conn.exchange_scope_live = false;
+        ret refused;
+    }
+    conn.exchange_generation = generation;
+    conn.active_slot         = slot;
+    conn.service_pending     = false;
+    conn.head_ready          = false;
+    conn.response_started    = false;
+    conn.body_done           = false;
+    conn.cancelling          = false;
+    conn.stirred             = false;
+    conn.body_notified       = false;
+    conn.informationals_sent = 0;
+    conn.stage_length        = 0;
+    conn.stage_offset        = 0;
+    var scratch: *u8 = nil;
+    if (conn.arena_held) {
+        scratch = conn.arena.data;
+        memory.raw_zero(scratch, server.configured.request_memory_bytes);
+    }
+    conn.call = Call{
+        exchange:     ?conn.exchange,
+        memory:       scratch,
+        memory_bytes: server.configured.request_memory_bytes,
+        waker:        Waker{server: server, index: conn.index, generation: generation},
+    };
+    conn.exchange_live = true;
+    ret 0;
+}
+
+fun release_exchange_memory(conn: *Connection) {
+    if (conn.stage_held) {
+        release_chunk(conn, conn.stage);
+        conn.stage_held = false;
+    }
+    if (conn.arena_held) {
+        release_chunk(conn, conn.arena);
+        conn.arena_held = false;
+    }
+    conn.stage_length = 0;
+    conn.stage_offset = 0;
+}
+
+# the exchange is terminal: its memory, scope and capacity go back
+fun end_exchange(conn: *Connection) {
+    release_exchange_memory(conn);
+    if (conn.exchange_scope_live) {
+        operation_ok(cancel.destroy(?conn.exchange_scope));
+        conn.exchange_scope_live = false;
+    }
+    conn.exchange_live           = false;
+    conn.service_pending         = false;
+    conn.head_ready              = false;
+    conn.response_started        = false;
+    conn.cancelling              = false;
+    conn.stirred                 = false;
+    conn.body_notified           = false;
+    conn.body_deadline.active    = false;
+    conn.request_body.connection = nil;
+    release_capacity(conn.server);
+}
+
+# settle an exchange whose cancellation waits on its handler's response body
+fun settle_cancel(conn: *Connection) {
+    if (conn.response.body_kind == message.BODY_READER) {
+        val reader: *body.Reader = conn.response.body_reader;
+        if (reader.pending_kind != body.OP_NONE) {
+            if (!conn.stirred) { ret; }
+            conn.stirred = false;
+            body.complete_reader(reader, reader.pending_token);
+            if (reader.pending_kind != body.OP_NONE) { ret; }
+        }
+    }
+    if (exchange.settle_cancellation(?conn.exchange) != exchange.FINISH_BODY_PENDING) {
+        end_exchange(conn);
+    }
+}
+
+# the exchange goes away before it completed. a handler still pending is told
+fun abort_exchange(conn: *Connection, why: exchange.Cause) {
+    if (!conn.exchange_live || conn.cancelling) { ret; }
+    val server: *Server = conn.server;
+    conn.cancelling         = true;
+    server.report.cancelled = server.report.cancelled + 1;
+    if (conn.service_pending) {
+        conn.service_pending = false;
+        if (server.handler.abandon != nil) { server.handler.abandon(server.handler.ctx, ?conn.call); }
+    }
+    conn.stirred = false;
+    if (exchange.close_exchange(?conn.exchange, exchange.closure(why, 0, 0))
+        != exchange.FINISH_BODY_PENDING) {
+        end_exchange(conn);
+    }
+}
+
+fun abort_connection(conn: *Connection, why: exchange.Cause) Step {
+    abort_exchange(conn, why);
+    val state: h1.State = conn.engine.state;
+    if (state != h1.CLOSED && state != h1.FAILED && state != h1.CLOSING) {
+        h1.cancel_connection(?conn.engine);
+    }
+    conn.phase = CONN_CLOSING;
+    ret STEP_DONE;
+}
+
+fun begin_response(conn: *Connection, now: time.Instant) bool {
+    var trailers: *field.Fields = nil;
+    if (conn.response.trailers.len != 0) { trailers = ?conn.response.trailers; }
+    if (!h1.prepare_response(?conn.engine, conn.active_slot, conn.response.status,
+        reason_for(conn.response.status), ?conn.response.fields, trailers, now)) { ret false; }
+    conn.response_started = true;
+    ret true;
+}
+
+# answer a handler failure with a bodyless status, or close when a response is on its way
+fun fail_exchange(conn: *Connection, code: status.Status) Step {
+    val limits: message.Limits = conn.server.configured.limits;
+    if (conn.response.committed || conn.response_started) {
+        ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+    }
+    if (!message.init_response(?conn.response, conn.response_fields,
+        limits.response_fields.max_count, conn.response_trailers,
+        limits.response_trailers.max_count, conn.exchange_generation, limits)
+        || message.set_status(?conn.response, code) != message.RESPONSE_OK
+        || message.add_field(?conn.response, field.Field{
+        name:  view.view(field.CONTENT_LENGTH, str_len(field.CONTENT_LENGTH)),
+        value: view.view("0", 1), sensitive: false
+    }) != field.ADD_OK
+        || exchange.commit(?conn.exchange, limits) != message.RESPONSE_OK) {
+        ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+    }
+    conn.head_ready = true;
+    ret STEP_PROGRESS;
+}
+
+fun run_handler(conn: *Connection) Step {
+    val server: *Server = conn.server;
+    conn.stirred = false;
+    val served: exchange.ServiceStatus = server.handler.serve(server.handler.ctx, ?conn.call);
+    if (served == exchange.SERVICE_PENDING) {
+        conn.service_pending = true;
+        ret STEP_BLOCKED;
+    }
+    conn.service_pending = false;
+    if (served == exchange.SERVICE_COMPLETE && conn.response.committed
+        && conn.response.body_kind != message.BODY_WRITER) {
+        conn.head_ready = true;
+        ret STEP_PROGRESS;
+    }
+    server.report.failed = server.report.failed + 1;
+    ret fail_exchange(conn, status.INTERNAL_SERVER_ERROR);
+}
+
+# answer a request without the handler, and close after it
+fun begin_answer(conn: *Connection, slot: usize, code: status.Status, now: time.Instant) Step {
+    val server: *Server = conn.server;
+    conn.has_pending      = false;
+    conn.rejection_fields = field.init(?conn.rejection_items[0], 2,
+        server.configured.limits.response_fields);
+    if (h1.rejection(?conn.engine, slot) == 0 && !conn.slots[slot].inbound_complete) {
+        h1.set_disposition(?conn.engine, slot, h1.BODY_REJECT);
+    }
+    if (field.append(?conn.rejection_fields, field.Field{
+        name:  view.view(field.CONTENT_LENGTH, str_len(field.CONTENT_LENGTH)),
+        value: view.view("0", 1), sensitive: false
+    }) != field.ADD_OK
+        || field.append(?conn.rejection_fields, field.Field{
+        name:  view.view(field.CONNECTION, str_len(field.CONNECTION)),
+        value: view.view("close", 5), sensitive: false
+    }) != field.ADD_OK
+        || !h1.prepare_response(?conn.engine, slot, code, reason_for(code),
+        ?conn.rejection_fields, nil, now)) {
+        ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+    }
+    conn.rejecting            = true;
+    conn.rejected_slot        = slot;
+    conn.body_deadline.active = false;
+    server.report.rejected    = server.report.rejected + 1;
+    ret STEP_PROGRESS;
+}
+
+fun pump_rejection(conn: *Connection, now: time.Instant) Step {
+    val engine: *h1.Engine = ?conn.engine;
+    if (engine.write_pending) { ret STEP_BLOCKED; }
+    if (engine.write_length != 0) {
+        if (!h1.submit_write(engine)) { ret abort_connection(conn, exchange.CAUSE_TRANSPORT); }
+        ret STEP_PROGRESS;
+    }
+    if (conn.slots[conn.rejected_slot].outbound_complete) {
+        if (!h1.release(engine, conn.rejected_slot, now)) {
+            ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+        }
+        conn.rejecting     = false;
+        conn.rejected_slot = NO_SLOT;
+        ret STEP_PROGRESS;
+    }
+    val offered: h1.Offer = h1.offer(engine, conn.rejected_slot, nil, 0, true);
+    if (offered.status == h1.OFFER_ERROR)   { ret abort_connection(conn, exchange.CAUSE_CONNECTION); }
+    if (offered.status == h1.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    ret STEP_PROGRESS;
+}
+
+fun start_exchange(conn: *Connection, slot: usize, now: time.Instant) Step {
+    val server: *Server = conn.server;
+    if (!conn.reserved) {
+        if (server.exchanges_live >= server.configured.max_exchanges || server.waiting_count != 0) {
+            enqueue(conn);
+            ret STEP_BLOCKED;
+        }
+        server.exchanges_live = server.exchanges_live + 1;
+        conn.reserved         = true;
+    }
+    if (server.configured.request_memory_bytes != 0 && !conn.arena_held) {
+        # a refusal registers the account, and the pool's wake schedules it again
+        val got: buffers.Acquired = buffers.source_acquire(?server.source, ?conn.account,
+            request_of(server.configured.request_memory_bytes, LANE_REQUEST), true);
+        if (!granted(got)) { ret STEP_BLOCKED; }
+        conn.arena      = got.chunk;
+        conn.arena_held = true;
+    }
+    conn.reserved = false;
+    val refused: status.Status = make_exchange(conn, slot, now);
+    if (refused != 0) {
+        release_exchange_memory(conn);
+        release_capacity(server);
+        ret begin_answer(conn, slot, refused, now);
+    }
+    conn.has_pending = false;
+    if (!conn.slots[slot].inbound_complete) {
+        conn.body_deadline = deadline.after(now, server.configured.body_timeout_ns);
+    }
+    # a handler waiting on its request body needs the connection to keep reading
+    val served: Step = run_handler(conn);
+    if (served == STEP_BLOCKED) { ret STEP_PROGRESS; }
+    ret served;
+}
+
+fun start_slot(conn: *Connection, slot: usize, now: time.Instant) Step {
+    val rejected: status.Status = h1.rejection(?conn.engine, slot);
+    if (rejected != 0) { ret begin_answer(conn, slot, rejected, now); }
+    ret start_exchange(conn, slot, now);
+}
+
+fun exchange_cause(conn: *Connection, kind: h1.EventKind) exchange.Cause {
+    if (kind == h1.EVENT_TIMED_OUT)                                        { ret exchange.CAUSE_TIMEOUT; }
+    if (kind == h1.EVENT_ERROR && conn.engine.error == h1.ERROR_TRANSPORT) { ret exchange.CAUSE_TRANSPORT; }
+    ret exchange.CAUSE_CONNECTION;
+}
+
+# one engine event as connection work
+fun apply(conn: *Connection, event: h1.Event, now: time.Instant) Step {
+    val server: *Server      = conn.server;
+    val kind:   h1.EventKind = event.kind;
+    if (kind == h1.EVENT_NEED_READ) {
+        h1.submit_read(?conn.engine);
+        ret STEP_BLOCKED;
+    }
+    if (kind == h1.EVENT_NONE || kind == h1.EVENT_SATURATED || kind == h1.EVENT_MEMORY_BLOCKED) {
+        ret STEP_BLOCKED;
+    }
+    # the peer sent all it will. what was admitted is still answered, then the engine closes
+    if (kind == h1.EVENT_PEER_CLOSED) { ret STEP_BLOCKED; }
+    if (kind == h1.EVENT_TUNNEL)      { ret abort_connection(conn, exchange.CAUSE_CONNECTION); }
+    if (kind == h1.EVENT_CLOSED || kind == h1.EVENT_ERROR || kind == h1.EVENT_TIMED_OUT
+        || kind == h1.EVENT_CANCELLED) {
+        if (conn.phase == CONN_ACTIVE && kind == h1.EVENT_TIMED_OUT) {
+            server.report.timed_out = server.report.timed_out + 1;
+        }
+        abort_exchange(conn, exchange_cause(conn, kind));
+        conn.phase = CONN_CLOSING;
+        ret STEP_DONE;
+    }
+    if (kind == h1.EVENT_REQUEST_HEADERS || kind == h1.EVENT_REQUEST_REJECTED) {
+        conn.has_pending  = true;
+        conn.pending_slot = event.slot;
+        if (conn.exchange_live || conn.rejecting) { ret STEP_BLOCKED; }
+        ret start_slot(conn, event.slot, now);
+    }
+    if (kind == h1.EVENT_REQUEST_COMPLETE) {
+        conn.body_deadline.active = false;
+        conn.stirred              = true;
+        ret STEP_PROGRESS;
+    }
+    # a held body is reported again until it is consumed, and stirs the handler once
+    if (kind == h1.EVENT_REQUEST_BODY) {
+        if (conn.body_notified || !conn.exchange_live) { ret STEP_BLOCKED; }
+        conn.body_notified = true;
+        conn.stirred       = true;
+        ret STEP_PROGRESS;
+    }
+    if (kind == h1.EVENT_OUTBOUND_INFORMATIONAL) {
+        conn.informationals_sent = conn.informationals_sent + 1;
+    }
+    ret STEP_PROGRESS;
+}
+
+fun pump_inbound(conn: *Connection, now: time.Instant) Step {
+    if (conn.has_pending) { ret STEP_BLOCKED; }
+    ret apply(conn, h1.process(?conn.engine, now), now);
+}
+
+# the response body into the staging buffer, then through the serializer
+fun advance_body(conn: *Connection) Step {
+    val server:   *Server    = conn.server;
+    val engine:   *h1.Engine = ?conn.engine;
+    val capacity: usize      = server.configured.connection.write_bytes;
+    if (conn.stage_offset >= conn.stage_length) {
+        conn.stage_offset = 0;
+        conn.stage_length = 0;
+        if (!conn.body_done) {
+            if (conn.response.body_kind == message.BODY_READER) {
+                if (!conn.stage_held) {
+                    val got: buffers.Acquired = buffers.source_acquire(?server.source,
+                        ?conn.account, request_of(capacity, LANE_CONNECTION), true);
+                    if (!granted(got)) { ret STEP_BLOCKED; }
+                    conn.stage      = got.chunk;
+                    conn.stage_held = true;
+                }
+                val reader:   *body.Reader = conn.response.body_reader;
+                var progress: body.Progress;
+                if (reader.pending_kind == body.OP_NONE) {
+                    progress = body.read(reader, conn.stage.data, capacity);
+                }
+                or (reader.pending_kind == body.OP_READ) {
+                    if (!conn.stirred) { ret STEP_BLOCKED; }
+                    conn.stirred = false;
+                    progress     = body.complete_reader(reader, reader.pending_token);
+                }
+                or {
+                    ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+                }
+                if (progress.status == body.DATA)     { conn.stage_length = progress.count; }
+                or (progress.status == body.PENDING)  { ret STEP_BLOCKED; }
+                or (progress.status == body.COMPLETE) { conn.body_done = true; }
+                or {
+                    server.report.failed = server.report.failed + 1;
+                    ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+                }
+            }
+            or {
+                conn.body_done = true;
+            }
+        }
+    }
+    var payload: *u8   = nil;
+    var length:  usize = 0;
+    if (conn.stage_offset < conn.stage_length) {
+        payload = ?conn.stage.data[conn.stage_offset];
+        length  = conn.stage_length - conn.stage_offset;
+    }
+    val final:   bool     = conn.body_done && length == 0;
+    val offered: h1.Offer = h1.offer(engine, conn.active_slot, payload, length, final);
+    if (offered.status == h1.OFFER_ERROR)   { ret abort_connection(conn, exchange.CAUSE_CONNECTION); }
+    if (offered.status == h1.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+    conn.stage_offset = conn.stage_offset + offered.consumed;
+    if (offered.consumed == 0 && offered.produced == 0 && !final) { ret STEP_BLOCKED; }
+    ret STEP_PROGRESS;
+}
+
+# the response is on the wire: the request body settles, then the exchange
+fun settle_exchange(conn: *Connection, now: time.Instant) Step {
+    val server:  *Server      = conn.server;
+    val request: *body.Reader = conn.request.body;
+    if (!body.reader_terminal_state(request)) {
+        if (request.pending_kind != body.OP_NONE) {
+            if (!conn.stirred) { ret STEP_BLOCKED; }
+            conn.stirred = false;
+            body.complete_reader(request, request.pending_token);
+            ret STEP_PROGRESS;
+        }
+        if (body.drain(request).status == body.PENDING) { ret STEP_BLOCKED; }
+        if (!body.reader_terminal_state(request)) {
+            ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+        }
+    }
+    if (exchange.finish(?conn.exchange) != exchange.FINISH_OK) {
+        ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+    }
+    val slot: usize = conn.active_slot;
+    end_exchange(conn);
+    conn.active_slot     = NO_SLOT;
+    server.report.served = server.report.served + 1;
+    if (!h1.release(?conn.engine, slot, now)) {
+        ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+    }
+    ret STEP_PROGRESS;
+}
+
+# response work: informationals, the head, the body, then settlement
+fun pump_response(conn: *Connection, now: time.Instant) Step {
+    val engine: *h1.Engine = ?conn.engine;
+    if (engine.write_pending) { ret STEP_BLOCKED; }
+    if (engine.write_length != 0) {
+        if (!h1.submit_write(engine)) { ret abort_connection(conn, exchange.CAUSE_TRANSPORT); }
+        ret STEP_PROGRESS;
+    }
+    val slot: *h1.Slot = ?conn.slots[conn.active_slot];
+    if (!conn.response_started) {
+        if (slot.serializer_active) {
+            val offered: h1.Offer = h1.offer(engine, conn.active_slot, nil, 0, true);
+            if (offered.status == h1.OFFER_ERROR)   { ret abort_connection(conn, exchange.CAUSE_CONNECTION); }
+            if (offered.status == h1.OFFER_BLOCKED) { ret STEP_BLOCKED; }
+            if (offered.status == h1.OFFER_DONE) {
+                conn.informationals_sent = conn.informationals_sent + 1;
+            }
+            ret STEP_PROGRESS;
+        }
+        if (conn.informationals_sent < conn.exchange.informationals.len) {
+            val item: *message.Informational = ?conn.exchange.informationals.items[conn.informationals_sent];
+            if (!h1.prepare_informational(engine, conn.active_slot, item.status,
+                reason_for(item.status), ?item.fields, now)) {
+                ret abort_connection(conn, exchange.CAUSE_CONNECTION);
+            }
+            ret STEP_PROGRESS;
+        }
+        if (!conn.head_ready)           { ret STEP_IDLE; }
+        if (!begin_response(conn, now)) { ret abort_connection(conn, exchange.CAUSE_CONNECTION); }
+        ret STEP_PROGRESS;
+    }
+    if (!slot.outbound_complete) { ret advance_body(conn); }
+    ret settle_exchange(conn, now);
+}
+
+fun step(conn: *Connection, now: time.Instant) Step {
+    val engine: *h1.Engine = ?conn.engine;
+    if (conn.exchange_live && conn.cancelling) {
+        settle_cancel(conn);
+        if (conn.exchange_live) { ret STEP_BLOCKED; }
+    }
+    if (conn.phase != CONN_ACTIVE || engine.state == h1.CLOSED || engine.state == h1.FAILED) {
+        abort_exchange(conn, exchange.CAUSE_CONNECTION);
+        conn.phase = CONN_CLOSING;
+        ret STEP_DONE;
+    }
+    if (conn.exchange_live) {
+        if (conn.service_pending && conn.stirred) {
+            val resumed: Step = run_handler(conn);
+            if (resumed != STEP_BLOCKED) { ret resumed; }
+        }
+        val pumped: Step = pump_response(conn, now);
+        if (pumped == STEP_PROGRESS || pumped == STEP_DONE) { ret pumped; }
+        ret pump_inbound(conn, now);
+    }
+    if (conn.rejecting)   { ret pump_rejection(conn, now); }
+    if (conn.has_pending) { ret start_slot(conn, conn.pending_slot, now); }
+    # a draining engine answers what it already read, then closes instead of reading again
+    if (engine.state == h1.DRAINING && engine.input_offset == engine.input_length
+        && h1.progress_close(engine)) { ret STEP_PROGRESS; }
+    ret pump_inbound(conn, now);
+}
+
+fun abandon_slots(conn: *Connection) {
+    var i: usize = 0;
+    for (i < conn.server.configured.connection.max_pipeline) {
+        val slot: *h1.Slot = ?conn.slots[i];
+        if (slot.state == h1.SLOT_LIVE) { h1.abandon(?conn.engine, i, slot.sequence); }
+        i = i + 1;
+    }
+}
+
+# release a closed connection's record once every owner has settled
+fun finalize(conn: *Connection) {
+    val server: *Server    = conn.server;
+    val engine: *h1.Engine = ?conn.engine;
+    if (conn.exchange_live) {
+        abort_exchange(conn, exchange.CAUSE_CONNECTION);
+        if (conn.exchange_live) { ret; }
+    }
+    if (engine.state != h1.CLOSED || engine.read_pending || engine.write_pending
+        || engine.shutdown_pending || engine.close_pending) { ret; }
+    abandon_slots(conn);
+    if (!h1.destroy(engine)) {
+        conn.phase = CONN_STUCK;
+        ret;
+    }
+    conn.engine_live = false;
+    # the engine closes its socket through the transport, unless that close was refused
+    if (io_handle.socket_is_valid(conn.stream.handle)) {
+        val closed: res[io_runtime.Token, io_error.Error] = net_async.submit_stream_close(
+            ?server.driver, ?server.root, ?conn.stream, lifecycle.ABORTIVE,
+            (?server.discard_context)::usize);
+        if (sel closed.ok) { server.discards = server.discards + 1; }
+    }
+    release_exchange_memory(conn);
+    if (conn.account_open) {
+        buffers.source_close_account(?server.source, ?conn.account);
+        conn.account_open = false;
+    }
+    operation_ok(cancel.destroy(?conn.operation_root));
+    operation_ok(cancel.destroy(?conn.control_scope));
+    dequeue(conn);
+    if (conn.reserved) {
+        conn.reserved = false;
+        release_capacity(server);
+    }
+    conn.phase           = CONN_FREE;
+    conn.has_pending     = false;
+    conn.rejecting       = false;
+    server.live          = server.live - 1;
+    server.accept_paused = false;
+    server.report.closed = server.report.closed + 1;
+}
+
+fun advance(conn: *Connection, now: time.Instant) {
+    if (conn.phase == CONN_FREE || conn.phase == CONN_STUCK) { ret; }
+    var steps: usize = 0;
+    for (steps < MAX_STEPS) {
+        if (step(conn, now) != STEP_PROGRESS) { brk; }
+        steps = steps + 1;
+    }
+    # a connection still moving when its bound ran out takes another turn
+    if (steps == MAX_STEPS)         { schedule(conn); }
+    if (conn.phase == CONN_CLOSING) { finalize(conn); }
+}
+
+fun signal_drain(conn: *Connection) {
+    if (conn.engine_live && conn.engine.state == h1.OPEN) { h1.begin_graceful(?conn.engine); }
+    schedule(conn);
+}
+
+fun format_address(endpoint: ip.Endpoint, output: *u8) usize {
+    val written: usize = ip.addr_format(endpoint.addr, output, PEER_BYTES);
+    if (written >= PEER_BYTES) { ret 0; }
+    ret written;
+}
+
+fun open_connection(server: *Server, conn: *Connection, stream: tcp.Stream,
+    now: time.Instant) bool {
+    conn.stream   = stream;
+    conn.peer     = server.accept_peer;
+    conn.peer_len = format_address(conn.peer, ?conn.peer_text[0]);
+    conn.local    = server.report.endpoint;
+    val local: res[ip.Endpoint, io_error.Error] = tcp.stream_local_endpoint(?conn.stream);
+    if (sel local.ok) { conn.local = local.ok; }
+    conn.local_len = format_address(conn.local, ?conn.local_text[0]);
+    if (conn.peer_len == 0 || conn.local_len == 0)                                       { ret false; }
+    if (!operation_ok(cancel.make_root(?conn.operation_root, opt[time.Instant].none{}))) { ret false; }
+    if (!operation_ok(cancel.make_root(?conn.control_scope, opt[time.Instant].none{}))) {
+        operation_ok(cancel.destroy(?conn.operation_root));
+        ret false;
+    }
+    conn.runtime_stream = transport.RuntimeStream{
+        runtime:               ?server.runtime,
+        context:               conn::ptr,
+        submit_read:           stream_read,
+        submit_readable:       stream_readable,
+        submit_write:          stream_write,
+        submit_shutdown_write: stream_shutdown,
+        submit_close:          stream_close,
+    };
+    var channel: transport.Transport;
+    conn.channel = channel;
+    var engine: h1.Engine;
+    conn.engine = engine;
+    val budgets_opened: buffers.Reason = buffers.source_open_account(?server.source,
+        ?conn.account, (conn.index + 1)::u64, server.budgets, 0);
+    conn.account_open = sel budgets_opened.none;
+    if (!conn.account_open
+        || !transport.make_runtime_adapter(?conn.adapter, ?conn.runtime_stream, transport.PLAINTEXT)
+        || !transport.init(?conn.channel, conn.adapter, ?conn.operation_root,
+        ?conn.control_scope, ?conn.channel_slots[0], TRANSPORT_SLOTS)
+        || !h1.init(?conn.engine, h1.SERVER, ?conn.channel, ?conn.operation_root, conn.slots,
+        server.configured.connection.max_pipeline, ?server.source, ?conn.account,
+        server.configured.connection, now)) {
+        if (conn.account_open) { buffers.source_close_account(?server.source, ?conn.account); }
+        conn.account_open = false;
+        operation_ok(cancel.destroy(?conn.operation_root));
+        operation_ok(cancel.destroy(?conn.control_scope));
+        ret false;
+    }
+    atomic.store(?conn.woken, 0);
+    conn.engine_live          = true;
+    conn.exchange_live        = false;
+    conn.exchange_scope_live  = false;
+    conn.cancelling           = false;
+    conn.has_pending          = false;
+    conn.rejecting            = false;
+    conn.queued               = false;
+    conn.reserved             = false;
+    conn.arena_held           = false;
+    conn.stage_held           = false;
+    conn.active_slot          = NO_SLOT;
+    conn.body_deadline.active = false;
+    conn.phase                = CONN_ACTIVE;
+    server.live               = server.live + 1;
+    ret true;
+}
+
+fun free_connection(server: *Server) *Connection {
+    var i: usize = 0;
+    for (i < server.configured.max_connections) {
+        if (server.connections[i].phase == CONN_FREE) { ret ?server.connections[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun on_accept(server: *Server, completion: *io_runtime.Completion, now: time.Instant) {
+    server.accept_pending = false;
+    val taken: opt[tcp.Stream] = net_async.accepted(completion);
+    if (sel taken.none) {
+        if (completion.has_error && completion.error.kind != io_error.CANCELLED) {
+            server.report.accept_errors = server.report.accept_errors + 1;
+            # out of descriptors: accept again once a connection frees one
+            if (completion.error.kind == io_error.RESOURCE_EXHAUSTED) { server.accept_paused = true; }
+        }
+        ret;
+    }
+    var stream: tcp.Stream  = taken.some;
+    var conn:   *Connection = nil;
+    if (server.state == READY) { conn = free_connection(server); }
+    if (conn == nil || !open_connection(server, conn, stream, now)) {
+        if (conn != nil) { server.report.accept_errors = server.report.accept_errors + 1; }
+        # never submitted on, so it is not the driver's to close
+        tcp.stream_close(?stream);
+        ret;
+    }
+    server.report.accepted = server.report.accepted + 1;
+    schedule(conn);
+}
+
+fun dispatch(server: *Server, completion: *io_runtime.Completion, now: time.Instant) {
+    val context: *IoContext = completion.context::*IoContext;
+    if (context == nil) { ret; }
+    if (context.kind == CONTEXT_ACCEPT) {
+        on_accept(server, completion, now);
+        ret;
+    }
+    if (context.kind == CONTEXT_LISTENER) {
+        server.listener_closing = false;
+        ret;
+    }
+    if (context.kind == CONTEXT_DISCARD) {
+        server.discards = server.discards - 1;
+        ret;
+    }
+    val conn: *Connection = context.connection;
+    if (conn == nil || !conn.engine_live) { ret; }
+    var settled: transport.Completion;
+    if (!translate(?settled, completion, context.token_context)) { ret; }
+    apply(conn, h1.complete_io(?conn.engine, ?settled, now), now);
+    schedule(conn);
+}
+
+fun collect_wakes(server: *Server) {
+    if (atomic.exchange(?server.wakes, 0) == 0) { ret; }
+    var i: usize = 0;
+    for (i < server.configured.max_connections) {
+        val conn:  *Connection = ?server.connections[i];
+        val named: i64         = atomic.exchange(?conn.woken, 0);
+        if (named != 0 && conn.exchange_live && named::u64 == conn.exchange_generation) {
+            conn.stirred = true;
+            schedule(conn);
+        }
+        i = i + 1;
+    }
+}
+
+# accounts the pool refused are driven again once it can fund them
+fun collect_memory(server: *Server) {
+    var handles: [64]u64;
+    for (true) {
+        val count: usize = buffers.source_ready(?server.source, ?handles[0], BATCH);
+        var i:     usize = 0;
+        for (i < count) {
+            val index: usize = (handles[i] - 1)::usize;
+            if (index < server.configured.max_connections) { schedule(?server.connections[index]); }
+            i = i + 1;
+        }
+        if (count < BATCH) { brk; }
+    }
+}
+
+fun expire(server: *Server, now: time.Instant) {
+    var i: usize = 0;
+    for (i < server.configured.max_connections) {
+        val conn: *Connection = ?server.connections[i];
+        i = i + 1;
+        if (conn.phase != CONN_ACTIVE || !conn.engine_live) { cnt; }
+        if (deadline.expired(conn.body_deadline, now)) {
+            conn.body_deadline.active = false;
+            server.report.timed_out   = server.report.timed_out + 1;
+            h1.cancel_connection(?conn.engine);
+            apply(conn, h1.tick(?conn.engine, now), now);
+            schedule(conn);
+            cnt;
+        }
+        if (deadline.expired(h1.next_deadline(?conn.engine), now)) {
+            apply(conn, h1.tick(?conn.engine, now), now);
+            schedule(conn);
+        }
+    }
+}
+
+fun run_scheduled(server: *Server, now: time.Instant) {
+    val n:      usize = server.configured.max_connections;
+    var budget: usize = server.scheduled_count;
+    for (budget != 0) {
+        val index: usize = server.scheduled[server.scheduled_head];
+        server.scheduled_head  = (server.scheduled_head + 1) % n;
+        server.scheduled_count = server.scheduled_count - 1;
+        budget                 = budget - 1;
+        val conn: *Connection = ?server.connections[index];
+        conn.scheduled = false;
+        advance(conn, now);
+    }
+}
+
+fun maintain_accept(server: *Server) {
+    if (server.state != READY || !server.listening || server.accept_pending
+        || server.accept_paused || server.live >= server.configured.max_connections) { ret; }
+    val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_accept(?server.driver,
+        ?server.root, ?server.listener, ?server.accept_peer, (?server.accept_context)::usize);
+    if (sel submitted.err) {
+        server.report.accept_errors = server.report.accept_errors + 1;
+        server.accept_paused        = true;
+        ret;
+    }
+    server.accept_tracked = true;
+    server.accept_pending = true;
+}
+
+fun close_listener(server: *Server) {
+    if (!server.listening) { ret; }
+    server.listening = false;
+    if (!server.accept_tracked) {
+        tcp.listener_close(?server.listener);
+        ret;
+    }
+    val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_listener_close(
+        ?server.driver, ?server.root, ?server.listener, (?server.listener_context)::usize);
+    if (sel submitted.ok) { server.listener_closing = true; }
+}
+
+fun open_listener(server: *Server) bool {
+    val listened: res[tcp.Listener, io_error.Error] = net_async.listen(server.configured.address,
+        server.configured.backlog);
+    if (sel listened.err) { ret false; }
+    server.listener        = listened.ok;
+    server.listening       = true;
+    server.report.endpoint = server.configured.address;
+    val bound: res[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?server.listener);
+    if (sel bound.ok) { server.report.endpoint = bound.ok; }
+    ret true;
+}
+
+fun begin_drain(server: *Server, now: time.Instant) {
+    server.state                    = DRAINING;
+    server.drain_deadline           = deadline.after(now, server.configured.drain_timeout_ns);
+    server.report.drain_connections = server.live;
+    server.report.drain_exchanges   = server.exchanges_live;
+    close_listener(server);
+    var i: usize = 0;
+    for (i < server.configured.max_connections) {
+        val conn: *Connection = ?server.connections[i];
+        if (conn.phase == CONN_ACTIVE) { signal_drain(conn); }
+        i = i + 1;
+    }
+}
+
+# the drain deadline: what is still in flight is abandoned and closed abortively
+fun force(server: *Server, now: time.Instant) {
+    server.forced        = true;
+    server.stop_deadline = deadline.after(now, server.configured.stop_timeout_ns);
+    var i: usize = 0;
+    for (i < server.configured.max_connections) {
+        val conn: *Connection = ?server.connections[i];
+        i = i + 1;
+        if (conn.phase != CONN_ACTIVE && conn.phase != CONN_CLOSING) { cnt; }
+        if (conn.exchange_live && !conn.cancelling) {
+            server.report.abandoned_exchanges = server.report.abandoned_exchanges + 1;
+        }
+        val state: h1.State = conn.engine.state;
+        if (conn.phase == CONN_ACTIVE && state != h1.CLOSED && state != h1.FAILED
+            && state != h1.CLOSING) {
+            server.report.abandoned_connections = server.report.abandoned_connections + 1;
+        }
+        abort_connection(conn, exchange.CAUSE_CONNECTION);
+        schedule(conn);
+    }
+}
+
+fun call_start(server: *Server) HookStatus {
+    if (server.hooks.start == nil) { ret HOOK_DONE; }
+    ret server.hooks.start(server.hooks.ctx);
+}
+
+fun call_ready(server: *Server) HookStatus {
+    if (server.hooks.ready == nil) { ret HOOK_DONE; }
+    ret server.hooks.ready(server.hooks.ctx, server.report.endpoint);
+}
+
+fun call_drain(server: *Server) HookStatus {
+    if (server.hooks.drain == nil) { ret HOOK_DONE; }
+    ret server.hooks.drain(server.hooks.ctx, server.drain_deadline.at);
+}
+
+fun call_stop(server: *Server) HookStatus {
+    if (server.hooks.stop == nil) { ret HOOK_DONE; }
+    ret server.hooks.stop(server.hooks.ctx, ?server.report);
+}
+
+fun stop_requested(server: *Server) bool {
+    ret atomic.load(?server.stop_requested) != 0;
+}
+
+fun enter_stopping(server: *Server, now: time.Instant) {
+    server.state = STOPPING;
+    if (!server.forced) {
+        server.stop_deadline = deadline.after(now, server.configured.stop_timeout_ns);
+    }
+    server.report.unsettled = server.live;
+    var snapshot: buffers.Snapshot;
+    if (buffers.snapshot(?server.pool, ?snapshot)) {
+        server.report.memory_live         = snapshot.bytes_live;
+        server.report.memory_peak         = snapshot.bytes_peak;
+        server.report.backing_allocations = snapshot.backing_allocations;
+    }
+}
+
+fun progress_start(server: *Server, now: time.Instant) {
+    if (!server.started) {
+        val started: HookStatus = call_start(server);
+        if (started == HOOK_PENDING) { ret; }
+        if (started != HOOK_DONE) {
+            server.report.failure = FAILURE_START;
+            server.state          = STOPPED;
+            ret;
+        }
+        server.started = true;
+        if (!open_listener(server)) {
+            server.report.failure = FAILURE_BIND;
+            enter_stopping(server, now);
+            ret;
+        }
+    }
+    if (stop_requested(server)) {
+        begin_drain(server, now);
+        ret;
+    }
+    val readied: HookStatus = call_ready(server);
+    if (readied == HOOK_PENDING) { ret; }
+    if (readied != HOOK_DONE) {
+        server.report.failure = FAILURE_READY;
+        begin_drain(server, now);
+        ret;
+    }
+    server.state = READY;
+}
+
+fun progress_drain(server: *Server, now: time.Instant) {
+    if (!server.report.drain_hook_finished && !server.forced) {
+        val drained: HookStatus = call_drain(server);
+        if (drained == HOOK_FAILED && server.report.failure == FAILURE_NONE) {
+            server.report.failure = FAILURE_DRAIN;
+        }
+        if (drained != HOOK_PENDING) { server.report.drain_hook_finished = true; }
+    }
+    if (!server.forced && deadline.expired(server.drain_deadline, now)) { force(server, now); }
+    val quiet: bool = server.live == 0 && server.discards == 0 && !server.listener_closing
+        && !server.accept_pending;
+    if ((quiet && (server.report.drain_hook_finished || server.forced))
+        || (server.forced && deadline.expired(server.stop_deadline, now))) {
+        enter_stopping(server, now);
+    }
+}
+
+fun progress_stop(server: *Server, now: time.Instant) {
+    val stopped: HookStatus = call_stop(server);
+    if (stopped == HOOK_PENDING && !deadline.expired(server.stop_deadline, now)) { ret; }
+    if (stopped != HOOK_DONE && server.report.failure == FAILURE_NONE) {
+        server.report.failure = FAILURE_STOP;
+    }
+    server.state = STOPPED;
+}
+
+fun earliest_deadline(server: *Server, now: time.Instant) deadline.Deadline {
+    var earliest: deadline.Deadline = deadline.none();
+    if (server.state == STARTING || server.state == STOPPING
+        || (server.state == DRAINING && !server.report.drain_hook_finished)) {
+        earliest = deadline.after(now, server.configured.hook_poll_ns);
+    }
+    if (server.state == DRAINING) {
+        earliest = deadline.earlier(earliest, server.drain_deadline);
+        if (server.forced) { earliest = deadline.earlier(earliest, server.stop_deadline); }
+    }
+    var i: usize = 0;
+    for (i < server.configured.max_connections) {
+        val conn: *Connection = ?server.connections[i];
+        if (conn.phase == CONN_ACTIVE && conn.engine_live) {
+            earliest = deadline.earlier(earliest, h1.next_deadline(?conn.engine));
+            earliest = deadline.earlier(earliest, conn.body_deadline);
+        }
+        i = i + 1;
+    }
+    ret earliest;
+}
+
+# milliseconds until the next deadline, rounded up, or -1 for none
+fun wait_timeout(server: *Server, now: time.Instant) i32 {
+    if (server.scheduled_count != 0 || (stop_requested(server) && server.state == READY)) { ret 0; }
+    val earliest: deadline.Deadline = earliest_deadline(server, now);
+    if (!earliest.active)                       { ret -1; }
+    if (!time.instant_before(now, earliest.at)) { ret 0; }
+    val seconds: i64 = earliest.at.sec - now.sec;
+    if (seconds > 2000000) { ret 2000000000; }
+    val nanoseconds: i64 = seconds * 1000000000 + earliest.at.nsec - now.nsec;
+    ret ((nanoseconds + 999999) / 1000000)::i32;
+}
+
+fun turn(server: *Server, timeout: i32) {
+    var completions: [64]io_runtime.Completion;
+    val waited:      res[usize, io_error.Error] = net_async.wait(?server.driver, ?completions[0],
+        BATCH, timeout);
+    val now: time.Instant = instant_now();
+    if (sel waited.ok) {
+        var i: usize = 0;
+        for (i < waited.ok) {
+            dispatch(server, ?completions[i], now);
+            i = i + 1;
+        }
+    }
+    collect_wakes(server);
+    collect_memory(server);
+    expire(server, now);
+    run_scheduled(server, now);
+    maintain_accept(server);
+}
+
+# run the server on the calling thread until it has drained and stopped
+#
+# start, bind, ready, serve until shutdown, drain until every connection has
+# closed or the drain deadline abandons what is left, then stop. the report is
+# also what the stop hook saw
+pub fun serve(server: *Server) Report {
+    if (server == nil || !server.made || server.state != NEW) {
+        var refused: Report;
+        refused.failure = FAILURE_STATE;
+        ret refused;
+    }
+    # a peer that resets mid-write must fail the write, not the process
+    os.ignore_sigpipe();
+    server.state = STARTING;
+    for (server.state != STOPPED) {
+        val now: time.Instant = instant_now();
+        if (server.state == STARTING)                        { progress_start(server, now); }
+        if (server.state == READY && stop_requested(server)) { begin_drain(server, now); }
+        if (server.state == DRAINING)                        { progress_drain(server, now); }
+        if (server.state == STOPPING)                        { progress_stop(server, now); }
+        if (server.state == STOPPED)                         { brk; }
+        maintain_accept(server);
+        turn(server, wait_timeout(server, now));
+    }
+    ret server.report;
+}
+
+#[testing]
+val STREAM_BYTES: u64 = 1048576;
+
+#[testing]
+def Scenario: fun(*Harness) i64;
+
+# a server on a loopback port with a client thread that the ready hook starts
+#[testing]
+rec Harness {
+    server:   Server;
+    backing:  A.Allocator;
+    client:   thread.Thread;
+    spawned:  bool;
+    endpoint: ip.Endpoint;
+    scenario: Scenario;
+    result:   i64;
+    cancels:  i64;
+    abandons: i64;
+    drains:   i64;
+    stops:    i64;
+}
+
+# the response body a test exchange streams, kept in the exchange's own scratch
+#[testing]
+rec TestBody {
+    reader:   body.Reader;
+    waker:    Waker;
+    harness:  *Harness;
+    digits:   [24]u8;
+    text:     *u8;
+    length:   u64;
+    sent:     u64;
+    endless:  bool;
+    stalling: bool;
+    token:    u64;
+    output:   *u8;
+    capacity: usize;
+}
+
+#[testing]
+fun io_done(outcome: err[io_error.Error]) bool {
+    ret sel outcome.ok;
+}
+
+#[testing]
+fun digits_of(value: u64, output: *u8) usize {
+    var scratch: [24]u8;
+    var count:   usize = 0;
+    var rest:    u64   = value;
+    for (count == 0 || rest != 0) {
+        scratch[count] = ('0' + (rest % 10)::u8);
+        rest           = rest / 10;
+        count          = count + 1;
+    }
+    var i: usize = 0;
+    for (i < count) {
+        output[i] = scratch[count - 1 - i];
+        i         = i + 1;
+    }
+    ret count;
+}
+
+#[testing]
+fun fill_body(state: *TestBody, output: *u8, capacity: usize) body.Progress {
+    var count: usize = capacity;
+    if (!state.endless && (state.length - state.sent) < count::u64) {
+        count = (state.length - state.sent)::usize;
+    }
+    if (state.text != nil) { memory.raw_copy(output, ?state.text[state.sent::usize], count); }
+    or                     { memory.raw_fill(output, 'x', count); }
+    state.sent = state.sent + count::u64;
+    ret body.data(count);
+}
+
+# a streamed body stalls on every other read and wakes its own exchange, so the
+# pending read and the wake that resumes it run on every chunk. an endless body
+# sends one chunk and then parks, never finishing, until it is cancelled
+#[testing]
+fun test_read(context: ptr, output: *u8, capacity: usize,
+    trailers: *field.Fields) body.Progress {
+    val state: *TestBody = context::*TestBody;
+    if (!state.endless && state.sent == state.length) { ret body.complete(body.REUSE_ALLOWED); }
+    if (state.endless && state.sent != 0) {
+        state.token = state.token + 1;
+        ret body.pending(state.token);
+    }
+    if (state.stalling) {
+        state.stalling = false;
+        state.token    = state.token + 1;
+        state.output   = output;
+        state.capacity = capacity;
+        wake(state.waker);
+        ret body.pending(state.token);
+    }
+    if (state.text == nil) { state.stalling = true; }
+    ret fill_body(state, output, capacity);
+}
+
+#[testing]
+fun test_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progress {
+    val state: *TestBody = context::*TestBody;
+    if (token != state.token) { ret body.failed("unexpected completion", body.REUSE_FORBIDDEN); }
+    # a turn the body did not ask for finds it still parked
+    if (state.endless) {
+        state.token = state.token + 1;
+        ret body.pending(state.token);
+    }
+    state.stalling = true;
+    ret fill_body(state, state.output, state.capacity);
+}
+
+#[testing]
+fun test_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
+    val state: *TestBody = context::*TestBody;
+    if (mode == body.CANCEL) {
+        state.harness.cancels = state.harness.cancels + 1;
+        ret body.cancelled(body.REUSE_FORBIDDEN);
+    }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+#[testing]
+fun test_release(context: ptr) {}
+
+#[testing]
+fun path_is(target: view.View, text: str) bool {
+    val length: usize = str_len(text);
+    ret target.len == length && memory.raw_equal(target.data, text, length);
+}
+
+# answers with its own path, or streams /stream and /endless
+#[testing]
+fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
+    val harness: *Harness           = context::*Harness;
+    val active:  *exchange.Exchange = call.exchange;
+    val state:   *TestBody          = call.memory::*TestBody;
+    val path:    view.View          = active.request.target.path;
+    state.harness  = harness;
+    state.waker    = call.waker;
+    state.text     = path.data;
+    state.length   = path.len::u64;
+    state.stalling = false;
+    if (path_is(path, "/stream") || path_is(path, "/endless")) {
+        state.text     = nil;
+        state.length   = STREAM_BYTES;
+        state.endless  = path_is(path, "/endless");
+        state.stalling = !state.endless;
+    }
+    if (!state.endless) {
+        val count: usize = digits_of(state.length, ?state.digits[0]);
+        if (message.add_field(active.response, field.Field{
+            name:  view.view(field.CONTENT_LENGTH, str_len(field.CONTENT_LENGTH)),
+            value: view.view(?state.digits[0], count), sensitive: false
+        }) != field.ADD_OK) {
+            ret exchange.SERVICE_FAILED;
+        }
+    }
+    state.reader = body.init_reader(state::ptr, test_read, test_finish, test_complete,
+        test_release, body.OWNER_APPLICATION, active.generation, !state.endless, state.length,
+        active.limits.response_body, nil, active.scope);
+    if (message.set_body_reader(active.response, ?state.reader, active.limits) != message.RESPONSE_OK
+        || exchange.commit(active, active.limits) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret exchange.SERVICE_COMPLETE;
+}
+
+#[testing]
+fun test_abandon(context: ptr, call: *Call) {
+    val harness: *Harness = context::*Harness;
+    harness.abandons = harness.abandons + 1;
+}
+
+#[testing]
+fun client_main(argument: *u8) {
+    val harness: *Harness = argument::*Harness;
+    harness.result = harness.scenario(harness);
+    shutdown(?harness.server);
+}
+
+#[testing]
+fun ready_hook(context: ptr, endpoint: ip.Endpoint) HookStatus {
+    val harness: *Harness = context::*Harness;
+    harness.endpoint = endpoint;
+    val spawned: thread.Operation = thread.spawn_with(client_main, harness::*u8, ?harness.client);
+    if (sel spawned.err) { ret HOOK_FAILED; }
+    harness.spawned = true;
+    ret HOOK_DONE;
+}
+
+#[testing]
+fun drain_hook(context: ptr, at: time.Instant) HookStatus {
+    val harness: *Harness = context::*Harness;
+    harness.drains = harness.drains + 1;
+    ret HOOK_DONE;
+}
+
+#[testing]
+fun stop_hook(context: ptr, report: *Report) HookStatus {
+    val harness: *Harness = context::*Harness;
+    harness.stops = harness.stops + 1;
+    ret HOOK_DONE;
+}
+
+#[testing]
+fun test_config() Config {
+    var configured: Config = config_default(ip.endpoint(127, 0, 0, 1, 0));
+    configured.max_connections              = 4;
+    configured.max_exchanges                = 4;
+    configured.memory_bytes                 = 8388608;
+    configured.request_memory_bytes         = $size_of(TestBody);
+    configured.connection.max_pipeline      = 4;
+    configured.connection.header_timeout_ns = 10000000000;
+    configured.drain_timeout_ns             = 10000000000;
+    ret configured;
+}
+
+# serve until the scenario's client has finished and the drain has stopped the server
+#[testing]
+fun run_scenario(harness: *Harness, configured: Config, scenario: Scenario, report: *Report) bool {
+    harness.scenario = scenario;
+    harness.result   = -1;
+    val backed: err[A.Error] = page.make(?harness.backing);
+    if (sel backed.err) { ret false; }
+    val hooks: Hooks = Hooks{ctx: harness::ptr, start: nil, ready: ready_hook,
+        drain: drain_hook, stop: stop_hook};
+    val handler: Handler = Handler{ctx: harness::ptr, serve: test_serve, abandon: test_abandon};
+    if (!make(?harness.server, configured, handler, hooks, ?harness.backing)) { ret false; }
+    @report = serve(?harness.server);
+    if (harness.spawned) { thread.join(?harness.client); }
+    ret destroy(?harness.server);
+}
+
+#[testing]
+fun connect_to(harness: *Harness, stream: *tcp.Stream) bool {
+    val connected: res[tcp.Stream, io_error.Error] = tcp.connect(harness.endpoint);
+    if (sel connected.err) { ret false; }
+    @stream = connected.ok;
+    ret io_done(tcp.stream_set_read_timeout(stream, 10000));
+}
+
+#[testing]
+fun send_text(stream: *tcp.Stream, text: str) bool {
+    val length: usize = str_len(text);
+    var offset: usize = 0;
+    for (offset < length) {
+        val sent: res[usize, io_error.Error] = tcp.stream_write(stream, ?text[offset], length - offset);
+        if (sel sent.err) { ret false; }
+        if (sent.ok == 0) { ret false; }
+        offset = offset + sent.ok;
+    }
+    ret true;
+}
+
+#[testing]
+fun find(haystack: *u8, length: usize, needle: str) usize {
+    val count: usize = str_len(needle);
+    var i:     usize = 0;
+    for (i + count <= length) {
+        if (memory.raw_equal(?haystack[i], needle, count)) { ret i; }
+        i = i + 1;
+    }
+    ret NO_SLOT;
+}
+
+# read into buffer until it holds needle, from `have` bytes already there
+#[testing]
+fun read_until(stream: *tcp.Stream, buffer: *u8, capacity: usize, have: *usize,
+    needle: str) bool {
+    for (find(buffer, @have, needle) == NO_SLOT) {
+        if (@have == capacity) { ret false; }
+        val got: res[usize, io_error.Error] = tcp.stream_read(stream, ?buffer[@have], capacity - @have);
+        if (sel got.err) { ret false; }
+        if (got.ok == 0) { ret false; }
+        @have = @have + got.ok;
+    }
+    ret true;
+}
+
+# read until the peer is gone, counting what arrived. false when the read timed out
+#[testing]
+fun read_to_end(stream: *tcp.Stream, count: *u64) bool {
+    var sink: [4096]u8;
+    for (true) {
+        val got: res[usize, io_error.Error] = tcp.stream_read(stream, ?sink[0], 4096);
+        if (sel got.err) {
+            ret got.err.kind != io_error.TIMEOUT && got.err.kind != io_error.WOULD_BLOCK;
+        }
+        if (got.ok == 0) { ret true; }
+        @count = @count + got.ok::u64;
+    }
+    ret false;
+}
+
+#[testing]
+fun keep_alive_scenario(harness: *Harness) i64 {
+    var stream: tcp.Stream;
+    var buffer: [2048]u8;
+    var have:   usize = 0;
+    if (!connect_to(harness, ?stream)) { ret 1; }
+    if (!send_text(?stream, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n/a")) { ret 2; }
+    have = 0;
+    if (!send_text(?stream, "GET /b HTTP/1.1\r\nHost: x\r\n\r\nGET /c HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n/c")) { ret 3; }
+    val second: usize = find(?buffer[0], have, "\r\n\r\n/b");
+    if (second == NO_SLOT || second > find(?buffer[0], have, "\r\n\r\n/c")) { ret 4; }
+    # the drain closes the idle keep-alive connection without a byte more
+    shutdown(?harness.server);
+    var extra: u64 = 0;
+    if (!read_to_end(?stream, ?extra) || extra != 0) { ret 5; }
+    tcp.stream_close(?stream);
+    ret 0;
+}
+
+test serve__keep_alive_pipelined_client_then_drain {
+    var harness: Harness;
+    var report:  Report;
+    if (!run_scenario(?harness, test_config(), keep_alive_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                                  { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.accepted != 1 || report.served != 3
+        || report.closed != 1 || report.cancelled != 0 || report.drain_connections != 1
+        || report.abandoned_connections != 0 || report.unsettled != 0) { ret 2; }
+    if (harness.drains != 1 || harness.stops != 1 || !report.drain_hook_finished
+        || report.memory_live != 0) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+fun limits_scenario(harness: *Harness) i64 {
+    var first:  tcp.Stream;
+    var second: tcp.Stream;
+    var buffer: [2048]u8;
+    var have:   usize = 0;
+    var extra:  u64   = 0;
+    if (!connect_to(harness, ?first)
+        || !send_text(?first, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?first, ?buffer[0], 2048, ?have, "\r\n\r\n/a")) { ret 1; }
+    # past the connection cap a client waits in the backlog, unserved
+    if (!connect_to(harness, ?second)
+        || !io_done(tcp.stream_set_read_timeout(?second, 300))
+        || !send_text(?second, "GET /b HTTP/1.1\r\nHost: x\r\n\r\n")) { ret 2; }
+    have = 0;
+    if (read_until(?second, ?buffer[0], 2048, ?have, "\r\n\r\n/b") || have != 0) { ret 3; }
+    tcp.stream_close(?first);
+    if (!io_done(tcp.stream_set_read_timeout(?second, 10000))
+        || !read_until(?second, ?buffer[0], 2048, ?have, "\r\n\r\n/b")) { ret 4; }
+    # a header line past its limit is answered 431 and closed
+    have = 0;
+    if (!send_text(?second, "GET /c HTTP/1.1\r\nHost: x\r\nX-Long: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\r\n\r\n")
+        || !read_until(?second, ?buffer[0], 2048, ?have, "HTTP/1.1 431 ")
+        || !read_to_end(?second, ?extra)) { ret 5; }
+    tcp.stream_close(?second);
+    # a body past the exchange limit is refused 413 and closed without being read
+    var third: tcp.Stream;
+    have = 0;
+    if (!connect_to(harness, ?third)
+        || !send_text(?third, "POST /d HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n")
+        || !read_until(?third, ?buffer[0], 2048, ?have, "HTTP/1.1 413 ")
+        || !read_to_end(?third, ?extra)) { ret 6; }
+    tcp.stream_close(?third);
+    # a head that never finishes is closed at the header timeout
+    var fourth: tcp.Stream;
+    if (!connect_to(harness, ?fourth) || !send_text(?fourth, "GET / HTTP/1.1\r\n")
+        || !read_to_end(?fourth, ?extra)) { ret 7; }
+    tcp.stream_close(?fourth);
+    ret 0;
+}
+
+test serve__limits_and_timeouts_refuse_or_close {
+    var harness:    Harness;
+    var report:     Report;
+    var configured: Config = test_config();
+    configured.max_connections                   = 1;
+    configured.connection.header_timeout_ns      = 1000000000;
+    configured.connection.parser.max_header_line = 128;
+    configured.limits.request_body.max_bytes     = 1024;
+    if (!run_scenario(?harness, configured, limits_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                           { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.accepted != 4 || report.served != 2
+        || report.rejected != 2 || report.timed_out != 1 || report.closed != 4
+        || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    ret 0;
+}
+
+#[testing]
+fun drain_scenario(harness: *Harness) i64 {
+    var endless: tcp.Stream;
+    var stream:  tcp.Stream;
+    var buffer:  [2048]u8;
+    var have:    usize = 0;
+    if (!connect_to(harness, ?endless)
+        || !send_text(?endless, "GET /endless HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?endless, ?buffer[0], 2048, ?have, "\r\n\r\n")) { ret 1; }
+    have = 0;
+    if (!connect_to(harness, ?stream)
+        || !send_text(?stream, "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n")) { ret 2; }
+    # the drain begins while both responses are in flight
+    shutdown(?harness.server);
+    val head:     usize = find(?buffer[0], have, "\r\n\r\n") + 4;
+    var received: u64   = (have - head)::u64;
+    if (!read_to_end(?stream, ?received) || received != STREAM_BYTES) { ret 3; }
+    var ignored: u64 = 0;
+    if (!read_to_end(?endless, ?ignored)) { ret 4; }
+    tcp.stream_close(?stream);
+    tcp.stream_close(?endless);
+    ret 0;
+}
+
+test serve__drain_finishes_a_stream_and_abandons_a_parked_one {
+    var harness:    Harness;
+    var report:     Report;
+    var configured: Config = test_config();
+    configured.drain_timeout_ns = 2000000000;
+    if (!run_scenario(?harness, configured, drain_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                          { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.accepted != 2 || report.served != 1
+        || report.drain_connections != 2 || report.drain_exchanges != 2
+        || report.abandoned_exchanges != 1 || report.abandoned_connections != 1
+        || report.cancelled != 1 || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    if (harness.cancels != 1 || harness.abandons != 0 || harness.stops != 1) { ret 3; }
+    ret 0;
 }
