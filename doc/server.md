@@ -120,16 +120,26 @@ The request side of `limits` (method, target, fields and trailers) is derived fr
 
 ## Timeouts
 
-Every deadline is an absolute monotonic instant. Slow progress never refreshes it.
+Every deadline is an absolute monotonic instant. An exchange is bounded in three
+phases, so a response that keeps making progress, such as server-sent events, a
+chunked stream or a slow download, lives until it ends or the drain deadline,
+while one that stalls is closed.
 
 | Timeout | Runs |
 | --- | --- |
 | `connection.header_timeout_ns` | from a connection's accept, or its readability when idle, to a complete request head |
 | `body_timeout_ns` | from the start of an exchange to the end of its request body |
-| `connection.request_timeout_ns` | over a whole exchange, request and response, so a long streamed response needs it raised |
+| `response_timeout_ns` | from the end of the request body to the response's first accepted write, and from each write the client accepts to the next, until the response ends |
+| `connection.request_timeout_ns` | the optional absolute cap over a whole exchange, request and response. 0, the default, is none |
 | `connection.idle_timeout_ns` | while a keep-alive connection holds no request |
-| `connection.write_timeout_ns` | from a response head to the end of the response |
-| `connection.total_timeout_ns` | over a connection's whole life |
+| `connection.write_timeout_ns` | optional, from a response head to the end of the response. 0, the default, is none |
+| `connection.total_timeout_ns` | optional, over a connection's whole life. 0, the default, is none |
+
+`response_timeout_ns` also bounds a handler that has not answered: its clock starts
+when the request is in, and nothing but an accepted write moves it, so a pending
+handler, or a response body reader that stops producing, is closed at it just as a
+client that stops reading is. A write the client accepts before its request body
+ends does not start it, since the body deadline governs until then.
 
 A connection past any of them is closed abortively, and an exchange in flight on it
 is abandoned as above. `Report.timed_out` counts them.
