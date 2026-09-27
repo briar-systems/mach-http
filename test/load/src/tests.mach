@@ -238,7 +238,8 @@ test load__sustained_keep_alive_holds_memory_steady {
     var hooks:    server.Hooks = server.no_hooks();
     hooks.ctx   = (?load)::ptr;
     hooks.ready = ready;
-    val handler: server.Handler = server.Handler{ctx: (?load)::ptr, serve: serve_ok, abandon: nil};
+    val handler: server.Handler = server.Handler{ctx: (?load)::ptr, serve: serve_ok, abandon: nil,
+        settle: nil};
     if (!server.make(?load.server, configured, handler, hooks, ?load.backing)) { ret 2; }
     val report: server.Report = server.serve(?load.server);
     if (load.spawned)                  { thread.join(?load.coordinator); }

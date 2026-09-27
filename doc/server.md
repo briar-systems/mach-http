@@ -36,6 +36,7 @@ when it does.
 ```mach
 pub def ServeFun:   fun(ptr, *Call) exchange.ServiceStatus;
 pub def AbandonFun: fun(ptr, *Call);
+pub def SettleFun:  fun(ptr, *Call);
 ```
 
 `serve` is entered once per exchange. The `Call` carries the exchange in HANDLING
@@ -47,7 +48,10 @@ exchange, and a `Waker` for it.
   as the socket drains. A `body.Writer` response is refused.
 - `SERVICE_PENDING` means the handler is waiting on something of its own. `serve` is
   entered again after each wake of the exchange and after request body progress,
-  until it returns something else.
+  until it returns something else. A handler that sets `call.wake_at` to a monotonic
+  instant before returning is also entered again at that instant, if nothing woke
+  it first, so a framework enforces its own per-request deadline without a timer of
+  its own. `wake_at` is cleared before every entry.
 - `SERVICE_FAILED`, or a completion with no committed response, is answered 500 if
   no response has started, and closes the connection otherwise.
 
@@ -65,6 +69,15 @@ returned `SERVICE_PENDING`: a connection failure, a timeout, or the drain deadli
 The exchange is then cancelled through `exchange.close_exchange`, which finishes its
 bodies with `body.CANCEL`. A body whose cancellation is itself pending keeps the
 exchange, its scratch and its connection until it completes after a wake.
+
+`settle` is called exactly once for every exchange `serve` was entered for, when the
+exchange is terminal: its response written and its request body settled, or its
+cancellation settled. `call.exchange.completion` is final, and the scratch is still
+valid, so this is where a framework releases what it held for the request and
+records its outcome. After `settle` returns, the scratch goes back to the pool. A
+request answered without the handler (400, 413, 414, 431) never reaches either. A
+connection counted in `Report.unsettled` never settles its exchange. `abandon` and
+`settle` may each be nil.
 
 The request is valid for the exchange's generation. Its fields, target and trailers
 borrow the connection's parser storage, and its body reader pulls bytes the engine
