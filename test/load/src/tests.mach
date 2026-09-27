@@ -1,0 +1,266 @@
+# sustained keep-alive load against http.server.server
+
+use std.runtime;
+
+use http.core.body;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.server.server;
+use A: std.allocator;
+use std.allocator.heap;
+use std.chrono.time;
+use io_error: std.io.error;
+use std.memory;
+use std.net.ip;
+use std.net.tcp;
+use std.print;
+use std.sync.thread;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view;
+
+#[testing]
+val CONNECTIONS: usize = 8;
+#[testing]
+val WARMUP: usize = 500;
+#[testing]
+val SUSTAINED: usize = 4000;
+#[testing]
+val REQUEST: str = "GET /load HTTP/1.1\r\nHost: load\r\n\r\n";
+#[testing]
+val RESPONSE_END: str = "\r\n\r\nok";
+
+#[testing]
+rec Body {
+    reader: body.Reader;
+    sent:   bool;
+}
+
+#[testing]
+rec Worker {
+    stream:   tcp.Stream;
+    requests: usize;
+    failed:   bool;
+    client:   thread.Thread;
+}
+
+#[testing]
+rec Load {
+    server:      server.Server;
+    heap:        heap.Heap;
+    source:      heap.Source;
+    backing:     A.Allocator;
+    endpoint:    ip.Endpoint;
+    coordinator: thread.Thread;
+    spawned:     bool;
+    workers:     [8]Worker;
+    result:      i32;
+    warm_live:   usize;
+    steady_live: usize;
+    elapsed_ns:  i64;
+}
+
+#[testing]
+fun body_read(context: ptr, output: *u8, capacity: usize, trailers: *field.Fields) body.Progress {
+    val state: *Body = context::*Body;
+    if (state.sent) { ret body.complete(body.REUSE_ALLOWED); }
+    state.sent = true;
+    output[0]  = 'o';
+    output[1]  = 'k';
+    ret body.data(2);
+}
+
+#[testing]
+fun body_finish(context: ptr, mode: body.Mode, trailers: *field.Fields) body.Progress {
+    if (mode == body.CANCEL)  { ret body.cancelled(body.REUSE_FORBIDDEN); }
+    if (mode == body.TIMEOUT) { ret body.timed_out(body.REUSE_FORBIDDEN); }
+    ret body.complete(body.REUSE_ALLOWED);
+}
+
+#[testing]
+fun body_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progress {
+    ret body.failed("no operation pends", body.REUSE_FORBIDDEN);
+}
+
+#[testing]
+fun body_release(context: ptr) {}
+
+# a two byte body out of the exchange's own scratch
+#[testing]
+fun serve_ok(context: ptr, call: *server.Call) exchange.ServiceStatus {
+    val active: *exchange.Exchange = call.exchange;
+    val state:  *Body              = call.memory::*Body;
+    state.reader = body.init_reader(state::ptr, body_read, body_finish, body_complete,
+        body_release, body.OWNER_APPLICATION, active.generation, true, 2,
+        active.limits.response_body, nil, active.scope);
+    if (message.add_field(active.response, field.Field{
+        name:  view.view(field.CONTENT_LENGTH, str_len(field.CONTENT_LENGTH)),
+        value: view.view("2", 1), sensitive: false
+    }) != field.ADD_OK
+        || message.set_body_reader(active.response, ?state.reader, active.limits) != message.RESPONSE_OK
+        || exchange.commit(active, active.limits) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret exchange.SERVICE_COMPLETE;
+}
+
+#[testing]
+fun ends_with(buffer: *u8, length: usize, suffix: str) bool {
+    val count: usize = str_len(suffix);
+    ret length >= count && memory.raw_equal(?buffer[length - count], suffix, count);
+}
+
+# one keep-alive connection's requests, each answered before the next is sent
+#[testing]
+fun work(argument: *u8) {
+    val worker: *Worker = argument::*Worker;
+    val length: usize   = str_len(REQUEST);
+    var buffer: [256]u8;
+    var i:      usize   = 0;
+    for (i < worker.requests) {
+        var offset: usize = 0;
+        for (offset < length) {
+            val sent: res[usize, io_error.Error] = tcp.stream_write(?worker.stream,
+                ?REQUEST[offset], length - offset);
+            if (sel sent.err) {
+                worker.failed = true;
+                ret;
+            }
+            offset = offset + sent.ok;
+        }
+        var have: usize = 0;
+        for (!ends_with(?buffer[0], have, RESPONSE_END)) {
+            val got: res[usize, io_error.Error] = tcp.stream_read(?worker.stream,
+                ?buffer[have], 256 - have);
+            if (sel got.err) {
+                worker.failed = true;
+                ret;
+            }
+            if (got.ok == 0 || have + got.ok == 256) {
+                worker.failed = true;
+                ret;
+            }
+            have = have + got.ok;
+        }
+        i = i + 1;
+    }
+}
+
+#[testing]
+fun phase(load: *Load, requests: usize) bool {
+    var i: usize = 0;
+    for (i < CONNECTIONS) {
+        load.workers[i].requests = requests;
+        val spawned: thread.Operation = thread.spawn_with(work, (?load.workers[i])::*u8,
+            ?load.workers[i].client);
+        if (sel spawned.err) { ret false; }
+        i = i + 1;
+    }
+    var failed: bool = false;
+    i = 0;
+    for (i < CONNECTIONS) {
+        thread.join(?load.workers[i].client);
+        if (load.workers[i].failed) { failed = true; }
+        i = i + 1;
+    }
+    ret !failed;
+}
+
+#[testing]
+fun instant_ns() i64 {
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.err) { ret 0; }
+    ret clock.ok.sec * 1000000000 + clock.ok.nsec;
+}
+
+# warm every connection up, then measure a sustained run between two quiet points
+#[testing]
+fun coordinate(argument: *u8) {
+    val load: *Load = argument::*Load;
+    load.result = 1;
+    var i: usize = 0;
+    for (i < CONNECTIONS) {
+        val connected: res[tcp.Stream, io_error.Error] = tcp.connect(load.endpoint);
+        if (sel connected.err) {
+            server.shutdown(?load.server);
+            ret;
+        }
+        load.workers[i].stream = connected.ok;
+        tcp.stream_set_read_timeout(?load.workers[i].stream, 30000);
+        i = i + 1;
+    }
+    load.result = 2;
+    if (phase(load, WARMUP)) {
+        load.warm_live = heap.live_bytes(?load.heap);
+        val started: i64 = instant_ns();
+        load.result = 3;
+        if (phase(load, SUSTAINED)) {
+            load.elapsed_ns  = instant_ns() - started;
+            load.steady_live = heap.live_bytes(?load.heap);
+            load.result      = 0;
+        }
+    }
+    i = 0;
+    for (i < CONNECTIONS) {
+        tcp.stream_close(?load.workers[i].stream);
+        i = i + 1;
+    }
+    server.shutdown(?load.server);
+}
+
+#[testing]
+fun ready(context: ptr, endpoint: ip.Endpoint) server.HookStatus {
+    val load: *Load = context::*Load;
+    load.endpoint = endpoint;
+    val spawned: thread.Operation = thread.spawn_with(coordinate, load::*u8, ?load.coordinator);
+    if (sel spawned.err) { ret server.HOOK_FAILED; }
+    load.spawned = true;
+    ret server.HOOK_DONE;
+}
+
+test load__sustained_keep_alive_holds_memory_steady {
+    var load: Load;
+    load.result = -1;
+    heap.native_source(?load.source);
+    val made_heap: err[A.Error] = heap.init(?load.heap, ?load.source, 0);
+    if (sel made_heap.err) { ret 1; }
+    val made_allocator: err[A.Error] = heap.make(?load.backing, ?load.heap);
+    if (sel made_allocator.err) { ret 1; }
+    var configured: server.Config = server.config_default(ip.endpoint(127, 0, 0, 1, 0));
+    configured.max_connections      = CONNECTIONS;
+    configured.max_exchanges        = CONNECTIONS;
+    configured.memory_bytes         = 16777216;
+    configured.request_memory_bytes = $size_of(Body);
+    var hooks: server.Hooks = server.no_hooks();
+    hooks.ctx   = (?load)::ptr;
+    hooks.ready = ready;
+    val handler: server.Handler = server.Handler{ctx: (?load)::ptr, serve: serve_ok, abandon: nil};
+    if (!server.make(?load.server, configured, handler, hooks, ?load.backing)) { ret 2; }
+    val report: server.Report = server.serve(?load.server);
+    if (load.spawned)                  { thread.join(?load.coordinator); }
+    if (!server.destroy(?load.server)) { ret 3; }
+    if (load.result != 0)              { ret 10 + load.result; }
+    val requests:   u64 = (CONNECTIONS * (WARMUP + SUSTAINED))::u64;
+    val sustained:  u64 = (CONNECTIONS * SUSTAINED)::u64;
+    var per_second: u64 = 0;
+    if (load.elapsed_ns > 0) { per_second = sustained * 1000000000 / load.elapsed_ns::u64; }
+    print.printlnf("load: {} requests over {} connections in {} ms, {} requests/s",
+        sustained, CONNECTIONS, load.elapsed_ns / 1000000, per_second);
+    print.printlnf("load: heap {} bytes after warmup, {} after the sustained run, {} buffer allocations",
+        load.warm_live, load.steady_live, report.backing_allocations);
+    if (report.failure != server.FAILURE_NONE || report.served != requests
+        || report.accepted != CONNECTIONS::u64 || report.closed != CONNECTIONS::u64
+        || report.unsettled != 0) { ret 4; }
+    # nothing is still borrowed, nothing grew once warm, and the pool reached its
+    # backing only for the buffers one warm connection set holds at once
+    if (report.memory_live != 0 || load.steady_live > load.warm_live
+        || report.backing_allocations > (CONNECTIONS * 16)::u64) { ret 5; }
+    ret 0;
+}
