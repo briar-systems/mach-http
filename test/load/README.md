@@ -16,10 +16,14 @@ case prints the sustained throughput, and it asserts:
 
 - every request was served, and every connection closed and was released
 - no buffer is still borrowed when the server stops
-- the heap holds no more after the sustained run than after the warmup, measured at
-  the same quiet point, with every connection idle between requests
 - the buffer pool reached its backing allocator only for the buffers the warm
   connections hold at once, a number that does not grow with the request count
+- nothing the server allocated outlives `destroy`: the heap returns to exactly the
+  bytes it held before `make`
+
+The heap is not compared mid-run. A client holding its last response does not mean
+the server has released that exchange's buffers, and the pool keeps released chunks
+up to its high water, so a mid-run reading measures timing, not leaks.
 
 Throughput is printed, not asserted. A slow machine moves the number and not the
 verdict.
