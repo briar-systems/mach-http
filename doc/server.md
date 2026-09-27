@@ -59,6 +59,13 @@ Every final response the server writes carries a `Date` in IMF-fixdate form, as 
 origin server with a clock must send it (RFC 9110 section 6.6.1). The date is
 formatted once per second. A `Date` the handler set is sent as it is.
 
+A response the handler left unframed, with neither `Content-Length` nor
+`Transfer-Encoding`, is framed by the server so it does not end the connection: a
+body reader with a declared length gets `Content-Length`, an unsized reader gets
+`Transfer-Encoding: chunked` for an HTTP/1.1 request (an HTTP/1.0 one stays
+close-delimited), and a response with no body whose status permits content gets
+`Content-Length: 0`. Framing fields the handler set are sent as they are.
+
 A body operation that returned PENDING, the handler's response reader or its own
 request body read, is completed with `body.complete_reader` only after the exchange
 is woken or its request body moves. A completion may be attempted on a turn the body
