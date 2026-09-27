@@ -51,6 +51,10 @@ exchange, and a `Waker` for it.
 - `SERVICE_FAILED`, or a completion with no committed response, is answered 500 if
   no response has started, and closes the connection otherwise.
 
+Every final response the server writes carries a `Date` in IMF-fixdate form, as an
+origin server with a clock must send it (RFC 9110 section 6.6.1). The date is
+formatted once per second. A `Date` the handler set is sent as it is.
+
 A body operation that returned PENDING, the handler's response reader or its own
 request body read, is completed with `body.complete_reader` only after the exchange
 is woken or its request body moves. A completion may be attempted on a turn the body
