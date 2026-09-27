@@ -1,7 +1,7 @@
 use std.runtime;
 use std.types.string.str;
 
-pub val VERSION: str = "0.22.0";
+pub val VERSION: str = "0.23.0";
 
 fwd http.core.method;
 fwd http.core.status;
