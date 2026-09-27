@@ -144,9 +144,12 @@ pub rec Handler {
 # request_memory_bytes: the handler scratch each exchange carries, 0 for none
 # connection:           the HTTP/1 engine: parser limits, pipeline depth, buffer
 #                       sizes and the header, request, idle, write and total timeouts.
-#                       its lanes are the server's own
+#                       its lanes are the server's own. request_timeout_ns is the
+#                       optional absolute cap on an exchange, 0 for none
 # limits:               the exchange limits. the request head side follows the parser
 # body_timeout_ns:      from a request head to the end of its body
+# response_timeout_ns:  from the end of a request body, and again from each response
+#                       write the client accepts, to the next one or the response's end
 # drain_timeout_ns:     from the drain to abandoning what is left
 # stop_timeout_ns:      how long abandoned work may take to settle, and the stop hook
 # hook_poll_ns:         how often a pending hook is called again
@@ -160,6 +163,7 @@ pub rec Config {
     connection:           h1.Config;
     limits:               message.Limits;
     body_timeout_ns:      u64;
+    response_timeout_ns:  u64;
     drain_timeout_ns:     u64;
     stop_timeout_ns:      u64;
     hook_poll_ns:         u64;
@@ -326,6 +330,8 @@ rec Connection {
     length_text:      [24]u8;
     rejection_fields: field.Fields;
     body_deadline:    deadline.Deadline;
+    # the response's progress deadline, rearmed by each write the client accepts
+    response_deadline: deadline.Deadline;
 }
 
 pub rec Server {
@@ -434,8 +440,14 @@ fun request_limits(configured: Config) message.Limits {
     ret limits;
 }
 
-# a configuration any server takes, listening on `address`
+# a configuration any server takes, listening on `address`. a response lives
+# while it makes progress, so the engine's whole-exchange, whole-response and
+# whole-connection bounds are off
 pub fun config_default(address: ip.Endpoint) Config {
+    var connection: h1.Config = h1.config_default();
+    connection.request_timeout_ns = 0;
+    connection.write_timeout_ns   = 0;
+    connection.total_timeout_ns   = 0;
     ret Config{
         address:              address,
         backlog:              128,
@@ -443,9 +455,10 @@ pub fun config_default(address: ip.Endpoint) Config {
         max_exchanges:        256,
         memory_bytes:         67108864,
         request_memory_bytes: 16384,
-        connection:           h1.config_default(),
+        connection:           connection,
         limits:               message.limits_default(),
         body_timeout_ns:      30000000000,
+        response_timeout_ns:  30000000000,
         drain_timeout_ns:     30000000000,
         stop_timeout_ns:      5000000000,
         hook_poll_ns:         10000000,
@@ -464,6 +477,7 @@ pub fun config_valid(configured: Config) bool {
         && product(configured.max_connections, configured.limits.max_informational, ?fields)
         && h1.config_valid(configured.connection, configured.connection.max_pipeline)
         && deadline.duration_valid(configured.body_timeout_ns)
+        && deadline.duration_valid(configured.response_timeout_ns)
         && deadline.duration_valid(configured.drain_timeout_ns)
         && deadline.duration_valid(configured.stop_timeout_ns)
         && deadline.duration_valid(configured.hook_poll_ns);
@@ -1113,15 +1127,16 @@ fun end_exchange(conn: *Connection) {
         operation_ok(cancel.destroy(?conn.exchange_scope));
         conn.exchange_scope_live = false;
     }
-    conn.exchange_live           = false;
-    conn.service_pending         = false;
-    conn.head_ready              = false;
-    conn.response_started        = false;
-    conn.cancelling              = false;
-    conn.stirred                 = false;
-    conn.body_notified           = false;
-    conn.body_deadline.active    = false;
-    conn.request_body.connection = nil;
+    conn.exchange_live            = false;
+    conn.service_pending          = false;
+    conn.head_ready               = false;
+    conn.response_started         = false;
+    conn.cancelling               = false;
+    conn.stirred                  = false;
+    conn.body_notified            = false;
+    conn.body_deadline.active     = false;
+    conn.response_deadline.active = false;
+    conn.request_body.connection  = nil;
     release_capacity(server);
 }
 
@@ -1380,6 +1395,11 @@ fun pump_rejection(conn: *Connection, now: time.Instant) Step {
     ret STEP_PROGRESS;
 }
 
+# the request is in, so the response owes the client progress from here
+fun arm_response(conn: *Connection, now: time.Instant) {
+    conn.response_deadline = deadline.after(now, conn.server.configured.response_timeout_ns);
+}
+
 fun start_exchange(conn: *Connection, slot: usize, now: time.Instant) Step {
     val server: *Server = conn.server;
     if (!conn.reserved) {
@@ -1406,7 +1426,8 @@ fun start_exchange(conn: *Connection, slot: usize, now: time.Instant) Step {
         ret begin_answer(conn, slot, refused, now);
     }
     conn.has_pending = false;
-    if (!conn.slots[slot].inbound_complete) {
+    if (conn.slots[slot].inbound_complete) { arm_response(conn, now); }
+    or {
         conn.body_deadline = deadline.after(now, server.configured.body_timeout_ns);
     }
     # a handler waiting on its request body needs the connection to keep reading
@@ -1459,6 +1480,7 @@ fun apply(conn: *Connection, event: h1.Event, now: time.Instant) Step {
     if (kind == h1.EVENT_REQUEST_COMPLETE) {
         conn.body_deadline.active = false;
         conn.stirred              = true;
+        if (conn.exchange_live && event.slot == conn.active_slot) { arm_response(conn, now); }
         ret STEP_PROGRESS;
     }
     # a held body is reported again until it is consumed, and stirs the handler once
@@ -1749,22 +1771,23 @@ fun open_connection(server: *Server, conn: *Connection, stream: tcp.Stream,
         ret false;
     }
     atomic.store(?conn.woken, 0);
-    conn.engine_live          = true;
-    conn.exchange_live        = false;
-    conn.entered              = false;
-    conn.wake_deadline        = deadline.none();
-    conn.exchange_scope_live  = false;
-    conn.cancelling           = false;
-    conn.has_pending          = false;
-    conn.rejecting            = false;
-    conn.queued               = false;
-    conn.reserved             = false;
-    conn.arena_held           = false;
-    conn.stage_held           = false;
-    conn.active_slot          = NO_SLOT;
-    conn.body_deadline.active = false;
-    conn.phase                = CONN_ACTIVE;
-    server.live               = server.live + 1;
+    conn.engine_live              = true;
+    conn.exchange_live            = false;
+    conn.entered                  = false;
+    conn.wake_deadline            = deadline.none();
+    conn.exchange_scope_live      = false;
+    conn.cancelling               = false;
+    conn.has_pending              = false;
+    conn.rejecting                = false;
+    conn.queued                   = false;
+    conn.reserved                 = false;
+    conn.arena_held               = false;
+    conn.stage_held               = false;
+    conn.active_slot              = NO_SLOT;
+    conn.body_deadline.active     = false;
+    conn.response_deadline.active = false;
+    conn.phase                    = CONN_ACTIVE;
+    server.live                   = server.live + 1;
     ret true;
 }
 
@@ -1820,6 +1843,10 @@ fun dispatch(server: *Server, completion: *io_runtime.Completion, now: time.Inst
     if (conn == nil || !conn.engine_live) { ret; }
     var settled: transport.Completion;
     if (!translate(?settled, completion, context.token_context)) { ret; }
+    if (conn.response_deadline.active && settled.kind == transport.WRITE
+        && settled.status == transport.IO_COMPLETE && settled.count != 0) {
+        arm_response(conn, now);
+    }
     apply(conn, h1.complete_io(?conn.engine, ?settled, now), now);
     schedule(conn);
 }
@@ -1865,9 +1892,12 @@ fun expire(server: *Server, now: time.Instant) {
             conn.stirred              = true;
             schedule(conn);
         }
-        if (deadline.expired(conn.body_deadline, now)) {
-            conn.body_deadline.active = false;
-            server.report.timed_out   = server.report.timed_out + 1;
+        # a request body or a response that stopped moving closes the connection
+        if (deadline.expired(conn.body_deadline, now)
+            || deadline.expired(conn.response_deadline, now)) {
+            conn.body_deadline.active     = false;
+            conn.response_deadline.active = false;
+            server.report.timed_out       = server.report.timed_out + 1;
             h1.cancel_connection(?conn.engine);
             apply(conn, h1.tick(?conn.engine, now), now);
             schedule(conn);
@@ -2078,6 +2108,7 @@ fun earliest_deadline(server: *Server, now: time.Instant) deadline.Deadline {
         if (conn.phase == CONN_ACTIVE && conn.engine_live) {
             earliest = deadline.earlier(earliest, h1.next_deadline(?conn.engine));
             earliest = deadline.earlier(earliest, conn.body_deadline);
+            earliest = deadline.earlier(earliest, conn.response_deadline);
             if (conn.service_pending) { earliest = deadline.earlier(earliest, conn.wake_deadline); }
         }
         i = i + 1;
@@ -2145,6 +2176,10 @@ pub fun serve(server: *Server) Report {
 
 #[testing]
 val STREAM_BYTES: u64 = 1048576;
+#[testing]
+val TRICKLE_CHUNKS: u64 = 8;
+#[testing]
+val TRICKLE_BYTES: usize = 16;
 
 #[testing]
 def Scenario: fun(*Harness) i64;
@@ -2166,6 +2201,9 @@ rec Harness {
     settles:  i64;
     settled:  i64;
     late:     i64;
+    # the /trickle exchange and the chunks its client has asked for
+    trickle: Waker;
+    nudges:  i64;
 }
 
 # the response body a test exchange streams, kept in the exchange's own scratch
@@ -2179,6 +2217,7 @@ rec TestBody {
     length:   u64;
     sent:     u64;
     endless:  bool;
+    trickle:  bool;
     stalling: bool;
     token:    u64;
     output:   *u8;
@@ -2213,6 +2252,7 @@ fun digits_of(value: u64, output: *u8) usize {
 #[testing]
 fun fill_body(state: *TestBody, output: *u8, capacity: usize) body.Progress {
     var count: usize = capacity;
+    if (state.trickle && count > TRICKLE_BYTES) { count = TRICKLE_BYTES; }
     if (!state.endless && (state.length - state.sent) < count::u64) {
         count = (state.length - state.sent)::usize;
     }
@@ -2224,14 +2264,17 @@ fun fill_body(state: *TestBody, output: *u8, capacity: usize) body.Progress {
 
 # a streamed body stalls on every other read and wakes its own exchange, so the
 # pending read and the wake that resumes it run on every chunk. an endless body
-# sends one chunk and then parks, never finishing, until it is cancelled
+# sends one chunk and then parks, never finishing, until it is cancelled. a
+# trickled body sends one small chunk per nudge from its client
 #[testing]
 fun test_read(context: ptr, output: *u8, capacity: usize,
     trailers: *field.Fields) body.Progress {
     val state: *TestBody = context::*TestBody;
     if (!state.endless && state.sent == state.length) { ret body.complete(body.REUSE_ALLOWED); }
-    if (state.endless && state.sent != 0) {
-        state.token = state.token + 1;
+    if ((state.endless || state.trickle) && state.sent != 0) {
+        state.token    = state.token + 1;
+        state.output   = output;
+        state.capacity = capacity;
         ret body.pending(state.token);
     }
     if (state.stalling) {
@@ -2251,7 +2294,7 @@ fun test_complete(context: ptr, token: u64, trailers: *field.Fields) body.Progre
     val state: *TestBody = context::*TestBody;
     if (token != state.token) { ret body.failed("unexpected completion", body.REUSE_FORBIDDEN); }
     # a turn the body did not ask for finds it still parked
-    if (state.endless) {
+    if (state.endless || (state.trickle && atomic.exchange(?state.harness.nudges, 0) == 0)) {
         state.token = state.token + 1;
         ret body.pending(state.token);
     }
@@ -2323,6 +2366,12 @@ fun test_serve(context: ptr, call: *Call) exchange.ServiceStatus {
         state.length   = STREAM_BYTES;
         state.endless  = path_is(path, "/endless");
         state.stalling = !state.endless;
+    }
+    if (path_is(path, "/trickle")) {
+        state.text      = nil;
+        state.length    = TRICKLE_CHUNKS * TRICKLE_BYTES::u64;
+        state.trickle   = true;
+        harness.trickle = call.waker;
     }
     if (!state.endless && framed) {
         val count: usize = digits_of(state.length, ?state.digits[0]);
@@ -2668,6 +2717,59 @@ fun drain_scenario(harness: *Harness) i64 {
     tcp.stream_close(?stream);
     tcp.stream_close(?endless);
     tcp.stream_close(?held);
+    ret 0;
+}
+
+#[testing]
+fun progress_scenario(harness: *Harness) i64 {
+    var stalled: tcp.Stream;
+    var stream:  tcp.Stream;
+    var buffer:  [2048]u8;
+    var have:    usize = 0;
+    # a stream that sends its head and a chunk, then stops
+    if (!connect_to(harness, ?stalled)
+        || !send_text(?stalled, "GET /endless HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stalled, ?buffer[0], 2048, ?have, "\r\n\r\n")) { ret 1; }
+    have = 0;
+    val started: time.Instant = test_now();
+    if (!connect_to(harness, ?stream)
+        || !send_text(?stream, "GET /trickle HTTP/1.1\r\nHost: x\r\n\r\n")
+        || !read_until(?stream, ?buffer[0], 2048, ?have, "\r\n\r\n")) { ret 2; }
+    val total:    u64 = TRICKLE_CHUNKS * TRICKLE_BYTES::u64;
+    var received: u64 = (have - (find(?buffer[0], have, "\r\n\r\n") + 4))::u64;
+    # one chunk a tenth of a second, each well inside the response timeout
+    for (received < total) {
+        os.sleep(100000000);
+        atomic.store(?harness.nudges, 1);
+        if (!wake(harness.trickle)) { ret 3; }
+        val got: res[usize, io_error.Error] = tcp.stream_read(?stream, ?buffer[0], 2048);
+        if (sel got.err) { ret 4; }
+        if (got.ok == 0) { ret 4; }
+        received = received + got.ok::u64;
+    }
+    # the stream outlived the response timeout more than twice over
+    if (received != total || time.instant_before(test_now(), time.instant_add(started, 600000000))) {
+        ret 5;
+    }
+    # the stalled one was closed at its response timeout, long before the drain
+    var ignored: u64 = 0;
+    if (!read_to_end(?stalled, ?ignored)) { ret 6; }
+    tcp.stream_close(?stalled);
+    tcp.stream_close(?stream);
+    ret 0;
+}
+
+test serve__a_response_lives_while_it_makes_progress {
+    var harness:    Harness;
+    var report:     Report;
+    var configured: Config = test_config();
+    configured.response_timeout_ns = 300000000;
+    if (!run_scenario(?harness, configured, progress_scenario, ?report)) { ret 1; }
+    if (harness.result != 0)                                             { ret 10 + harness.result::i32; }
+    if (report.failure != FAILURE_NONE || report.accepted != 2 || report.served != 1
+        || report.timed_out != 1 || report.cancelled != 1 || report.abandoned_exchanges != 0
+        || report.unsettled != 0 || report.memory_live != 0) { ret 2; }
+    if (harness.cancels != 1 || harness.settles != 2 || harness.settled != 1) { ret 3; }
     ret 0;
 }
 
