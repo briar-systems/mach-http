@@ -22,6 +22,11 @@ pub fun duration_valid(value: u64) bool {
     ret value != 0 && value <= 0x7fffffffffffffff;
 }
 
+# a duration that may be zero, which is no deadline at all
+pub fun optional_valid(value: u64) bool {
+    ret value <= 0x7fffffffffffffff;
+}
+
 # saturates at the latest representable instant
 pub fun after(now: time.Instant, duration: u64) Deadline {
     var seconds:     u64 = duration / 1000000000;
@@ -34,6 +39,12 @@ pub fun after(now: time.Instant, duration: u64) Deadline {
         ret Deadline{active: true, at: time.Instant{sec: 0x7fffffffffffffff, nsec: 999999999}};
     }
     ret Deadline{active: true, at: time.Instant{sec: now.sec + seconds::i64, nsec: nanoseconds}};
+}
+
+# after(now, duration), or no deadline for a zero duration
+pub fun after_optional(now: time.Instant, duration: u64) Deadline {
+    if (duration == 0) { ret none(); }
+    ret after(now, duration);
 }
 
 pub fun expired(value: Deadline, now: time.Instant) bool {
@@ -63,5 +74,7 @@ test deadline__expiry_is_inclusive_and_saturates {
     if (expired(none(), start))                                               { ret 4; }
     if (earlier(none(), at).at.sec != 11 || earlier(at, none()).at.sec != 11) { ret 5; }
     if (latest(start, at.at).sec != 11 || latest(at.at, start).sec != 11)     { ret 6; }
+    if (after_optional(start, 0).active || after_optional(start, 1).at.sec != 11
+        || !optional_valid(0) || duration_valid(0)) { ret 7; }
     ret 0;
 }

@@ -45,7 +45,10 @@ Every `now` the engine takes is a `std.chrono.time.Instant`, read with
 `time.instant()`. The header, request, write, idle and total deadlines are
 `Instant`s computed from it, and an expired one times out the engine's cancellation
 scope. The type is distinct from the wall-clock `time.Time`, so a calendar reading
-cannot be passed where a deadline is expected.
+cannot be passed where a deadline is expected. `request_timeout_ns`,
+`write_timeout_ns` and `total_timeout_ns` may be zero, which arms no such deadline,
+for a host that bounds its exchanges and connections itself. The header and idle
+timeouts are always armed.
 
 A server owes its peer a request within `header_timeout_ns` whenever no slot is
 live. The request-wait deadline is armed at `init`, since a new connection owes its
