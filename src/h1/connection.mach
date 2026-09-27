@@ -302,10 +302,10 @@ pub fun config_valid(configured: Config, capacity: usize) bool {
         && line_bytes(configured.parser) != 0
         && configured.max_drain_bytes != 0
         && deadline.duration_valid(configured.header_timeout_ns)
-        && deadline.duration_valid(configured.request_timeout_ns)
+        && deadline.optional_valid(configured.request_timeout_ns)
         && deadline.duration_valid(configured.idle_timeout_ns)
-        && deadline.duration_valid(configured.write_timeout_ns)
-        && deadline.duration_valid(configured.total_timeout_ns);
+        && deadline.optional_valid(configured.write_timeout_ns)
+        && deadline.optional_valid(configured.total_timeout_ns);
 }
 
 fun empty_event(engine: *Engine, kind: EventKind) Event {
@@ -536,7 +536,7 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     engine.tunnel_reported    = false;
     engine.idle_deadline      = deadline.after(now, configured.idle_timeout_ns);
     engine.wait_deadline      = Deadline{active: false, at: now};
-    engine.total_deadline     = deadline.after(now, configured.total_timeout_ns);
+    engine.total_deadline     = deadline.after_optional(now, configured.total_timeout_ns);
     engine.error              = ERROR_NONE;
     engine.initialized        = true;
     await_request(engine, now);
@@ -574,7 +574,7 @@ fun start_slot(engine: *Engine, index: usize, now: time.Instant) *Slot {
     slot.state                  = SLOT_LIVE;
     slot.sequence               = next_sequence(engine);
     slot.header_deadline        = deadline.after(now, engine.configured.header_timeout_ns);
-    slot.request_deadline       = deadline.after(now, engine.configured.request_timeout_ns);
+    slot.request_deadline       = deadline.after_optional(now, engine.configured.request_timeout_ns);
     engine.count                = engine.count + 1;
     engine.idle_deadline.active = false;
     engine.wait_deadline.active = false;
@@ -808,7 +808,7 @@ pub fun enqueue_request(engine: *Engine, version: message.Version,
     slot.out_kind          = OUT_REQUEST;
     slot.upgrade_requested = upgrade_requested(fields);
     slot.close_after       = !slot.serializer.plan.keep_alive;
-    slot.write_deadline    = deadline.after(now, engine.configured.write_timeout_ns);
+    slot.write_deadline    = deadline.after_optional(now, engine.configured.write_timeout_ns);
     ret index;
 }
 
@@ -887,7 +887,7 @@ pub fun prepare_informational(engine: *Engine, index: usize, code: status.Status
     slot.serializer_active = true;
     slot.out_kind          = OUT_INFORMATIONAL;
     if (!slot.write_deadline.active) {
-        slot.write_deadline = deadline.after(now, engine.configured.write_timeout_ns);
+        slot.write_deadline = deadline.after_optional(now, engine.configured.write_timeout_ns);
     }
     ret true;
 }
@@ -919,7 +919,7 @@ pub fun prepare_response(engine: *Engine, index: usize, code: status.Status,
         || code == status.SWITCHING_PROTOCOLS;
     if (!slot.serializer.plan.keep_alive && !slot.tunnel_ready) { slot.close_after = true; }
     if (!slot.write_deadline.active) {
-        slot.write_deadline = deadline.after(now, engine.configured.write_timeout_ns);
+        slot.write_deadline = deadline.after_optional(now, engine.configured.write_timeout_ns);
     }
     ret true;
 }
@@ -1482,6 +1482,18 @@ pub fun progress_close(engine: *Engine) bool {
         ret true;
     }
     ret false;
+}
+
+# the host is done with a tunnel it ran over this engine's transport. input the
+# engine still held is dropped, and the engine closes like a draining one, through
+# progress_close. a total deadline still applies to that close
+pub fun end_tunnel(engine: *Engine) bool {
+    if (engine == nil || !engine.initialized || engine.state != TUNNEL) { ret false; }
+    engine.input_offset         = engine.input_length;
+    engine.idle_deadline.active = false;
+    engine.wait_deadline.active = false;
+    engine.state                = DRAINING;
+    ret true;
 }
 
 pub fun cancel_connection(engine: *Engine) bool {
@@ -2113,6 +2125,10 @@ test server__informationals_and_upgrade_preserve_wire_order {
     val tunnel: Event = process(?fixture.engine, now);
     if (tunnel.kind != EVENT_TUNNEL || tunnel.slot != headers.slot || tunnel.body_length != 3
         || !memory.raw_equal(tunnel.body, "xyz", 3)) { ret 5; }
+    # the host's tunnel ends and the engine closes gracefully, the tunnel bytes unparsed
+    if (!release(?fixture.engine, headers.slot, now) || !end_tunnel(?fixture.engine)
+        || end_tunnel(?fixture.engine) || !progress_close(?fixture.engine)
+        || !fixture.engine.shutdown_pending) { ret 6; }
     ret 0;
 }
 
