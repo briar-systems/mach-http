@@ -290,7 +290,9 @@ fun line_bytes(configured: parser.Limits) usize {
     ret bytes;
 }
 
-fun config_valid(configured: Config, capacity: usize) bool {
+# whether init takes `configured` for a pipeline ring of `capacity` slot records,
+# so a host can refuse a configuration before it serves any connection
+pub fun config_valid(configured: Config, capacity: usize) bool {
     ret configured.max_pipeline != 0 && configured.max_pipeline <= capacity
         && configured.read_bytes != 0 && configured.write_bytes != 0
         && configured.slot_storage_bytes != 0 && configured.slot_scratch_bytes != 0
@@ -1201,6 +1203,8 @@ pub fun process(engine: *Engine, now: time.Instant) Event {
     }
     val checked: Event = tick(engine, now);
     if (checked.kind != EVENT_NONE) { ret checked; }
+    # a closing engine only waits for its close, and input it holds is never parsed
+    if (engine.state == CLOSING) { ret empty_event(engine, EVENT_NONE); }
     if (engine.state == TUNNEL) {
         if (engine.tunnel_reported) { ret empty_event(engine, EVENT_NONE); }
         engine.tunnel_reported = true;
@@ -2042,7 +2046,8 @@ test client__connect_tunnels_without_consuming_tunnel_bytes {
 test server__keep_alive_and_graceful_close_reuse_bounded_storage {
     var fixture: Fixture;
     val now:     time.Instant = test_now(100);
-    if (!make_fixture(?fixture, SERVER, 1)) { ret 1; }
+    if (!config_valid(test_config(1), 1) || config_valid(test_config(2), 1)) { ret 8; }
+    if (!make_fixture(?fixture, SERVER, 1))                                  { ret 1; }
     var no_fields:      field.Fields = field.init(nil, 0, field.limits(0, 0, 0, 0));
     var i:              usize        = 0;
     var prior_sequence: u64          = 0;
@@ -2066,6 +2071,10 @@ test server__keep_alive_and_graceful_close_reuse_bounded_storage {
         fixture.io.shutdown_token, transport.SHUTDOWN_WRITE, 0);
     if (complete_io(?fixture.engine, ?shutdown, now).kind != EVENT_NONE
         || !progress_close(?fixture.engine) || fixture.io.close_calls != 1) { ret 6; }
+    # a peer end of stream seen while closing never reopens the engine
+    fixture.engine.input_eof = true;
+    if (process(?fixture.engine, now).kind != EVENT_NONE
+        || fixture.engine.state != CLOSING) { ret 9; }
     var closed: transport.Completion = transport.completed(
         fixture.io.close_token, transport.CLOSE, 0);
     if (complete_io(?fixture.engine, ?closed, now).kind != EVENT_CLOSED

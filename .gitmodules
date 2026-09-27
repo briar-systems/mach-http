@@ -13,3 +13,6 @@
 [submodule "test/h3-quic/dep/tls"]
 	path = test/h3-quic/dep/tls
 	url = https://github.com/briar-systems/mach-tls
+[submodule "test/load/dep/std"]
+	path = test/load/dep/std
+	url = https://github.com/briar-systems/mach-std

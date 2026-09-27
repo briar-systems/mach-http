@@ -1,7 +1,7 @@
 [project]
-id = "http"
+id = "load"
 mach = "^6"
-version = "0.22.0"
+version = "0.0.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -51,14 +51,16 @@ simd = "scalarize"
 vectorize = true
 float_reassoc = false
 
-[artifact.http]
+[artifact.load]
 kind = "static"
-entry = "lib/http.mach"
-out = "lib/http"
+entry = "tests.mach"
+out = "lib/load"
 targets = ["*"]
 link = []
 need = []
 
+[dep.http]
+path = "../.."
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"

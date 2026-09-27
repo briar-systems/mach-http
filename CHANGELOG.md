@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-27
+
+### Added
+
+- `http.server.server`, a framework-neutral HTTP/1.1 runner that serves one handler over the service exchange. `make`, `serve` on the calling thread, `shutdown` from any thread, `wake` and `destroy`. Each accepted socket drives `http.h1.connection` (keep-alive, pipelining, wire-ordered responses) over `std.net.async`. A `Handler` serves and abandons calls, and each `Call` carries the exchange, per-exchange scratch and a thread-safe `Waker`. It bounds connections (the listen backlog holds the rest), in-flight exchanges (FIFO across connections) and buffer memory, answers parser limits with 414 and 431 and the body limit with 413, and enforces header, body, idle, write, request and total timeouts. Drain closes the listener, lets responses in flight finish and at the deadline abandons exchanges and aborts connections, and a `Report` counts both. `Hooks` run at start, ready (with the bound address), drain (with the deadline) and stop (with the report). Every final response carries `Date` unless the handler set one. Plaintext only, no upgrades, CONNECT tunnels or h2c. See `doc/server.md` (#189).
+- `h1.config_valid` is public, so a host can refuse a configuration before it serves a connection (#189).
+- A `test/load` subproject, run in CI, holds a sustained keep-alive load against the server runner and asserts every request is served and memory stays bounded (#189).
+
+### Fixed
+
+- `h1.process` on a CLOSING engine no longer parses held input, so an end of stream seen while closing cannot move the engine back to DRAINING and strand its close completion (#189).
+
 ## [0.21.0] - 2026-09-26
 
 http builds on mach 6 and mach-std 9.0.0 (#183). Its protocol surface is unchanged.
