@@ -82,6 +82,16 @@ fun single_varint(typ: u64) bool {
         || typ == frame.FRAME_MAX_PUSH_ID;
 }
 
+# the error a single-integer frame must fail with, given its payload bytes on
+# the wire and its declared length, or ERROR_NONE when it must not fail
+fun single_varint_error(payload: *u8, present: u64, declared: u64) frame.Error {
+    val value: Integer = integer_at(payload, present::usize);
+    if (value.whole && value.length::u64 == declared) { ret frame.ERROR_NONE; }
+    if (value.whole && value.length::u64 < present)   { ret frame.ERROR_FRAME; }
+    if (present == declared)                          { ret frame.ERROR_FRAME; }
+    ret frame.ERROR_TRUNCATED;
+}
+
 fun drive_frames(kind: frame.StreamKind, data: *u8, len: usize, stride: usize,
     run: *Run) bool {
     run.trace  = 0;
@@ -99,6 +109,9 @@ fun drive_frames(kind: frame.StreamKind, data: *u8, len: usize, stride: usize,
     var pending:  u64   = 0;
     var boundary: bool  = true;
     var frames:   usize = 0;
+    var open:     bool  = false;
+    var header:   frame.Header;
+    var body:     usize = 0;
     for {
         if (offset == len && boundary) { brk; }
         var given: usize = len - offset;
@@ -121,6 +134,9 @@ fun drive_frames(kind: frame.StreamKind, data: *u8, len: usize, stride: usize,
             run.trace = verdict.mix(run.trace, event.header.typ);
             payload   = 0;
             pending   = 0;
+            open      = true;
+            header    = event.header;
+            body      = offset;
         }
         or (event.kind == frame.EVENT_PAYLOAD) {
             if (event.data != bytes || event.data_length != event.consumed
@@ -156,9 +172,23 @@ fun drive_frames(kind: frame.StreamKind, data: *u8, len: usize, stride: usize,
             frames   = frames + 1;
             start    = offset;
             boundary = true;
+            open     = false;
         }
         or (event.kind == frame.EVENT_ERROR) {
             if (event.error == frame.ERROR_NONE) { ret fail(run, "h3: a frame failed without saying why"); }
+            # the parser is driven as documented, so a refusal is about the bytes
+            if (event.error == frame.ERROR_STATE) {
+                ret fail(run, "h3: bytes on the wire failed as a misused parser");
+            }
+            if (open && single_varint(header.typ)) {
+                var present: u64 = (len - body)::u64;
+                if (present > header.length) { present = header.length; }
+                var at: *u8 = nil;
+                if (present != 0) { at = ?data[body]; }
+                if (event.error != single_varint_error(at, present, header.length)) {
+                    ret fail(run, "h3: a single-integer frame failed with another error than its payload");
+                }
+            }
             run.trace = verdict.mix(run.trace, (offset::u64 << 8) | event.error::u64);
             run.shape = verdict.mark(run.shape, 16 + event.error::u64);
             brk;

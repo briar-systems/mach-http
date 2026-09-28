@@ -38,8 +38,10 @@ An input is answered when its entry point parses it or refuses it with a typed
 error, and every view the parse publishes lies inside the input or the storage
 it was copied into. A harness also checks what its parser promises: a stream
 parser answers the same whether the input arrives whole or a byte at a time, a
-frame header is the one on the wire and its payload is exactly its length, a
-huffman string or an integer is exactly the encoding of what it decoded to, a
+frame header is the one on the wire and its payload is exactly its length, an
+http/3 frame refused from the wire is never refused as a misused parser and one
+that carries a single integer fails with exactly the error its payload calls
+for, a huffman string or an integer is exactly the encoding of what it decoded to, a
 refused header block leaves the dynamic table as it was, an encoder instruction
 answers the entry it made, a decoder-stream instruction is taken exactly when
 RFC 9204 allows it, a stream preface is refused exactly when it duplicates a
