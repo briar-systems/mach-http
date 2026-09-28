@@ -64,7 +64,7 @@ path = "../.."
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.0"
+version = "^9.3"
 
 [dep.quic]
 git = "https://github.com/briar-systems/mach-quic"
