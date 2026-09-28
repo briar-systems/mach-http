@@ -1,0 +1,239 @@
+# the http/1.1 message parser, requests and responses
+#
+# each input is parsed twice, handed over whole and then one byte at a time, and
+# the two parses must agree on every message, error and body byte. a message that
+# completes and keeps the connection is followed by the next one in the input,
+# as a pipelining peer would send it
+
+use http.core.field;
+use http.core.method;
+use http.core.target;
+use http.h1.framing;
+use http.h1.parser;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.verdict;
+
+val LINE:     usize = 8192;
+val STORAGE:  usize = 32768;
+val FIELDS:   usize = 100;
+val TRAILERS: usize = 32;
+
+var line:     [LINE]u8;
+var storage:  [STORAGE]u8;
+var fields:   [FIELDS]field.Field;
+var trailers: [TRAILERS]field.Field;
+
+# what one parse of an input answered. `trace` covers every observation that must
+# not depend on how the input was split, `shape` is the outcome it reports
+rec Run {
+    trace:    u64;
+    shape:    u64;
+    messages: usize;
+    body:     u64;
+    detail:   *u8;
+}
+
+fun stored(value: view.View, p: *parser.Parser) bool {
+    ret verdict.view_inside(value, p.storage, p.storage_length);
+}
+
+fun fields_valid(list: *field.Fields, p: *parser.Parser, trace: *u64) bool {
+    if (list.len > list.capacity) { ret false; }
+    var i: usize = 0;
+    for (i < list.len) {
+        val item: field.Field = list.items[i];
+        if (!stored(item.name, p) || !stored(item.value, p)
+            || !field.valid_name(item.name) || !field.valid_value(item.value)) { ret false; }
+        @trace = verdict.mix_bytes(@trace, item.name.data, item.name.len);
+        @trace = verdict.mix_bytes(@trace, item.value.data, item.value.len);
+        i      = i + 1;
+    }
+    ret true;
+}
+
+fun within(part: view.View, whole: view.View) bool {
+    ret verdict.view_inside(part, whole.data, whole.len);
+}
+
+# every view of an accepted head lies in the parser's storage and holds what the
+# grammar allows
+fun head_valid(p: *parser.Parser, run: *Run) bool {
+    val parsed: *parser.Parsed = ?p.parsed;
+    var trace:  u64            = run.trace;
+    if (p.kind == parser.REQUEST) {
+        # a known method names its static token, and only an extension is stored
+        if ((parsed.method.kind == method.EXTENSION && !stored(parsed.method.token, p))
+            || !method.valid(parsed.method, 32) || !stored(parsed.target.raw, p)) { ret false; }
+        val raw: view.View = parsed.target.raw;
+        if (!within(parsed.target.scheme, raw) || !within(parsed.target.authority, raw)
+            || !within(parsed.target.path, raw) || !within(parsed.target.query, raw)
+            || !target.well_formed(parsed.target)) { ret false; }
+        if (parsed.target.form == target.ASTERISK && parsed.method.kind != method.OPTIONS) {
+            ret false;
+        }
+        if ((parsed.target.form == target.AUTHORITY) != (parsed.method.kind == method.CONNECT)) {
+            ret false;
+        }
+        trace = verdict.mix_bytes(trace, parsed.method.token.data, parsed.method.token.len);
+        trace = verdict.mix_bytes(trace, raw.data, raw.len);
+        trace = verdict.mix(trace, parsed.target.form::u64);
+    }
+    or {
+        if (!stored(parsed.reason, p) || parsed.status < 100 || parsed.status > 999) { ret false; }
+        trace = verdict.mix(trace, parsed.status::u64);
+    }
+    if (parsed.version.major != 1 || parsed.version.minor > 1) { ret false; }
+    if (!fields_valid(?parsed.fields, p, ?trace))              { ret false; }
+    val plan: framing.Plan = parsed.plan;
+    if (plan.error != framing.FRAME_OK || plan.mode < framing.FRAME_NONE
+        || plan.mode > framing.FRAME_TUNNEL
+        || (plan.mode != framing.FRAME_LENGTH && plan.length != 0)) { ret false; }
+    trace = verdict.mix(trace, (plan.mode::u64 << 8) | (plan.keep_alive::u64 << 1)
+        | plan.transfer_coded::u64);
+    trace     = verdict.mix(trace, plan.length);
+    run.trace = trace;
+    run.shape = verdict.mix(run.shape, (parsed.method.kind::u64 << 24)
+        | (parsed.target.form::u64 << 16) | (plan.mode::u64 << 8)
+        | (parsed.version.minor::u64 << 4) | verdict.bucket(parsed.fields.len));
+    if (p.kind == parser.RESPONSE) { run.shape = verdict.mix(run.shape, (parsed.status / 100)::u64); }
+    ret true;
+}
+
+fun fail(run: *Run, detail: *u8) bool {
+    run.detail = detail;
+    ret false;
+}
+
+# parse every message of the input handing it over `stride` bytes at a time
+fun drive(kind: parser.Kind, request_method: method.Kind, data: *u8, len: usize,
+    stride: usize, run: *Run) bool {
+    run.trace    = 0;
+    run.shape    = 0;
+    run.messages = 0;
+    run.body     = 0;
+    run.detail   = "";
+    var p:  parser.Parser;
+    var ok: bool = false;
+    if (kind == parser.REQUEST) {
+        ok = parser.init_request(?p, ?line[0], LINE, ?storage[0], STORAGE,
+            ?fields[0], FIELDS, ?trailers[0], TRAILERS, parser.limits_default());
+    }
+    or {
+        ok = parser.init_response(?p, request_method, ?line[0], LINE, ?storage[0], STORAGE,
+            ?fields[0], FIELDS, ?trailers[0], TRAILERS, parser.limits_default());
+    }
+    if (!ok) { ret fail(run, "h1: the parser refused its own configuration"); }
+    var offset:   usize = 0;
+    var body:     u64   = 0;
+    var finished: bool  = false;
+    for (!finished) {
+        var result: parser.Feed;
+        var given:  usize = 0;
+        if (offset < len) {
+            given = len - offset;
+            if (given > stride) { given = stride; }
+            result = parser.feed(?p, ?data[offset], given);
+        }
+        or {
+            result = parser.feed(?p, nil, 0);
+            if (result.status == parser.PARSE_NEED_INPUT || result.status == parser.PARSE_BODY) {
+                result = parser.finish_eof(?p, true);
+            }
+        }
+        if (result.consumed > given) { ret fail(run, "h1: a feed consumed more than it was given"); }
+        if (result.body_length != 0) {
+            if (result.status != parser.PARSE_BODY
+                || !verdict.inside(result.body, result.body_length, ?data[offset], given)) {
+                ret fail(run, "h1: a body view lies outside the bytes fed");
+            }
+            run.trace = verdict.mix_bytes(run.trace, result.body, result.body_length);
+            body      = body + result.body_length::u64;
+        }
+        offset = offset + result.consumed;
+        if (result.status == parser.PARSE_HEADERS) {
+            run.trace = verdict.mix(run.trace, offset::u64);
+            if (!head_valid(?p, run)) { ret fail(run, "h1: an accepted head is not what the grammar allows"); }
+            verdict.accept();
+        }
+        or (result.status == parser.PARSE_MESSAGE) {
+            val plan: framing.Plan = p.parsed.plan;
+            if (plan.mode == framing.FRAME_LENGTH && body != plan.length) {
+                ret fail(run, "h1: a length-framed message delivered another number of body bytes");
+            }
+            if ((plan.mode == framing.FRAME_NONE || plan.mode == framing.FRAME_TUNNEL) && body != 0) {
+                ret fail(run, "h1: a bodyless message delivered body bytes");
+            }
+            if (!fields_valid(?p.parsed.trailers, ?p, ?run.trace)) {
+                ret fail(run, "h1: a trailer is not what the grammar allows");
+            }
+            if (plan.mode != framing.FRAME_CHUNKED && p.parsed.trailers.len != 0) {
+                ret fail(run, "h1: a message not chunked carried trailers");
+            }
+            run.trace    = verdict.mix(run.trace, (offset::u64 << 20) ^ body);
+            run.shape    = verdict.mix(run.shape, 0x100 | verdict.bucket(p.parsed.trailers.len));
+            run.messages = run.messages + 1;
+            run.body     = run.body + body;
+            body         = 0;
+            # a pipelining peer sends the next message on a connection that persists
+            if (offset >= len || !plan.keep_alive || plan.mode == framing.FRAME_TUNNEL
+                || plan.mode == framing.FRAME_CLOSE) {
+                finished = true;
+            }
+            or (!parser.reset(?p)) { ret fail(run, "h1: a completed parser refused to reset"); }
+        }
+        or (result.status == parser.PARSE_ERROR) {
+            if (result.error == parser.ERROR_NONE || p.error != result.error) {
+                ret fail(run, "h1: a parse failed without saying why");
+            }
+            run.trace = verdict.mix(run.trace, (offset::u64 << 32) ^ (p.error_offset << 8)
+                ^ result.error::u64);
+            run.shape = verdict.mix(run.shape, 0x200 | result.error::u64);
+            finished  = true;
+        }
+        or (result.status == parser.PARSE_NEED_INPUT) {
+            if (given != 0 && result.consumed == 0) {
+                ret fail(run, "h1: a feed asked for more input without taking what it had");
+            }
+        }
+        or (result.status != parser.PARSE_BODY) {
+            ret fail(run, "h1: a feed answered an unknown status");
+        }
+    }
+    ret true;
+}
+
+fun answer_one(kind: parser.Kind, request_method: method.Kind, data: *u8, len: usize,
+    outcome: *u64) *u8 {
+    var whole:    Run;
+    var bytewise: Run;
+    if (!drive(kind, request_method, data, len, len + 1, ?whole)) { ret whole.detail; }
+    if (!drive(kind, request_method, data, len, 1, ?bytewise))    { ret bytewise.detail; }
+    if (whole.trace != bytewise.trace || whole.shape != bytewise.shape
+        || whole.messages != bytewise.messages || whole.body != bytewise.body) {
+        ret "h1: the whole input and the same input byte by byte parsed differently";
+    }
+    @outcome = verdict.mix(@outcome, whole.shape);
+    @outcome = verdict.mix(@outcome, verdict.bucket(whole.messages));
+    ret nil;
+}
+
+pub fun answer_request(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    val detail:  *u8 = answer_one(parser.REQUEST, 0, data, len, ?outcome);
+    if (detail != nil) { ret verdict.violated(detail); }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_response(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    var detail:  *u8 = answer_one(parser.RESPONSE, method.GET, data, len, ?outcome);
+    if (detail == nil) { detail = answer_one(parser.RESPONSE, method.HEAD, data, len, ?outcome); }
+    if (detail == nil) { detail = answer_one(parser.RESPONSE, method.CONNECT, data, len, ?outcome); }
+    if (detail != nil) { ret verdict.violated(detail); }
+    ret verdict.answered(outcome);
+}

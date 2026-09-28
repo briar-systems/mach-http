@@ -1,0 +1,118 @@
+# field-section semantics shared by the http/2 and http/3 engines
+#
+# the input is field lines, `name: value` separated by newlines, as a header
+# decoder would hand them over. a line with no `: ` after its first byte is a
+# name with an empty value
+
+use http.core.field;
+use http.core.section;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.verdict;
+
+val LINES: usize = 128;
+
+var items: [LINES]field.Field;
+
+fun split(data: *u8, len: usize) usize {
+    var count:  usize = 0;
+    var offset: usize = 0;
+    for (offset < len && count < LINES) {
+        var finish: usize = offset;
+        for (finish < len && data[finish] != '\n') { finish = finish + 1; }
+        var colon: usize = offset + 1;
+        for (colon + 1 < finish && !(data[colon] == ':' && data[colon + 1] == ' ')) {
+            colon = colon + 1;
+        }
+        if (colon + 1 >= finish) { colon = finish; }
+        items[count] = field.Field{name: view.view(?data[offset], colon - offset),
+            value: view.view(nil, 0), sensitive: false};
+        if (colon + 2 <= finish) {
+            items[count].value = view.view(?data[colon + 2], finish - colon - 2);
+        }
+        count  = count + 1;
+        offset = finish + 1;
+    }
+    ret count;
+}
+
+# a pseudo-field view the block published is the value of that field
+fun pseudo_value(value: view.View, count: usize, name: *u8, name_length: usize) bool {
+    if (value.len == 0) { ret true; }
+    var i: usize = 0;
+    for (i < count) {
+        if (items[i].value.data == value.data && items[i].value.len == value.len
+            && (field.name_equal(items[i].name, view.view(name, name_length))
+            || field.name_equal(items[i].name, view.view("host", 4)))) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun length_of(value: view.View) u64 {
+    var result: u64   = 0;
+    var i:      usize = 0;
+    for (i < value.len) {
+        result = result * 10 + (value.data[i] - '0')::u64;
+        i      = i + 1;
+    }
+    ret result;
+}
+
+fun block_valid(block: *section.Block, count: usize, kind: u8) bool {
+    if (block.fields != ?items[0] || block.count != count || block.regular_offset > count) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < count) {
+        val pseudo: bool = items[i].name.len != 0 && items[i].name.data[0] == ':';
+        if (pseudo != (i < block.regular_offset))        { ret false; }
+        if (!pseudo && !field.valid_name(items[i].name)) { ret false; }
+        if (!field.valid_value(items[i].value))          { ret false; }
+        if (field.name_equal(items[i].name, view.view("content-length", 14))
+            && (!block.has_content_length || length_of(items[i].value) != block.content_length)) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    if (!pseudo_value(block.method, count, ":method", 7) || !pseudo_value(block.scheme, count, ":scheme", 7)
+        || !pseudo_value(block.path, count, ":path", 5)
+        || !pseudo_value(block.authority, count, ":authority", 10)
+        || !pseudo_value(block.protocol, count, ":protocol", 9)) { ret false; }
+    if (kind == section.TRAILERS && block.regular_offset != 0 && count != 0) { ret false; }
+    if (kind == section.REQUEST || kind == section.PUSH) {
+        ret block.method.len != 0 && block.status == 0;
+    }
+    if (kind == section.RESPONSE)      { ret block.status >= 200 && block.status <= 999; }
+    if (kind == section.INFORMATIONAL) { ret block.status >= 100 && block.status < 200; }
+    ret block.status == 0 && block.method.len == 0;
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    val count:   usize = split(data, len);
+    var outcome: u64   = verdict.bucket(count);
+    var kind:    u8    = section.REQUEST;
+    for (kind <= section.PUSH) {
+        var mode: u8 = 0;
+        for (mode < 4) {
+            var block:    section.Block;
+            val accepted: bool = section.validate(?items[0], count, kind, (mode & 1) != 0,
+                65536, (mode & 2) != 0, ?block);
+            outcome = verdict.mix(outcome, accepted::u64);
+            if (accepted) {
+                verdict.accept();
+                if (!block_valid(?block, count, kind)) {
+                    ret verdict.violated("section: an accepted section breaks the rules it was validated against");
+                }
+                outcome = verdict.mix(outcome, (block.status / 100)::u64);
+            }
+            mode = mode + 1;
+        }
+        kind = kind + 1;
+    }
+    ret verdict.answered(outcome);
+}

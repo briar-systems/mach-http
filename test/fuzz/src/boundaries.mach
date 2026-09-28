@@ -1,0 +1,64 @@
+# every untrusted-input entry point the lane answers, by corpus directory name
+
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use fuzz.h1;
+use fuzz.h2;
+use fuzz.h3;
+use fuzz.qpack;
+use fuzz.router;
+use fuzz.section;
+use fuzz.url;
+use fuzz.verdict;
+use fuzz.websocket;
+
+pub def AnswerFn: fun(*u8, usize) verdict.Verdict;
+
+pub rec Boundary {
+    name:   str;
+    answer: AnswerFn;
+}
+
+pub val CAPACITY: usize = 32;
+
+fun put(out: *Boundary, i: usize, name: str, answer: AnswerFn) usize {
+    if (i >= CAPACITY) { ret i; }
+    out[i].name   = name;
+    out[i].answer = answer;
+    ret i + 1;
+}
+
+pub fun all(out: *Boundary) usize {
+    var i: usize = 0;
+    i = put(out, i, "h1-request", h1.answer_request);
+    i = put(out, i, "h1-response", h1.answer_response);
+    i = put(out, i, "h2-frame", h2.answer_frame);
+    i = put(out, i, "hpack", h2.answer_hpack);
+    i = put(out, i, "hpack-huffman", h2.answer_huffman);
+    i = put(out, i, "hpack-integer", h2.answer_integer);
+    i = put(out, i, "h3-varint", h3.answer_varint);
+    i = put(out, i, "h3-frame", h3.answer_frame);
+    i = put(out, i, "h3-stream", h3.answer_stream);
+    i = put(out, i, "qpack-encoder-stream", qpack.answer_encoder_stream);
+    i = put(out, i, "qpack-decoder-stream", qpack.answer_decoder_stream);
+    i = put(out, i, "qpack-field-section", qpack.answer_field_section);
+    i = put(out, i, "field-section", section.answer);
+    i = put(out, i, "websocket-frame", websocket.answer_frame);
+    i = put(out, i, "websocket-upgrade", websocket.answer_upgrade);
+    i = put(out, i, "websocket-response", websocket.answer_response);
+    i = put(out, i, "router", router.answer);
+    i = put(out, i, "url", url.answer);
+    ret i;
+}
+
+pub fun lookup(table: *Boundary, n: usize, name: str) opt[usize] {
+    var i: usize = 0;
+    for (i < n) {
+        if (str_equals(table[i].name, name)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}

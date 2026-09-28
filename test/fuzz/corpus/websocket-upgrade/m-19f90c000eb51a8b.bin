@@ -1,0 +1,6 @@
+T / HTTP/1.1
+Host:s
+e:
+Sec-WebSocket-Protocol:chat
+Sec-WebSocket-Version:13
+

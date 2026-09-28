@@ -16,3 +16,6 @@
 [submodule "test/load/dep/std"]
 	path = test/load/dep/std
 	url = https://github.com/briar-systems/mach-std
+[submodule "test/fuzz/dep/std"]
+	path = test/fuzz/dep/std
+	url = https://github.com/briar-systems/mach-std

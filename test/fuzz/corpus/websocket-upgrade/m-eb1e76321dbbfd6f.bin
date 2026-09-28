@@ -1,0 +1,6 @@
+GET / HTTP/1.1
+Host:e
+Upgrade:
+Sec-WebSocket-Protocol:chat,s
+Sec-WebSocket-Version:13
+

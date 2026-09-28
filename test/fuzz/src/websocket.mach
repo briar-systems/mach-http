@@ -1,0 +1,408 @@
+# websocket framing and the opening handshake on both sides
+
+use http.core.body;
+use http.core.exchange;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.status;
+use http.core.target;
+use http.h1.parser;
+use ws: http.websocket;
+use http.websocket.negotiation;
+use std.chrono.time;
+use std.sync.cancel;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.guard;
+use fuzz.request;
+use fuzz.verdict;
+
+rec Run {
+    trace:  u64;
+    shape:  u64;
+    detail: *u8;
+}
+
+fun fail(run: *Run, detail: *u8) bool {
+    run.detail = detail;
+    ret false;
+}
+
+val TEXT: usize = 16384;
+
+var control: [125]u8;
+var text:    [TEXT]u8;
+
+# the utf-8 validity RFC 3629 defines, read independently of the decoder
+fun utf8_valid(data: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        val c:    u8    = data[i];
+        var need: usize = 0;
+        var low:  u8    = 0x80;
+        var high: u8    = 0xbf;
+        if (c <= 0x7f)              { need = 0; }
+        or (c >= 0xc2 && c <= 0xdf) { need = 1; }
+        or (c == 0xe0) {
+            need = 2;
+            low  = 0xa0;
+        }
+        or (c == 0xed) {
+            need = 2;
+            high = 0x9f;
+        }
+        or (c >= 0xe1 && c <= 0xef) { need = 2; }
+        or (c == 0xf0) {
+            need = 3;
+            low  = 0x90;
+        }
+        or (c == 0xf4) {
+            need = 3;
+            high = 0x8f;
+        }
+        or (c >= 0xf1 && c <= 0xf3) { need = 3; }
+        or                          { ret false; }
+        if (need > len - i - 1)     { ret false; }
+        var k: usize = 1;
+        for (k <= need) {
+            val next: u8 = data[i + k];
+            if ((k == 1 && (next < low || next > high)) || (k > 1 && (next < 0x80 || next > 0xbf))) {
+                ret false;
+            }
+            k = k + 1;
+        }
+        i = i + need + 1;
+    }
+    ret true;
+}
+
+fun drive_frames(role: ws.Role, data: *u8, len: usize, stride: usize, run: *Run) bool {
+    run.trace  = 0;
+    run.shape  = 0;
+    run.detail = "";
+    var decoder: ws.Decoder;
+    if (!ws.decoder_init(?decoder, role, ws.limits_default(), ?control[0], 125)) {
+        ret fail(run, "websocket: the decoder refused its configuration");
+    }
+    var offset:      usize = 0;
+    var text_length: usize = 0;
+    var in_text:     bool  = false;
+    var events:      usize = 0;
+    for {
+        if (offset == len && decoder.header_length == 0 && !decoder.frame_ready) { brk; }
+        var given: usize = len - offset;
+        if (given > stride) { given = stride; }
+        var bytes: *u8 = nil;
+        if (given != 0) { bytes = ?data[offset]; }
+        val event: ws.Event = ws.feed(?decoder, bytes, given, offset + given == len);
+        if (event.consumed > given) { ret fail(run, "websocket: a feed consumed more than it was given"); }
+        if (event.kind == ws.EVENT_DATA) {
+            if (!verdict.inside(event.data, event.data_length, bytes, event.consumed)
+                || (event.data_length != 0 && event.data != ?bytes[event.consumed - event.data_length])) {
+                ret fail(run, "websocket: a data view is not the payload bytes fed");
+            }
+            # a text message is only answered once it completes, since a bad byte
+            # refuses the bytes fed with it whether or not they came first
+            if (event.opcode != ws.OPCODE_TEXT) {
+                run.trace = verdict.mix_bytes(run.trace, event.data, event.data_length);
+            }
+            if (event.opcode == ws.OPCODE_TEXT) {
+                if (event.data_length > TEXT - text_length) { ret fail(run, "websocket: a text message outgrew the input"); }
+                var i: usize = 0;
+                for (i < event.data_length) {
+                    text[text_length + i] = event.data[i];
+                    i                     = i + 1;
+                }
+                text_length = text_length + event.data_length;
+                in_text     = true;
+            }
+            if (event.message_final) {
+                # a text message the decoder completed is well-formed utf-8
+                if (in_text && !utf8_valid(?text[0], text_length)) {
+                    ret fail(run, "websocket: a completed text message is not utf-8");
+                }
+                run.trace   = verdict.mix_bytes(run.trace, ?text[0], text_length);
+                run.trace   = verdict.mix(run.trace, (offset + event.consumed)::u64);
+                run.shape   = verdict.mark(run.shape, event.opcode::u64);
+                text_length = 0;
+                in_text     = false;
+                verdict.accept();
+            }
+            if (!ws.release(?decoder)) { ret fail(run, "websocket: a held event could not be released"); }
+        }
+        or (event.kind == ws.EVENT_PING || event.kind == ws.EVENT_PONG
+            || event.kind == ws.EVENT_CLOSE) {
+            if (!verdict.inside(event.data, event.data_length, ?control[0], 125)) {
+                ret fail(run, "websocket: a control payload lies outside the control buffer");
+            }
+            run.trace = verdict.mix_bytes(verdict.mix(run.trace, (event.kind::u64 << 16)
+                | event.close_code::u64), event.data, event.data_length);
+            run.trace = verdict.mix(run.trace, (offset + event.consumed)::u64);
+            run.shape = verdict.mark(run.shape, 16 + event.kind::u64);
+            verdict.accept();
+            if (event.kind == ws.EVENT_CLOSE) {
+                if (event.close_code != 1005 && (event.close_code < 1000 || event.close_code >= 5000
+                    || event.data_length < 2 || !utf8_valid(?event.data[2], event.data_length - 2))) {
+                    ret fail(run, "websocket: a close frame carried an invalid code or reason");
+                }
+                brk;
+            }
+            if (!ws.release(?decoder)) { ret fail(run, "websocket: a held event could not be released"); }
+        }
+        or (event.kind == ws.EVENT_ERROR) {
+            if (event.error == ws.ERROR_NONE) { ret fail(run, "websocket: a frame failed without saying why"); }
+            # a utf-8 error is found where the chunk that carried it ends
+            var at: u64 = (offset + event.consumed)::u64;
+            if (event.error == ws.ERROR_UTF8) { at = 0; }
+            run.trace = verdict.mix(run.trace, (at << 16) | (event.error::u64 << 12)
+                | event.close_code::u64);
+            run.shape = verdict.mark(run.shape, 32 + event.error::u64);
+            brk;
+        }
+        or (event.kind == ws.EVENT_NEED_INPUT) {
+            if (given == 0 || event.consumed == 0) {
+                ret fail(run, "websocket: a feed asked for more input without taking what it had");
+            }
+        }
+        or { ret fail(run, "websocket: a feed answered an unknown event"); }
+        offset = offset + event.consumed;
+        events = events + 1;
+    }
+    ret true;
+}
+
+# the decoder unmasks in place, so each parse reads its own copy
+fun answer_role(role: ws.Role, data: *u8, len: usize, outcome: *u64) *u8 {
+    var whole:    Run;
+    var bytewise: Run;
+    val first:    guard.Copy = guard.place(data, len);
+    val second:   guard.Copy = guard.place(data, len);
+    if (first.base == nil || second.base == nil) { ret "websocket: the guarded allocator refused a copy"; }
+    val whole_ok:    bool = drive_frames(role, first.data, len, len + 1, ?whole);
+    val bytewise_ok: bool = drive_frames(role, second.data, len, 1, ?bytewise);
+    guard.release(first);
+    guard.release(second);
+    if (!whole_ok)    { ret whole.detail; }
+    if (!bytewise_ok) { ret bytewise.detail; }
+    if (whole.trace != bytewise.trace || whole.shape != bytewise.shape) {
+        ret "websocket: the whole input and the same input byte by byte decoded differently";
+    }
+    @outcome = verdict.mix(@outcome, whole.shape);
+    ret nil;
+}
+
+# the same bytes as a server reads them, masked, and as a client reads them
+pub fun answer_frame(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    var detail:  *u8 = answer_role(ws.SERVER, data, len, ?outcome);
+    if (detail == nil) { detail = answer_role(ws.CLIENT, data, len, ?outcome); }
+    if (detail != nil) { ret verdict.violated(detail); }
+    ret verdict.answered(outcome);
+}
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+# how many fields carry the name, in any case
+fun count(list: *field.Fields, name: *u8, name_length: usize) usize {
+    var found: usize = 0;
+    var i:     usize = 0;
+    for (i < list.len) {
+        if (field.name_equal(list.items[i].name, view.view(name, name_length))) { found = found + 1; }
+        i = i + 1;
+    }
+    ret found;
+}
+
+# whether some field of the name holds the text anywhere, in any case
+fun mentions(list: *field.Fields, name: *u8, name_length: usize, word: *u8, word_length: usize) bool {
+    var i: usize = 0;
+    for (i < list.len) {
+        val value: view.View = list.items[i].value;
+        if (field.name_equal(list.items[i].name, view.view(name, name_length))) {
+            var at: usize = 0;
+            for (at + word_length <= value.len) {
+                var k: usize = 0;
+                for (k < word_length && lower(value.data[at + k]) == word[k]) { k = k + 1; }
+                if (k == word_length) { ret true; }
+                at = at + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun equal_text(value: view.View, text_value: *u8, length: usize) bool {
+    if (value.len != length) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (value.data[i] != text_value[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+var response_items:    [8]field.Field;
+var response_trailers: [1]field.Field;
+var accept_output:     [29]u8;
+
+# run the server's handshake over one request and check what a negotiated one promises
+fun serve(p: *parser.Parser, request_method: method.Method, request_target: target.Target,
+    version: message.Version, extended: view.View, selected: view.View,
+    outcome: *u64) *u8 {
+    val configured: message.Limits = request.limits();
+    var reader:     body.Reader;
+    var incoming:   message.Request;
+    if (!request.build(p, request_method, request_target, version, ?incoming, ?reader, 7)) {
+        @outcome = verdict.mix(@outcome, 0x40);
+        ret nil;
+    }
+    var response: message.Response;
+    if (!message.init_response(?response, ?response_items[0], 8, ?response_trailers[0], 1,
+        7, configured)) { ret "websocket: the response refused its configuration"; }
+    var scope: cancel.Scope;
+    val made:  cancel.Operation = cancel.make_root(?scope, opt[time.Instant].none{});
+    if (!(sel made.ok)) { ret "websocket: the cancellation scope could not be made"; }
+    var informationals: [1]message.Informational;
+    var exchange_value: exchange.Exchange;
+    var detail:         *u8 = nil;
+    if (!exchange.init(?exchange_value, ?incoming, ?response, ?informationals[0], 1, ?scope,
+        7, configured) || !exchange.begin(?exchange_value)) {
+        detail = "websocket: a valid request did not make an exchange";
+    }
+    or {
+        val result: negotiation.Handshake = negotiation.server(?exchange_value, extended,
+            selected, ?accept_output[0], 29);
+        @outcome = verdict.mix(@outcome, result.status::u64);
+        if (result.status == negotiation.NEGOTIATED) {
+            verdict.accept();
+            val fields: *field.Fields = ?incoming.fields;
+            if (count(fields, "sec-websocket-version", 21) != 1 || !response.committed
+                || !equal_text(result.protocol, selected.data, selected.len)) {
+                detail = "websocket: a negotiated upgrade ignored the version or protocol it was offered";
+            }
+            or (version.wire == message.WIRE_H1 && (request_method.kind != method.GET
+                || response.status != status.SWITCHING_PROTOCOLS || result.accept.len != 28
+                || !verdict.inside(result.accept.data, 28, ?accept_output[0], 29)
+                || count(fields, "sec-websocket-key", 17) != 1
+                || !mentions(fields, "connection", 10, "upgrade", 7)
+                || !mentions(fields, "upgrade", 7, "websocket", 9))) {
+                detail = "websocket: an http/1.1 upgrade was negotiated without what RFC 6455 requires";
+            }
+            or (version.wire != message.WIRE_H1 && (response.status != status.OK
+                || count(fields, "connection", 10) != 0 || count(fields, "upgrade", 7) != 0
+                || count(fields, "sec-websocket-key", 17) != 0)) {
+                detail = "websocket: an extended CONNECT was negotiated without what RFC 8441 requires";
+            }
+        }
+    }
+    cancel.destroy(?scope);
+    ret detail;
+}
+
+# the input is a client's opening request. it is served as an http/1.1 upgrade,
+# and its fields as an extended CONNECT over http/2 and http/3, each with and
+# without a selected subprotocol
+pub fun answer_upgrade(data: *u8, len: usize) verdict.Verdict {
+    var p: parser.Parser;
+    if (!request.head(parser.REQUEST, 0, data, len, ?p)) { ret verdict.answered(1); }
+    if (!request.bodyless(?p))                           { ret verdict.answered(2); }
+    var outcome:   u64           = 3;
+    val none:      view.View     = view.view(nil, 0);
+    val chat:      view.View     = view.view("chat", 4);
+    val socket:    view.View     = view.view("websocket", 9);
+    val authority: target.Target = target.authority(view.view("example.com", 11));
+    val connect:   method.Method = method.from_kind(method.CONNECT);
+    var detail:    *u8           = serve(?p, p.parsed.method, p.parsed.target, p.parsed.version, none, none,
+        ?outcome);
+    if (detail == nil) {
+        detail = serve(?p, p.parsed.method, p.parsed.target, p.parsed.version, none, chat, ?outcome);
+    }
+    if (detail == nil) {
+        detail = serve(?p, connect, authority, message.version_h2(), socket, none, ?outcome);
+    }
+    if (detail == nil) {
+        detail = serve(?p, connect, authority, message.version_h3(), socket, chat, ?outcome);
+    }
+    if (detail != nil) { ret verdict.violated(detail); }
+    ret verdict.answered(outcome);
+}
+
+val KEY:     *u8 = "dGhlIHNhbXBsZSBub25jZQ==";
+val ACCEPT:  *u8 = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+val OFFERED: *u8 = "chat, superchat";
+
+var scratch: [29]u8;
+
+fun trimmed_equal(list: *field.Fields, name: *u8, name_length: usize, expected: *u8,
+    expected_length: usize) bool {
+    var i: usize = 0;
+    for (i < list.len) {
+        if (field.name_equal(list.items[i].name, view.view(name, name_length))) {
+            val value: view.View = list.items[i].value;
+            var start: usize     = 0;
+            var end:   usize     = value.len;
+            for (start < end && (value.data[start] == ' ' || value.data[start] == '\t')) { start = start + 1; }
+            for (end > start && (value.data[end - 1] == ' ' || value.data[end - 1] == '\t')) { end = end - 1; }
+            ret equal_text(view.view(?value.data[start], end - start), expected, expected_length);
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun offered(protocol: view.View) bool {
+    ret protocol.len == 0 || equal_text(protocol, "chat", 4) || equal_text(protocol, "superchat", 9);
+}
+
+# the input is a server's answer to an opening request with a fixed key that
+# offered `chat` and `superchat`, checked as http/1.1 and as extended CONNECT
+pub fun answer_response(data: *u8, len: usize) verdict.Verdict {
+    var p: parser.Parser;
+    if (!request.head(parser.RESPONSE, method.GET, data, len, ?p)) { ret verdict.answered(1); }
+    var response: message.Response;
+    response.status = p.parsed.status;
+    response.fields = p.parsed.fields;
+    val fields:    *field.Fields         = ?response.fields;
+    val requested: view.View             = view.view(OFFERED, 15);
+    val upgraded:  negotiation.Handshake = negotiation.validate_h1_response(?response,
+        view.view(KEY, 24), requested, ?scratch[0], 29);
+    var outcome: u64 = verdict.mix(2, upgraded.status::u64);
+    if (upgraded.status == negotiation.NEGOTIATED) {
+        verdict.accept();
+        if (response.status != status.SWITCHING_PROTOCOLS
+            || count(fields, "sec-websocket-accept", 20) != 1
+            || !trimmed_equal(fields, "sec-websocket-accept", 20, ACCEPT, 28)
+            || !equal_text(upgraded.accept, ACCEPT, 28)
+            || !verdict.view_inside(upgraded.accept, p.storage, p.storage_length)
+            || count(fields, "sec-websocket-protocol", 22) > 1 || !offered(upgraded.protocol)
+            || !mentions(fields, "upgrade", 7, "websocket", 9)) {
+            ret verdict.violated("websocket: an http/1.1 handshake was accepted without what RFC 6455 requires");
+        }
+    }
+    var wire: message.Wire = message.WIRE_H2;
+    for (wire <= message.WIRE_H3) {
+        val extended: negotiation.Handshake = negotiation.validate_extended_response(?response,
+            wire, requested);
+        outcome = verdict.mix(outcome, extended.status::u64);
+        if (extended.status == negotiation.NEGOTIATED) {
+            verdict.accept();
+            if (response.status != status.OK || count(fields, "connection", 10) != 0
+                || count(fields, "upgrade", 7) != 0 || count(fields, "sec-websocket-accept", 20) != 0
+                || count(fields, "sec-websocket-protocol", 22) > 1 || !offered(extended.protocol)) {
+                ret verdict.violated("websocket: an extended CONNECT answer was accepted without what RFC 8441 requires");
+            }
+        }
+        wire = wire + 1;
+    }
+    ret verdict.answered(outcome);
+}

@@ -1,0 +1,275 @@
+# the http/3 frame and stream-preface parsers and their variable-length integers
+
+use http.h3.frame;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+use fuzz.verdict;
+
+# the value of the quic integer at data, read independently of the parser
+pub rec Integer {
+    value:  u64;
+    length: usize;
+    whole:  bool;
+}
+
+pub fun integer_at(data: *u8, len: usize) Integer {
+    if (len == 0) { ret Integer{value: 0, length: 0, whole: false}; }
+    val length: usize = 1::usize << (data[0] >> 6);
+    if (length > len) { ret Integer{value: 0, length: length, whole: false}; }
+    var value: u64   = (data[0] & 0x3f)::u64;
+    var i:     usize = 1;
+    for (i < length) {
+        value = (value << 8) | data[i]::u64;
+        i     = i + 1;
+    }
+    ret Integer{value: value, length: length, whole: true};
+}
+
+# the input is a run of integers, each fed a byte at a time
+pub fun answer_varint(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64   = 0;
+    var offset:  usize = 0;
+    for (offset < len) {
+        var integer: frame.Varint;
+        frame.varint_reset(?integer);
+        val expected: Integer = integer_at(?data[offset], len - offset);
+        var taken:    usize   = 0;
+        for (offset + taken < len && !integer.complete) {
+            if (frame.varint_feed(?integer, data[offset + taken]) != frame.ERROR_NONE) {
+                ret verdict.violated("h3: a varint refused a byte it still needed");
+            }
+            taken = taken + 1;
+        }
+        if (integer.complete != expected.whole || taken != expected.length && expected.whole) {
+            ret verdict.violated("h3: a varint completed at another length than its prefix");
+        }
+        if (!integer.complete) {
+            outcome = verdict.mark(outcome, 16 + taken::u64);
+            brk;
+        }
+        verdict.accept();
+        if (integer.value != expected.value || integer.value > 0x3fffffffffffffff
+            || frame.varint_size(integer.value) > taken
+            || frame.varint_feed(?integer, 0) != frame.ERROR_STATE) {
+            ret verdict.violated("h3: a varint decoded another value than its bytes");
+        }
+        outcome = verdict.mark(outcome, taken::u64);
+        offset  = offset + taken;
+    }
+    ret verdict.answered(outcome);
+}
+
+rec Run {
+    trace:  u64;
+    shape:  u64;
+    detail: *u8;
+}
+
+fun fail(run: *Run, detail: *u8) bool {
+    run.detail = detail;
+    ret false;
+}
+
+val SETTINGS: usize = 64;
+
+var settings: [SETTINGS]frame.Setting;
+
+fun single_varint(typ: u64) bool {
+    ret typ == frame.FRAME_CANCEL_PUSH || typ == frame.FRAME_GOAWAY
+        || typ == frame.FRAME_MAX_PUSH_ID;
+}
+
+fun drive_frames(kind: frame.StreamKind, data: *u8, len: usize, stride: usize,
+    run: *Run) bool {
+    run.trace  = 0;
+    run.shape  = 0;
+    run.detail = "";
+    var p: frame.Parser;
+    if (!frame.parser_init(?p, kind, ?settings[0], SETTINGS, frame.limits_default())) {
+        ret fail(run, "h3: the frame parser refused its configuration");
+    }
+    var offset:  usize = 0;
+    var start:   usize = 0;
+    var payload: u64   = 0;
+    # a frame's bytes are answered when it ends, since a byte that fails it
+    # refuses the bytes fed with it whether or not they came first
+    var pending:  u64   = 0;
+    var boundary: bool  = true;
+    var frames:   usize = 0;
+    for {
+        if (offset == len && boundary) { brk; }
+        var given: usize = len - offset;
+        if (given > stride) { given = stride; }
+        var bytes: *u8 = nil;
+        if (given != 0) { bytes = ?data[offset]; }
+        val event: frame.Event = frame.feed(?p, bytes, given, offset + given == len);
+        if (event.consumed > given) { ret fail(run, "h3: a feed consumed more than it was given"); }
+        offset = offset + event.consumed;
+        if (event.consumed != 0) { boundary = false; }
+        if (event.kind == frame.EVENT_HEADER) {
+            val typ:    Integer = integer_at(?data[start], len - start);
+            val length: Integer = integer_at(?data[start + typ.length], len - start - typ.length);
+            if (!typ.whole || !length.whole || typ.value != event.header.typ
+                || length.value != event.header.length
+                || offset - start != typ.length + length.length) {
+                ret fail(run, "h3: an accepted frame header is not the one on the wire");
+            }
+            run.trace = verdict.mix(run.trace, offset::u64);
+            run.trace = verdict.mix(run.trace, event.header.typ);
+            payload   = 0;
+            pending   = 0;
+        }
+        or (event.kind == frame.EVENT_PAYLOAD) {
+            if (event.data != bytes || event.data_length != event.consumed
+                || payload + event.data_length::u64 > event.header.length) {
+                ret fail(run, "h3: a payload view is not the bytes fed");
+            }
+            pending = verdict.mix_bytes(pending, event.data, event.data_length);
+            payload = payload + event.data_length::u64;
+            if (!frame.release(?p)) { ret fail(run, "h3: a held payload could not be released"); }
+        }
+        or (event.kind == frame.EVENT_FRAME_END) {
+            val typ:    Integer = integer_at(?data[start], len - start);
+            val length: Integer = integer_at(?data[start + typ.length], len - start - typ.length);
+            val body:   usize   = start + typ.length + length.length;
+            if (payload != event.header.length || offset - body != payload::usize) {
+                ret fail(run, "h3: a frame ended on another length than its header");
+            }
+            # a frame that carries one integer carries exactly that integer
+            if (single_varint(event.header.typ)) {
+                val value: Integer = integer_at(?data[body], payload::usize);
+                if (!value.whole || value.length != payload::usize || value.value != event.value) {
+                    ret fail(run, "h3: a single-integer frame answered another value");
+                }
+            }
+            if (event.header.typ == frame.FRAME_SETTINGS && p.settings_count > SETTINGS) {
+                ret fail(run, "h3: a settings frame held more settings than it had room for");
+            }
+            var typ_shape: u64 = event.header.typ;
+            if (typ_shape > 0xd) { typ_shape = 0xe; }
+            run.trace = verdict.mix(verdict.mix(run.trace, pending), event.value ^ offset::u64);
+            run.shape = verdict.mark(run.shape, typ_shape);
+            verdict.accept();
+            frames   = frames + 1;
+            start    = offset;
+            boundary = true;
+        }
+        or (event.kind == frame.EVENT_ERROR) {
+            if (event.error == frame.ERROR_NONE) { ret fail(run, "h3: a frame failed without saying why"); }
+            run.trace = verdict.mix(run.trace, (offset::u64 << 8) | event.error::u64);
+            run.shape = verdict.mark(run.shape, 16 + event.error::u64);
+            brk;
+        }
+        or (event.kind == frame.EVENT_NEED_INPUT) {
+            if (given != 0 && event.consumed == 0) {
+                ret fail(run, "h3: a feed asked for more input without taking what it had");
+            }
+            if (given == 0) { ret fail(run, "h3: a feed at the end of input asked for more"); }
+        }
+        or { ret fail(run, "h3: a feed answered an unknown event"); }
+    }
+    run.shape = verdict.mark(run.shape, 32 + verdict.bucket(frames));
+    ret true;
+}
+
+fun answer_kind(kind: frame.StreamKind, data: *u8, len: usize, outcome: *u64) *u8 {
+    var whole:    Run;
+    var bytewise: Run;
+    if (!drive_frames(kind, data, len, len + 1, ?whole)) { ret whole.detail; }
+    if (!drive_frames(kind, data, len, 1, ?bytewise))    { ret bytewise.detail; }
+    if (whole.trace != bytewise.trace || whole.shape != bytewise.shape) {
+        ret "h3: the whole input and the same input byte by byte framed differently";
+    }
+    @outcome = verdict.mix(@outcome, whole.shape);
+    ret nil;
+}
+
+# the same bytes on a request, a control and a push stream
+pub fun answer_frame(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    var detail:  *u8 = answer_kind(frame.KIND_REQUEST, data, len, ?outcome);
+    if (detail == nil) { detail = answer_kind(frame.KIND_CONTROL, data, len, ?outcome); }
+    if (detail == nil) { detail = answer_kind(frame.KIND_PUSH, data, len, ?outcome); }
+    if (detail != nil) { ret verdict.violated(detail); }
+    ret verdict.answered(outcome);
+}
+
+# the input is the prefaces of successive unidirectional streams from one peer,
+# answered against one set of critical streams and a model of which it allows
+fun drive_streams(peer_is_client: bool, data: *u8, len: usize, outcome: *u64) *u8 {
+    var critical: frame.CriticalStreams;
+    frame.critical_init(?critical);
+    var seen:   [4]bool;
+    var offset: usize = 0;
+    for (offset < len) {
+        var p: frame.StreamParser;
+        if (!frame.stream_parser_init(?p, ?critical, peer_is_client)) {
+            ret "h3: a stream parser refused its configuration";
+        }
+        val typ:   Integer           = integer_at(?data[offset], len - offset);
+        val event: frame.StreamEvent = frame.stream_feed(?p, ?data[offset], len - offset, true);
+        if (!typ.whole) {
+            if (event.kind != frame.STREAM_EVENT_ERROR || event.error != frame.ERROR_TRUNCATED) {
+                ret "h3: a truncated stream type was not refused as truncated";
+            }
+            @outcome = verdict.mark(@outcome, 16);
+            brk;
+        }
+        # a second control or qpack stream, or a push stream a client opened, is refused
+        var allowed: bool = !(typ.value == frame.STREAM_PUSH && peer_is_client);
+        if (typ.value == frame.STREAM_CONTROL || typ.value == frame.STREAM_QPACK_ENCODER
+            || typ.value == frame.STREAM_QPACK_DECODER) {
+            allowed = allowed && !seen[typ.value::usize];
+        }
+        if (allowed != (event.kind == frame.STREAM_EVENT_TYPE)
+            || (!allowed && event.error != frame.ERROR_STREAM_CREATION)) {
+            ret "h3: a stream type was allowed or refused against the rules for its kind";
+        }
+        if (!allowed) {
+            @outcome = verdict.mark(@outcome, 8 + bucketed_type(typ.value));
+            brk;
+        }
+        if (event.stream_type != typ.value || event.consumed != typ.length) {
+            ret "h3: a stream type is not the integer on the wire";
+        }
+        if (typ.value < 4) { seen[typ.value::usize] = true; }
+        verdict.accept();
+        var bucketed: u64 = typ.value;
+        if (bucketed > 4) { bucketed = 4; }
+        @outcome = verdict.mark(@outcome, bucketed);
+        offset   = offset + event.consumed;
+        if (typ.value == frame.STREAM_PUSH) {
+            val id:     Integer           = integer_at(?data[offset], len - offset);
+            val pushed: frame.StreamEvent = frame.stream_feed(?p, ?data[offset], len - offset, true);
+            if (!id.whole) {
+                if (pushed.kind != frame.STREAM_EVENT_ERROR) {
+                    ret "h3: a truncated push id was not refused";
+                }
+                brk;
+            }
+            if (pushed.kind != frame.STREAM_EVENT_PUSH_ID || pushed.push_id != id.value
+                || pushed.consumed != id.length) {
+                ret "h3: a push id is not the integer on the wire";
+            }
+            offset = offset + pushed.consumed;
+        }
+    }
+    ret nil;
+}
+
+fun bucketed_type(value: u64) u64 {
+    if (value > 4) { ret 4; }
+    ret value;
+}
+
+pub fun answer_stream(data: *u8, len: usize) verdict.Verdict {
+    var server: u64 = 0;
+    var client: u64 = 0;
+    var detail: *u8 = drive_streams(false, data, len, ?server);
+    if (detail == nil) { detail = drive_streams(true, data, len, ?client); }
+    if (detail != nil) { ret verdict.violated(detail); }
+    ret verdict.answered(verdict.mix(server, client));
+}
