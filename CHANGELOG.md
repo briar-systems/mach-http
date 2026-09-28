@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-27
+
+### Added
+
+- `h1.connection.Config.linger_timeout_ns` (default 5s, zero for no linger) and `h1.connection.Config.max_linger_bytes` (default 1 MiB), which bound how long and how much a closing server connection reads and discards (#180).
+
+### Changed
+
+- Breaking: `h1.connection.Config` has the two linger fields, so a `Config` literal must name them. A host that starts from `config_default` picks up the defaults with no change (#180).
+- A server engine lingers before it closes: after its write side is shut it reads and discards what the peer still sends until the peer's end of stream, `max_linger_bytes`, or `linger_timeout_ns`, then closes. Client engines close right after the shutdown as before. The idle and request-wait deadlines are off while lingering, and the total deadline and cancellation still fail the engine (#180).
+- Dependencies: requires mach-std 9.3.0, selected by `version = "^9.3"` in the root, `test/h3-quic` and `test/load` (#211).
+
+### Fixed
+
+- A server connection closed with client input still unread, so the client's stack could reset the connection under a response it had not read yet (RFC 9112 section 9.6) (#180).
+- A non-graceful draining connection holding input it will never parse (a refused body, pipelined requests after a close) waited for the header timeout and closed abortively. It now goes on to a lingering close. A connection lingering when the drain deadline cuts it is not counted in `abandoned_connections`, since its responses were delivered (#180).
+- An HTTP/1.0 request with a second Host field or an invalid Host value passed the parser. Both versions now refuse them with `ERROR_INVALID_HOST`, answered with 400, and only HTTP/1.1 requires Host to be present (RFC 9112 section 3.2). The serializer refuses the same client requests on the way out (#188).
+
 ## [0.24.0] - 2026-09-27
 
 ### Added
