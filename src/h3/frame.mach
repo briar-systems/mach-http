@@ -326,6 +326,8 @@ fun takes_single_varint(typ: u64) bool {
 }
 
 fun payload_byte(parser: *Parser, byte: u8) Error {
+    # a byte past the one integer of its frame is a malformed frame (RFC 9114 section 7.1)
+    if (takes_single_varint(parser.header.typ) && parser.value_complete) { ret ERROR_FRAME; }
     if (parser.header.typ == FRAME_SETTINGS || takes_single_varint(parser.header.typ)
         || (parser.header.typ == FRAME_PUSH_PROMISE && !parser.value_complete)) {
         val error: Error = varint_feed(?parser.integer, byte);
@@ -357,13 +359,8 @@ fun payload_byte(parser: *Parser, byte: u8) Error {
 fun finish_frame(parser: *Parser, consumed: usize) Event {
     if (parser.header.typ == FRAME_SETTINGS && (parser.setting_has_identifier
         || parser.integer.length != 0)) { ret fail(parser, consumed, ERROR_FRAME); }
-    if (takes_single_varint(parser.header.typ)
-        && (!parser.value_complete || parser.integer.length != parser.header.length::usize)) {
-        ret fail(parser, consumed, ERROR_FRAME);
-    }
-    if (parser.header.typ == FRAME_PUSH_PROMISE && !parser.value_complete) {
-        ret fail(parser, consumed, ERROR_FRAME);
-    }
+    if ((takes_single_varint(parser.header.typ) || parser.header.typ == FRAME_PUSH_PROMISE)
+        && !parser.value_complete) { ret fail(parser, consumed, ERROR_FRAME); }
     if (parser.header.typ == FRAME_SETTINGS) { parser.settings_received = true; }
     var event: Event = empty_event(EVENT_FRAME_END, consumed);
     event.header      = parser.header;
