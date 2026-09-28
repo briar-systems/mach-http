@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-09-28
+
+### Added
+
+- A fuzz lane in `test/fuzz`, on the same driver as mach-tls's, with a boundary per untrusted-input entry point: the h1 parser, h2 frames, hpack blocks, huffman and integers, h3 varints, frames and stream prefaces, the qpack encoder and decoder streams and field sections, `section.validate`, websocket frames and handshakes, router dispatch and capture decoding, and `client.url.parse`, with a checked-in corpus. `mach build test/fuzz` runs on every pull request and the replay runs on the heavy tier (#185).
+
+### Changed
+
+- Requires mach 6.5 (`mach = "^6.5"`). `VERSION` is `$mach.project.version`, so `mach.toml` is the only place the version lives, and CI seeds mach v6.5.0 (#215).
+- Dependencies: requires mach-std 9.4, selected by `version = "^9.4"` with the gitlink at v9.4.1, which maps a guard page below every linux thread stack. `test/fuzz` and `test/load` follow, and `test/h3-quic` moves to mach-quic 0.25.0 (`version = "^0.25"`), with crypto 0.26.0 and tls 0.16.0 under it. The public API is unchanged.
+
+### Fixed
+
+- `qpack.sections_init` clears every reference slot. It did not reset its index before clearing them, so the first slots kept whatever the storage held (#185).
+- A CANCEL_PUSH, GOAWAY or MAX_PUSH_ID frame with a payload byte after its integer fails with `ERROR_FRAME`, where it answered `ERROR_STATE` (#219).
+
 ## [0.25.0] - 2026-09-27
 
 ### Added
