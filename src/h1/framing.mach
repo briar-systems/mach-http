@@ -159,9 +159,8 @@ pub fun connect_authority(value: view.View) bool {
 pub fun request_host(version: message.Version, fields: *field.Fields) bool {
     if (version.major != 1 || (version.minor != 0 && version.minor != 1)
         || fields == nil || !field.validate(fields, fields.limits, false)) { ret false; }
-    if (version.minor == 0) { ret true; }
     var count: usize = 0;
-    var valid: bool  = false;
+    var valid: bool  = true;
     var i:     usize = 0;
     for (i < fields.len) {
         if (field_is(?fields.items[i], "host", 4)) {
@@ -170,7 +169,9 @@ pub fun request_host(version: message.Version, fields: *field.Fields) bool {
         }
         i = i + 1;
     }
-    ret count == 1 && valid;
+    # every version refuses a second or invalid Host, and only HTTP/1.1 requires one
+    # (rfc 9112 section 3.2)
+    ret valid && (count == 1 || (count == 0 && version.minor == 0));
 }
 
 fun ows(c: u8) bool {
@@ -498,5 +499,15 @@ test request_host__singular_and_syntax_checked {
     field.append(?fields, field.Field{name: view.view("Host", 4),
         value: view.view("example.com:99999", 17), sensitive: false});
     if (request_host(message.version_h1(1, 1), ?fields)) { ret 3; }
+    if (request_host(message.version_h1(1, 0), ?fields)) { ret 4; }
+    field.reset(?fields);
+    if (!request_host(message.version_h1(1, 0), ?fields)
+        || request_host(message.version_h1(1, 1), ?fields)) { ret 5; }
+    field.append(?fields, field.Field{name: view.view("Host", 4),
+        value: view.view("a.example", 9), sensitive: false});
+    if (!request_host(message.version_h1(1, 0), ?fields)) { ret 6; }
+    field.append(?fields, field.Field{name: view.view("Host", 4),
+        value: view.view("b.example", 9), sensitive: false});
+    if (request_host(message.version_h1(1, 0), ?fields)) { ret 7; }
     ret 0;
 }

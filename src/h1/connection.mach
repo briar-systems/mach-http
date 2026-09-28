@@ -125,15 +125,19 @@ pub val OFFER_ERROR:   OfferStatus = 5;
 # slot_scratch_bytes: serialized head and trailer bytes per slot
 # slot_lane:          the budget lane of per-request slot memory
 # connection_lane:    the budget lane of the read and write buffers
+# linger_timeout_ns:  how long a closing server discards input, zero for no linger
+# max_linger_bytes:   how much input a closing server discards before it closes
 pub rec Config {
     parser:             parser.Limits;
     max_pipeline:       usize;
     max_drain_bytes:    u64;
+    max_linger_bytes:   u64;
     header_timeout_ns:  u64;
     request_timeout_ns: u64;
     idle_timeout_ns:    u64;
     write_timeout_ns:   u64;
     total_timeout_ns:   u64;
+    linger_timeout_ns:  u64;
     read_bytes:         usize;
     write_bytes:        usize;
     slot_storage_bytes: usize;
@@ -250,6 +254,9 @@ pub rec Engine {
     shutdown_pending:   bool;
     shutdown_done:      bool;
     shutdown_token:     transport.Token;
+    linger_done:        bool;
+    lingered:           u64;
+    linger_deadline:    Deadline;
     close_pending:      bool;
     close_token:        transport.Token;
     graceful_requested: bool;
@@ -269,11 +276,13 @@ pub fun config_default() Config {
         parser:             parser.limits_default(),
         max_pipeline:       16,
         max_drain_bytes:    1048576,
+        max_linger_bytes:   1048576,
         header_timeout_ns:  10000000000,
         request_timeout_ns: 30000000000,
         idle_timeout_ns:    60000000000,
         write_timeout_ns:   30000000000,
         total_timeout_ns:   300000000000,
+        linger_timeout_ns:  5000000000,
         read_bytes:         8192,
         write_bytes:        8192,
         slot_storage_bytes: 40960,
@@ -305,7 +314,8 @@ pub fun config_valid(configured: Config, capacity: usize) bool {
         && deadline.optional_valid(configured.request_timeout_ns)
         && deadline.duration_valid(configured.idle_timeout_ns)
         && deadline.optional_valid(configured.write_timeout_ns)
-        && deadline.optional_valid(configured.total_timeout_ns);
+        && deadline.optional_valid(configured.total_timeout_ns)
+        && deadline.optional_valid(configured.linger_timeout_ns);
 }
 
 fun empty_event(engine: *Engine, kind: EventKind) Event {
@@ -530,6 +540,9 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
     engine.held_slot          = NO_SLOT;
     engine.shutdown_pending   = false;
     engine.shutdown_done      = false;
+    engine.linger_done        = false;
+    engine.lingered           = 0;
+    engine.linger_deadline    = Deadline{active: false, at: now};
     engine.close_pending      = false;
     engine.graceful_requested = false;
     engine.tunnel_slot        = NO_SLOT;
@@ -548,7 +561,8 @@ pub fun init(engine: *Engine, role: Role, connection_transport: *transport.Trans
 # after that. a running wait is never rearmed, so a memory refusal cannot extend
 # it, and it only ends when a slot starts. the idle deadline keeps running beside it
 fun await_request(engine: *Engine, now: time.Instant) {
-    if (engine.role != SERVER || engine.count != 0 || engine.wait_deadline.active) { ret; }
+    if (engine.role != SERVER || engine.count != 0 || engine.wait_deadline.active
+        || engine.shutdown_done) { ret; }
     engine.wait_deadline = deadline.after(now, engine.configured.header_timeout_ns);
 }
 
@@ -735,6 +749,7 @@ pub fun next_deadline(engine: *Engine) Deadline {
     if (engine == nil || !engine.initialized || engine.state == CLOSED || engine.state == TUNNEL
         || engine.state == CLOSING || engine.state == FAILED) { ret result; }
     result = deadline.earlier(result, engine.total_deadline);
+    result = deadline.earlier(result, engine.linger_deadline);
     if (engine.count == 0) {
         result = deadline.earlier(result, engine.idle_deadline);
         result = deadline.earlier(result, engine.wait_deadline);
@@ -771,6 +786,7 @@ pub fun tick(engine: *Engine, now: time.Instant) Event {
     if ((sel reason.timed_out))                                           { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
     if (!(sel reason.active))                                             { ret fail(engine, ERROR_CANCELLED); }
     if (deadline.expired(engine.total_deadline, now))                     { ret fail(engine, ERROR_TOTAL_TIMEOUT); }
+    if (deadline.expired(engine.linger_deadline, now))                    { end_linger(engine); }
     if (engine.count == 0 && deadline.expired(engine.idle_deadline, now)) { ret fail(engine, ERROR_IDLE_TIMEOUT); }
     if (engine.count == 0 && deadline.expired(engine.wait_deadline, now)) { ret fail(engine, ERROR_HEADER_TIMEOUT); }
     var offset: usize = 0;
@@ -959,6 +975,38 @@ pub fun offer(engine: *Engine, index: usize, body: *u8,
     ret Offer{status: OFFER_BODY, consumed: result.consumed, produced: 0, error: ERROR_NONE};
 }
 
+def Submitted: u8;
+val SUBMITTED:      Submitted = 1;
+val SUBMIT_MEMORY:  Submitted = 2;
+val SUBMIT_REFUSED: Submitted = 3;
+
+# a readable wait when the transport has not reported input, else a read into
+# the read buffer. nothing left to parse, so the idle wait holds no buffer
+fun submit_input(engine: *Engine) Submitted {
+    if (!engine.readable) {
+        release_read(engine);
+        val waited: res[transport.Token, io_error.Error] = transport.readable(
+            engine.transport, engine.scope, engine.next_sequence::usize);
+        if ((sel waited.err)) { ret SUBMIT_REFUSED; }
+        engine.read_token   = waited.ok;
+        engine.read_kind    = transport.READABLE;
+        engine.read_pending = true;
+        ret SUBMITTED;
+    }
+    if (!acquire_read(engine)) { ret SUBMIT_MEMORY; }
+    engine.input_length = 0;
+    engine.input_offset = 0;
+    val submitted: res[transport.Token, io_error.Error] = transport.read(
+        engine.transport, engine.scope, engine.read_buffer, engine.read_capacity,
+        engine.next_sequence::usize);
+    if ((sel submitted.err)) { ret SUBMIT_REFUSED; }
+    engine.read_token   = submitted.ok;
+    engine.read_kind    = transport.READ;
+    engine.readable     = false;
+    engine.read_pending = true;
+    ret SUBMITTED;
+}
+
 pub fun submit_read(engine: *Engine) bool {
     if (engine == nil || !engine.initialized || engine.read_pending || engine.input_eof
         || engine.input_offset != engine.input_length || engine.held_length != 0
@@ -967,35 +1015,9 @@ pub fun submit_read(engine: *Engine) bool {
         || (engine.role == CLIENT && current_inbound(engine) == NO_SLOT)
         || (engine.role == SERVER && engine.count >= engine.capacity
         && current_inbound(engine) == NO_SLOT)) { ret false; }
-    if (!engine.readable) {
-        # nothing left to parse, so the idle wait holds no buffer
-        release_read(engine);
-        val waited: res[transport.Token, io_error.Error] = transport.readable(
-            engine.transport, engine.scope, engine.next_sequence::usize);
-        if ((sel waited.err)) {
-            fail(engine, ERROR_TRANSPORT);
-            ret false;
-        }
-        engine.read_token   = waited.ok;
-        engine.read_kind    = transport.READABLE;
-        engine.read_pending = true;
-        ret true;
-    }
-    if (!acquire_read(engine)) { ret false; }
-    engine.input_length = 0;
-    engine.input_offset = 0;
-    val submitted: res[transport.Token, io_error.Error] = transport.read(
-        engine.transport, engine.scope, engine.read_buffer, engine.read_capacity,
-        engine.next_sequence::usize);
-    if ((sel submitted.err)) {
-        fail(engine, ERROR_TRANSPORT);
-        ret false;
-    }
-    engine.read_token   = submitted.ok;
-    engine.read_kind    = transport.READ;
-    engine.readable     = false;
-    engine.read_pending = true;
-    ret true;
+    val submitted: Submitted = submit_input(engine);
+    if (submitted == SUBMIT_REFUSED) { fail(engine, ERROR_TRANSPORT); }
+    ret submitted == SUBMITTED;
 }
 
 pub fun submit_write(engine: *Engine) bool {
@@ -1077,6 +1099,12 @@ pub fun complete_io(engine: *Engine, completion: *transport.Completion,
     }
     val checked: Event = tick(engine, now);
     if (checked.kind != EVENT_NONE) { ret checked; }
+    # once the write side is shut, input is only discarded
+    if (engine.shutdown_done
+        && (completion.kind == transport.READ || completion.kind == transport.READABLE)) {
+        linger_input(engine, completion);
+        ret empty_event(engine, EVENT_NONE);
+    }
     if (completion.kind == transport.READABLE) {
         if (completion.status == transport.IO_COMPLETE) {
             engine.readable = true;
@@ -1129,6 +1157,7 @@ pub fun complete_io(engine: *Engine, completion: *transport.Completion,
     if (completion.kind == transport.SHUTDOWN_WRITE) {
         if (completion.status != transport.IO_COMPLETE) { ret fail(engine, ERROR_TRANSPORT); }
         engine.shutdown_done = true;
+        begin_linger(engine, now);
         ret empty_event(engine, EVENT_NONE);
     }
     engine.close_pending = false;
@@ -1204,7 +1233,7 @@ pub fun process(engine: *Engine, now: time.Instant) Event {
     val checked: Event = tick(engine, now);
     if (checked.kind != EVENT_NONE) { ret checked; }
     # a closing engine only waits for its close, and input it holds is never parsed
-    if (engine.state == CLOSING) { ret empty_event(engine, EVENT_NONE); }
+    if (engine.state == CLOSING || engine.shutdown_done) { ret empty_event(engine, EVENT_NONE); }
     if (engine.state == TUNNEL) {
         if (engine.tunnel_reported) { ret empty_event(engine, EVENT_NONE); }
         engine.tunnel_reported = true;
@@ -1454,6 +1483,38 @@ fun protocol_done(engine: *Engine) bool {
     ret true;
 }
 
+# a server whose write side is shut keeps reading and discarding what its peer
+# still sends, until the peer ends its stream, max_linger_bytes arrived, or
+# linger_timeout_ns passed. closing with that input unread would have the peer's
+# stack reset the connection, and the peer could lose the response it has not
+# read yet (rfc 9112 section 9.6)
+fun begin_linger(engine: *Engine, now: time.Instant) {
+    engine.idle_deadline.active = false;
+    engine.wait_deadline.active = false;
+    engine.lingered             = input_available(engine)::u64;
+    engine.input_offset         = engine.input_length;
+    engine.linger_deadline      = deadline.after_optional(now, engine.configured.linger_timeout_ns);
+    if (engine.role != SERVER || engine.input_eof || !engine.linger_deadline.active
+        || engine.lingered >= engine.configured.max_linger_bytes) { end_linger(engine); }
+}
+
+fun end_linger(engine: *Engine) {
+    engine.linger_done            = true;
+    engine.linger_deadline.active = false;
+}
+
+fun linger_input(engine: *Engine, completion: *transport.Completion) {
+    if (completion.status == transport.IO_COMPLETE && completion.kind == transport.READABLE) {
+        engine.readable = true;
+        ret;
+    }
+    if (completion.status == transport.IO_COMPLETE && completion.count != 0) {
+        engine.lingered = engine.lingered + completion.count::u64;
+        if (engine.lingered < engine.configured.max_linger_bytes) { ret; }
+    }
+    end_linger(engine);
+}
+
 pub fun progress_close(engine: *Engine) bool {
     if (engine == nil || !engine.initialized || engine.state != DRAINING
         || !protocol_done(engine)) { ret false; }
@@ -1467,6 +1528,14 @@ pub fun progress_close(engine: *Engine) bool {
         engine.shutdown_token   = submitted.ok;
         engine.shutdown_pending = true;
         ret true;
+    }
+    if (engine.shutdown_done && !engine.linger_done) {
+        if (engine.read_pending) { ret false; }
+        val submitted: Submitted = submit_input(engine);
+        if (submitted == SUBMITTED) { ret true; }
+        # a refused buffer is retried when the account is ready, or the linger ends
+        if (submitted == SUBMIT_MEMORY) { ret false; }
+        end_linger(engine);
     }
     if (engine.shutdown_done && !engine.close_pending) {
         engine.state = CLOSING;
@@ -1693,6 +1762,7 @@ fun test_config(pipeline: usize) Config {
     configured.slot_scratch_bytes       = 512;
     configured.slot_lane                = 0;
     configured.connection_lane          = 1;
+    configured.linger_timeout_ns        = 0;
     ret configured;
 }
 
@@ -2637,11 +2707,29 @@ test rejection__malformed_head_is_answered_then_the_connection_closes {
         || !memory.raw_equal(fixture.io.write_buffer, "HTTP/1.1 400 Bad Request\r\n", 26)) { ret 6; }
     if (complete_write(?fixture, fixture.io.write_length, now).kind != EVENT_OUTBOUND_COMPLETE
         || !release(?fixture.engine, rejected.slot, now) || fixture.engine.count != 0) { ret 7; }
+    fixture.engine.configured.linger_timeout_ns = 5000000000;
     if (!progress_close(?fixture.engine) || fixture.io.shutdown_calls != 1) { ret 8; }
     var shutdown: transport.Completion = transport.completed(
         fixture.io.shutdown_token, transport.SHUTDOWN_WRITE, 0);
     if (complete_io(?fixture.engine, ?shutdown, now).kind != EVENT_NONE
-        || !progress_close(?fixture.engine) || fixture.io.close_calls != 1) { ret 9; }
+        || !deadline_at(next_deadline(?fixture.engine), 105)) { ret 9; }
+    # what the peer still sends is read and discarded, never parsed, until the linger ends
+    if (!progress_close(?fixture.engine) || fixture.io.close_calls != 0
+        || fixture.engine.read_kind != transport.READABLE) { ret 10; }
+    var ready: transport.Completion = transport.completed(
+        fixture.io.readable_token, transport.READABLE, 0);
+    if (complete_io(?fixture.engine, ?ready, now).kind != EVENT_NONE
+        || !progress_close(?fixture.engine) || fixture.engine.read_kind != transport.READ) { ret 11; }
+    memory.raw_copy(fixture.io.read_buffer, "GET / HTTP/1.1\r\n\r\n", 18);
+    var late: transport.Completion = transport.completed(fixture.io.read_token, transport.READ, 18);
+    if (complete_io(?fixture.engine, ?late, now).kind != EVENT_NONE
+        || process(?fixture.engine, now).kind != EVENT_NONE || fixture.engine.count != 0
+        || fixture.engine.lingered != 18
+        || !progress_close(?fixture.engine) || fixture.io.close_calls != 0) { ret 12; }
+    # the linger ends at its deadline even with a read still pending
+    if (tick(?fixture.engine, test_now(105)).kind != EVENT_NONE
+        || !deadline_at(next_deadline(?fixture.engine), 400)
+        || !progress_close(?fixture.engine) || fixture.io.close_calls != 1) { ret 13; }
     ret 0;
 }
 
