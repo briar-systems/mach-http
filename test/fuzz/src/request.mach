@@ -1,0 +1,88 @@
+# a message head read off the wire by the http/1.1 parser, as the connection
+# engine hands it to the layers above
+
+use http.core.body;
+use http.core.field;
+use http.core.message;
+use http.core.method;
+use http.core.target;
+use http.h1.framing;
+use http.h1.parser;
+use std.chrono.time;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+
+val LINE:     usize = 8192;
+val STORAGE:  usize = 32768;
+val FIELDS:   usize = 100;
+val TRAILERS: usize = 32;
+
+var line:     [LINE]u8;
+var storage:  [STORAGE]u8;
+var fields:   [FIELDS]field.Field;
+var trailers: [TRAILERS]field.Field;
+
+# parse the head of the message at data. false when the parser refused it or the
+# input ended first
+pub fun head(kind: parser.Kind, request_method: method.Kind, data: *u8, len: usize,
+    p: *parser.Parser) bool {
+    var ok: bool = false;
+    if (kind == parser.REQUEST) {
+        ok = parser.init_request(p, ?line[0], LINE, ?storage[0], STORAGE,
+            ?fields[0], FIELDS, ?trailers[0], TRAILERS, parser.limits_default());
+    }
+    or {
+        ok = parser.init_response(p, request_method, ?line[0], LINE, ?storage[0], STORAGE,
+            ?fields[0], FIELDS, ?trailers[0], TRAILERS, parser.limits_default());
+    }
+    if (!ok || len == 0) { ret false; }
+    ret parser.feed(p, data, len).status == parser.PARSE_HEADERS;
+}
+
+# whether the head declared no body, which is all an empty reader can stand for
+pub fun bodyless(p: *parser.Parser) bool {
+    val plan: framing.Plan = p.parsed.plan;
+    ret plan.mode == framing.FRAME_NONE || (plan.mode == framing.FRAME_LENGTH && plan.length == 0);
+}
+
+pub fun metadata(version: message.Version) message.Metadata {
+    ret message.Metadata{
+        version:       version,
+        secure:        true,
+        early_data:    false,
+        peer:          message.unspecified_endpoint(),
+        local:         message.unspecified_endpoint(),
+        received_at:   time.Time{sec: 1, nsec: 0},
+        deadline:      opt[time.Instant].none{},
+        request_index: 1,
+    };
+}
+
+# a request with the head's method, target and fields and an empty body, over
+# the given version and generation
+pub fun build(p: *parser.Parser, request_method: method.Method, request_target: target.Target,
+    version: message.Version, request: *message.Request, reader: *body.Reader,
+    generation: u64) bool {
+    @reader = body.empty_reader(generation);
+    val configured: message.Limits = limits();
+    ret message.init_request(request, request_method, request_target, metadata(version),
+        p.parsed.fields, p.parsed.trailers, reader, generation, configured);
+}
+
+# the request side follows the parser, as the server derives it, so a head the
+# parser admits is never refused again
+pub fun limits() message.Limits {
+    val parsing: parser.Limits  = parser.limits_default();
+    var result:  message.Limits = message.limits_default();
+    result.max_method_bytes = parsing.max_method_bytes;
+    result.target           = target.limits(parsing.max_target_bytes, 16,
+        parsing.max_target_bytes, parsing.max_target_bytes, parsing.max_target_bytes);
+    result.request_fields = field.limits(parsing.max_headers, parsing.max_header_bytes,
+        parsing.max_header_line, parsing.max_header_line);
+    result.request_trailers = field.limits(parsing.max_trailers, parsing.max_trailer_bytes,
+        parsing.max_header_line, parsing.max_header_line);
+    ret result;
+}

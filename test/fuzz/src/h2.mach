@@ -1,0 +1,321 @@
+# the http/2 frame parser and the hpack decoder, huffman code and integers
+
+use http.core.field;
+use http.h2.frame;
+use http.h2.hpack;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.verdict;
+
+rec Run {
+    trace:  u64;
+    shape:  u64;
+    detail: *u8;
+}
+
+fun fail(run: *Run, detail: *u8) bool {
+    run.detail = detail;
+    ret false;
+}
+
+fun header_at(data: *u8) frame.Header {
+    ret frame.Header{
+        length:    (data[0]::u32 << 16) | (data[1]::u32 << 8) | data[2]::u32,
+        typ:       data[3],
+        flags:     data[4],
+        stream_id: ((data[5]::u32 << 24) | (data[6]::u32 << 16) | (data[7]::u32 << 8)
+            | data[8]::u32) & 0x7fffffff,
+    };
+}
+
+fun same_header(a: frame.Header, b: frame.Header) bool {
+    ret a.length == b.length && a.typ == b.typ && a.flags == b.flags
+        && a.stream_id == b.stream_id;
+}
+
+# a frame the parser accepted keeps the stream rules of RFC 9113 section 6
+fun header_allowed(header: frame.Header) bool {
+    if (header.length > frame.DEFAULT_MAX_FRAME_SIZE) { ret false; }
+    val connection: bool = header.typ == frame.FRAME_SETTINGS || header.typ == frame.FRAME_PING
+        || header.typ == frame.FRAME_GOAWAY;
+    val stream: bool = header.typ == frame.FRAME_DATA || header.typ == frame.FRAME_HEADERS
+        || header.typ == frame.FRAME_PRIORITY || header.typ == frame.FRAME_RESET_STREAM
+        || header.typ == frame.FRAME_PUSH_PROMISE || header.typ == frame.FRAME_CONTINUATION;
+    if (connection && header.stream_id != 0) { ret false; }
+    if (stream && header.stream_id == 0)     { ret false; }
+    ret true;
+}
+
+fun drive_frames(data: *u8, len: usize, stride: usize, run: *Run) bool {
+    run.trace  = 0;
+    run.shape  = 0;
+    run.detail = "";
+    var p: frame.Parser;
+    if (!frame.parser_init(?p, frame.limits_default())) { ret fail(run, "h2: the frame parser refused its limits"); }
+    var offset:  usize = 0;
+    var start:   usize = 0;
+    var payload: u64   = 0;
+    # a frame's bytes are answered when it ends, since a byte that fails it
+    # refuses the bytes fed with it whether or not they came first
+    var pending:  u64   = 0;
+    var boundary: bool  = true;
+    var frames:   usize = 0;
+    for {
+        if (offset == len && boundary) { brk; }
+        var given: usize = len - offset;
+        if (given > stride) { given = stride; }
+        var bytes: *u8 = nil;
+        if (given != 0) { bytes = ?data[offset]; }
+        val event: frame.Event = frame.feed(?p, bytes, given, offset + given == len);
+        if (event.consumed > given) { ret fail(run, "h2: a feed consumed more than it was given"); }
+        offset = offset + event.consumed;
+        if (event.consumed != 0) { boundary = false; }
+        if (event.kind == frame.EVENT_HEADER) {
+            if (offset - start != 9 || !same_header(event.header, header_at(?data[start]))
+                || !header_allowed(event.header)) {
+                ret fail(run, "h2: an accepted frame header is not the one on the wire");
+            }
+            run.trace = verdict.mix(run.trace, (offset::u64 << 8) | event.header.typ::u64);
+            payload   = 0;
+            pending   = 0;
+        }
+        or (event.kind == frame.EVENT_PAYLOAD) {
+            if (event.data != bytes || event.data_length != event.consumed
+                || payload + event.data_length::u64 > event.header.length::u64) {
+                ret fail(run, "h2: a payload view is not the bytes fed");
+            }
+            pending = verdict.mix_bytes(pending, event.data, event.data_length);
+            payload = payload + event.data_length::u64;
+            if (!frame.release(?p)) { ret fail(run, "h2: a held payload could not be released"); }
+        }
+        or (event.kind == frame.EVENT_FRAME_END) {
+            if (payload != event.header.length::u64 || offset - start != 9 + payload::usize) {
+                ret fail(run, "h2: a frame ended on another length than its header");
+            }
+            var typ: u64 = event.header.typ::u64;
+            if (typ > 9) { typ = 10; }
+            run.trace = verdict.mix(verdict.mix(run.trace, pending), offset::u64);
+            run.shape = verdict.mark(run.shape, typ);
+            verdict.accept();
+            frames   = frames + 1;
+            start    = offset;
+            boundary = true;
+        }
+        or (event.kind == frame.EVENT_ERROR) {
+            if (event.error == frame.ERROR_NONE) { ret fail(run, "h2: a frame failed without saying why"); }
+            run.trace = verdict.mix(run.trace, (offset::u64 << 8) | event.error::u64);
+            run.shape = verdict.mark(run.shape, 16 + event.error::u64);
+            brk;
+        }
+        or (event.kind == frame.EVENT_NEED_INPUT) {
+            if (given != 0 && event.consumed == 0) {
+                ret fail(run, "h2: a feed asked for more input without taking what it had");
+            }
+            if (given == 0) { ret fail(run, "h2: a feed at the end of input asked for more"); }
+        }
+        or { ret fail(run, "h2: a feed answered an unknown event"); }
+    }
+    run.shape = verdict.mark(run.shape, 32 + verdict.bucket(frames));
+    ret true;
+}
+
+pub fun answer_frame(data: *u8, len: usize) verdict.Verdict {
+    var whole:    Run;
+    var bytewise: Run;
+    if (!drive_frames(data, len, len + 1, ?whole)) { ret verdict.violated(whole.detail); }
+    if (!drive_frames(data, len, 1, ?bytewise))    { ret verdict.violated(bytewise.detail); }
+    if (whole.trace != bytewise.trace || whole.shape != bytewise.shape) {
+        ret verdict.violated("h2: the whole input and the same input byte by byte framed differently");
+    }
+    ret verdict.answered(whole.shape);
+}
+
+pub fun answer_integer(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    var prefix:  u8  = 1;
+    for (prefix <= 8) {
+        val decoded: hpack.Integer = hpack.decode_integer(data, len, 0, prefix);
+        outcome = verdict.mix(outcome, decoded.error::u64);
+        if (decoded.error == hpack.ERROR_NONE) {
+            verdict.accept();
+            # an accepted integer is exactly the minimal encoding of its value
+            val maximum: u8    = ((1::u16 << prefix) - 1)::u8;
+            var again:   [16]u8;
+            val written: usize = hpack.encode_integer(decoded.value, prefix,
+                data[0] & ~maximum, ?again[0], 16);
+            if (decoded.next == 0 || decoded.next > len || written != decoded.next
+                || !same_bytes(?again[0], data, written)) {
+                ret verdict.violated("hpack: an accepted integer is not its value's encoding");
+            }
+            outcome = verdict.mix(outcome, verdict.bucket(decoded.next));
+        }
+        or (decoded.error != hpack.ERROR_INPUT && decoded.error != hpack.ERROR_INTEGER) {
+            ret verdict.violated("hpack: an integer failed with an unexpected error");
+        }
+        prefix = prefix + 1;
+    }
+    ret verdict.answered(outcome);
+}
+
+fun same_bytes(a: *u8, b: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+val HUFFMAN_OUTPUT: usize = 32768;
+
+var huffman_output: [HUFFMAN_OUTPUT]u8;
+var huffman_again:  [HUFFMAN_OUTPUT]u8;
+
+pub fun answer_huffman(data: *u8, len: usize) verdict.Verdict {
+    val written: usize = hpack.huffman_decode(data, len, ?huffman_output[0], HUFFMAN_OUTPUT,
+        HUFFMAN_OUTPUT);
+    if (written == (-1)::usize) { ret verdict.answered(1); }
+    verdict.accept();
+    # the code is canonical and its padding is fixed, so an accepted string is
+    # exactly the encoding of what it decoded to
+    val size:    usize = hpack.huffman_encoded_size(?huffman_output[0], written);
+    val encoded: usize = hpack.huffman_encode(?huffman_output[0], written, ?huffman_again[0],
+        HUFFMAN_OUTPUT);
+    if (size != len || encoded != len || !same_bytes(?huffman_again[0], data, len)) {
+        ret verdict.violated("hpack: an accepted huffman string is not the encoding of its decoding");
+    }
+    ret verdict.answered(verdict.mix(2, verdict.bucket(written)));
+}
+
+val TABLE_ENTRIES: usize = 128;
+val TABLE_BYTES:   usize = 4096;
+val ENCODED:       usize = 16384;
+val DECODED_COUNT: usize = 100;
+val DECODED_BYTES: usize = 65536;
+
+var table_items:   [TABLE_ENTRIES]hpack.Entry;
+var table_storage: [TABLE_BYTES]u8;
+var encoded:       [ENCODED]u8;
+var decoded:       [DECODED_COUNT]field.Field;
+var decoded_bytes: [DECODED_BYTES]u8;
+var pending:       [DECODED_COUNT]hpack.Entry;
+
+# the dynamic table's own accounting, and a fold of what it holds
+fun table_digest(table: *hpack.DynamicTable, digest: *u64) bool {
+    # a lowered allowed size stands above the table until the peer's update
+    if (table.count > table.capacity || table.bytes > table.max_bytes
+        || (table.max_bytes > table.allowed_max_bytes && !table.requires_update)
+        || table.storage_length > table.storage_capacity) { ret false; }
+    var bytes:    usize = 0;
+    var physical: usize = 0;
+    var result:   u64   = verdict.mix(table.count::u64, table.max_bytes::u64);
+    var i:        usize = 0;
+    for (i < table.count) {
+        val item: hpack.Entry = table.items[i];
+        if (!verdict.view_inside(item.name, table.storage, table.storage_length)
+            || !verdict.view_inside(item.value, table.storage, table.storage_length)
+            || item.size != item.name.len + item.value.len + 32) { ret false; }
+        bytes    = bytes + item.size;
+        physical = physical + item.name.len + item.value.len;
+        result   = verdict.mix_bytes(verdict.mix(result, item.name.len::u64), item.name.data,
+            item.name.len);
+        result = verdict.mix_bytes(verdict.mix(result, item.value.len::u64), item.value.data,
+            item.value.len);
+        i = i + 1;
+    }
+    @digest = result;
+    ret bytes == table.bytes && physical == table.storage_length;
+}
+
+# the input is a table setting byte and then header blocks, each a two-byte
+# length and that many bytes, decoded in order against one dynamic table. the
+# last block takes whatever bytes remain
+pub fun answer_hpack(data: *u8, len: usize) verdict.Verdict {
+    if (len == 0) { ret verdict.answered(0); }
+    var table: hpack.DynamicTable;
+    if (!hpack.table_init(?table, ?table_items[0], TABLE_ENTRIES, ?table_storage[0],
+        TABLE_BYTES, TABLE_BYTES, TABLE_BYTES)) {
+        ret verdict.violated("hpack: the table refused its configuration");
+    }
+    # a peer that lowers SETTINGS_HEADER_TABLE_SIZE owes a size update first
+    val allowed: usize = (data[0] & 0x0f)::usize * 256;
+    if ((data[0] & 0x80) != 0 && !hpack.table_set_allowed_max(?table, allowed)) {
+        ret verdict.violated("hpack: the table refused a lower allowed size");
+    }
+    var outcome: u64   = verdict.bucket((data[0] & 0x80)::usize);
+    var offset:  usize = 1;
+    var blocks:  usize = 0;
+    for (offset < len) {
+        var size: usize = len - offset;
+        if (size >= 2) {
+            val declared: usize = (data[offset]::usize << 8) | data[offset + 1]::usize;
+            offset = offset + 2;
+            size   = len - offset;
+            if (declared < size) { size = declared; }
+        }
+        or {
+            offset = len;
+            size   = 0;
+        }
+        var before: u64 = 0;
+        if (!table_digest(?table, ?before)) {
+            ret verdict.violated("hpack: the dynamic table's accounting broke");
+        }
+        var decoder: hpack.Decoder;
+        if (!hpack.decoder_init(?decoder, ?table, ?encoded[0], ENCODED, ?decoded[0],
+            DECODED_COUNT, ?decoded_bytes[0], DECODED_BYTES, ?pending[0], DECODED_COUNT,
+            hpack.limits_default())) {
+            ret verdict.violated("hpack: the decoder refused its configuration");
+        }
+        # the block arrives in two pieces, as it would across CONTINUATION frames
+        val half:  usize        = size / 2;
+        val first: hpack.Decode = hpack.decoder_feed(?decoder, ?data[offset], half, false);
+        if (first.status != hpack.DECODE_NEED_INPUT || first.consumed != half) {
+            ret verdict.violated("hpack: a partial block was not buffered");
+        }
+        val result: hpack.Decode = hpack.decoder_feed(?decoder, ?data[offset + half],
+            size - half, true);
+        offset = offset + size;
+        var after: u64 = 0;
+        if (!table_digest(?table, ?after)) {
+            ret verdict.violated("hpack: the dynamic table's accounting broke");
+        }
+        if (result.status == hpack.DECODE_COMPLETE) {
+            verdict.accept();
+            if (result.count != decoder.field_count) {
+                ret verdict.violated("hpack: a block reported another field count than it decoded");
+            }
+            var bytes: usize = 0;
+            var i:     usize = 0;
+            for (i < result.count) {
+                val item: field.Field = decoded[i];
+                if (!verdict.view_inside(item.name, ?decoded_bytes[0], decoder.storage_length)
+                    || !verdict.view_inside(item.value, ?decoded_bytes[0], decoder.storage_length)
+                    || item.name.len == 0) {
+                    ret verdict.violated("hpack: a decoded field lies outside the decoder's storage");
+                }
+                bytes = bytes + item.name.len + item.value.len + 32;
+                i     = i + 1;
+            }
+            if (bytes != result.bytes || table.requires_update) {
+                ret verdict.violated("hpack: a decoded block's size or table update is not what it decoded");
+            }
+            outcome = verdict.mark(outcome, 8 + verdict.bucket(result.count));
+            outcome = verdict.mark(outcome, 12 + verdict.bucket(table.count));
+        }
+        or {
+            # decoding is transactional, so a refused block leaves the table as it was
+            if (result.status != hpack.DECODE_ERROR || result.error == hpack.ERROR_NONE
+                || before != after) {
+                ret verdict.violated("hpack: a refused block changed the dynamic table");
+            }
+            outcome = verdict.mark(outcome, 16 + result.error::u64);
+        }
+        blocks = blocks + 1;
+    }
+    ret verdict.answered(verdict.mark(outcome, 32 + verdict.bucket(blocks)));
+}
