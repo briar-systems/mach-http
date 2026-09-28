@@ -66,4 +66,4 @@ path = "../.."
 # as in the other subprojects, because a path dependency carries no pin for it
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.3"
+version = "^9.4"
