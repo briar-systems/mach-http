@@ -1,6 +1,6 @@
 [project]
 id = "http"
-mach = "^6"
+mach = "^6.5"
 version = "0.25.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
