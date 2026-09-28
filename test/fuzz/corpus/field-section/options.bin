@@ -1,0 +1,4 @@
+:method: OPTIONS
+:scheme: https
+:path: *
+host: example.com

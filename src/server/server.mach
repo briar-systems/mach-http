@@ -2399,11 +2399,11 @@ pub fun serve(server: *Server) Report {
 }
 
 #[testing]
-val STREAM_BYTES: u64 = 1048576;
+val STREAM_BYTES:   u64   = 1048576;
 #[testing]
-val TRICKLE_CHUNKS: u64 = 8;
+val TRICKLE_CHUNKS: u64   = 8;
 #[testing]
-val TRICKLE_BYTES: usize = 16;
+val TRICKLE_BYTES:  usize = 16;
 
 #[testing]
 def Scenario: fun(*Harness) i64;

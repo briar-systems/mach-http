@@ -27,15 +27,15 @@ use std.types.string.str_len;
 use std.types.view;
 
 #[testing]
-val CONNECTIONS: usize = 8;
+val CONNECTIONS:  usize = 8;
 #[testing]
-val WARMUP: usize = 500;
+val WARMUP:       usize = 500;
 #[testing]
-val SUSTAINED: usize = 4000;
+val SUSTAINED:    usize = 4000;
 #[testing]
-val REQUEST: str = "GET /load HTTP/1.1\r\nHost: load\r\n\r\n";
+val REQUEST:      str   = "GET /load HTTP/1.1\r\nHost: load\r\n\r\n";
 #[testing]
-val RESPONSE_END: str = "\r\n\r\nok";
+val RESPONSE_END: str   = "\r\n\r\nok";
 
 #[testing]
 rec Body {

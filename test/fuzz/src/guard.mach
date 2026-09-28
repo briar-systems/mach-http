@@ -1,0 +1,47 @@
+# a copy of an input that ends on the last byte before an unreadable page, for a
+# harness whose parser writes to its input and so needs a copy per parse
+
+use std.allocator.testing;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+pub rec Copy {
+    data: *u8;
+    base: *u8;
+    size: usize;
+}
+
+var guard: testing.Testing;
+var made:  bool;
+
+pub fun place(bytes: *u8, len: usize) Copy {
+    var copy: Copy = Copy{data: nil, base: nil, size: 0};
+    if (!made) {
+        val started: err[A.Error] = testing.make(?guard);
+        if (sel started.err) { ret copy; }
+        made = true;
+    }
+    var size: usize = len;
+    if (size == 0) { size = 1; }
+    val placed: res[*u8, A.Error] = A.allocate[u8](testing.allocator_of(?guard), size);
+    if (sel placed.err) { ret copy; }
+    copy.base = placed.ok;
+    copy.size = size;
+    copy.data = placed.ok;
+    var i: usize = 0;
+    for (i < len) {
+        copy.data[i] = bytes[i];
+        i            = i + 1;
+    }
+    if (len == 0) { copy.data = (copy.data::usize + 1)::*u8; }
+    ret copy;
+}
+
+pub fun release(copy: Copy) {
+    if (copy.base != nil) { A.deallocate[u8](testing.allocator_of(?guard), copy.base, copy.size); }
+}

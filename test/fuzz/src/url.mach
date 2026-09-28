@@ -1,0 +1,77 @@
+# the client's url parser, as it reads a redirect's Location
+
+use http.client.policy;
+use http.client.url;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.verdict;
+
+fun at(data: *u8, len: usize, offset: usize, part: view.View) bool {
+    if (part.len == 0) { ret true; }
+    ret part.data == ?data[offset] && offset + part.len <= len;
+}
+
+fun byte_at(data: *u8, len: usize, offset: usize, expected: u8) bool {
+    ret offset < len && data[offset] == expected;
+}
+
+# an accepted url is exactly its parts laid end to end, and each part is one
+# the grammar allows
+fun parts_valid(parsed: url.URL, data: *u8, len: usize) bool {
+    if (parsed.raw.data != data || parsed.raw.len != len) { ret false; }
+    if (!at(data, len, 0, parsed.scheme_text) || !byte_at(data, len, parsed.scheme_text.len, ':')
+        || !byte_at(data, len, parsed.scheme_text.len + 1, '/')
+        || !byte_at(data, len, parsed.scheme_text.len + 2, '/')) { ret false; }
+    var offset: usize = parsed.scheme_text.len + 3;
+    if (parsed.authority.len == 0 || !at(data, len, offset, parsed.authority)) { ret false; }
+    val host_offset: usize = offset + parsed.ipv6_literal::usize;
+    if (parsed.host.len == 0 || !at(data, len, host_offset, parsed.host)) { ret false; }
+    offset = offset + parsed.authority.len;
+    if (!at(data, len, offset, parsed.path)
+        || (parsed.path.len != 0 && data[offset] != '/')) { ret false; }
+    offset = offset + parsed.path.len;
+    if (parsed.has_query) {
+        if (!byte_at(data, len, offset, '?') || !at(data, len, offset + 1, parsed.query)) { ret false; }
+        offset = offset + 1 + parsed.query.len;
+    }
+    if (parsed.has_fragment) {
+        if (!byte_at(data, len, offset, '#') || !at(data, len, offset + 1, parsed.fragment)) { ret false; }
+        offset = offset + 1 + parsed.fragment.len;
+    }
+    if (offset != len)                                                 { ret false; }
+    if (parsed.scheme != policy.HTTP && parsed.scheme != policy.HTTPS) { ret false; }
+    if (!parsed.explicit_port
+        && parsed.port != 80 * (parsed.scheme == policy.HTTP)::u16 + 443 * (parsed.scheme == policy.HTTPS)::u16) {
+        ret false;
+    }
+    if (parsed.port == 0 || parsed.host.len > 253) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (data[i] <= ' ' || data[i] >= 127) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < parsed.authority.len) {
+        if (parsed.authority.data[i] == '@' || parsed.authority.data[i] == '\\') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    val parsed:  url.Parsed = url.parse(view.view(data, len), url.limits_default());
+    var outcome: u64        = parsed.status::u64;
+    if (parsed.status != url.URL_OK) { ret verdict.answered(outcome); }
+    verdict.accept();
+    if (!parts_valid(parsed.url, data, len)) {
+        ret verdict.violated("url: an accepted url is not its parts laid end to end");
+    }
+    outcome = verdict.mix(outcome, (parsed.url.scheme::u64 << 8) | (parsed.url.explicit_port::u64 << 4)
+        | (parsed.url.ipv6_literal::u64 << 3) | (parsed.url.has_query::u64 << 1)
+        | parsed.url.has_fragment::u64);
+    ret verdict.answered(verdict.mix(outcome, verdict.bucket(parsed.url.path.len)));
+}

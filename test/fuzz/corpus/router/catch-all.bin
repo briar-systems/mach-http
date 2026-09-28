@@ -1,0 +1,3 @@
+GET /files/a%62/c%20d/e HTTP/1.1
+Host: example.com
+

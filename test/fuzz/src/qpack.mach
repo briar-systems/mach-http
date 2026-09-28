@@ -1,0 +1,393 @@
+# the qpack encoder and decoder streams and field sections
+
+use http.core.field;
+use http.h2.hpack;
+use http.h3.qpack;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view;
+
+use fuzz.verdict;
+
+val CAPACITY:    usize = 4096;
+val ENTRIES:     usize = 128;
+val INSTRUCTION: usize = 32768;
+val SCRATCH:     usize = 32768;
+val SECTIONS:    usize = 128;
+val REFERENCES:  usize = 1024;
+val ENCODED:     usize = 65536;
+val FIELDS:      usize = 100;
+val STORAGE:     usize = 65536;
+
+var entries:        [ENTRIES]qpack.Entry;
+var table_storage:  [CAPACITY]u8;
+var table_scratch:  [CAPACITY]u8;
+var instruction:    [INSTRUCTION]u8;
+var scratch:        [SCRATCH]u8;
+var section_items:  [SECTIONS]qpack.Section;
+var references:     [REFERENCES]qpack.Reference;
+var encoded:        [ENCODED]u8;
+var fields:         [FIELDS]field.Field;
+var storage:        [STORAGE]u8;
+var field_scratch:  [SCRATCH]u8;
+var encoder_output: [256]u8;
+var encoder_refs:   [FIELDS]u64;
+
+# sections are handed storage that may hold anything, as the connection's
+# records do, so the lane fills it with live-looking garbage first
+fun poison_sections() {
+    var i: usize = 0;
+    for (i < SECTIONS) {
+        section_items[i] = qpack.Section{stream_id: 4, required_insert_count: 1, base: 0,
+            sequence: 1, blocked: true, active: true};
+        i = i + 1;
+    }
+    i = 0;
+    for (i < REFERENCES) {
+        references[i] = qpack.Reference{section: 0, absolute: 0, active: true};
+        i             = i + 1;
+    }
+}
+
+fun make_table(table: *qpack.DynamicTable) bool {
+    @table = qpack.DynamicTable{items: nil, entry_capacity: 0, count: 0, storage: nil,
+        storage_capacity: 0, storage_length: 0, scratch: nil, scratch_capacity: 0, bytes: 0,
+        capacity:         0, max_capacity: 0, insert_count: 0, dropped_count: 0, generation: 0,
+        valid:            false};
+    ret qpack.table_init(table, ?entries[0], ENTRIES, ?table_storage[0], CAPACITY,
+        ?table_scratch[0], CAPACITY, CAPACITY);
+}
+
+# the table's own accounting, and a fold of what it holds
+fun table_digest(table: *qpack.DynamicTable, digest: *u64) bool {
+    if (table.count > table.entry_capacity || table.bytes > table.capacity
+        || table.capacity > table.max_capacity || table.storage_length > table.storage_capacity
+        || table.dropped_count + table.count::u64 != table.insert_count) { ret false; }
+    var bytes:    usize = 0;
+    var physical: usize = 0;
+    var result:   u64   = verdict.mix(table.insert_count, table.capacity::u64);
+    var i:        usize = 0;
+    for (i < table.count) {
+        val item: qpack.Entry = table.items[i];
+        if (!verdict.view_inside(item.name, table.storage, table.storage_length)
+            || !verdict.view_inside(item.value, table.storage, table.storage_length)
+            || item.size != item.name.len + item.value.len + 32
+            || item.absolute != table.insert_count - 1 - i::u64) { ret false; }
+        bytes    = bytes + item.size;
+        physical = physical + item.name.len + item.value.len;
+        result   = verdict.mix_bytes(verdict.mix(result, item.name.len::u64), item.name.data,
+            item.name.len);
+        result = verdict.mix_bytes(verdict.mix(result, item.value.len::u64), item.value.data,
+            item.value.len);
+        i = i + 1;
+    }
+    @digest = result;
+    ret bytes == table.bytes && physical == table.storage_length;
+}
+
+rec Run {
+    trace:  u64;
+    shape:  u64;
+    detail: *u8;
+}
+
+fun fail(run: *Run, detail: *u8) bool {
+    run.detail = detail;
+    ret false;
+}
+
+# feed encoder-stream instructions `stride` bytes at a time until the input ends
+# or the stream fails. `applied` is where the last complete instruction ended
+fun drive_encoder(table: *qpack.DynamicTable, data: *u8, len: usize, stride: usize,
+    eof: bool, run: *Run, applied: *usize) bool {
+    var decoder: qpack.EncoderStreamDecoder;
+    if (!qpack.encoder_stream_decoder_init(?decoder, table, ?instruction[0], INSTRUCTION,
+        ?scratch[0], SCRATCH, qpack.limits_default())) {
+        ret fail(run, "qpack: the encoder stream refused its configuration");
+    }
+    var offset: usize = 0;
+    @applied = 0;
+    for {
+        var given: usize = len - offset;
+        if (given > stride)                                    { given = stride; }
+        if (given == 0 && (!eof || decoder.input_length == 0)) { brk; }
+        var bytes: *u8 = nil;
+        if (given != 0) { bytes = ?data[offset]; }
+        val result: qpack.Instruction = qpack.encoder_stream_feed(?decoder, bytes, given,
+            eof && offset + given == len);
+        if (result.consumed > given) { ret fail(run, "qpack: a feed consumed more than it was given"); }
+        offset = offset + result.consumed;
+        var digest: u64 = 0;
+        if (!table_digest(table, ?digest)) { ret fail(run, "qpack: the dynamic table's accounting broke"); }
+        if (result.status == qpack.INSTRUCTION_COMPLETE) {
+            if ((result.kind != qpack.INSTRUCTION_SET_CAPACITY
+                && result.absolute != table.insert_count - 1)
+                || (result.kind == qpack.INSTRUCTION_SET_CAPACITY
+                && result.value != table.capacity::u64)) {
+                ret fail(run, "qpack: an instruction answered another entry than it made");
+            }
+            verdict.accept();
+            run.trace = verdict.mix(run.trace, (offset::u64 << 8) | result.kind::u64);
+            run.trace = verdict.mix(run.trace, digest);
+            run.shape = verdict.mark(run.shape, result.kind::u64);
+            @applied  = offset;
+        }
+        or (result.status == qpack.INSTRUCTION_ERROR) {
+            if (result.error == qpack.ERROR_NONE) {
+                ret fail(run, "qpack: an instruction failed without saying why");
+            }
+            run.trace = verdict.mix(run.trace, (offset::u64 << 8) | result.error::u64);
+            run.trace = verdict.mix(run.trace, digest);
+            run.shape = verdict.mark(run.shape, 16 + result.error::u64);
+            brk;
+        }
+        or (result.consumed != given) {
+            ret fail(run, "qpack: a feed asked for more input without taking what it had");
+        }
+        or (given == 0) { brk; }
+    }
+    ret true;
+}
+
+pub fun answer_encoder_stream(data: *u8, len: usize) verdict.Verdict {
+    var whole:    Run;
+    var bytewise: Run;
+    var table:    qpack.DynamicTable;
+    var applied:  usize = 0;
+    whole.trace = 0;
+    whole.shape = 0;
+    if (!make_table(?table) || !drive_encoder(?table, data, len, len + 1, true, ?whole, ?applied)) {
+        ret verdict.violated(whole.detail);
+    }
+    bytewise.trace = 0;
+    bytewise.shape = 0;
+    if (!make_table(?table) || !drive_encoder(?table, data, len, 1, true, ?bytewise, ?applied)) {
+        ret verdict.violated(bytewise.detail);
+    }
+    if (whole.trace != bytewise.trace || whole.shape != bytewise.shape) {
+        ret verdict.violated("qpack: the whole encoder stream and the same stream byte by byte differ");
+    }
+    ret verdict.answered(verdict.mark(whole.shape, 32 + verdict.bucket(table.count)));
+}
+
+fun named(name: *u8, name_length: usize, value: *u8, value_length: usize) field.Field {
+    ret field.Field{name: view.view(name, name_length), value: view.view(value, value_length),
+        sensitive: false};
+}
+
+# one section on `stream` that references the named entries of the table
+fun encode_section(table: *qpack.DynamicTable, sections: *qpack.Sections, stream: u64,
+    first: field.Field, second: field.Field, both: bool) bool {
+    var encoder: qpack.FieldEncoder;
+    if (!qpack.field_encoder_init(?encoder, table, sections, stream, ?encoder_output[0], 256,
+        ?encoder_refs[0], FIELDS, qpack.limits_default())) { ret false; }
+    if (!qpack.field_encoder_field(?encoder, first, false).ok)          { ret false; }
+    if (both && !qpack.field_encoder_field(?encoder, second, false).ok) { ret false; }
+    ret qpack.field_encoder_finish(?encoder).ok;
+}
+
+# an encoder with four entries and sections outstanding on streams 4, 8 and 12,
+# the state a peer's decoder stream acknowledges, cancels and increments
+fun make_encoder(table: *qpack.DynamicTable, sections: *qpack.Sections) bool {
+    if (!make_table(table) || qpack.table_set_capacity(table, CAPACITY) != qpack.ERROR_NONE) {
+        ret false;
+    }
+    val a: field.Field = named("x-a", 3, "1", 1);
+    val b: field.Field = named("x-b", 3, "2", 1);
+    val c: field.Field = named("x-c", 3, "3", 1);
+    val d: field.Field = named("x-d", 3, "4", 1);
+    if (qpack.table_insert(table, a.name, a.value) != qpack.ERROR_NONE
+        || qpack.table_insert(table, b.name, b.value) != qpack.ERROR_NONE
+        || qpack.table_insert(table, c.name, c.value) != qpack.ERROR_NONE
+        || qpack.table_insert(table, d.name, d.value) != qpack.ERROR_NONE) { ret false; }
+    @sections = qpack.Sections{items: nil, capacity: 0, section_limit: 0, references: nil,
+        reference_capacity: 0, reference_limit: 0, table: nil, count: 0, blocked_count: 0,
+        known_received:     0, next_sequence: 0, max_blocked_streams: 0, valid: false};
+    poison_sections();
+    if (!qpack.sections_init(sections, ?section_items[0], SECTIONS, ?references[0], REFERENCES,
+        table, qpack.limits_default())) { ret false; }
+    ret encode_section(table, sections, 4, a, b, true)
+        && encode_section(table, sections, 8, c, c, false)
+        && encode_section(table, sections, 12, c, d, true)
+        && encode_section(table, sections, 12, d, d, false);
+}
+
+# the sections' accounting agrees with the references and entries they hold
+fun sections_consistent(table: *qpack.DynamicTable, sections: *qpack.Sections) bool {
+    var count: usize = 0;
+    var i:     usize = 0;
+    for (i < sections.section_limit) {
+        if (sections.items[i].active) { count = count + 1; }
+        i = i + 1;
+    }
+    if (count != sections.count || sections.blocked_count > sections.count
+        || sections.known_received > table.insert_count) { ret false; }
+    i = 0;
+    for (i < table.count) {
+        var held: usize = 0;
+        var r:    usize = 0;
+        for (r < sections.reference_limit) {
+            if (sections.references[r].active
+                && sections.references[r].absolute == table.items[i].absolute) {
+                if (!sections.items[sections.references[r].section].active) { ret false; }
+                held = held + 1;
+            }
+            r = r + 1;
+        }
+        if (held != table.items[i].references) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun outstanding(sections: *qpack.Sections, stream: u64) bool {
+    var i: usize = 0;
+    for (i < sections.section_limit) {
+        if (sections.items[i].active && sections.items[i].stream_id == stream
+            && sections.items[i].required_insert_count != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the instruction at data is one RFC 9204 section 4.4 lets this state take
+fun instruction_allowed(data: *u8, len: usize, table: *qpack.DynamicTable,
+    sections: *qpack.Sections, complete: *bool) bool {
+    var prefix: u8 = 6;
+    if ((data[0] & 0x80) != 0) { prefix = 7; }
+    val integer: hpack.Integer = hpack.decode_integer(data, len, 0, prefix);
+    @complete = integer.error != hpack.ERROR_INPUT;
+    if (integer.error != hpack.ERROR_NONE || integer.value > qpack.MAX_INTEGER) { ret false; }
+    if ((data[0] & 0x80) != 0)                                                  { ret outstanding(sections, integer.value); }
+    if ((data[0] & 0xc0) == 0x40)                                               { ret true; }
+    ret integer.value != 0 && integer.value <= table.insert_count - sections.known_received;
+}
+
+pub fun answer_decoder_stream(data: *u8, len: usize) verdict.Verdict {
+    var table:    qpack.DynamicTable;
+    var sections: qpack.Sections;
+    if (!make_encoder(?table, ?sections)) { ret verdict.violated("qpack: the encoder state could not be built"); }
+    var decoder: qpack.DecoderStreamDecoder;
+    if (!qpack.decoder_stream_decoder_init(?decoder, ?table, ?sections, ?instruction[0],
+        INSTRUCTION, qpack.limits_default())) {
+        ret verdict.violated("qpack: the decoder stream refused its configuration");
+    }
+    var outcome: u64   = 0;
+    var offset:  usize = 0;
+    for (offset < len) {
+        var complete: bool = false;
+        val allowed:  bool = instruction_allowed(?data[offset], len - offset, ?table, ?sections,
+            ?complete);
+        val result: qpack.Instruction = qpack.decoder_stream_feed(?decoder, ?data[offset],
+            len - offset, true);
+        if (!sections_consistent(?table, ?sections)) {
+            ret verdict.violated("qpack: the sections' accounting broke");
+        }
+        if (!complete) {
+            if (result.status != qpack.INSTRUCTION_ERROR) {
+                ret verdict.violated("qpack: a truncated instruction was not refused at the end of the stream");
+            }
+            outcome = verdict.mark(outcome, 32);
+            brk;
+        }
+        if (allowed != (result.status == qpack.INSTRUCTION_COMPLETE)) {
+            ret verdict.violated("qpack: a decoder-stream instruction was taken or refused against RFC 9204");
+        }
+        if (!allowed) {
+            outcome = verdict.mark(outcome, 16 + result.kind::u64);
+            brk;
+        }
+        verdict.accept();
+        outcome = verdict.mark(outcome, result.kind::u64);
+        offset  = offset + result.consumed;
+    }
+    outcome = verdict.mix(outcome, verdict.bucket(sections.count));
+    ret verdict.answered(verdict.mix(outcome, verdict.bucket(sections.blocked_count)));
+}
+
+# the input is a two-byte length, that many bytes of encoder stream applied to
+# the decoder's table, and then one field section decoded against it
+pub fun answer_field_section(data: *u8, len: usize) verdict.Verdict {
+    var table:    qpack.DynamicTable;
+    var sections: qpack.Sections;
+    if (!make_table(?table)) { ret verdict.violated("qpack: the table refused its configuration"); }
+    sections.valid = false;
+    poison_sections();
+    if (!qpack.sections_init(?sections, ?section_items[0], SECTIONS, ?references[0], REFERENCES,
+        ?table, qpack.limits_default())) {
+        ret verdict.violated("qpack: the sections refused their configuration");
+    }
+    var prefix: usize = 0;
+    var offset: usize = len;
+    if (len >= 2) {
+        prefix = (data[0]::usize << 8) | data[1]::usize;
+        if (prefix > len - 2) { prefix = len - 2; }
+        offset = 2 + prefix;
+    }
+    var run:     Run;
+    var applied: usize = 0;
+    run.trace = 0;
+    run.shape = 0;
+    if (len >= 2 && !drive_encoder(?table, ?data[2], prefix, prefix + 1, false, ?run, ?applied)) {
+        ret verdict.violated(run.detail);
+    }
+    var before: u64 = 0;
+    if (!table_digest(?table, ?before)) { ret verdict.violated("qpack: the dynamic table's accounting broke"); }
+    var decoder: qpack.FieldDecoder;
+    decoder.initialized = false;
+    if (!qpack.field_decoder_init(?decoder, ?table, ?sections, 0, ?encoded[0], ENCODED,
+        ?fields[0], FIELDS, ?storage[0], STORAGE, ?field_scratch[0], SCRATCH,
+        qpack.limits_default())) {
+        ret verdict.violated("qpack: the field decoder refused its configuration");
+    }
+    val size:  usize        = len - offset;
+    val half:  usize        = size / 2;
+    val first: qpack.Decode = qpack.field_decoder_feed(?decoder, ?data[offset], half, false);
+    if (first.status != qpack.DECODE_NEED_INPUT) { ret verdict.violated("qpack: a partial section was not buffered"); }
+    val result: qpack.Decode = qpack.field_decoder_feed(?decoder, ?data[offset + half],
+        size - half, true);
+    var after: u64 = 0;
+    if (!table_digest(?table, ?after) || before != after) {
+        ret verdict.violated("qpack: decoding a field section changed the dynamic table");
+    }
+    var outcome: u64 = verdict.mark(run.shape, 32 + verdict.bucket(table.count));
+    if (result.status == qpack.DECODE_COMPLETE) {
+        verdict.accept();
+        if (result.required_insert_count > table.insert_count || sections.count != 0
+            || result.count != decoder.field_count) {
+            ret verdict.violated("qpack: a decoded section kept state it had finished with");
+        }
+        var bytes: usize = 0;
+        var i:     usize = 0;
+        for (i < result.count) {
+            val item: field.Field = fields[i];
+            if (!verdict.view_inside(item.name, ?storage[0], decoder.storage_length)
+                || !verdict.view_inside(item.value, ?storage[0], decoder.storage_length)) {
+                ret verdict.violated("qpack: a decoded field lies outside the decoder's storage");
+            }
+            bytes = bytes + item.name.len + item.value.len + 32;
+            i     = i + 1;
+        }
+        if (bytes != result.bytes) { ret verdict.violated("qpack: a decoded section's size is not what it decoded"); }
+        ret verdict.answered(verdict.mix(outcome, 0x100 | verdict.bucket(result.count)));
+    }
+    if (result.status == qpack.DECODE_BLOCKED) {
+        # a blocked section waits on inserts that have not arrived, and holds one slot
+        if (result.required_insert_count <= table.insert_count || sections.count != 1
+            || sections.blocked_count != 1) {
+            ret verdict.violated("qpack: a section blocked on inserts it already had");
+        }
+        if (!qpack.field_decoder_cancel(?decoder) || sections.count != 0
+            || sections.blocked_count != 0) {
+            ret verdict.violated("qpack: a cancelled blocked section kept its slot");
+        }
+        ret verdict.answered(verdict.mix(outcome, 0x200));
+    }
+    if (result.status != qpack.DECODE_ERROR || result.error == qpack.ERROR_NONE
+        || sections.count != 0) {
+        ret verdict.violated("qpack: a refused section kept a slot or said nothing");
+    }
+    ret verdict.answered(verdict.mix(outcome, 0x300 | result.error::u64));
+}

@@ -1,0 +1,124 @@
+# request routing and capture decoding against a fixed route table
+
+use http.core.body;
+use http.core.message;
+use http.core.method;
+use http.h1.parser;
+use http.router.router;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+use fuzz.request;
+use fuzz.verdict;
+
+val ROUTES:   usize = 8;
+val SEGMENTS: usize = 64;
+val CAPTURES: usize = 16;
+val DECODED:  usize = 8192;
+
+var specs:    [ROUTES]router.Route;
+var compiled: [ROUTES]router.CompiledRoute;
+var segments: [SEGMENTS]router.Segment;
+var captures: [CAPTURES]router.Capture;
+var decoded:  [DECODED]u8;
+var table:    router.Router;
+var ready:    bool;
+
+fun handler(context: ptr, incoming: *message.Request, response: *message.Response,
+    params: *router.Params) res[u8, str] {
+    ret res[u8, str].ok{router.HANDLER_RESPOND};
+}
+
+fun text(value: *u8, length: usize) view.View {
+    ret view.view(value, length);
+}
+
+fun spec(i: usize, method_text: *u8, method_length: usize, host: *u8, host_length: usize,
+    pattern: *u8, pattern_length: usize) {
+    specs[i] = router.Route{method: text(method_text, method_length),
+        host:        text(host, host_length), pattern: text(pattern, pattern_length),
+        handler_ctx: nil, handler: handler};
+}
+
+fun setup() bool {
+    if (ready) { ret true; }
+    spec(0, "GET", 3, nil, 0, "/", 1);
+    spec(1, "GET", 3, nil, 0, "/users/:id", 10);
+    spec(2, "*", 1, nil, 0, "/files/*path", 12);
+    spec(3, "GET", 3, "api.example.com", 15, "/users/me", 9);
+    spec(4, "*", 1, "*.example.com:8443", 18, "/admin/:section/:item", 21);
+    spec(5, "OPTIONS", 7, nil, 0, "*", 1);
+    spec(6, "CONNECT", 7, nil, 0, "*", 1);
+    spec(7, "POST", 4, "example.com", 11, "/users/:id/posts", 16);
+    val result: router.Compile = router.compile(?table, ?specs[0], ROUTES, ?compiled[0], ROUTES,
+        ?segments[0], SEGMENTS, router.limits_default());
+    ready = result.status == router.COMPILE_OK;
+    ret ready;
+}
+
+fun dot_segment(data: *u8, len: usize) bool {
+    ret (len == 1 && data[0] == '.') || (len == 2 && data[0] == '.' && data[1] == '.');
+}
+
+# a capture decodes to exactly its length, and never to a separator, a control
+# byte or a segment that would climb out of the route
+fun capture_valid(capture: *router.Capture, path: view.View) bool {
+    if (!verdict.view_inside(capture.value, path.data, path.len)
+        || capture.decoded_length > DECODED
+        || !router.decode_capture(capture, ?decoded[0], DECODED)) { ret false; }
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (i <= capture.decoded_length) {
+        if (i == capture.decoded_length || decoded[i] == '/') {
+            if (dot_segment(?decoded[start], i - start)) { ret false; }
+            start = i + 1;
+        }
+        if (i < capture.decoded_length) {
+            val c: u8 = decoded[i];
+            if (c < ' ' || c == 127 || c == '\\' || (c == '/' && !capture.catch_all)) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the input is a request head, routed as its connection would route it
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    if (!setup()) { ret verdict.violated("router: the route table did not compile"); }
+    var p: parser.Parser;
+    if (!request.head(parser.REQUEST, 0, data, len, ?p)) { ret verdict.answered(1); }
+    var reader:   body.Reader;
+    var incoming: message.Request;
+    if (!request.build(?p, p.parsed.method, p.parsed.target, p.parsed.version, ?incoming,
+        ?reader, 9)) { ret verdict.answered(2); }
+    val matched: router.Dispatch = router.dispatch(?table, ?incoming, ?captures[0], CAPTURES);
+    var outcome: u64             = verdict.mix(3, matched.status::u64);
+    if (matched.status != router.DISPATCH_MATCH) {
+        if (matched.params.len != 0) { ret verdict.violated("router: a request that matched nothing captured"); }
+        ret verdict.answered(outcome);
+    }
+    verdict.accept();
+    val route: *router.CompiledRoute = ?table.routes[matched.route];
+    if (matched.source_index >= ROUTES || route.source_index != matched.source_index
+        || matched.params.len != route.parameter_count
+        || matched.params.request_generation != incoming.generation
+        || matched.params.router_generation != table.generation) {
+        ret verdict.violated("router: a match answered another route than it chose");
+    }
+    if (!route.any_method && !view.view_eq_str(incoming.method.token, specs[matched.source_index].method.data)) {
+        ret verdict.violated("router: a route matched a method it does not serve");
+    }
+    var i: usize = 0;
+    for (i < matched.params.len) {
+        if (!capture_valid(?captures[i], incoming.target.path)) {
+            ret verdict.violated("router: a capture decodes outside what a path segment may hold");
+        }
+        i = i + 1;
+    }
+    ret verdict.answered(verdict.mix(outcome, matched.source_index::u64));
+}

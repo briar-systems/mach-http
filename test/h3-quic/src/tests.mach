@@ -27,11 +27,11 @@ fun transition_ok(outcome: cancel.Transition) bool {
 }
 
 #[testing]
-val SLOTS: usize = 6;
+val SLOTS:          usize = 6;
 #[testing]
-val EXCHANGES: usize = 12;
+val EXCHANGES:      usize = 12;
 #[testing]
-val REQUEST_BYTES: usize = 96;
+val REQUEST_BYTES:  usize = 96;
 #[testing]
 val RESPONSE_BYTES: usize = 128;
 
