@@ -1,0 +1,6 @@
+:method: CONNECT
+:protocol: websocket
+:scheme: https
+:path: /chat
+:authority: example.com
+sec-websocket-version: 13

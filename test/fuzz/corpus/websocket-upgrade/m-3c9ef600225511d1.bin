@@ -1,0 +1,5 @@
+T / HTTP/1.1
+Host:s
+U:
+Sec-WebSocket-Version:13
+

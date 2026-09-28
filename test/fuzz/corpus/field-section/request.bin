@@ -1,0 +1,5 @@
+:method: GET
+:scheme: https
+:path: /
+:authority: example.com
+accept: */*

@@ -1,0 +1,5 @@
+:method: CONNECT
+:protocOl: t
+:scheme: s
+:path: t
+:authority: s
