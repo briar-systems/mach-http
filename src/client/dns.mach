@@ -14,7 +14,6 @@ use std.types.bool.true;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
-use std.types.string.str;
 use std.types.view;
 
 fun operation_ok(outcome: cancellation.Operation) bool {

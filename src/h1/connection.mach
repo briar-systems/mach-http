@@ -119,14 +119,14 @@ pub val OFFER_ERROR:   OfferStatus = 5;
 
 # every buffer is borrowed from the connection's std.memory.buffers account
 # ---
+# max_linger_bytes:   how much input a closing server discards before it closes
+# linger_timeout_ns:  how long a closing server discards input, zero for no linger
 # read_bytes:         the read buffer, held from readability until its input is consumed
 # write_bytes:        the write buffer, held while output is staged
 # slot_storage_bytes: parsed field and trailer bytes per slot
 # slot_scratch_bytes: serialized head and trailer bytes per slot
 # slot_lane:          the budget lane of per-request slot memory
 # connection_lane:    the budget lane of the read and write buffers
-# linger_timeout_ns:  how long a closing server discards input, zero for no linger
-# max_linger_bytes:   how much input a closing server discards before it closes
 pub rec Config {
     parser:             parser.Limits;
     max_pipeline:       usize;
