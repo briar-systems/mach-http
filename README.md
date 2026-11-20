@@ -265,7 +265,8 @@ The remaining protocol and integration work is tracked in this repository.
 
 ## Development
 
-Dependencies use pinned Git tags.
+The project builds with mach 7. Each dependency is pinned by its committed gitlink
+under `dep/`, and std follows `branch/dev` until its v7 release.
 
 ```sh
 mach dep pull .
