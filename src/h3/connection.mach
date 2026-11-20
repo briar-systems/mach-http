@@ -4814,11 +4814,11 @@ fun closure_is(storage: *ExchangeMemory, cause: exchange.Cause, code: u64) bool 
         && why.cause == cause && why.code == code && why.detail == 0;
 }
 
+# the wire reads the stream's byte after this returns, so the caller owns it
 #[testing]
-fun second_control(fixture: *Fixture) bool {
-    var control: [1]u8;
-    control[0] = frame.STREAM_CONTROL::u8;
-    ret peer_stream(fixture, 6, ?control[0], 1, false) != nil;
+fun second_control(fixture: *Fixture, control: *u8) bool {
+    @control = frame.STREAM_CONTROL::u8;
+    ret peer_stream(fixture, 6, control, 1, false) != nil;
 }
 
 test closure__carries_cause {
@@ -4843,10 +4843,11 @@ test closure__carries_cause {
     # the connection failed on a protocol error
     var protocol_fixture: Fixture;
     var protocol_storage: ExchangeMemory;
+    var protocol_control: u8;
     if (!make_fixture(?protocol_fixture, SERVER, test_config())
         || server_handshake(?protocol_fixture).kind != EVENT_SETTINGS
         || taken_request(?protocol_fixture, ?protocol_storage) == nil
-        || !second_control(?protocol_fixture)) { ret 6; }
+        || !second_control(?protocol_fixture, ?protocol_control)) { ret 6; }
     if (drive(?protocol_fixture, EVENT_ERROR, 64).code != H3_STREAM_CREATION_ERROR
         || !closure_is(?protocol_storage, exchange.CAUSE_CONNECTION, H3_STREAM_CREATION_ERROR)) { ret 7; }
     # the connection scope was cancelled by its owner
@@ -4861,11 +4862,12 @@ test closure__carries_cause {
     # a scope the exchange's caller ended first keeps its cause through the engine's close
     var caller_fixture: Fixture;
     var caller_storage: ExchangeMemory;
+    var caller_control: u8;
     if (!make_fixture(?caller_fixture, SERVER, test_config())
         || server_handshake(?caller_fixture).kind != EVENT_SETTINGS
         || taken_request(?caller_fixture, ?caller_storage) == nil
         || !transition_ok(cancel.cancel(?caller_storage.scope))
-        || !second_control(?caller_fixture)) { ret 10; }
+        || !second_control(?caller_fixture, ?caller_control)) { ret 10; }
     if (drive(?caller_fixture, EVENT_ERROR, 64).code != H3_STREAM_CREATION_ERROR
         || !closure_is(?caller_storage, exchange.CAUSE_CALLER, 0)) { ret 11; }
     # a goaway rejection on the client side
