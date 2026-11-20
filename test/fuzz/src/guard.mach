@@ -22,7 +22,7 @@ var made:  bool;
 pub fun place(bytes: *u8, len: usize) Copy {
     var copy: Copy = Copy{data: nil, base: nil, size: 0};
     if (!made) {
-        val started: err[A.Error] = testing.make(?guard);
+        val started: err[A.Error] = testing.init(?guard);
         if (sel started.err) { ret copy; }
         made = true;
     }

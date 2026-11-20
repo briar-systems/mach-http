@@ -3398,13 +3398,13 @@ fun make_buffers(fixture: *Fixture, classes: *buffers.ClassConfig, class_count: 
     config.lanes         = 2;
     config.global_budget = 1 << 26;
     config.initial_slots = 16;
-    if (!buffers.make(?fixture.pool, config, ?fixture.backing)) { ret false; }
+    if (!buffers.init(?fixture.pool, config, ?fixture.backing)) { ret false; }
     fixture.source = buffers.source(?fixture.pool);
     var budgets: buffers.Budgets;
     budgets.lanes    = 2;
     budgets.bytes[0] = 1 << 25;
     budgets.bytes[1] = 1 << 25;
-    val opened: buffers.Reason = buffers.source_open_account(?fixture.source,
+    val opened: buffers.Reason = buffers.source_account_init(?fixture.source,
         ?fixture.account, 1, budgets, 0);
     ret sel opened.none;
 }
@@ -3809,7 +3809,7 @@ test abandon_exchange__cancels_bound_exchange {
         || storage.exchange.state != exchange.CANCELLED_STATE
         || exchange_for(?fixture.engine, 1) != nil
         || !release_stream(?fixture.engine, 1, request.generation, test_now(100))) { ret 4; }
-    if (!operation_ok(cancel.destroy(?storage.scope))) { ret 5; }
+    if (!operation_ok(cancel.dnit(?storage.scope))) { ret 5; }
     ret 0;
 }
 
@@ -3871,7 +3871,7 @@ test abandon_exchange__stale_generation_detaches_nothing {
     if (abandon_exchange(?fixture.engine, 3,
         second_request.generation) != ?second.exchange
         || !release_stream(?fixture.engine, 3, second_request.generation, test_now(100))) { ret 9; }
-    if (!operation_ok(cancel.destroy(?first.scope)) || !operation_ok(cancel.destroy(?second.scope))) { ret 10; }
+    if (!operation_ok(cancel.dnit(?first.scope)) || !operation_ok(cancel.dnit(?second.scope))) { ret 10; }
     ret 0;
 }
 
@@ -4565,7 +4565,7 @@ test priority__self_dependency_is_stream_error_keeping_hpack {
         || next.headers.authority.len != 1 || next.headers.authority.data[0] != 'y') {
         ret 5;
     }
-    if (!operation_ok(cancel.destroy(?storage.scope))) { ret 6; }
+    if (!operation_ok(cancel.dnit(?storage.scope))) { ret 6; }
     ret 0;
 }
 

@@ -830,7 +830,7 @@ fun submit_refused(outcome: res[Token, io_error.Error]) bool {
 #[testing]
 fun make_fixture(fixture: *Fixture, security: Security) bool {
     if (page_refused(page.make(?fixture.allocator)))                        { ret false; }
-    if (refused(io_runtime.make(?fixture.runtime, ?fixture.allocator, 16))) { ret false; }
+    if (refused(io_runtime.init(?fixture.runtime, ?fixture.allocator, 16))) { ret false; }
     if (!operation_ok(cancel.make_root(?fixture.operation_root, opt[time.Instant].none{}))
         || !operation_ok(cancel.make_root(?fixture.control_root, opt[time.Instant].none{}))) { ret false; }
     fixture.state.runtime                = ?fixture.runtime;
@@ -848,10 +848,10 @@ fun make_fixture(fixture: *Fixture, security: Security) bool {
 
 #[testing]
 fun destroy_fixture(fixture: *Fixture) bool {
-    if (io_runtime.pending(?fixture.runtime) != 0)                                                                      { ret false; }
-    if (!operation_ok(cancel.destroy(?fixture.operation_root)) || !operation_ok(cancel.destroy(?fixture.control_root))) { ret false; }
-    if (close_refused(io_runtime.close(?fixture.runtime)))                                                              { ret false; }
-    ret !refused(io_runtime.destroy(?fixture.runtime));
+    if (io_runtime.pending(?fixture.runtime) != 0)                                                                { ret false; }
+    if (!operation_ok(cancel.dnit(?fixture.operation_root)) || !operation_ok(cancel.dnit(?fixture.control_root))) { ret false; }
+    if (close_refused(io_runtime.close(?fixture.runtime)))                                                        { ret false; }
+    ret !refused(io_runtime.dnit(?fixture.runtime));
 }
 
 #[testing]
@@ -906,7 +906,7 @@ test complete_runtime__child_deadline_times_out_once {
         || !complete_runtime(?fixture.transport, ?native, ?completion)) { ret 4; }
     if (completion.status != IO_TIMED_OUT || completion.context != 8
         || completion.error.kind != io_error.TIMEOUT) { ret 5; }
-    if (!operation_ok(cancel.destroy(?scope)) || !destroy_fixture(?fixture)) { ret 6; }
+    if (!operation_ok(cancel.dnit(?scope)) || !destroy_fixture(?fixture)) { ret 6; }
     ret 0;
 }
 
@@ -925,7 +925,7 @@ test complete_runtime__cancellation_retains_buffer_until_dequeue {
     if (!take_runtime(?fixture.runtime, ?native)
         || !complete_runtime(?fixture.transport, ?native, ?completion)
         || completion.status != IO_CANCELLED || completion.context != 5) { ret 5; }
-    if (complete(?fixture.transport, ?completion) || !operation_ok(cancel.destroy(?scope))
+    if (complete(?fixture.transport, ?completion) || !operation_ok(cancel.dnit(?scope))
         || !destroy_fixture(?fixture)) { ret 6; }
     ret 0;
 }
@@ -1076,7 +1076,7 @@ test readable__completes_at_once_over_buffered_plaintext {
     var backing: allocator.Allocator;
     if (page_refused(page.make(?backing))) { ret 1; }
     var runtime: io_runtime.Runtime;
-    if (refused(io_runtime.make(?runtime, ?backing, 4))) { ret 1; }
+    if (refused(io_runtime.init(?runtime, ?backing, 4))) { ret 1; }
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
     if (!operation_ok(cancel.make_root(?operations, opt[time.Instant].none{}))
@@ -1117,9 +1117,9 @@ test readable__completes_at_once_over_buffered_plaintext {
     if (refused(io_runtime.complete(?runtime, state.last_wait, 0, 1, false))
         || !take_runtime(?runtime, ?native) || !complete_runtime(?secured, ?native, ?completion)
         || completion.kind != READABLE || completion.context != 53) { ret 8; }
-    if (!operation_ok(cancel.destroy(?operations)) || !operation_ok(cancel.destroy(?controls))
+    if (!operation_ok(cancel.dnit(?operations)) || !operation_ok(cancel.dnit(?controls))
         || close_refused(io_runtime.close(?runtime))
-        || refused(io_runtime.destroy(?runtime))) { ret 9; }
+        || refused(io_runtime.dnit(?runtime))) { ret 9; }
     ret 0;
 }
 
@@ -1172,7 +1172,7 @@ test write__secured_adapter_hides_internal_directions {
     var backing: allocator.Allocator;
     if (page_refused(page.make(?backing))) { ret 1; }
     var runtime: io_runtime.Runtime;
-    if (refused(io_runtime.make(?runtime, ?backing, 2))) { ret 1; }
+    if (refused(io_runtime.init(?runtime, ?backing, 2))) { ret 1; }
     var operations: cancel.Scope;
     var controls:   cancel.Scope;
     if (!operation_ok(cancel.make_root(?operations, opt[time.Instant].none{})) || !operation_ok(cancel.make_root(?controls, opt[time.Instant].none{}))) { ret 2; }
@@ -1200,9 +1200,9 @@ test write__secured_adapter_hides_internal_directions {
         || snapshot(?secured).security != SECURED) { ret 5; }
     var completion: Completion = completed(token, WRITE, 5);
     if (!complete(?secured, ?completion) || completion.context != 19 || completion.count != 5) { ret 6; }
-    if (!operation_ok(cancel.destroy(?operations)) || !operation_ok(cancel.destroy(?controls))
+    if (!operation_ok(cancel.dnit(?operations)) || !operation_ok(cancel.dnit(?controls))
         || close_refused(io_runtime.close(?runtime))
-        || refused(io_runtime.destroy(?runtime))) { ret 7; }
+        || refused(io_runtime.dnit(?runtime))) { ret 7; }
     ret 0;
 }
 

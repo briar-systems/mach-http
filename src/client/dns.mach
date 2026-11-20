@@ -760,7 +760,7 @@ pub fun complete(cache: *Cache, token: Token,
     }
     entry.completing = true;
     mutex.unlock(?cache.lock);
-    if (!operation_ok(cancellation.destroy(?entry.scope))) {
+    if (!operation_ok(cancellation.dnit(?entry.scope))) {
         mutex.lock(?cache.lock);
         val current: *Entry = entry_for_locked(cache, token);
         if (current != nil && current.completing) { current.completing = false; }
@@ -822,7 +822,7 @@ pub fun abandon(cache: *Cache, token: Token, failure: resolver.Error,
     }
     entry.completing = true;
     mutex.unlock(?cache.lock);
-    if (!operation_ok(cancellation.destroy(?entry.scope))) {
+    if (!operation_ok(cancellation.dnit(?entry.scope))) {
         mutex.lock(?cache.lock);
         val current: *Entry = entry_for_locked(cache, token);
         if (current != nil && current.completing) { current.completing = false; }

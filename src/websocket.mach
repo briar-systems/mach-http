@@ -1204,7 +1204,7 @@ test connection__backpressure_retains_only_connection_buffers {
     completion = transport.completed(adapter_state.token, transport.CLOSE, 0);
     if (complete_io(?connection, ?completion).kind != EVENT_CLOSED
         || connection.decoder.state != CLOSED || connection.encoder.state != CLOSED) { ret 10; }
-    if (!operation_ok(cancel.destroy(?operation_scope)) || !operation_ok(cancel.destroy(?control_scope))) { ret 11; }
+    if (!operation_ok(cancel.dnit(?operation_scope)) || !operation_ok(cancel.dnit(?control_scope))) { ret 11; }
     ret 0;
 }
 

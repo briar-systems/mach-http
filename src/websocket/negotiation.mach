@@ -493,7 +493,7 @@ test server__h1_upgrade_commits_exchange {
         || exchange_value.state != exchange.RESPONDING
         || exchange.finish(?exchange_value) != exchange.FINISH_OK
         || exchange_value.completion.reuse != body.REUSE_FORBIDDEN) { ret 6; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 7; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 7; }
     ret 0;
 }
 
@@ -531,7 +531,7 @@ fun extended_test(version: message.Version, generation: u64) i32 {
         || response.status != status.OK || !response.committed
         || validate_extended_response(?response, version.wire,
         view.view("chat, mach", 10)).status != NEGOTIATED) { ret 3; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 4; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 4; }
     ret 0;
 }
 

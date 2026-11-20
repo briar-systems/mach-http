@@ -706,7 +706,7 @@ pub fun settle_link_close(link: *Link, abortive: bool, code: u64, budget: usize)
 # the storage half of close_link: releases the operation scopes and accounts
 # of two drivers that already settled their close
 pub fun release_link(link: *Link) bool {
-    ret operation_ok(cancel.destroy(?link.client.scope)) && operation_ok(cancel.destroy(?link.server.scope))
+    ret operation_ok(cancel.dnit(?link.client.scope)) && operation_ok(cancel.dnit(?link.server.scope))
         && close_account(link.client) && close_account(link.server);
 }
 

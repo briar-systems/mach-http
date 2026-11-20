@@ -305,7 +305,7 @@ fun serve(p: *parser.Parser, request_method: method.Method, request_target: targ
             }
         }
     }
-    cancel.destroy(?scope);
+    cancel.dnit(?scope);
     ret detail;
 }
 

@@ -616,7 +616,7 @@ fun make_pool(server: *Server) bool {
     pool_config.lanes         = LANES;
     pool_config.global_budget = server.configured.memory_bytes;
     pool_config.initial_slots = connections * 4;
-    if (!buffers.make(?server.pool, pool_config, ?server.allocator)) { ret false; }
+    if (!buffers.init(?server.pool, pool_config, ?server.allocator)) { ret false; }
     server.source = buffers.source(?server.pool);
     val slot_set: usize = measure(server, line_bytes(configured.parser), LANE_REQUEST)
         + measure(server, configured.slot_storage_bytes, LANE_REQUEST)
@@ -633,7 +633,7 @@ fun make_pool(server: *Server) bool {
     # one connection's whole set must fit, or no request could ever be served
     if (slot_set == 0 || connection_lane == 0
         || slot_set + connection_lane > server.configured.memory_bytes) {
-        buffers.destroy(?server.pool);
+        buffers.dnit(?server.pool);
         ret false;
     }
     ret true;
@@ -753,19 +753,19 @@ pub fun make(server: *Server, configured: Config, handler: Handler, hooks: Hooks
         ret false;
     }
     val runtime_slots: usize               = configured.max_connections * TRANSPORT_SLOTS + 8;
-    val made_runtime:  err[io_error.Error] = io_runtime.make(?server.runtime, ?server.allocator,
+    val made_runtime:  err[io_error.Error] = io_runtime.init(?server.runtime, ?server.allocator,
         runtime_slots);
     if (sel made_runtime.err) {
-        buffers.destroy(?server.pool);
+        buffers.dnit(?server.pool);
         release_storage(server);
         ret false;
     }
-    val made_driver: err[io_error.Error] = net_async.make(?server.driver, ?server.runtime);
+    val made_driver: err[io_error.Error] = net_async.init(?server.driver, ?server.runtime);
     if (sel made_driver.err || !operation_ok(cancel.make_root(?server.root,
         opt[time.Instant].none{}))) {
         io_runtime.close(?server.runtime);
-        io_runtime.destroy(?server.runtime);
-        buffers.destroy(?server.pool);
+        io_runtime.dnit(?server.runtime);
+        buffers.dnit(?server.pool);
         release_storage(server);
         ret false;
     }
@@ -796,10 +796,10 @@ pub fun destroy(server: *Server) bool {
             ?completions[0], BATCH, -1);
         if (sel waited.err) { brk; }
     }
-    net_async.destroy(?server.driver);
-    io_runtime.destroy(?server.runtime);
-    operation_ok(cancel.destroy(?server.root));
-    buffers.destroy(?server.pool);
+    net_async.dnit(?server.driver);
+    io_runtime.dnit(?server.runtime);
+    operation_ok(cancel.dnit(?server.root));
+    buffers.dnit(?server.pool);
     release_storage(server);
     server.made = false;
     ret true;
@@ -1146,7 +1146,7 @@ fun make_exchange(conn: *Connection, slot: usize, now: time.Instant) status.Stat
         refused = status.INTERNAL_SERVER_ERROR;
     }
     if (refused != 0) {
-        operation_ok(cancel.destroy(?conn.exchange_scope));
+        operation_ok(cancel.dnit(?conn.exchange_scope));
         conn.exchange_scope_live = false;
         ret refused;
     }
@@ -1207,7 +1207,7 @@ fun end_exchange(conn: *Connection) {
     if (conn.tunnel_owner.drive != nil) { release_stage(conn); }
     or                                  { release_exchange_memory(conn); }
     if (conn.exchange_scope_live) {
-        operation_ok(cancel.destroy(?conn.exchange_scope));
+        operation_ok(cancel.dnit(?conn.exchange_scope));
         conn.exchange_scope_live = false;
     }
     conn.exchange_live            = false;
@@ -1856,15 +1856,15 @@ fun finalize(conn: *Connection) {
     }
     release_exchange_memory(conn);
     if (conn.account_open) {
-        buffers.source_close_account(?server.source, ?conn.account);
+        buffers.source_account_dnit(?server.source, ?conn.account);
         conn.account_open = false;
     }
     if (conn.tunnel_scope_live) {
-        operation_ok(cancel.destroy(?conn.tunnel_scope));
+        operation_ok(cancel.dnit(?conn.tunnel_scope));
         conn.tunnel_scope_live = false;
     }
-    operation_ok(cancel.destroy(?conn.operation_root));
-    operation_ok(cancel.destroy(?conn.control_scope));
+    operation_ok(cancel.dnit(?conn.operation_root));
+    operation_ok(cancel.dnit(?conn.control_scope));
     dequeue(conn);
     if (conn.reserved) {
         conn.reserved = false;
@@ -1919,7 +1919,7 @@ fun open_connection(server: *Server, conn: *Connection, stream: tcp.Stream,
     if (conn.peer_len == 0 || conn.local_len == 0)                                       { ret false; }
     if (!operation_ok(cancel.make_root(?conn.operation_root, opt[time.Instant].none{}))) { ret false; }
     if (!operation_ok(cancel.make_root(?conn.control_scope, opt[time.Instant].none{}))) {
-        operation_ok(cancel.destroy(?conn.operation_root));
+        operation_ok(cancel.dnit(?conn.operation_root));
         ret false;
     }
     conn.runtime_stream = transport.RuntimeStream{
@@ -1935,7 +1935,7 @@ fun open_connection(server: *Server, conn: *Connection, stream: tcp.Stream,
     conn.channel = channel;
     var engine: h1.Engine;
     conn.engine = engine;
-    val budgets_opened: buffers.Reason = buffers.source_open_account(?server.source,
+    val budgets_opened: buffers.Reason = buffers.source_account_init(?server.source,
         ?conn.account, (conn.index + 1)::u64, server.budgets, 0);
     conn.account_open = sel budgets_opened.none;
     if (!conn.account_open
@@ -1945,10 +1945,10 @@ fun open_connection(server: *Server, conn: *Connection, stream: tcp.Stream,
         || !h1.init(?conn.engine, h1.SERVER, ?conn.channel, ?conn.operation_root, conn.slots,
         server.configured.connection.max_pipeline, ?server.source, ?conn.account,
         server.configured.connection, now)) {
-        if (conn.account_open) { buffers.source_close_account(?server.source, ?conn.account); }
+        if (conn.account_open) { buffers.source_account_dnit(?server.source, ?conn.account); }
         conn.account_open = false;
-        operation_ok(cancel.destroy(?conn.operation_root));
-        operation_ok(cancel.destroy(?conn.control_scope));
+        operation_ok(cancel.dnit(?conn.operation_root));
+        operation_ok(cancel.dnit(?conn.control_scope));
         ret false;
     }
     atomic.store(?conn.woken, 0);
