@@ -58,3 +58,7 @@ need = []
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
 ref = "branch/dev"
+
+[dep.encoding]
+git = "https://github.com/briar-systems/mach-encoding"
+ref = "branch/dev"

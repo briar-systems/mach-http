@@ -19,3 +19,6 @@
 [submodule "test/fuzz/dep/std"]
 	path = test/fuzz/dep/std
 	url = https://github.com/briar-systems/mach-std
+[submodule "dep/encoding"]
+	path = dep/encoding
+	url = https://github.com/briar-systems/mach-encoding
