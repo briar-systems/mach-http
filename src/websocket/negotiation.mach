@@ -1,3 +1,4 @@
+use encoding.base64;
 use http.core.body;
 use http.core.exchange;
 use http.core.field;
@@ -5,7 +6,6 @@ use http.core.message;
 use http.core.method;
 use http.core.status;
 use http.core.target;
-use std.encoding.base64;
 use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
