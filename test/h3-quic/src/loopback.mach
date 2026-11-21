@@ -23,7 +23,6 @@ use std.types.bool.true;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
-use std.types.string.str;
 
 fun is_ok_usize_u8(outcome: res[usize, u8]) bool {
     ret sel outcome.ok;
