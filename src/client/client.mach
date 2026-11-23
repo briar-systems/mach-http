@@ -1988,7 +1988,7 @@ pub fun release_request(client: *Client, token: Token) bool {
     if (!client_ready(client)) { ret false; }
     val slot: *RequestSlot = slot_for(client, token);
     if (slot == nil || slot.state != STATE_TERMINAL
-        || !operation_ok(cancellation.destroy(?slot.scope))) { ret false; }
+        || !operation_ok(cancellation.dnit(?slot.scope))) { ret false; }
     clear_slot(client, token.index::usize);
     client.live_requests = client.live_requests - 1;
     ret true;
@@ -2363,7 +2363,7 @@ fun test_shutdown(client: *Client, cache: *dns.Cache,
     if (maintenance(client, now).kind != MAINTENANCE_NONE) { ret false; }
     if (!destroy(client) || !dns.destroy(cache)
         || !pool.destroy(connections)
-        || !operation_ok(cancellation.destroy(parent))) { ret false; }
+        || !operation_ok(cancellation.dnit(parent))) { ret false; }
     ret true;
 }
 

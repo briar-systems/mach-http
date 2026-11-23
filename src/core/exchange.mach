@@ -426,7 +426,7 @@ test emit_informational__shares_the_final_generation {
         || emit_informational(?exchange, ?hint, configured) != message.INFORM_OK) { ret 4; }
     if (commit(?exchange, configured) != message.RESPONSE_OK || finish(?exchange) != FINISH_OK
         || exchange.completion.outcome != OUTCOME_OK || !reusable(?exchange)) { ret 5; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 6; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 6; }
     ret 0;
 }
 
@@ -452,7 +452,7 @@ test finish__reuse_after_body_rejection_follows_adapter {
     if (!init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 51, configured) || !begin(?exchange)) { ret 1; }
     if (body.reject(?request_body).status != body.REJECTED || commit(?exchange, configured) != message.RESPONSE_OK
         || finish(?exchange) != FINISH_OK || exchange.completion.reuse != body.REUSE_FORBIDDEN || reusable(?exchange)) { ret 2; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 3; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 3; }
     cancel.make_root(?scope, opt[time.Instant].none{});
     body_state   = test_body(body.REUSE_ALLOWED, false);
     request_body = body.init_reader(?body_state, test_read, test_finish, test_complete, test_release,
@@ -465,7 +465,7 @@ test finish__reuse_after_body_rejection_follows_adapter {
     begin(?exchange);
     if (body.reject(?request_body).status != body.REJECTED || commit(?exchange, configured) != message.RESPONSE_OK
         || finish(?exchange) != FINISH_OK || !reusable(?exchange)) { ret 4; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 5; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 5; }
     ret 0;
 }
 
@@ -497,7 +497,7 @@ test finish__waits_for_streamed_response_body {
     var bytes: [4]u8;
     if (body.write(?writer, ?bytes[0], 4).count != 4 || body.finish(?writer).status != body.COMPLETE) { ret 2; }
     if (finish(?exchange) != FINISH_OK || exchange.completion.bytes_out != 4 || !reusable(?exchange)) { ret 3; }
-    if (!operation_ok(cancel.destroy(?scope)))                                                        { ret 4; }
+    if (!operation_ok(cancel.dnit(?scope)))                                                           { ret 4; }
     ret 0;
 }
 
@@ -527,7 +527,7 @@ test finish__post_commit_mutation_fails_closed {
     response.fields.bytes = 1;
     if (finish(?exchange) != FINISH_OK || exchange.state != FAILED_STATE
         || exchange.completion.outcome != OUTCOME_FAILED || exchange.completion.reuse != body.REUSE_FORBIDDEN) { ret 2; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 3; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 3; }
     ret 0;
 }
 
@@ -559,7 +559,7 @@ test cancel_exchange__settles_both_body_directions {
     if (cancel_exchange(?exchange) != FINISH_OK || exchange.state != CANCELLED_STATE
         || exchange.completion.outcome != OUTCOME_CANCELLED
         || exchange.completion.reuse != body.REUSE_FORBIDDEN || response_state.releases != 1) { ret 1; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 2; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 2; }
     cancel.make_root(?scope, opt[time.Instant].none{});
     state        = test_body(body.REUSE_FORBIDDEN, false);
     request_body = body.init_reader(?state, test_read, test_finish, test_complete, test_release,
@@ -572,7 +572,7 @@ test cancel_exchange__settles_both_body_directions {
     begin(?exchange);
     if (timeout_exchange(?exchange) != FINISH_OK || exchange.state != TIMED_OUT_STATE
         || exchange.completion.outcome != OUTCOME_TIMED_OUT || exchange.completion.reuse != body.REUSE_FORBIDDEN) { ret 3; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 4; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 4; }
     ret 0;
 }
 
@@ -599,6 +599,6 @@ test init__scope_deadline_must_match_request_metadata {
     if (!init(?exchange, ?request, ?response, ?infos[0], 8, ?scope, 81, configured) || !begin(?exchange)) { ret 2; }
     cancel.expire(?scope, deadline);
     if (settle_cancellation(?exchange) != FINISH_OK || exchange.state != TIMED_OUT_STATE) { ret 3; }
-    if (!operation_ok(cancel.destroy(?scope)))                                            { ret 4; }
+    if (!operation_ok(cancel.dnit(?scope)))                                               { ret 4; }
     ret 0;
 }

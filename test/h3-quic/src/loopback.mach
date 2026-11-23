@@ -23,7 +23,6 @@ use std.types.bool.true;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
-use std.types.string.str;
 
 fun is_ok_usize_u8(outcome: res[usize, u8]) bool {
     ret sel outcome.ok;
@@ -706,7 +705,7 @@ pub fun settle_link_close(link: *Link, abortive: bool, code: u64, budget: usize)
 # the storage half of close_link: releases the operation scopes and accounts
 # of two drivers that already settled their close
 pub fun release_link(link: *Link) bool {
-    ret operation_ok(cancel.destroy(?link.client.scope)) && operation_ok(cancel.destroy(?link.server.scope))
+    ret operation_ok(cancel.dnit(?link.client.scope)) && operation_ok(cancel.dnit(?link.server.scope))
         && close_account(link.client) && close_account(link.server);
 }
 

@@ -265,7 +265,9 @@ The remaining protocol and integration work is tracked in this repository.
 
 ## Development
 
-Dependencies use pinned Git tags.
+The project builds with mach 7. Each dependency is pinned by its committed gitlink
+under `dep/`. WebSocket handshake keys use base64 from mach-encoding. std and
+mach-encoding follow `branch/dev` until their v7 releases.
 
 ```sh
 mach dep pull .

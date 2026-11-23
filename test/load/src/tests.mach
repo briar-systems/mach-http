@@ -227,7 +227,7 @@ test load__sustained_keep_alive_holds_memory_steady {
     heap.native_source(?load.source);
     val made_heap: err[A.Error] = heap.init(?load.heap, ?load.source, 0);
     if (sel made_heap.err) { ret 1; }
-    val made_allocator: err[A.Error] = heap.make(?load.backing, ?load.heap);
+    val made_allocator: err[A.Error] = heap.allocator(?load.backing, ?load.heap);
     if (sel made_allocator.err) { ret 1; }
     var configured: server.Config = server.config_default(ip.endpoint(127, 0, 0, 1, 0));
     configured.max_connections      = CONNECTIONS;

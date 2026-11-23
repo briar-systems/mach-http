@@ -826,7 +826,7 @@ test read__exact_declared_length_releases_once {
     if (read(?reader, ?output[0], 4).status != COMPLETE || reader.state != COMPLETE_STATE
         || reader.reuse != REUSE_ALLOWED || adapter.release_calls != 1) { ret 3; }
     if (read(?reader, ?output[0], 4).status != COMPLETE || adapter.release_calls != 1) { ret 4; }
-    if (!operation_ok(cancel.destroy(?scope)))                                         { ret 5; }
+    if (!operation_ok(cancel.dnit(?scope)))                                            { ret 5; }
     ret 0;
 }
 
@@ -842,7 +842,7 @@ test read__completion_publishes_trailers {
     var output: [4]u8;
     if (read(?reader, ?output[0], 4).status != DATA || read(?reader, ?output[0], 4).status != COMPLETE) { ret 1; }
     if (fields.len != 1 || field.find_first(?fields, view.view("Digest", 6)) == nil)                    { ret 2; }
-    if (!operation_ok(cancel.destroy(?scope)))                                                          { ret 3; }
+    if (!operation_ok(cancel.dnit(?scope)))                                                             { ret 3; }
     ret 0;
 }
 
@@ -867,7 +867,7 @@ test complete__requires_matching_pending_token {
     if (finish(?writer).status != INVALID || complete_writer(?writer, 42).status != INVALID) { ret 5; }
     if (complete_writer(?writer, 43).status != DATA || writer.transferred != 2
         || finish(?writer).status != COMPLETE || adapter.release_calls != 1) { ret 6; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 7; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 7; }
     ret 0;
 }
 
@@ -888,7 +888,7 @@ test drain__and_reject_are_exclusive {
     if (rejected_result.status != REJECTED)       { ret 4; }
     if (rejected_reader.reuse != REUSE_FORBIDDEN) { ret 5; }
     if (reject_adapter.release_calls != 1)        { ret 6; }
-    if (!operation_ok(cancel.destroy(?scope)))    { ret 7; }
+    if (!operation_ok(cancel.dnit(?scope)))       { ret 7; }
     ret 0;
 }
 
@@ -909,7 +909,7 @@ test drain__skips_declared_length_check {
     if (read(?short_reader, ?bytes[0], 8).status != DATA || short_reader.transferred != 2) { ret 3; }
     val ended: Progress = read(?short_reader, ?bytes[0], 8);
     if (ended.status != ERROR || short_reader.reuse != REUSE_FORBIDDEN) { ret 4; }
-    if (!operation_ok(cancel.destroy(?scope)))                          { ret 5; }
+    if (!operation_ok(cancel.dnit(?scope)))                             { ret 5; }
     ret 0;
 }
 
@@ -923,14 +923,14 @@ test read__scope_cancel_and_timeout_settle_outcome {
     cancel.cancel(?scope);
     var output: [4]u8;
     if (read(?reader, ?output[0], 4).status != CANCELLED || adapter.finish_mode != CANCEL) { ret 1; }
-    if (!operation_ok(cancel.destroy(?scope)))                                             { ret 2; }
+    if (!operation_ok(cancel.dnit(?scope)))                                                { ret 2; }
     cancel.make_root(?scope, opt[time.Instant].none{});
     var timeout_adapter: TestAdapter = test_adapter(REUSE_FORBIDDEN, false);
     var timeout_body:    Reader      = init_reader(?timeout_adapter, test_read, test_finish, test_complete, test_release,
         OWNER_ENGINE, 11, false, 0, limits(8, 4, 4), ?fields, ?scope);
     cancel.timeout(?scope);
     if (read(?timeout_body, ?output[0], 4).status != TIMED_OUT || timeout_adapter.finish_mode != TIMEOUT) { ret 3; }
-    if (!operation_ok(cancel.destroy(?scope)))                                                            { ret 4; }
+    if (!operation_ok(cancel.dnit(?scope)))                                                               { ret 4; }
     ret 0;
 }
 
@@ -944,7 +944,7 @@ test drain__cancel_preempts_pending_operation {
     if (drain(?reader).status != PENDING) { ret 1; }
     cancel.cancel(?scope);
     if (drain(?reader).status != CANCELLED || adapter.finish_mode != CANCEL || adapter.release_calls != 1) { ret 2; }
-    if (!operation_ok(cancel.destroy(?scope)))                                                             { ret 3; }
+    if (!operation_ok(cancel.dnit(?scope)))                                                                { ret 3; }
     cancel.make_root(?scope, opt[time.Instant].none{});
     adapter = test_adapter(REUSE_FORBIDDEN, true);
     var writer: Writer = init_writer(?adapter, test_write, test_finish, test_complete, test_release,
@@ -952,7 +952,7 @@ test drain__cancel_preempts_pending_operation {
     if (finish(?writer).status != PENDING) { ret 4; }
     cancel.timeout(?scope);
     if (finish(?writer).status != TIMED_OUT || adapter.finish_mode != TIMEOUT || adapter.release_calls != 1) { ret 5; }
-    if (!operation_ok(cancel.destroy(?scope)))                                                               { ret 6; }
+    if (!operation_ok(cancel.dnit(?scope)))                                                                  { ret 6; }
     ret 0;
 }
 
@@ -983,7 +983,7 @@ test read__limits_and_adapter_violations_release {
         OWNER_ENGINE, 22, false, 0, limits(2, 2, 1), ?fields, ?scope);
     if (write(?writer, ?bytes[0], 2).status != DATA || write(?writer, ?bytes[0], 1).status != LIMIT_REACHED
         || adapter.release_calls != 1) { ret 5; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 6; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 6; }
     ret 0;
 }
 
@@ -1003,7 +1003,7 @@ test write__bounded_chunks_and_exact_completion {
         OWNER_APPLICATION, 14, true, 4, limits(8, 4, 2), ?fields, ?scope);
     if (write(?writer, ?input[0], 2).status != DATA || finish(?writer).status != ERROR
         || writer.reuse != REUSE_FORBIDDEN || adapter.release_calls != 1) { ret 4; }
-    if (!operation_ok(cancel.destroy(?scope))) { ret 5; }
+    if (!operation_ok(cancel.dnit(?scope))) { ret 5; }
     ret 0;
 }
 
@@ -1021,6 +1021,6 @@ test init_reader__requires_release_authority {
         || !validate_reader(?empty, limits(8, 4, 2), 15)) { ret 2; }
     empty.declared_length = 1;
     if (validate_reader(?empty, limits(8, 4, 2), 15)) { ret 3; }
-    if (!operation_ok(cancel.destroy(?scope)))        { ret 4; }
+    if (!operation_ok(cancel.dnit(?scope)))           { ret 4; }
     ret 0;
 }

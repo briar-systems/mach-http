@@ -1,7 +1,6 @@
 use http.core.method;
 use std.types.bool.bool;
 use std.types.bool.false;
-use std.types.bool.true;
 
 pub def Status: u16;
 
